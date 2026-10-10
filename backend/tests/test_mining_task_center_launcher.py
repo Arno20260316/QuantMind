@@ -427,3 +427,58 @@ def test_launcher_init_uses_resolved_log_dir(tmp_path: Path, monkeypatch) -> Non
     assert launcher._log_dir == tmp_path / "logs"
     assert launcher._log_dir.is_dir()
     assert launcher._tasks == {}
+
+
+# ── 挖掘频率（移植 P1.5） ─────────────────────────────────
+
+
+def test_freq_survives_disk_roundtrip(tmp_path: Path) -> None:
+    """task_state.json 也要带 freq：engine 重启后补位执行仍按分钟口径起子进程。"""
+    writer = _launcher_with(tmp_path)
+    writer._persist_task(
+        _task(freq="1min", mining_start="2026-03-04", mining_end="2026-08-25")
+    )
+
+    reader = _launcher_with(tmp_path)
+    reader._load_tasks()
+
+    task = reader._tasks["t-1"]
+    assert task.freq == "1min"
+    assert (task.mining_start, task.mining_end) == ("2026-03-04", "2026-08-25")
+
+
+def test_load_tasks_tolerates_missing_freq(tmp_path: Path) -> None:
+    """老 task_state.json 没有 freq 键 → 空串（日线），不炸加载。"""
+    writer = _launcher_with(tmp_path)
+    writer._persist_task(_task())
+    state_path = next((tmp_path / "t-1").glob("*.json"))
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    raw.pop("freq", None)
+    state_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    reader = _launcher_with(tmp_path)
+    reader._load_tasks()
+    assert reader._tasks["t-1"].freq == ""
+
+
+@pytest.mark.asyncio
+async def test_db_create_forwards_freq(monkeypatch) -> None:
+    store = _RecordingStore()
+    monkeypatch.setattr(launcher_module, "_task_store", lambda: store)
+    launcher = _launcher_with()
+
+    await launcher._db_create(_task(task_id="t-min", freq="1min"))
+    await launcher._db_create(_task(task_id="t-day"))
+
+    assert store.calls[0][1]["freq"] == "1min"
+    assert store.calls[1][1]["freq"] == ""
+
+
+@pytest.mark.asyncio
+async def test_status_payload_mining_config_carries_freq() -> None:
+    launcher = _launcher_with()
+    launcher._tasks["t-1"] = _task(freq="1min")
+    launcher._tasks["t-2"] = _task(task_id="t-2")
+
+    assert (await launcher.get_task_status("t-1"))["mining_config"]["freq"] == "1min"
+    assert (await launcher.get_task_status("t-2"))["mining_config"]["freq"] is None

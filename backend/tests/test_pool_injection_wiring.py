@@ -88,6 +88,22 @@ def _launcher_for(task: EvolutionTask, tmp_path) -> AlphaAgentLauncher:
     obj._log_dir = tmp_path / "logs"
     obj._log_dir.mkdir(parents=True, exist_ok=True)
     obj._collect_results = lambda t, d: {}  # type: ignore[method-assign]
+    # 掐掉 DB 旁路：_run_evolution 的心跳/收尾会摸真 task_store，asyncpg 池
+    # 被绑到本用例的 asyncio.run 一次性 loop 上；同进程后续真库用例（task_store
+    # 的全套）探活即报「attached to a different loop」→ 静默 skip。本文件测的是
+    # env 接线，DB 写入是噪声。
+    for name in (
+        "_db_create",
+        "_db_sync_progress",
+        "_db_sync_progress_throttled",
+        "_db_finish",
+        "_db_cancel",
+    ):
+
+        async def _noop(*_a, **_kw):
+            return None
+
+        setattr(obj, name, _noop)
     return obj
 
 

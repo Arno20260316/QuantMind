@@ -15,14 +15,28 @@ import pickle
 import re
 import shutil
 import time
+from bisect import bisect_right
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+# 运行时导入（不止注解用）：``quantdb_coverage_from_dir`` 要构造 Window。
+# mining_config 只依赖 mining_datasets（纯表），不反向依赖本模块，无环。
+from backend.services.engine.alpha_agent.mining_config import Window
+
 from .market_adapters import get_adapter, list_markets
 from .market_adapters.base import MarketAdapter
+from .mining_datasets import (
+    DATASET_SHORT_NAMES,
+    ENRICH_BY_DATASET,
+    L2_DATASET,
+    SUPPORTED_DATASETS,
+    datasets_from_env,
+)
+from .qlib_conf_template import install_qlib_execute_patch
 from .stage_prompt import STAGE_BLOCK_MARKER, render_eval_criteria_block
 
 logger = logging.getLogger(__name__)
@@ -30,51 +44,25 @@ logger = logging.getLogger(__name__)
 # QuantDB 富化列白名单（仅 A 股）：{源列名: 输出列名}，输出列在 h5 中加 "$" 前缀。
 # 这些列会随 daily_pv.h5 一起提供给 RD-Agent，LLM 可直接在因子表达式中引用
 # （$<输出列名>），使因子能用上 QuantDB 的预计算技术指标/估值/资金流/筹码等富数据。
-_ENRICH_FEATURES_DAILY: dict[str, str] = {
-    "rsi_14": "rsi_14",
-    "macd_hist": "macd_hist",
-    "vol_atr_14": "atr_14",
-    "beta_20": "beta_20",
-    "pe_ttm": "pe_ttm",
-    "pb": "pb",
-    "ps_ttm": "ps_ttm",
-    "dividend_rate": "div_yield",
-    "total_mv": "total_mv",
-    "float_mv": "float_mv",
-    "net_profit_ttm": "np_ttm",
-}
-_ENRICH_L1: dict[str, str] = {
-    "turn_5": "turn_5",
-    "turn_20": "turn_20",
-    "turn_z_20": "turn_z_20",
-    "amt_net_flow_5": "netflow_5",
-    "amt_net_flow_20": "netflow_20",
-    "mfi_14": "mfi_14",
-    "obv_slope_20": "obv_slope",
-    "vol_parkinson_20": "parkinson_20",
-    "tech_bb_width": "bb_width",
-    "tech_bb_pos": "bb_pos",
-    "tech_adx_14": "adx_14",
-    "tech_max_drawdown_20": "maxdd_20",
-    "fun_bp": "bp",
-    "fun_ep": "ep",
-    "fun_roe": "roe",
-    "fun_peg": "peg",
-    "fun_np_growth": "np_growth",
-    "chip_profit_ratio_20": "chip_profit_20",
-    "style_idio_vol_20": "idio_vol_20",
-    "ind_strength_20": "ind_strength",
-    "concept_hot_score": "concept_hot",
-}
+#
+# 白名单本体已抽到 ``mining_datasets``（单源）：数据集选择（移植 P1）
+# 要同时驱动**数据面**（本文件 _merge_enrich/_merge_l2_factors）与**提示面**
+# （a_share._l2_referenceable_columns 等），留副本必然漂移。下划线名字保留给
+# 既有引用方（market_adapters/a_share.py、既有测试）。
+_ENRICH_FEATURES_DAILY = ENRICH_BY_DATASET["features_daily"]
+_ENRICH_L1 = ENRICH_BY_DATASET["l1_factors"]
+# 静态数据集的输出列名（不含 L2——动态列集由 l2_factor_columns 现场读盘）
 _ENRICH_OUTPUT_COLUMNS: tuple[str, ...] = tuple(
-    _ENRICH_FEATURES_DAILY.values()
-) + tuple(_ENRICH_L1.values())
+    col
+    for _dataset in ("features_daily", "l1_factors")
+    for col in (ENRICH_BY_DATASET[_dataset] or {}).values()
+)
 
 # L2 微观结构因子全量接入挖掘数据面（T-MV-07）：l2_factors 的真因子列经
 # _merge_l2_factors 并入 daily_pv.h5，LLM 因子表达式可直接引用 $<真列名>。
 # 列清单每次现场读盘（l2_factor_columns）：「数据面列清单与目录一致」的验收
 # 即此谓词；这里不维护静态名单，避免与上游发布漂移。
-_L2_LIBRARY = "l2_factors"
+_L2_LIBRARY = L2_DATASET
 _L2_SKIP_COLUMNS: frozenset[str] = frozenset(
     {
         # 键列
@@ -97,6 +85,37 @@ _L2_SKIP_COLUMNS: frozenset[str] = frozenset(
 # 分块 fetch：200+ 列一次性 DuckDB→pandas 的峰值内存约 8GB（float64），
 # 48 列/块把单块峰值压到 ~2GB 以内，逐块 merge 后立即释放
 _L2_FETCH_CHUNK = 48
+
+# 无自定义窗口（QM_MINING_WINDOW_* 未设）时 h5 数据面的旧默认跨度，保持迁移前
+# 行为逐位不变（含共享缓存文件名）。
+_H5_DEFAULT_START = date(2020, 1, 1)
+_H5_DEFAULT_END = date(2026, 12, 31)
+
+
+class MinuteDataError(RuntimeError):
+    """分钟数据面（provider / h5）不可用——显式失败，绝不静默退回日线。
+
+    分钟任务最坏的失败形态是「悄悄按日线跑完、产出一批自称分钟因子的东西」，
+    所以从 provider 构建到 h5 生成、再到 conf 渲染，每一环拿不到分钟数据都
+    直接抛错让任务失败。
+    """
+
+
+def _h5_cache_name(
+    debug: bool, start: date, end: date, datasets: Sequence[str]
+) -> str:
+    """共享缓存文件名：默认组合沿用旧名，自定义窗口/数据集按内容分文件。
+
+    「窗口 A 生成的缓存冒充窗口 B 的数据面」是静默错数据（LLM 引用到的列、
+    因子计算覆盖的区间都随之错位），所以缓存身份 = 窗口 + 数据集选择。默认
+    组合（旧默认窗口 + 全数据集）保持 ``daily_pv_all.h5``/``daily_pv_debug.h5``
+    旧名，存量缓存与外部脚本（rd_mined_materialize / 回测同源读取）零变化。
+    """
+    base = "daily_pv_debug" if debug else "daily_pv_all"
+    if (start, end) == (_H5_DEFAULT_START, _H5_DEFAULT_END) and datasets == SUPPORTED_DATASETS:
+        return f"{base}.h5"
+    short = "+".join(DATASET_SHORT_NAMES[d] for d in datasets)
+    return f"{base}__{start.isoformat()}_{end.isoformat()}__{short}.h5"
 
 
 def l2_factor_columns(quantdb_dir: str) -> list[str]:
@@ -133,6 +152,92 @@ def l2_factor_columns(quantdb_dir: str) -> list[str]:
     return []
 
 
+#: 各市场 → ``shared.qlib_paths`` 的 provider key（回测日历所在目录）
+_QLIB_PROVIDER_KEY_BY_MARKET: dict[str, str] = {
+    "a_share": "CN",
+    "hong_kong": "HK",
+    "us_stock": "US",
+    "crypto": "CRYPTO",
+    "futures": "FUTURES",
+}
+
+
+def quantdb_coverage_from_dir(quantdb_dir: str | os.PathLike[str] | None) -> Window | None:
+    """QuantDB 日线覆盖窗口（挖掘数据面同源）。
+
+    覆盖 = ``1_kline_data/daily_forward`` 分区目录 ``dt=YYYYMMDD`` 的 min/max
+    ——挖掘 h5 实际读取的库，不用交易日历冒充数据覆盖。
+
+    ``quantdb_dir`` 为空 / 该目录下没有任何分区 → ``None``（语义 = 不做覆盖
+    校验、不做末端保护：宁可放行由引擎侧失败，也不做假校验）；目录不存在或
+    不可读时**抛 OSError**（不吞——由调用方决定是记日志放行还是拦），2000+ 个
+    分区目录的现读由调用方缓存（路由侧 TTL 300s）。
+    """
+    if not quantdb_dir:
+        return None
+    daily_dir = Path(quantdb_dir) / "1_kline_data" / "daily_forward"
+    days = sorted(
+        d.name[3:] for d in daily_dir.iterdir() if d.is_dir() and d.name.startswith("dt=")
+    )
+    if not days:
+        return None
+    return Window(
+        date.fromisoformat(f"{days[0][:4]}-{days[0][4:6]}-{days[0][6:8]}"),
+        date.fromisoformat(f"{days[-1][:4]}-{days[-1][4:6]}-{days[-1][6:8]}"),
+    )
+
+
+def _read_calendar_days(provider_dir: Path) -> list[date]:
+    """读 qlib provider 的 ``calendars/day.txt`` → 升序交易日列表（空 = 不可用）。"""
+    text = (provider_dir / "calendars" / "day.txt").read_text(encoding="utf-8")
+    return [date.fromisoformat(ln.strip()) for ln in text.splitlines() if ln.strip()]
+
+
+def _last_trading_day_on_or_before(day: date, days: Sequence[date]) -> date | None:
+    """``days`` 中 ≤ ``day`` 的最后一个交易日；没有回 ``None``。"""
+    idx = bisect_right(list(days), day) - 1
+    return days[idx] if idx >= 0 else None
+
+
+def qlib_backtest_data_end(
+    coverage: Window | None = None, *, market: str = "a_share"
+) -> date | None:
+    """回测可用末端（交易日）= qlib 日历倒数第二个交易日 ∩ 数据覆盖末端。
+
+    **为什么是倒数第二个**：qlib 回测按 t+1 成交，``TradeCalendarManager
+    .get_step_time`` 取「下一根 bar」的时间步（qlib/backtest/utils.py:131），
+    回测终点压在日历最后一根 bar 上必然 ``IndexError: index N is out of
+    bounds for axis 0 with size N``（2026-10-10 实证：test_end=2026-10-09 崩、
+    前移一个交易日通过）。这个末端恰恰是默认窗口会锚到的位置，所以不是边角
+    情形，是"默认配置必然跑挂"。
+
+    再取 min 覆盖末端：qlib 缓存（provider_uri）可能落后于 QuantDB 覆盖，
+    只锚覆盖会照旧把终点推到缓存日历的最后一根 bar 上（同一个 IndexError）；
+    只锚日历则会在覆盖回退时读过界。覆盖末端落在非交易日（周末/假日）时
+    向前贴到最近交易日——否则 min 出来的仍是「日历最后一根 bar」之外的日子。
+
+    读不到日历（provider 未就绪）/ 市场无对应 provider / 覆盖整体早于日历
+    → ``None`` = **不做末端保护**（与 ``validate_coverage`` 同一哲学：宁可放行
+    由引擎侧失败，也不做假保护）。
+    """
+    provider_key = _QLIB_PROVIDER_KEY_BY_MARKET.get(market)
+    if not provider_key:
+        return None
+    try:
+        from backend.shared.qlib_paths import resolve_qlib_provider_uri
+
+        days = _read_calendar_days(Path(resolve_qlib_provider_uri(provider_key)))
+    except Exception as exc:  # noqa: BLE001 - 日历读不到不拦挖掘（只记一笔）
+        logger.warning("[%s] qlib 回测日历读取失败，跳过末端保护: %s", market, exc)
+        return None
+    if len(days) < 2:
+        return None
+    guard = days[-2]
+    if coverage is None or coverage.end >= guard:
+        return guard
+    return _last_trading_day_on_or_before(coverage.end, days)
+
+
 class RDLoopWrapper:
     """封装 RD-Agent FactorRDLoop，提供 QuantMind 兼容接口"""
 
@@ -148,6 +253,131 @@ class RDLoopWrapper:
     @property
     def market_name(self) -> str:
         return self.adapter.market_name
+
+    def _freq(self) -> str:
+        """本任务挖掘频率（env ``QM_MINING_FREQ``；缺省 day；非法值/市场不支持显式抛）。"""
+        from backend.services.engine.alpha_agent.mining_config import (
+            freq_from_env,
+            normalize_freq,
+        )
+
+        return normalize_freq(freq_from_env(), market=self.market)
+
+    def _ensure_minute_provider(self) -> Path:
+        """确保 1min provider 就绪且新鲜（本次重建则记录报告），返回目录。"""
+        from backend.services.engine import minute_qlib_provider as MP
+
+        provider_dir, report = MP.ensure_minute_provider(
+            universe=MP.DEFAULT_UNIVERSE,  # conf 模板钉 csi300，两者必须同池
+            log=lambda msg: logger.info("[%s] %s", self.market, msg),
+        )
+        if report is not None:
+            logger.info(
+                "[%s] minute provider 构建完成：%d 只 / %d bar / %d 日（%s~%s），警告 %d 条",
+                self.market,
+                report.symbols,
+                report.bars,
+                report.days,
+                report.first,
+                report.last,
+                len(report.warnings),
+            )
+            for msg in report.warnings[:10]:
+                logger.warning("[%s] minute provider 警告: %s", self.market, msg)
+        return provider_dir
+
+    def _generate_minute_h5(
+        self,
+        provider_dir: str | os.PathLike[str],
+        output_path: str,
+        *,
+        debug: bool = False,
+    ) -> bool:
+        """从分钟 provider bins 生成任务数据面 ``daily_pv.h5``（1min MultiIndex）。
+
+        - 列 = provider 的 8 个 1min 字段（$open/$high/$low/$close/$volume/
+          $amount/$vwap/$factor），与因子表达式读到的是**同一份 bin**——写代码
+          时看到的数据与评估时算的数据逐位一致；
+        - 窗口 = [挖掘起点, 检验终点]（自定义窗口）。分钟挖掘**必须**显式给窗口：
+          默认窗口是 2016/2020 年起的日线尺度，落在 121 天分钟覆盖之外——这里
+          显式拒，不静默截断成"看上去成功、实际换了个区间"；
+        - debug 变体取码表前 50 只（与日线 debug 同一惯例），LLM 先在 debug 上
+          试代码、全量变体跑全池；
+        - 共享缓存放 provider 目录内 ``h5_cache/``：provider 重建 = 整目录原子
+          换入 → 缓存随之失效，不存在「h5 与 provider 口径漂移」的中间态。
+        """
+        from backend.services.engine import minute_qlib_provider as MP
+
+        custom = self._custom_windows()
+        if custom is None:
+            raise MinuteDataError(
+                "分钟挖掘必须显式指定挖掘数据区间（QM_MINING_WINDOW_* 未设置或非法）："
+                "分钟数据覆盖只有约 121 个交易日，日线尺度的默认窗口不适用"
+            )
+        start = custom[0].start
+        end = (custom[1] or custom[0]).end
+        facts = MP.minute_data_facts(provider_dir)
+        if facts is None:
+            raise MinuteDataError(
+                f"分钟 provider meta 不可用：{Path(provider_dir) / 'meta.json'}；"
+                "先构建分钟数据面（minute_qlib_provider）再来挖"
+            )
+        cover_start, cover_end = facts.coverage.start, facts.coverage.end
+        if start < cover_start or end > cover_end:
+            raise MinuteDataError(
+                f"数据窗口 {start.isoformat()} ~ {end.isoformat()} 超出分钟数据覆盖 "
+                f"{cover_start.isoformat()} ~ {cover_end.isoformat()}；"
+                "请把区间收进覆盖范围（前端会给出可用端点）"
+            )
+        if not facts.contains(start, end):
+            # 起点落在覆盖内但跨过空洞（或整段落在空洞里）：按可用连续块拦
+            raise MinuteDataError(
+                f"数据窗口 {start.isoformat()} ~ {end.isoformat()} 跨过分钟数据空洞 "
+                f"（{facts.gap_text()}）；可用连续块 "
+                f"{facts.usable_start.isoformat()} ~ {cover_end.isoformat()}，"
+                f"共 {facts.usable_days} 个交易日"
+            )
+        self._minute_window = (start, end)
+
+        meta = MP.read_minute_meta(provider_dir) or {}
+        symbols = sorted(str(s) for s in meta.get("built_symbols", []))
+        if not symbols:
+            raise MinuteDataError(f"分钟 provider 没有已构建标的：{provider_dir}")
+        if debug:
+            symbols = symbols[:50]
+
+        cache_dir = Path(provider_dir) / "h5_cache"
+        cache_path = cache_dir / (
+            f"minute_pv_{'debug' if debug else 'all'}_{start.isoformat()}_{end.isoformat()}.h5"
+        )
+        if cache_path.is_file():
+            logger.info("[%s] minute h5 cache hit: %s", self.market, cache_path)
+            self._link_h5(str(cache_path), output_path)
+            return True
+
+        try:
+            frame = MP.read_minute_frame(provider_dir, symbols, start=start, end=end)
+            if frame.empty:
+                logger.error("[%s] minute frame 为空：%s", self.market, provider_dir)
+                return False
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = f"{cache_path}.tmp-{os.getpid()}"
+            frame.to_hdf(tmp_path, key="data", mode="w")
+            os.replace(tmp_path, cache_path)
+            self._link_h5(str(cache_path), output_path)
+            logger.info(
+                "[%s] Generated minute h5: %s (%d rows, %d cols, %s~%s)",
+                self.market,
+                cache_path,
+                len(frame),
+                frame.shape[1],
+                start,
+                end,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 —— 生成失败如实返回 False 由调用方响亮失败
+            logger.error("[%s] Failed to generate minute h5: %s", self.market, exc)
+            return False
 
     def _configure_env(self, task_log_dir: str) -> dict[str, str]:
         """从 MarketAdapter 构建环境变量"""
@@ -175,12 +405,39 @@ class RDLoopWrapper:
             env["CHAT_MODEL"] = f"openai/{model}"
         env["REASONING_MODEL"] = env.get("CHAT_MODEL", "")
         env["CHAT_STREAM"] = "false"
-        # 回测数据从 2016 年开始 (默认 2008 太慢)
-        env.setdefault("QLIB_FACTOR_TRAIN_START", os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"))
-        env.setdefault("QLIB_FACTOR_VALID_START", os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"))
-        env.setdefault("QLIB_FACTOR_VALID_END", os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"))
-        env.setdefault("QLIB_FACTOR_TEST_START", os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"))
-        env.setdefault("QLIB_FACTOR_TEST_END", os.getenv("QLIB_FACTOR_TEST_END", "2025-12-31"))
+        # 自定义窗口任务（launcher 注入 QM_MINING_WINDOW_*）：旧 QLIB_FACTOR_*
+        # 变量与 QM_* 同源派生，任何下游读取方拿到的都是同一套窗口。
+        custom = self._custom_windows()
+        if custom is not None:
+            from backend.services.engine.alpha_agent.mining_config import task_env
+
+            # data_end：子进程再算一次末端保护（渲染进 conf 的 test 段/回测窗
+            # 必须留出次日行情）。请求入口已退让过，此处幂等；兜的是手工改写
+            # QM_MINING_WINDOW_* 的进程——env 里写出的端点 = 实际消费的端点。
+            env.update(
+                task_env(
+                    custom[0],
+                    custom[1],
+                    datasets_from_env(),
+                    data_end=qlib_backtest_data_end(market=self.market),
+                )
+            )
+        else:
+            # 无自定义窗口：保持旧静态兜底（手动运行/直跑脚本场景）
+            env.setdefault("QLIB_FACTOR_TRAIN_START", os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"))
+            # TRAIN_END 曾缺失 → FactorBasePropSetting 落到类默认 2014-12-31，
+            # 与这里的 train_start 2016-01-01 组成倒置区间（train 段恒为空）。
+            # 2020-12-31 与既有 valid（2021~2022）/test（2023~2025）首尾相接。
+            env.setdefault("QLIB_FACTOR_TRAIN_END", os.getenv("QLIB_FACTOR_TRAIN_END", "2020-12-31"))
+            env.setdefault("QLIB_FACTOR_VALID_START", os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"))
+            env.setdefault("QLIB_FACTOR_VALID_END", os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"))
+            env.setdefault("QLIB_FACTOR_TEST_START", os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"))
+            env.setdefault("QLIB_FACTOR_TEST_END", os.getenv("QLIB_FACTOR_TEST_END", "2025-12-31"))
+        # mlflow 3.x 默认拒绝 filesystem tracking backend（"maintenance mode"），而
+        # qlib 的 MLflowExpManager（qrun）与 read_exp_res.py 用的就是 ./mlruns 文件
+        # 后端 → 不开此开关，qrun 在建实验时即抛 MlflowException 退出（2026-10-10
+        # 实证：日志里 qrun 全部 exit 1，全盘 0 个 qlib_res.csv）。文件后端本身仍可用。
+        env.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
         # 因子处理并行数
         env.setdefault("MULTI_PROC_N", os.getenv("MULTI_PROC_N", "4"))
         # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
@@ -219,8 +476,34 @@ class RDLoopWrapper:
                 "请围绕此方向进行因子探索。Focus factor exploration on this theme.\n"
             )
         suffix += render_eval_criteria_block()
+        suffix += self._minute_prompt_block()
         suffix += self._pool_context_block()
         return suffix
+
+    def _minute_prompt_block(self) -> str:
+        """分钟任务的静态数据面说明（不含它，LLM 会按日线语义写表达式）。
+
+        日线任务返回空串——这段文字一旦误挂到日线任务上，LLM 会按分钟语义
+        构造表达式（日线数据上算出来的是另一回事），是纯误导。
+        """
+        from backend.services.engine.alpha_agent.mining_config import FREQ_MINUTE
+
+        if self._freq() != FREQ_MINUTE:
+            return ""
+        window = getattr(self, "_minute_window", None)
+        cover = f"{window[0].isoformat()} ~ {window[1].isoformat()}" if window else "见数据文件说明"
+        return (
+            "\n\n====== 分钟级挖掘 / 1-Minute Frequency ======\n"
+            "本任务在 **1 分钟 bar** 上做原生因子挖掘（不是日线！）：数据文件里的索引是分钟"
+            "时间戳（含 09:25 集合竞价 bar），因子表达式与生成的因子代码都在分钟截面上计算。\n"
+            f"本任务数据窗口：{cover}。\n"
+            "可用字段：$open / $high / $low / $close / $volume / $amount / $vwap / $factor"
+            "（价格已按日复权因子调整，同一交易日内 $factor 恒定；$vwap = 成交均价）。\n"
+            "时间序列算子在分钟 bar 上滚动（如 Ref($close, 1) = 上一根 1min bar，"
+            "Mean($close, 20) = 最近 20 根 1min bar）；IC 口径为 1 分钟前向收益。\n"
+            "注意：日线富化列（技术指标 / 估值 / 资金流 / L2 微观结构等）在分钟数据面**不存在**，"
+            "引用会得到空列——请只用上面列出的分钟字段与它们的派生量构造因子。\n"
+        )
 
     def _build_stage_block(self) -> str:
         """读时计算的阶段块（当前轮次：RD-Agent 日志 tag 优先，目录数兜底）。
@@ -327,6 +610,10 @@ class RDLoopWrapper:
 
         # 注入中文指令
         self._patch_prompts_for_chinese()
+
+        # qrun 前渲染 conf_*.yaml 的 Jinja 占位符：vendored RD-Agent 缺这一步，
+        # 未渲染的配置是非法 YAML（详见 qlib_conf_template 模块 docstring）。
+        install_qlib_execute_patch()
 
         prop_setting_path = self.adapter.get_prop_setting_class()
         prop_cls = import_class(prop_setting_path)
@@ -494,6 +781,41 @@ class RDLoopWrapper:
         target_all = os.path.join(base_dir, "git_ignore_folder/factor_implementation_source_data/daily_pv.h5")
         target_debug = os.path.join(base_dir, "git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5")
 
+        # 分钟原生挖掘（P1.5）：数据面换成 1min h5（与 provider bins 同源）；
+        # **不动** ~/.qlib 全局 symlink——分钟任务的 provider_uri 由 conf 渲染层
+        # 直接改写指向分钟 provider，避免把并发日线任务共用的全局指向改掉。
+        # 任何一环失败都显式抛，绝不静默退回日线数据。
+        freq = self._freq()
+        if self.market == "a_share" and freq != "day":
+            # 日线富化列（技术指标/资金流/L2）在分钟数据面不存在：选择被路由层
+            # 收敛为空；这里兜手工/env 直跑的进程，如实记一笔而不是让 LLM 以为
+            # 这些列还在。**读原始 env 值**（不解析成 key）：本块只做"已忽略"
+            # 告知，未登记 key 原样透出即可，不为一句日志炸掉整轮挖掘。
+            raw_datasets = str(os.environ.get("QM_MINING_DATASETS") or "").strip()
+            if raw_datasets:
+                logger.warning(
+                    "[%s] 分钟模式忽略数据集选择 %s（日线富化列不出现在 1min 数据面）",
+                    self.market,
+                    raw_datasets,
+                )
+            provider_dir = self._ensure_minute_provider()
+            ok_all = self._generate_minute_h5(provider_dir, target_all, debug=False)
+            ok_debug = self._generate_minute_h5(provider_dir, target_debug, debug=True)
+            if not (ok_all and ok_debug):
+                raise MinuteDataError(
+                    f"分钟数据面生成失败（provider={provider_dir}，"
+                    f"all={ok_all}, debug={ok_debug}）"
+                )
+            # 日线富化列不在分钟数据面：不给 LLM 喂日线种子因子（引用即空值）
+            self._base_features_path = None
+            logger.info(
+                "[%s] 分钟数据面就绪：%s（窗口 %s ~ %s）",
+                self.market,
+                provider_dir,
+                *self._minute_window,
+            )
+            return
+
         # A 股：优先从 QuantDB parquet 生成 .h5，失败则 fallback 到预生成文件
         if self.market == "a_share":
             quantdb_dir = self._resolve_quantdb_dir()
@@ -619,6 +941,25 @@ class RDLoopWrapper:
                 return d
         return None
 
+    def _custom_windows(self) -> tuple[Window, Window | None] | None:
+        """任务自定义窗口（env ``QM_MINING_WINDOW_*``）→ (mining, validation)。
+
+        未设 = ``None``（调用方走旧默认路径，行为零变化）。env 非法时记 error
+        并退回 ``None``：请求入口（/evolve）已做同样校验，这里只是防手动运行
+        的进程拿到半截/倒置配置后静默按错窗口挖。
+        """
+        try:
+            from backend.services.engine.alpha_agent.mining_config import (
+                window_from_env,
+            )
+
+            return window_from_env()
+        except ValueError as exc:
+            logger.error(
+                "[%s] QM_MINING_WINDOW_* 配置非法，退回默认窗口: %s", self.market, exc
+            )
+            return None
+
     @staticmethod
     def _resolve_market_data_dir(container_path: str) -> Path:
         """解析市场本地 parquet 数据目录（容器挂载 /data/quantX）。
@@ -676,15 +1017,28 @@ class RDLoopWrapper:
             True if h5 file was generated/already current, False on failure.
         """
         cache_dir = os.path.join(quantdb_dir, ".h5_cache")
+
+        # 数据面窗口 = 数据必须覆盖的全跨度（挖掘起点 → 检验终点）：因子值要在
+        # 实验分段（含检验段）上算得出来，只给挖掘窗会缺检验段。无自定义窗口时
+        # 用旧默认跨度，行为逐位不变。
+        custom = self._custom_windows()
+        if custom is None:
+            start_d = _H5_DEFAULT_START
+            default_end = _H5_DEFAULT_END
+        else:
+            start_d = custom[0].start
+            default_end = (custom[1] or custom[0]).end
+        end_d = end_date or default_end
+        datasets = datasets_from_env()
         cache_path = os.path.join(
-            cache_dir, "daily_pv_debug.h5" if debug else "daily_pv_all.h5"
+            cache_dir, _h5_cache_name(debug, start_d, end_d, datasets)
         )
 
         # 共享缓存命中：直接链接到任务目录（避免重复生成）；探测模式禁用
         if (
             use_cache
             and os.path.exists(cache_path)
-            and self._h5_cache_fresh(quantdb_dir, cache_path)
+            and self._h5_cache_fresh(quantdb_dir, cache_path, datasets=datasets)
         ):
             logger.info("[%s] h5 cache hit: %s", self.market, cache_path)
             self._link_h5(cache_path, output_path)
@@ -717,7 +1071,6 @@ class RDLoopWrapper:
                 # 探测模式确定性抽样：排序后取前 N——全量/截断两次生成必须
                 # 拿到同一批标的，否则探针对比无意义（set 迭代序不保证）
                 symbols = sorted(symbols)[: int(symbols_limit)]
-            start_d, end_d = date(2020, 1, 1), end_date or date(2026, 12, 31)
 
             # 批量读取：一次查全部 symbol，避免逐股票 N 次分区扫描
             # （早期实现对 ~5400 只股票各查 2 次，单次生成需 40 分钟以上）
@@ -760,12 +1113,21 @@ class RDLoopWrapper:
             # 合并 QuantDB 富化列（技术指标/估值/资金流/筹码等），供因子直接引用
             # （子集模式=debug 或探测抽样：只拉这批标的的富化数据）
             enrich_symbols = symbols if (debug or symbols_limit is not None) else None
-            df = self._merge_enrich(df, hub, start_d, end_d, enrich_symbols)
-
-            # L2 微观结构因子全量接入（T-MV-07）：列清单现场读盘，分块左连接
-            df, l2_cols = self._merge_l2_factors(
-                df, hub, quantdb_dir, start_d, end_d, enrich_symbols
+            df = self._merge_enrich(
+                df, hub, start_d, end_d, enrich_symbols, datasets=datasets
             )
+
+            # L2 微观结构因子全量接入（T-MV-07）：列清单现场读盘，分块左连接；
+            # 数据集选择不含 L2 时整段跳过（选择必须真正控制喂给 LLM 的列）
+            if L2_DATASET in datasets:
+                df, l2_cols = self._merge_l2_factors(
+                    df, hub, quantdb_dir, start_d, end_d, enrich_symbols
+                )
+            else:
+                l2_cols = []
+                logger.info(
+                    "[%s] 数据集选择不含 %s，跳过 L2 接入", self.market, L2_DATASET
+                )
 
             instruments = [self._to_qlib_symbol(str(s)) for s in df["symbol"]]
             data: dict[str, Any] = {
@@ -828,12 +1190,20 @@ class RDLoopWrapper:
         start: date,
         end: date,
         symbols: list[str] | None,
+        *,
+        datasets: Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """把 QuantDB 富化列按 (symbol, trade_date) 左连接到 K 线 DataFrame。"""
-        for dataset, mapping in (
-            ("features_daily", _ENRICH_FEATURES_DAILY),
-            ("l1_factors", _ENRICH_L1),
-        ):
+        """把 QuantDB 富化列按 (symbol, trade_date) 左连接到 K 线 DataFrame。
+
+        ``datasets`` = 任务选择的数据集（None 时读 env ``QM_MINING_DATASETS``，
+        未设=全选）；只合并选中数据集，未选中的整段不读不并——选择要真正控制
+        喂给 LLM 的列，而非只记 provenance。
+        """
+        selected = datasets_from_env() if datasets is None else tuple(datasets)
+        for dataset in ("features_daily", "l1_factors"):
+            mapping = ENRICH_BY_DATASET[dataset]
+            if dataset not in selected or mapping is None:
+                continue  # 未选中的数据集不读不并
             try:
                 sub = hub.fetch_ml_columns(
                     dataset, list(mapping.keys()), start, end, symbols=symbols
@@ -975,30 +1345,39 @@ class RDLoopWrapper:
         return names
 
     @staticmethod
-    def _h5_cache_fresh(quantdb_dir: str, cache_path: str) -> bool:
-        """判断共享缓存是否仍是最新。
+    def _h5_cache_fresh(
+        quantdb_dir: str,
+        cache_path: str,
+        *,
+        datasets: Sequence[str] | None = None,
+    ) -> bool:
+        """判断共享缓存是否仍是最新（``datasets`` 缺省=全选，即迁移前语义）。
 
-        mtime 维度：K 线/features_daily/l1/l2 最新分区均不晚于缓存；列覆盖
-        维度：L2 接入（T-MV-07）改的是「数据面有哪些列」——存量缓存在此之前
-        生成时 mtime 仍可能新鲜但缺整批 L2 列，必须按 schema 重生成，否则
-        「数据面列清单与目录一致」在存量缓存上永远不成立。覆盖检查只在 L2
-        库存在时生效（部分块失败留下的残面会在下次启动重试补齐）。
+        mtime 维度：K 线 + **已选数据集**的最新分区均不晚于缓存（未选中的数据
+        集更新不影响这份缓存的构成，不参与判定）；列覆盖维度：L2 接入
+        （T-MV-07）改的是「数据面有哪些列」——存量缓存在此之前生成时 mtime 仍
+        可能新鲜但缺整批 L2 列，必须按 schema 重生成。L2 覆盖检查只在 **L2 被
+        选中且本机有 L2 库**时生效（未选 L2 的缓存没有 L2 列是正确形态；部分块
+        失败留下的残面会在下次启动重试补齐）。
         """
         try:
             cache_mtime = os.path.getmtime(cache_path)
         except OSError:
             return False
-        sources = (
-            "1_kline_data/daily_forward",
-            "6_ml_datasets/features_daily",
-            "6_ml_datasets/l1_factors",
-            "6_ml_datasets/l2_factors",  # T-MV-07：L2 全量列已入面，随其更新
-        )
+        selected = datasets_from_env() if datasets is None else tuple(datasets)
+        sources = ["1_kline_data/daily_forward"]
+        sources += [
+            f"6_ml_datasets/{name}"
+            for name in ("features_daily", "l1_factors", L2_DATASET)
+            if name in selected
+        ]
         latest = max(
             RDLoopWrapper._latest_partition_mtime(quantdb_dir, rel) for rel in sources
         )
         if not (latest > 0 and cache_mtime >= latest):
             return False
+        if L2_DATASET not in selected:
+            return True  # 未选 L2：这份缓存不含 L2 列是正确的
         l2_expected = l2_factor_columns(quantdb_dir)
         if not l2_expected:
             return True  # 本机无 L2 库：无覆盖义务

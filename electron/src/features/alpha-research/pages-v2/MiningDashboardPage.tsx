@@ -158,7 +158,12 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         <div className="lg:col-span-1">
-          <ProgressSidebar progress={task.progress} timeline={task.timeline} tokenUsage={task.tokenUsage} />
+          <ProgressSidebar
+            progress={task.progress}
+            timeline={task.timeline}
+            tokenUsage={task.tokenUsage}
+            progressKind={task.progressKind}
+          />
         </div>
         <div className="lg:col-span-3">
           <LiveCharts

@@ -52,7 +52,15 @@ MARKET_FACTOR_SOURCES: dict[str, tuple[FactorSource, ...]] = {
     # EXCLUDED_FROM_TRAINING，那里没有 factor_defs）照样允许写入——**写进去的草稿
     # 列不出、读不了、发不了，是一条静默死路**。
     # 它占私人因子库 1336/2754（49%），2026-10-07 用户实测撞上。
-    "CN": ("l1_factors", "l2_factors", "l1_l2_factors", "alpha_library", "factor_defs"),
+    "CN": (
+        "l1_factors",
+        "l2_factors",
+        "l1_l2_factors",
+        "l1_batch1_factors",
+        "l1_batch2_factors",
+        "alpha_library",
+        "factor_defs",
+    ),
     "HK": ("l1_factors", "ccass_factors", "south_factors"),
     "US": ("l1_factors",),
     "CRYPTO": ("l1_factors",),

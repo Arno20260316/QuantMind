@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -491,4 +492,90 @@ def test_run_mining_evaluators_degrades_to_empty_on_bad_input() -> None:
             bad, bad, market="a_share", universe="csi300", factor_id="t_eval_bad"
         )
         == {}
+    )
+
+
+# ── expression kind（统计派 qlib 表达式） ─────────────────────────────
+
+_QLIB_DIR = os.environ.get("QM_TEST_QLIB_DIR", "/data/qlib/cn_data")
+
+
+def test_expression_kind_forces_qlib_bin(monkeypatch) -> None:
+    """表达式因子给了 h5 数据源也必须走 qlib_bin。
+
+    h5 执行器只认「Python 代码」契约（exec + calculate_*/Factor 类），表达式
+    进去就是必死；切数据源不是能力缺失，是数据面归属。同时锁住 dispatch：
+    expression 走 _backtest_via_qlib 而不是别的执行器。
+    """
+    calls: dict[str, tuple] = {}
+
+    async def _fake_qlib(*args, **kwargs):
+        calls["qlib"] = (args, kwargs)
+
+    async def _fake_h5(*args, **kwargs):
+        calls["h5"] = (args, kwargs)
+
+    monkeypatch.setattr(aa, "_backtest_via_qlib", _fake_qlib)
+    monkeypatch.setattr(aa, "_backtest_via_h5", _fake_h5)
+
+    asyncio.run(
+        aa._run_factor_backtest(  # noqa: SLF001
+            "t_expr_switch",
+            "Ref($close,5)/$close-1",
+            market="a_share",
+            data_source="h5",
+            start_date="2024-01-02",
+            end_date="2024-03-29",
+            universe="csi300",
+        )
+    )
+
+    assert "qlib" in calls, "expression 因子没有进 qlib 执行路径"
+    assert "h5" not in calls, "expression 因子被送进了 h5 执行器（只认 Python 代码）"
+
+
+def test_expression_subprocess_evaluates_like_pandas_on_qlib_data() -> None:
+    """表达式子进程求值 vs 宽窗 pandas 口径，在真实 qlib 数据上逐点对拍。
+
+    表达式是统计派候选（reversal_5d）的落库形态；期望值用**带暖机的**窗口
+    现算（表达式求值由 qlib 自动扩展历史，窗口头部的值必须与宽窗 pandas
+    一致）——这条把「回测求值 == 挖掘口径」钉死在真数据上，而不是只测路由。
+    """
+    if not Path(_QLIB_DIR).is_dir():
+        pytest.skip(f"qlib 数据目录不存在: {_QLIB_DIR}（QM_TEST_QLIB_DIR 可覆盖）")
+
+    import qlib
+    from qlib.data import D
+
+    qlib.init(provider_uri=_QLIB_DIR, region="cn")
+
+    expression = "Ref($close,5)/$close-1"
+    instruments = ["sh600000", "sz000001"]
+    start, end = "2024-01-02", "2024-03-29"
+
+    s = asyncio.run(
+        aa._run_expression_factor_subprocess(  # noqa: SLF001
+            "t_expr_eval_00", expression, _QLIB_DIR, "cn", instruments, start, end
+        )
+    )
+
+    assert s is not None and len(s) > 0
+    assert s.index.names == ["datetime", "instrument"]
+    assert set(s.index.get_level_values("instrument")) <= set(instruments)
+
+    # 宽窗（起点提前 40 个交易日）现算 pandas 口径：groupby(level=0) 即逐票
+    wide = D.features(
+        instruments, ["$close"], start_time="2023-11-01", end_time=end, freq="day"
+    )
+    expected = (wide["$close"].groupby(level=0).shift(5) / wide["$close"] - 1).rename("e")
+    expected = aa._canonicalize_multiindex(expected).dropna()  # noqa: SLF001
+
+    joined = pd.DataFrame({"got": s, "exp": expected}).dropna()
+    assert len(joined) > 100, f"对比点太少：{len(joined)}"
+    np.testing.assert_allclose(
+        joined["got"].to_numpy(dtype="float64"),
+        joined["exp"].to_numpy(dtype="float64"),
+        rtol=1e-4,
+        atol=1e-7,
+        err_msg="表达式求值与宽窗 pandas 口径不等价——回测与挖掘会两说",
     )

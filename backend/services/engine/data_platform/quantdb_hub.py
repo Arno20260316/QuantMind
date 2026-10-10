@@ -434,6 +434,9 @@ class QuantDBDataHub:
             for d in existing
         )
         placeholders = ", ".join("?" for _ in symbols)
+        # union_by_name：上游 QuantDB 会中途改列名/删列且不回写历史分区（features_daily
+        # 的 return_*d 于 2026-09-21 改名 future_return_*d、Symbol_val 更早被删），
+        # 跨代际分区按名并集读取、缺列留 NULL——与视图挂载 / _read_partitioned 同口径。
         if columns:
             # 内层必须带 dt 供 ROW_NUMBER 排序与外层输出；不做列裁剪时 SELECT * 已含 dt
             select_cols = ["symbol", "dt"] + [f'"{c}"' for c in columns if c not in ("symbol", "dt")]
@@ -444,7 +447,7 @@ class QuantDBDataHub:
             sql = f"""
                 SELECT {outer_sel} FROM (
                     SELECT {inner_sel}
-                    FROM read_parquet([{paths}], hive_partitioning=true)
+                    FROM read_parquet([{paths}], hive_partitioning=true, union_by_name=true)
                     WHERE symbol IN ({placeholders})
                 ) WHERE rn = 1
             """
@@ -452,7 +455,7 @@ class QuantDBDataHub:
             sql = f"""
                 SELECT * EXCLUDE (rn) FROM (
                     SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY dt DESC) AS rn
-                    FROM read_parquet([{paths}], hive_partitioning=true)
+                    FROM read_parquet([{paths}], hive_partitioning=true, union_by_name=true)
                     WHERE symbol IN ({placeholders})
                 ) WHERE rn = 1
             """

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Sparkles, Bot, Database, BarChart3, ArrowRight, Zap,
+  Bot, Database, BarChart3, ArrowRight, Zap,
   Layers, CheckCircle2, TrendingUp, Shield, Activity, Cpu,
   Loader2, Square, MessageSquareText, FileUp, AlertCircle
 } from 'lucide-react';
@@ -112,43 +112,34 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate, retryDraft, docR
       showNavigation={!!onNavigate}
     >
       <div className="max-w-5xl mx-auto flex flex-col items-center gap-8 py-6 pb-12 animate-fade-in-up">
-        {/* ================= 1. Hero Title & Headline ================= */}
-        <div className="text-center max-w-2xl flex flex-col items-center">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50/90 border border-blue-100/80 text-blue-600 text-xs font-bold mb-3 shadow-2xs">
-            <Sparkles className="w-3.5 h-3.5 text-blue-500 animate-pulse" />
-            <span>LLM 驱动自主量化因子演化平台</span>
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
-            <span className="text-[11px] font-mono text-slate-500">AutoAlpha 2.0</span>
-          </div>
-
-          <h2 className="text-2xl sm:text-3xl font-black tracking-tight mb-2.5 bg-gradient-to-r from-slate-900 via-blue-900 to-indigo-900 bg-clip-text text-transparent">
+        {/* ================= 1. Hero：一行信息条（标题 · 副题 · 后端状态） ================= */}
+        <div className="w-full flex flex-wrap items-center justify-center gap-x-3 gap-y-2">
+          <h2 className="text-xl sm:text-2xl font-black tracking-tight bg-gradient-to-r from-slate-900 via-blue-900 to-indigo-900 bg-clip-text text-transparent">
             欢迎使用 QuantaAlpha
           </h2>
-          <p className="text-sm sm:text-base text-slate-500 font-medium leading-relaxed">
+          <span className="hidden sm:block h-4 w-px bg-slate-200" aria-hidden="true" />
+          <p className="text-sm text-slate-500 font-medium leading-relaxed m-0">
             用自然语言描述量化假设，AI 自动生成表达式、因子特征、样本内挖掘与进化回测
           </p>
-
-          <div className="flex items-center gap-2 mt-2">
-            {backendAvailable === true && (
-              <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-100">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
-                已连接后端服务
-              </span>
-            )}
-            {backendAvailable === false && (
-              <span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-600 bg-amber-50 px-2.5 py-0.5 rounded-full border border-amber-100">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                后端未连接 · 使用演示模式
-              </span>
-            )}
-          </div>
+          {backendAvailable === true && (
+            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-100">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
+              已连接后端服务
+            </span>
+          )}
+          {backendAvailable === false && (
+            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-600 bg-amber-50 px-2.5 py-0.5 rounded-full border border-amber-100">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+              后端未连接 · 使用演示模式
+            </span>
+          )}
         </div>
 
         {/* ================= 2. Central Integrated Prompt Input ================= */}
         <div id="mining-input" className="w-full flex flex-col gap-3">
           {/* 多任务：提交在途一行 + 每个运行中/排队任务一行（相互独立，逐行可停） */}
           {(miningStarting || runningTasks.length > 0 || queuedTasks.length > 0) && (
-            <div className="w-full max-w-4xl mx-auto flex flex-col gap-2">
+            <div className="w-full max-w-5xl mx-auto flex flex-col gap-2">
               {miningStarting && (
                 <div className="w-full flex items-center gap-3 rounded-xl border border-blue-100 bg-blue-50/70 px-4 py-2.5 shadow-2xs">
                   <Loader2 className="w-4 h-4 text-blue-500 animate-spin shrink-0" />
@@ -248,7 +239,7 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate, retryDraft, docR
 
           {/* 提交失败（429 并发上限 / 建缓存失败等）：后端原文上屏，可关掉 */}
           {miningStartError && (
-            <div className="w-full max-w-4xl mx-auto flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50/80 px-4 py-2.5 text-xs font-bold text-rose-600">
+            <div className="w-full max-w-5xl mx-auto flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50/80 px-4 py-2.5 text-xs font-bold text-rose-600">
               <AlertCircle className="h-4 w-4 shrink-0" />
               <span className="flex-1 min-w-0 truncate" title={miningStartError}>
                 {miningStartError}

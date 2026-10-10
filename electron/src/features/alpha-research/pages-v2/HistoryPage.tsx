@@ -344,6 +344,14 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({
                             {directionModeLabel(row.direction_mode)}
                           </span>
                         )}
+                        {row.freq === '1min' && (
+                          <span
+                            className="mt-0.5 ml-1 inline-flex items-center rounded-full border border-violet-100 bg-violet-50/70 px-1.5 py-px text-[10px] font-bold text-violet-600"
+                            title="分钟原生挖掘（1min 数据面）：窗口/特征口径与日线任务不同"
+                          >
+                            1min
+                          </span>
+                        )}
                         {row.error && (
                           <div
                             className="mt-0.5 truncate text-[10px] text-rose-500"

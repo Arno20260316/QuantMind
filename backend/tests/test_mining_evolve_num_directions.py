@@ -56,7 +56,10 @@ class FakeLauncher:
             raise outcome
         if outcome is not None:
             return outcome
-        return SimpleNamespace(task_id=f"t{idx}", status="running", queue_position=None)
+        return SimpleNamespace(
+            task_id=f"t{idx}", status="running", queue_position=None,
+            deduplicated=False,
+        )
 
     async def start_evolution(self, user_id, **kw):
         self.evolve_calls.append({"user_id": user_id, **kw})
@@ -138,6 +141,16 @@ def _call(payload=None, **over):
         "num_directions": 1,
         "quality_gate_mode": "",
         "data_source": "",
+        # P1/P1.5 的挖掘配置 Query 参数同样必须显式传：缺省是 Query() 对象，
+        # 会在归一函数里以 TypeError/ValueError 爆掉（datasets 不可迭代 / freq 非法值）
+        "mining_start": "",
+        "mining_end": "",
+        "valid_start": "",
+        "valid_end": "",
+        "datasets": None,
+        "freq": "",
+        # P2 的算法 Query 参数同样必须显式传（缺省是 Query() 对象）
+        "algorithm": "",
     }
     kwargs.update(over)
     return router_mod.start_evolution(payload=payload, **kwargs)

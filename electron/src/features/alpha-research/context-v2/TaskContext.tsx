@@ -459,14 +459,21 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         const stored = getStoredDirectionConfig();
-        const useCustom = Boolean(config.useCustomMiningDirection);
-        const direction =
-          useCustom
+        // 方向文本只对消费它的算法（uses_llm=true）有意义：不消费的算法收到
+        // 方向是后端 400（显式拒绝，不是忽略）——这里不代填默认方向、不下发
+        // directions，而不是让用户被自己看不见的兜底文案拦下
+        const carriesDirection = config.carriesDirection !== false;
+        const useCustom = carriesDirection && Boolean(config.useCustomMiningDirection);
+        const direction = !carriesDirection
+          ? ''
+          : useCustom
             ? (getDefaultMiningDirection() || '价量因子挖掘')
             : (config.userInput && config.userInput.trim()) || getDefaultMiningDirection() || '价量因子挖掘';
         const resp = await apiStartMining({
           direction,
           directions: useCustom ? stored.labels : undefined,
+          algorithm: config.algorithm,
+          algorithmName: config.algorithmName,
           directionMode: stored.mode,
           market: config.miningMarket || 'a_share',
           universe: config.universe || defaults.defaultUniverse || 'csi300',
@@ -476,6 +483,12 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           librarySuffix: config.librarySuffix || defaults.defaultLibrarySuffix || undefined,
           qualityGateEnabled: config.qualityGateEnabled ?? defaults.qualityGateEnabled ?? true,
           parallelEnabled: config.parallelExecution ?? defaults.parallelExecution ?? false,
+          // 自定义挖掘区间/检验区间/数据集（移植 P1，仅 A 股）：
+          // 全空 = 不下发任何键，query 形态与迁移前逐键一致
+          miningConfig:
+            (config.miningMarket || 'a_share') === 'a_share'
+              ? config.miningConfig
+              : undefined,
           // 文档血统（文档链提交时带上）：落任务 source=doc + 回写文档 task_id
           docId: config.docId,
         });

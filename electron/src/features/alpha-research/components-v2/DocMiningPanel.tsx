@@ -19,7 +19,7 @@ import remarkGfm from 'remark-gfm';
 import {
   UploadCloud, FileText, Loader2, CheckCircle2, AlertCircle,
   RotateCcw, Wand2, Play, CloudUpload, ArrowUp, ArrowDown, X,
-  Server, Settings,
+  Server, Settings, SlidersHorizontal,
 } from 'lucide-react';
 import type { DocMiningResume, TaskConfig } from '../types-v2';
 import type { DocQuotaStatus, DocRow, OrganizeResult } from '../services-v2/docMiningApi';
@@ -40,6 +40,9 @@ import {
   uploadDocs,
 } from '../services-v2/docMiningApi';
 import { MineruSettingsSection } from './MineruSettingsSection';
+import { MiningConfigPanel } from './MiningConfigPanel';
+import { MiningOptionsBar } from './MiningOptionsBar';
+import { useMiningOptions } from './useMiningOptions';
 
 type Step = 'upload' | 'parse' | 'organize' | 'confirm';
 
@@ -127,6 +130,9 @@ export const DocMiningPanel: React.FC<DocMiningPanelProps> = ({
   /** 解析设置折叠区（通道未配置时自动展开一次，之后由用户控制） */
   const [settingsOpen, setSettingsOpen] = useState(false);
   const autoOpenedSettingsRef = useRef(false);
+  // 挖掘设置（与「文字指令」同一套状态机）：算法 / 市场 / 池 / 数据源 / 区间。
+  // requireLlm：文档挖掘的方向文本 = 文档整理产物、必下发，非 LLM 算法收到即 400
+  const mining = useMiningOptions({ requireLlm: true });
 
   const refreshQuota = useCallback(async () => {
     try {
@@ -407,9 +413,22 @@ export const DocMiningPanel: React.FC<DocMiningPanelProps> = ({
         return;
       }
       setError(null);
-      onStartMining({ userInput: text, docId: doc.doc_id });
+      onStartMining({
+        userInput: text,
+        docId: doc.doc_id,
+        // 确认步的挖掘设置随方向一起下发（与文字挖掘同一套提交散件）
+        miningMarket: mining.miningMarket as TaskConfig['miningMarket'],
+        universe: mining.universe,
+        dataSource: mining.dataSource as TaskConfig['dataSource'],
+        ...mining.miningConfigPayload,
+        ...(mining.algorithm
+          ? { algorithm: mining.algorithm, algorithmName: mining.algorithmLabel }
+          : {}),
+        // 文档挖掘的方向文本必下发；显式声明，不依赖 TaskContext 的缺省补全
+        carriesDirection: true,
+      } as TaskConfig);
     },
-    [doc, onStartMining],
+    [doc, onStartMining, mining],
   );
 
   const handleOrganize = useCallback(async () => {
@@ -446,7 +465,7 @@ export const DocMiningPanel: React.FC<DocMiningPanelProps> = ({
   return (
     <div
       id="doc-mining-panel"
-      className="w-full max-w-4xl mx-auto flex flex-col gap-3"
+      className="w-full max-w-5xl mx-auto flex flex-col gap-3"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -899,6 +918,26 @@ export const DocMiningPanel: React.FC<DocMiningPanelProps> = ({
               </span>
             )}
 
+            {/* 挖掘设置（与「文字指令」同一套口径）：确认过的方向 + 这里的设置
+                一起下发——不再是「点开始挖掘就按默认值裸跑」 */}
+            <div className="flex flex-col gap-2 rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
+              <div className="flex items-center gap-1.5">
+                <SlidersHorizontal className="h-3.5 w-3.5 text-slate-400" />
+                <span className="text-[11px] font-bold text-slate-500">
+                  挖掘设置（与「文字指令」同一套口径；算法只列消费方向文本的项）
+                </span>
+              </div>
+              <MiningOptionsBar options={mining} disabled={isRunning || busy} />
+              {mining.miningMarket === 'a_share' && mining.miningConfigPanelOpen && (
+                <MiningConfigPanel
+                  value={mining.miningConfig}
+                  onChange={mining.setMiningConfig}
+                  disabled={isRunning || busy}
+                  algorithm={mining.effectiveAlgorithm}
+                />
+              )}
+            </div>
+
             <div className="flex items-center justify-between gap-3">
               <button
                 type="button"
@@ -927,7 +966,7 @@ export const DocMiningPanel: React.FC<DocMiningPanelProps> = ({
               </button>
             </div>
             <span className="text-[10px] text-slate-400 text-right">
-              市场 / 股票池 / 数据源按「设置」中的默认值执行；本次任务会记录文档出处
+              市场 / 股票池 / 数据源 / 算法按上方设置执行；本次任务会记录文档出处
             </span>
           </div>
         )}

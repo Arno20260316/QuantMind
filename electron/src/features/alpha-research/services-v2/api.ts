@@ -10,6 +10,11 @@
  */
 
 import { apiClient } from '../../../services/aiStrategyClients';
+import {
+  appendMiningConfigQuery,
+  hasCustomMiningConfig,
+  miningConfigWire,
+} from './miningConfigApi';
 import type {
   ApiResponse,
   DataSummary,
@@ -17,6 +22,7 @@ import type {
   FactorCategory,
   FactorLibrary,
   FactorLibraryMarketFacts,
+  MiningConfigSelection,
   Task,
   TaskStatus,
   ExecutionPhase,
@@ -157,6 +163,16 @@ export function normalizeAgentTask(raw: any, configHint?: any): Task {
     updatedAt: raw?.updated_at ?? new Date().toISOString(),
     timeline: raw?.timeline ?? undefined,
     tokenUsage: raw?.token_usage ?? undefined,
+    // 任务实际使用的算法与进度面形状（P2）：老任务/老后端缺席 → undefined，
+    // 消费方（ProgressSidebar）按 workdir 形状退化渲染
+    algorithm:
+      typeof raw?.algorithm === 'string' && raw.algorithm
+        ? raw.algorithm
+        : undefined,
+    progressKind:
+      typeof raw?.progress_kind === 'string' && raw.progress_kind
+        ? raw.progress_kind
+        : undefined,
     factors: Array.isArray(raw?.factors) ? raw.factors.map(normalizeAgentFactor) : [],
   };
 }
@@ -276,6 +292,18 @@ export interface MiningStartParams {
    * 不带时 query 形态一字不动（老路径零回归）。
    */
   docId?: string;
+  /**
+   * 自定义挖掘区间 / 检验区间 / 数据集（移植 P1，仅 A 股）。
+   * 缺席或全空 = 不下发任何键（query 形态与迁移前逐键一致）。
+   */
+  miningConfig?: MiningConfigSelection;
+  /**
+   * 挖掘算法 key（移植 P2）。缺席/'' = 不下发 → 后端默认（rdagent，迁移前
+   * 唯一路径，query 形态逐键不变）。可选值见 GET /alpha-agent/algorithms。
+   */
+  algorithm?: string;
+  /** 算法名（仅进 configHint 供任务卡展示；不上 wire） */
+  algorithmName?: string;
 }
 
 /** 并行方向数（T-MV-04）：N>1 逐条派发回执里的失败条目（方向 + 后端原文原因） */
@@ -301,6 +329,9 @@ export async function startMining(
   params: MiningStartParams,
 ): Promise<ApiResponse<MiningStartResult>> {
   const loopN = params.maxRounds ?? params.maxLoops ?? 3;
+  // 自定义挖掘配置（移植 P1）：未自定义 = 空对象（不发键）。
+  // 半截日期对（只填一端）在这里抛错——提交路径兜住上屏，不静默丢参数
+  const miningWire = miningConfigWire(params.miningConfig);
   let res: { data?: { data?: any } };
   if (params.docId) {
     // JSON body 变体（与后端 EvolveRequest 字段对齐）；query 路径保持原样。
@@ -314,6 +345,9 @@ export async function startMining(
       directions: params.directions ?? [],
       direction_mode: params.directionMode || 'selected',
       doc_id: params.docId,
+      // 挖掘算法（移植 P2）：未选 = 不带键（后端按默认算法兜底）
+      ...(params.algorithm ? { algorithm: params.algorithm } : {}),
+      ...miningWire,
       // 入库闸门（T-MV-05）：只在关闭时携带 off；开启=不下发（默认行为）
       ...(params.qualityGateEnabled === false
         ? { quality_gate_mode: 'off' }
@@ -341,6 +375,9 @@ export async function startMining(
     if (params.qualityGateEnabled === false) {
       qs.set('quality_gate_mode', 'off');
     }
+    // 挖掘算法（移植 P2）：未选 = 不发键（query 与迁移前逐键一致）
+    if (params.algorithm) qs.set('algorithm', params.algorithm);
+    appendMiningConfigQuery(qs, params.miningConfig);
     res = await apiClient.post(`/alpha-agent/evolve?${qs.toString()}`);
   }
   const data = res.data?.data ?? {};
@@ -352,6 +389,14 @@ export async function startMining(
     librarySuffix: params.librarySuffix,
     qualityGateEnabled: params.qualityGateEnabled,
     parallelExecution: params.parallelEnabled,
+    // 算法（移植 P2）：未选 = 不带键（老任务的 config 形状逐键不变）
+    ...(params.algorithm
+      ? { algorithm: params.algorithm, algorithmName: params.algorithmName }
+      : {}),
+    // 撤解析展示用：任务行的参数快照（全空 = 未自定义，不带键）
+    ...(hasCustomMiningConfig(params.miningConfig)
+      ? { miningConfig: params.miningConfig }
+      : {}),
   };
   // 并行方向数（T-MV-04）：N>1 的回执带 items（逐条任务/失败）——成功条目归一
   // 为任务（各自方向进 configHint.userInput），失败条目原样逐条上报
@@ -514,6 +559,12 @@ export interface BatchDispatchParams {
   loopN?: number;
   /** 入库闸门（T-MV-05）：false → 显式 off；true/未给 → 不下发（同 startMining） */
   qualityGateEnabled?: boolean;
+  /**
+   * 自定义挖掘区间 / 检验区间 / 数据集（移植 P1，仅 A 股）。
+   * 与单条 evolve 同一套字段与校验（后端共用归一函数）——拆解批量派发
+   * 不带着首页选的窗口，用户会以为「设置过了却没用上」。
+   */
+  miningConfig?: MiningConfigSelection;
 }
 
 /** 批量派发：逐条排队成任务；运行期失败逐条回传（HTTP 恒 200）。 */
@@ -525,6 +576,7 @@ export async function dispatchMiningBatch(
     market: params.market || 'a_share',
     universe: params.universe || 'csi300',
     ...(params.loopN ? { loop_n: params.loopN } : {}),
+    ...miningConfigWire(params.miningConfig),
     ...(params.qualityGateEnabled === false
       ? { quality_gate_mode: 'off' }
       : {}),
@@ -586,6 +638,11 @@ export interface MiningHistoryRow {
   /** text=文字指令 / doc=文档解析链（P1）/ legacy=历史回填 */
   source: string;
   doc_id: string | null;
+  /**
+   * 挖掘频率（P1.5）：'1min' = 分钟原生挖掘；null = 日线（未指定，不伪装
+   * 成显式 'day'）。老任务行/后端未升级时可能缺席——判据一律 `=== '1min'`。
+   */
+  freq?: string | null;
   status: MiningHistoryStatus;
   progress_pct: number;
   current_loop: number;

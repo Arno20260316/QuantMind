@@ -283,6 +283,58 @@ def test_detect_factor_kind_syntax_error_raises():
         aa._detect_factor_kind("def main(:\n")
 
 
+# ── expression kind（统计派落库形态：qlib 表达式） ────────────────────
+
+
+@pytest.mark.unit
+def test_detect_factor_kind_routes_statistical_catalog_expressions():
+    """统计派目录里**每个**候选表达式都必须被识别成 expression。
+
+    统计派落库的 factor_code 就是表达式本身；识别不了 = 因子列表点「回测」
+    先撞「语法错误」（加 expression kind 的动因）。所以检测器不靠举例、直接
+    拿真实目录钉契约：新增候选带进白名单外字符，这里立刻红。
+    """
+    from backend.services.engine.alpha_agent.statistical import candidates as cand
+
+    for candidate in cand.CANDIDATES:
+        assert (
+            aa._detect_factor_kind(candidate.expression) == "expression"
+        ), f"{candidate.key} 的表达式未被识别为 expression：{candidate.expression}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ref($close,5)/$close-1",
+        "$close",
+        "Mean(($high-$low)/$close,20)",
+        "Greater($high-$low,Abs($high-Ref($close,1)))",
+        # 字形合法但不是注册算子：**故意**放行——由子进程 qlib 求值报
+        # 「operator not registered」，白名单只管字形，不管算子存在性
+        "open($close,5)",
+    ],
+)
+def test_looks_like_qlib_expression_accepts(text):
+    assert aa._looks_like_qlib_expression(text)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "drop tables",  # 无 $ 字段引用：是坏 Python，不是表达式
+        "Ref($close,5)\n/$close-1",  # 多行 = 代码不是表达式
+        "Ref($close,5); import os",  # 分号：语句分隔符不进白名单
+        "__import__(\"os\").system(\"id\")",  # 引号/括号外字符一律不认
+        "Ref($close,5) # $comment",  # 注释
+    ],
+)
+def test_looks_like_qlib_expression_rejects(text):
+    assert not aa._looks_like_qlib_expression(text)
+
+
 # ── worker ───────────────────────────────────────────────────────────
 
 

@@ -53,7 +53,10 @@ class FakeLauncher:
             raise outcome
         if outcome is not None:
             return outcome
-        return SimpleNamespace(task_id=f"t{idx}", status="running", queue_position=None)
+        return SimpleNamespace(
+            task_id=f"t{idx}", status="running", queue_position=None,
+            deduplicated=False,
+        )
 
 
 def _wire(monkeypatch, launcher: FakeLauncher, llm=CFG) -> None:
@@ -106,8 +109,12 @@ async def test_batch_dispatch_happy_all_started(monkeypatch) -> None:
 async def test_batch_dispatch_queue_position_passthrough(monkeypatch) -> None:
     launcher = FakeLauncher(
         {
-            0: SimpleNamespace(task_id="a", status="running", queue_position=None),
-            1: SimpleNamespace(task_id="b", status="queued", queue_position=4),
+            0: SimpleNamespace(
+                task_id="a", status="running", queue_position=None, deduplicated=False
+            ),
+            1: SimpleNamespace(
+                task_id="b", status="queued", queue_position=4, deduplicated=False
+            ),
         }
     )
     _wire(monkeypatch, launcher)

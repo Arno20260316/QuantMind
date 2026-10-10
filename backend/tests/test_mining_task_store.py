@@ -594,3 +594,39 @@ async def test_real_db_queued_row_survives_reconcile_and_is_filterable() -> None
     finally:
         await _cleanup(user)
         await _close()
+
+
+@pytest.mark.asyncio
+async def test_real_db_freq_roundtrip_and_day_default_is_null() -> None:
+    """频率随任务行持久化（P1.5）：显式 1min 落值、未指定= NULL。
+
+    频率是**复跑凭据**：分钟任务的窗口/调参没这条就无法判断当时按什么口径挖的。
+    未指定落 NULL 而非 "day"——「没有的值」不许伪装成显式日线（与 direction_mode
+    同规矩），否则历史页会把老任务一并显示成"用户选了日线"。
+    """
+    await _ready()
+    user = _scope()
+    tid_min = uuid.uuid4().hex[:16]
+    tid_day = uuid.uuid4().hex[:16]
+    try:
+        store = get_mining_task_store()
+        await _create(
+            store,
+            tid_min,
+            user,
+            freq="1min",
+            mining_start="2026-03-04",
+            mining_end="2026-08-25",
+        )
+        await _create(store, tid_day, user)
+
+        minute = await store.get_task(tid_min)
+        day = await store.get_task(tid_day)
+        assert minute is not None and day is not None
+        assert minute["freq"] == "1min"
+        assert minute["mining_start"] == "2026-03-04"
+        assert minute["mining_end"] == "2026-08-25"
+        assert day["freq"] is None, "未指定频率 = NULL，不写成 'day'"
+    finally:
+        await _cleanup(user)
+        await _close()

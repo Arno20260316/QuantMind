@@ -1,21 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Compass, Dna, Loader2, Sparkles } from 'lucide-react';
-import { TaskConfig, UniverseId, UniverseInfo } from '../types-v2';
-import { alphaAgentService, MarketInfo } from '../services/alphaAgentService';
-import { getPoolFactors, getUniverses } from '../services-v2/api';
+import { Send, Dna, Loader2, Sparkles } from 'lucide-react';
+import { TaskConfig } from '../types-v2';
+import { getPoolFactors } from '../services-v2/api';
 import type { PoolFactorRow } from '../services-v2/api';
+import { MiningConfigPanel } from './MiningConfigPanel';
+import { MiningOptionsBar } from './MiningOptionsBar';
+import { useMiningOptions } from './useMiningOptions';
 import type { DecomposeRequestPayload, SeedFactorRef } from './DecomposePanel';
 
 /** 父本选择上限（服务端 DECOMPOSE_SEED_MAX 是硬闸：更严时以它的 400 文案为准） */
 const SEED_MAX = 3;
 
-const MARKET_LABELS: Record<string, string> = {
-  a_share: 'A股',
-  crypto: '加密货币',
-  hong_kong: '港股',
-  us_stock: '美股',
-  futures: '期货',
-};
+/** 输入框自动增高上下限（style 与增高效应同源一处，不再两处各写一份数字） */
+const TEXTAREA_MIN_HEIGHT = 72;
+const TEXTAREA_MAX_HEIGHT = 240;
 
 interface ChatInputProps {
   onSubmit: (config: TaskConfig) => void;
@@ -52,11 +50,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 }) => {
   const [input, setInput] = useState(initialPrompt);
   const [useCustomMiningDirection, setUseCustomMiningDirection] = useState(false);
-  const [miningMarket, setMiningMarket] = useState<string>('a_share');
-  const [universe, setUniverse] = useState<UniverseId>('csi300');
-  const [universes, setUniverses] = useState<UniverseInfo[]>([]);
-  const [dataSource, setDataSource] = useState<string>('qlib_bin');
-  const [markets, setMarkets] = useState<MarketInfo[]>([]);
   const [config] = useState<Partial<TaskConfig>>({ librarySuffix: '' });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 父本（种子）选择器：展开时拉本市场本池「正向 / 反向」各 pool_score 前 50；选择数 ≤3
@@ -66,6 +59,26 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const [seedsLoading, setSeedsLoading] = useState(false);
   const [seedsError, setSeedsError] = useState<string | null>(null);
   const [seeds, setSeeds] = useState<SeedFactorRef[]>([]);
+
+  // 挖掘选项（算法/市场/池/数据源/挖掘配置）：与文档挖掘确认步共用同一份状态机
+  const mining = useMiningOptions();
+  const {
+    miningMarket,
+    universe,
+    dataSource,
+    algorithm,
+    algorithmLabel,
+    carriesDirection,
+    selectedNotReady,
+    miningConfig,
+    setMiningConfig,
+    miningConfigPanelOpen,
+    effectiveAlgorithm,
+    miningConfigPayload,
+    setMiningMarket,
+    setUniverse,
+    setDataSource,
+  } = mining;
 
   useEffect(() => {
     // 空串不清空：legacy 历史行方向为空是常态，不能把用户打了一半的字擦掉；
@@ -85,17 +98,20 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialConfigKey]);
 
-  useEffect(() => {
-    alphaAgentService.listMarkets().then(setMarkets).catch(() => {});
-    getUniverses()
-      .then((res) => setUniverses(res.data?.universes ?? []))
-      .catch(() => {});
-  }, []);
-
   // 种子按「本市场 × 本池」隔离：切市场/池即清空（旧池的父本对新池无意义）
   useEffect(() => {
     setSeeds([]);
   }, [miningMarket, universe]);
+
+  // 非 LLM 算法整块不适用：方向开关与父本都是提示词链的输入，当场收回
+  // （换算法时的市场/频率/数据集收回在 useMiningOptions 内完成）
+  useEffect(() => {
+    if (!carriesDirection) {
+      setUseCustomMiningDirection(false);
+      setSeeds([]);
+      setSeedPanelOpen(false);
+    }
+  }, [carriesDirection]);
 
   // 展开时并行拉「正向 / 反向」各 pool_score 前 50（方向口径 = ic_value 符号，
   // 与因子库「方向」列一致）；开着时切市场/池自动重拉。任一侧失败显式报错——
@@ -207,11 +223,19 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     if (isSubmitting) return;
     const suffix = config.librarySuffix?.trim() || undefined;
     onSubmit({
-      userInput: input.trim(),
-      useCustomMiningDirection,
+      // 不消费方向文本的算法：从源头不产生方向（后端收到即 400）
+      userInput: carriesDirection ? input.trim() : '',
+      useCustomMiningDirection: carriesDirection && useCustomMiningDirection,
       miningMarket: miningMarket as TaskConfig['miningMarket'],
       universe,
       dataSource: dataSource as TaskConfig['dataSource'],
+      // 挖掘配置仅在 A 股有效（面板也只在 A 股渲染；散件里再收一道，
+      // 防止「切市场又切回来」残留的自定义窗口被带到别的市场）
+      ...miningConfigPayload,
+      // 算法（未选 = 不下发键，走后端注册表默认）
+      ...(algorithm ? { algorithm, algorithmName: algorithmLabel } : {}),
+      // 能力面快照：TaskContext 据此决定要不要代填默认方向
+      carriesDirection,
       ...config,
       librarySuffix: suffix,
     } as TaskConfig);
@@ -225,23 +249,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   };
 
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = Math.max(52, Math.min(textareaRef.current.scrollHeight, 120)) + 'px';
-    }
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height =
+      Math.max(TEXTAREA_MIN_HEIGHT, Math.min(el.scrollHeight, TEXTAREA_MAX_HEIGHT)) + 'px';
   }, [input]);
-
-  const marketList = markets.length > 0
-    ? markets.map((m) => ({ id: m.market_id, name: m.market_name, ready: m.data_ready }))
-    : [
-        { id: 'a_share', name: 'A股', ready: true },
-        { id: 'crypto', name: '加密货币', ready: true },
-        { id: 'hong_kong', name: '港股', ready: false },
-        { id: 'us_stock', name: '美股', ready: false },
-        { id: 'futures', name: '期货', ready: false },
-      ];
-
-  const selectedNotReady = marketList.find(m => m.id === miningMarket)?.ready === false;
 
   // 拆解按钮可用性：与发送同门槛，另要求有非空输入且未开「自选方向」
   // （自选模式下输入框内容被忽略，拆解它没有意义）
@@ -259,127 +272,57 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       market: miningMarket,
       universe: String(universe),
       ...(seeds.length ? { seeds } : {}),
+      // 自定义挖掘配置随卡片批量派发一起带走（未自定义不携带键）
+      ...miningConfigPayload,
     });
   };
 
   const content = (
-    <div className={`relative w-full ${inline ? 'max-w-4xl mx-auto' : 'container mx-auto px-6 max-w-3xl'}`}>
-      {/* Animated gradient border ring */}
-      <div className="relative rounded-2xl bg-gradient-to-r from-blue-500/30 via-purple-500/30 to-pink-500/30 p-[1px] shadow-xl shadow-blue-500/5 transition-all">
-        <div className="rounded-2xl bg-white/95 backdrop-blur-xl overflow-hidden shadow-xs">
-          {/* Options row — compact inline chips */}
-          <div className="px-4 pt-3.5 pb-1 flex items-center gap-1.5 flex-wrap">
-            <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400 mr-0.5 select-none">市场</span>
-            {marketList.map((m) => (
-              <button
-                key={m.id}
-                onClick={() => setMiningMarket(m.id)}
-                disabled={isSubmitting || !m.ready}
-                className={`rounded-full px-2.5 py-[3px] text-[11px] font-semibold transition-all duration-200 flex items-center gap-1 ${
-                  miningMarket === m.id
-                    ? 'bg-blue-50 text-blue-600 ring-1 ring-blue-200 shadow-xs'
-                    : m.ready
-                      ? 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
-                      : 'text-slate-300 cursor-not-allowed'
-                }`}
-                title={!m.ready ? '数据未就绪，请先在管理后台同步数据' : `${MARKET_LABELS[m.id]}因子挖掘`}
-              >
-                <span className={`inline-block w-1.5 h-1.5 rounded-full ring-1 ${m.ready ? 'bg-emerald-400 ring-emerald-300' : 'bg-slate-300 ring-slate-200'}`} />
-                {m.name}
-              </button>
-            ))}
-
-            {/* Universe selector */}
-            {miningMarket === 'a_share' && (
-              <div className="flex items-center gap-1 ml-2 pl-2 border-l border-slate-200">
-                <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400 select-none">池</span>
-                <select
-                  value={universe}
-                  onChange={(e) => setUniverse(e.target.value as UniverseId)}
-                  disabled={isSubmitting}
-                  className="rounded-full bg-slate-50 px-2.5 py-[3px] text-[11px] font-medium text-slate-600 border-0 focus:outline-none focus:ring-1 focus:ring-blue-200 disabled:opacity-40 appearance-none cursor-pointer"
-                  title="选择因子挖掘的股票池"
-                >
-                  {universes.length > 0
-                    ? universes.map((u) => (
-                        <option key={u.id} value={u.id}>
-                          {u.isSystem === false ? '★ ' : ''}{u.name}{u.stockCount > 0 ? ` (${u.stockCount})` : ''}
-                        </option>
-                      ))
-                    : (
-                      <option value="csi300">沪深300</option>
-                    )}
-                </select>
-              </div>
-            )}
-
-            {/* Data source */}
-            <div className="flex items-center gap-1 ml-1 pl-1 border-l border-slate-200">
-              <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400 select-none">数据</span>
-              {[
-                { id: 'qlib_bin', name: 'Qlib' },
-                { id: 'parquet', name: 'Parquet' },
-              ].map((ds) => (
+    <div className={`relative w-full ${inline ? 'max-w-5xl mx-auto' : 'container mx-auto px-6 max-w-3xl'}`}>
+      {/* Animated gradient border ring（聚焦时整圈加亮：输入中一眼可见） */}
+      <div className="relative rounded-2xl bg-gradient-to-r from-blue-500/30 via-purple-500/30 to-pink-500/30 p-[1px] shadow-xl shadow-blue-500/5 transition-all duration-300 focus-within:from-blue-500/60 focus-within:via-purple-500/50 focus-within:to-pink-500/50 focus-within:shadow-blue-500/15">
+        <div className="rounded-[15px] bg-white/95 backdrop-blur-xl overflow-hidden shadow-xs">
+          {/* Options row — 单行芯片（窄窗横向滚动，不换行） */}
+          <div className="px-4 pt-3.5 pb-1">
+            <MiningOptionsBar
+              options={mining}
+              disabled={isSubmitting}
+              direction={{
+                active: useCustomMiningDirection,
+                onToggle: () => setUseCustomMiningDirection(!useCustomMiningDirection),
+              }}
+              trailing={onDecomposeRequest && carriesDirection ? (
+                /* 父本定向演化：拆解围绕选中的池内因子做受控变异。
+                   父本是拆解（LLM）的输入——不消费方向的算法整块不适用 */
                 <button
-                  key={ds.id}
-                  onClick={() => setDataSource(ds.id)}
+                  type="button"
+                  onClick={() => setSeedPanelOpen((v) => !v)}
                   disabled={isSubmitting}
-                  className={`rounded-full px-2.5 py-[3px] text-[11px] font-semibold transition-all duration-200 ${
-                    dataSource === ds.id
-                      ? 'bg-blue-50 text-blue-600 ring-1 ring-blue-200 shadow-xs'
+                  title={
+                    seeds.length > 0
+                      ? `已选 ${seeds.length} 个父本：拆解围绕其做受控变异（点开调整）`
+                      : '父本定向演化：选 1–3 个池内因子，拆解围绕其做受控变异（滞后/窗长/标准化/差分…）'
+                  }
+                  className={`shrink-0 ml-1 pl-1 border-l border-slate-200 flex items-center gap-1 rounded-full px-2.5 py-[3px] text-[11px] font-semibold transition-all duration-200 disabled:opacity-40 ${
+                    seedPanelOpen || seeds.length > 0
+                      ? 'bg-indigo-50 text-indigo-600 ring-1 ring-indigo-200 shadow-xs'
                       : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
                   }`}
                 >
-                  {ds.name}
+                  <Dna className="h-3 w-3" />
+                  <span>父本</span>
+                  {seeds.length > 0 && (
+                    <span className="rounded-full bg-indigo-600 text-white px-1.5 text-[10px] font-bold leading-4">
+                      {seeds.length}/{SEED_MAX}
+                    </span>
+                  )}
                 </button>
-              ))}
-            </div>
-
-            {/* Direction toggle */}
-            <button
-              type="button"
-              onClick={() => setUseCustomMiningDirection(!useCustomMiningDirection)}
-              title={useCustomMiningDirection ? '使用设置中的挖掘方向（已开）' : '使用设置中的挖掘方向（点击开启）'}
-              className={`ml-1 pl-1 border-l border-slate-200 flex items-center gap-1 rounded-full px-2.5 py-[3px] text-[11px] font-semibold transition-all duration-200 ${
-                useCustomMiningDirection
-                  ? 'bg-purple-50 text-purple-600 ring-1 ring-purple-200 shadow-xs'
-                  : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
-              }`}
-            >
-              <Compass className="h-3 w-3" />
-              <span>方向</span>
-            </button>
-
-            {/* 父本定向演化：拆解围绕选中的池内因子做受控变异 */}
-            {onDecomposeRequest && (
-              <button
-                type="button"
-                onClick={() => setSeedPanelOpen((v) => !v)}
-                disabled={isSubmitting}
-                title={
-                  seeds.length > 0
-                    ? `已选 ${seeds.length} 个父本：拆解围绕其做受控变异（点开调整）`
-                    : '父本定向演化：选 1–3 个池内因子，拆解围绕其做受控变异（滞后/窗长/标准化/差分…）'
-                }
-                className={`ml-1 pl-1 border-l border-slate-200 flex items-center gap-1 rounded-full px-2.5 py-[3px] text-[11px] font-semibold transition-all duration-200 disabled:opacity-40 ${
-                  seedPanelOpen || seeds.length > 0
-                    ? 'bg-indigo-50 text-indigo-600 ring-1 ring-indigo-200 shadow-xs'
-                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
-                }`}
-              >
-                <Dna className="h-3 w-3" />
-                <span>父本</span>
-                {seeds.length > 0 && (
-                  <span className="rounded-full bg-indigo-600 text-white px-1.5 text-[10px] font-bold leading-4">
-                    {seeds.length}/{SEED_MAX}
-                  </span>
-                )}
-              </button>
-            )}
+              ) : undefined}
+            />
           </div>
 
           {/* 父本选择面板（在流内展开：卡片 overflow-hidden 裁掉绝对定位下拉） */}
-          {onDecomposeRequest && seedPanelOpen && (
+          {onDecomposeRequest && carriesDirection && seedPanelOpen && (
             <div className="px-4 pb-2.5">
               <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
                 <div className="flex items-center gap-2 mb-1.5">
@@ -419,11 +362,23 @@ export const ChatInput: React.FC<ChatInputProps> = ({
             </div>
           )}
 
-          {/* Divider */}
-          <div className="mx-4 border-t border-slate-100" />
+          {/* 挖掘配置面板（在流内展开，同父本面板） */}
+          {miningMarket === 'a_share' && miningConfigPanelOpen && (
+            <div className="px-4 pb-2.5">
+              <MiningConfigPanel
+                value={miningConfig}
+                onChange={setMiningConfig}
+                disabled={isSubmitting}
+                algorithm={effectiveAlgorithm}
+              />
+            </div>
+          )}
+
+          {/* Divider（渐变细线，与两侧留白对齐） */}
+          <div className="mx-4 h-px bg-gradient-to-r from-transparent via-slate-200/90 to-transparent" />
 
           {/* Textarea + send row */}
-          <div className="flex items-end gap-2.5 px-4 py-3">
+          <div className="flex items-end gap-2.5 px-4 py-3.5">
             <textarea
               ref={textareaRef}
               value={input}
@@ -434,23 +389,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                   ? '任务提交中...'
                   : selectedNotReady
                     ? '该市场数据未就绪，请先在管理后台同步数据'
-                    : runningCount > 0
-                      ? `已有 ${runningCount} 个任务运行中，可继续提交新想法（任务相互独立）`
-                      : useCustomMiningDirection
-                        ? '已开启自选挖掘方向，将使用「设置 → 挖掘方向」中的选项'
-                        : miningMarket === 'crypto'
-                          ? '描述加密货币因子需求，如：短期动量反转、量价背离...'
-                          : '描述因子挖掘需求 (如：挖掘基于5日动量反转与成交量偏度组合的Alpha因子)，按 Enter 发送'
+                    : !carriesDirection
+                      ? `「${algorithmLabel || '当前算法'}」不消费方向文本：直接点发送即可（挖掘区间走「区间/频率/数据集」）`
+                      : runningCount > 0
+                        ? `已有 ${runningCount} 个任务运行中，可继续提交新想法（任务相互独立）`
+                        : useCustomMiningDirection
+                          ? '已开启自选挖掘方向，将使用「设置 → 挖掘方向」中的选项'
+                          : miningMarket === 'crypto'
+                            ? '描述加密货币因子需求，如：短期动量反转、量价背离...'
+                            : '描述因子挖掘需求 (如：挖掘基于5日动量反转与成交量偏度组合的Alpha因子)，按 Enter 发送'
               }
-              disabled={isSubmitting}
-              className="flex-1 bg-transparent text-sm placeholder:text-slate-400 focus:outline-none focus:ring-0 resize-none leading-relaxed font-sans rounded-xl border border-transparent focus:border-blue-200"
-              rows={2}
-              style={{ minHeight: '44px', maxHeight: '100px' }}
+              disabled={isSubmitting || !carriesDirection}
+              className="flex-1 bg-transparent text-sm placeholder:text-slate-400 focus:outline-none focus:ring-0 resize-none leading-relaxed font-sans rounded-xl border border-transparent"
+              rows={3}
+              style={{ minHeight: TEXTAREA_MIN_HEIGHT, maxHeight: TEXTAREA_MAX_HEIGHT }}
             />
 
             {/* 智能拆解：粗方向 → 多张正交卡片 → 批量派发（满员自动排队）。
                 仅在有输入、未开「自选方向」、市场就绪时可点 */}
-            {onDecomposeRequest && (
+            {onDecomposeRequest && carriesDirection && (
               <button
                 onClick={handleDecompose}
                 disabled={!decomposeEnabled}

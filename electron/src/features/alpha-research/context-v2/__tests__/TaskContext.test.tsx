@@ -534,3 +534,58 @@ describe('TaskContext：并行方向数（T-MV-04）', () => {
     expect(screen.getByTestId('start-error').textContent).toContain('硬件锁被占用');
   });
 });
+
+describe('TaskContext：算法能力面（P2）——方向文本按算法裁剪', () => {
+  test('不消费方向的算法：不代填默认方向、不下发 directions，算法随任务走', async () => {
+    render(
+      <TaskProvider>
+        <Probe />
+      </TaskProvider>,
+    );
+    await flush();
+
+    startMiningMock.mockResolvedValue({
+      success: true,
+      data: { taskId: 's1', task: mkTask('s1') },
+    });
+    await act(async () => {
+      handle.ctx.startMining({
+        userInput: '',
+        useCustomMiningDirection: false,
+        carriesDirection: false,
+        algorithm: 'statistical',
+        algorithmName: '统计量价挖掘',
+      } as any);
+    });
+
+    const sent = startMiningMock.mock.calls[0][0];
+    // 关键：不能落进 '价量因子挖掘' 兜底——后端对不消费方向的算法收到方向即 400
+    expect(sent.direction).toBe('');
+    expect(sent.directions).toBeUndefined();
+    expect(sent.algorithm).toBe('statistical');
+    expect(sent.algorithmName).toBe('统计量价挖掘');
+    expect(screen.getByTestId('tasks').textContent).toBe('s1:running:40');
+  });
+
+  test('老路径（carriesDirection 缺席）：兜底方向链与算法字段逐位不变', async () => {
+    render(
+      <TaskProvider>
+        <Probe />
+      </TaskProvider>,
+    );
+    await flush();
+
+    startMiningMock.mockResolvedValue({
+      success: true,
+      data: { taskId: 'r1', task: mkTask('r1') },
+    });
+    await act(async () => {
+      handle.ctx.startMining({ userInput: '自由文本方向' } as any);
+    });
+
+    const sent = startMiningMock.mock.calls[0][0];
+    expect(sent.direction).toBe('自由文本方向');
+    expect(sent.algorithm).toBeUndefined();
+    expect(sent.algorithmName).toBeUndefined();
+  });
+});

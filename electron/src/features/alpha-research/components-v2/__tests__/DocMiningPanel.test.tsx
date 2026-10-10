@@ -4,8 +4,11 @@
  * - **状态只信后端**：解析进度由轮询驱动，失败与超限都显示后端 error 原文；
  * - **人工确认是默认**：整理完落进可编辑草稿，用户点「开始挖掘」才提交；
  *   「整理后直通」打开才跳过确认步；
- * - **提交携带血统**：onStartMining 必须带 {userInput: 草稿, docId}，
- *   docId 丢了历史页就再也连不回文档。
+ * - **提交携带血统 + 设置**：onStartMining 必须带 {userInput: 草稿, docId}，
+ *   docId 丢了历史页就再也连不回文档；确认步的挖掘设置（市场/池/数据源/算法）
+ *   随方向一起下发——文档挖掘不再「点开始挖掘就按默认值裸跑」；
+ * - **算法只列消费方向文本的项**：uses_llm=false 的算法收到方向文本即 400，
+ *   文档挖掘的方向必下发，所以选择器里不允许出现（含「默认」项是统计派时）。
  * - **上传不止文件选择器一条路**：拖拽与 Ctrl/⌘+V 粘贴都能进待上传清单；
  *   拖 Files 必须 preventDefault（不拦 = 浏览器把图片当网页打开），
  *   纯文本拖拽/粘贴一律放行默认行为。
@@ -23,6 +26,7 @@ import type { DocRow } from '../../services-v2/docMiningApi';
 const {
   uploadDocsMock, getDocMock, getDocQuotaMock, organizeDocMock, getDocFileTextMock,
   getMineruSettingsMock,
+  listMarketsMock, getUniversesMock, getMiningAlgorithmsMock,
 } = vi.hoisted(() => ({
   uploadDocsMock: vi.fn(),
   getDocMock: vi.fn(),
@@ -30,6 +34,9 @@ const {
   organizeDocMock: vi.fn(),
   getDocFileTextMock: vi.fn(),
   getMineruSettingsMock: vi.fn(),
+  listMarketsMock: vi.fn(),
+  getUniversesMock: vi.fn(),
+  getMiningAlgorithmsMock: vi.fn(),
 }));
 
 vi.mock('../../services-v2/docMiningApi', async (importOriginal) => {
@@ -45,6 +52,49 @@ vi.mock('../../services-v2/docMiningApi', async (importOriginal) => {
     getMineruSettings: getMineruSettingsMock,
   };
 });
+
+// 挖掘设置条的数据面（确认步与文字挖掘共用 useMiningOptions）：不打真网络，
+// 默认「市场空表 → 兜底市场；目录失败 → 能力面未知（只影响选择器显隐）」
+vi.mock('../../services/alphaAgentService', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../services/alphaAgentService')>();
+  return {
+    ...actual,
+    alphaAgentService: { ...actual.alphaAgentService, listMarkets: listMarketsMock },
+  };
+});
+
+vi.mock('../../services-v2/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../services-v2/api')>();
+  return { ...actual, getUniverses: getUniversesMock };
+});
+
+vi.mock('../../services-v2/miningAlgorithmApi', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../services-v2/miningAlgorithmApi')>();
+  return { ...actual, getMiningAlgorithms: getMiningAlgorithmsMock };
+});
+
+/** 归一化形态的算法目录（getMiningAlgorithms 被整体替换，返回的就是这个形态）。
+ *  故意把注册表默认设为统计派（uses_llm=false）：文档挖掘必须自己绕开这个陷阱 */
+const ALGO_CATALOG = {
+  defaultKey: 'statistical',
+  algorithms: [
+    {
+      key: 'rdagent', name: 'RD-Agent 因子演化', version: '1.0.0', desc: 'LLM 多轮演化',
+      vendor: '', enabled: true, tags: [], markets: ['a_share', 'hong_kong'],
+      freqs: ['day', '1min'], usesDatasets: true, usesLlm: true, requiresGpu: true,
+      progressKind: 'workdir', stages: [], runner: 'scripts/alpha_agent/run_rd_agent.py',
+    },
+    {
+      key: 'statistical', name: '统计量价挖掘', version: '1.1.0', desc: '不调用 LLM',
+      vendor: '', enabled: true, tags: [], markets: ['a_share'],
+      freqs: ['day'], usesDatasets: false, usesLlm: false, requiresGpu: false,
+      progressKind: 'jsonl', stages: [], runner: '',
+    },
+  ],
+  invalid: [],
+};
 
 function mkDoc(over: Partial<DocRow> = {}): DocRow {
   return {
@@ -122,6 +172,26 @@ function primeUploadThenParsed(parsedOver: Partial<DocRow> = {}) {
   getDocMock.mockResolvedValue(mkDoc({ status: 'parsed', page_count: 12, ...parsedOver }));
 }
 
+/** 上传 → 解析 → 整理 → 确认步（草稿 markdown 可指定） */
+async function walkToConfirm(input: HTMLInputElement, markdown = '# 设置草稿') {
+  primeUploadThenParsed();
+  organizeDocMock.mockResolvedValue({
+    kind: 'free',
+    prompt_version: 'v1',
+    payload: {},
+    markdown,
+    truncated: false,
+    chunks_used: 1,
+    doc: mkDoc({ status: 'organized' }),
+  });
+  fireEvent.change(input, { target: { files: [mkFile('paper.pdf')] } });
+  await flush();
+  fireEvent.click(screen.getByRole('button', { name: /上传并解析/ }));
+  await flush();
+  fireEvent.click(screen.getByRole('button', { name: /开始整理/ }));
+  await flush();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   uploadDocsMock.mockReset();
@@ -140,6 +210,12 @@ beforeEach(() => {
     env_configured: false,
     env_mode: null,
   });
+  listMarketsMock.mockReset();
+  listMarketsMock.mockResolvedValue([]);
+  getUniversesMock.mockReset();
+  getUniversesMock.mockResolvedValue({ success: true, data: { universes: [] } });
+  getMiningAlgorithmsMock.mockReset();
+  getMiningAlgorithmsMock.mockResolvedValue({ success: false, error: '算法目录不可用' });
 });
 
 afterEach(() => {
@@ -389,9 +465,14 @@ describe('整理与确认：人工确认是默认', () => {
     expect(draft.value).toBe('# 整理草稿');
 
     fireEvent.click(screen.getByRole('button', { name: /开始挖掘/ }));
+    // 设置默认值随方向一起下发（与文字挖掘同一套散件）；未选算法不下发 algorithm 键
     expect(onStartMining).toHaveBeenCalledWith({
       userInput: '# 整理草稿',
       docId: 'd-1',
+      miningMarket: 'a_share',
+      universe: 'csi300',
+      dataSource: 'qlib_bin',
+      carriesDirection: true,
     });
   });
 
@@ -451,8 +532,53 @@ describe('整理与确认：人工确认是默认', () => {
     expect(onStartMining).toHaveBeenCalledWith({
       userInput: '# 直通草稿',
       docId: 'd-1',
+      miningMarket: 'a_share',
+      universe: 'csi300',
+      dataSource: 'qlib_bin',
+      carriesDirection: true,
     });
     expect(screen.queryByText('挖掘方向草稿（可直接编辑，将原样下发 RD-Agent）')).toBeNull();
+  });
+
+  test('确认步的挖掘设置随提交下发：数据源改 Parquet 即生效', async () => {
+    const { input, onStartMining } = renderPanel();
+    await flush();
+    await walkToConfirm(input);
+
+    expect(screen.getByText(/挖掘设置（与「文字指令」同一套口径/)).toBeTruthy();
+    fireEvent.click(screen.getByText('Parquet'));
+    fireEvent.click(screen.getByRole('button', { name: /开始挖掘/ }));
+
+    expect(onStartMining).toHaveBeenCalledWith(expect.objectContaining({
+      userInput: '# 设置草稿',
+      docId: 'd-1',
+      miningMarket: 'a_share',
+      universe: 'csi300',
+      dataSource: 'parquet',
+      carriesDirection: true,
+    }));
+  });
+
+  test('算法只列消费方向文本的项；注册表默认不消费时自动落到首个 LLM 算法', async () => {
+    // 目录默认 = 统计派（uses_llm=false）：文档挖掘方向必下发，不许它在选择器里当陷阱
+    getMiningAlgorithmsMock.mockResolvedValue({ success: true, data: ALGO_CATALOG });
+    const { input, onStartMining } = renderPanel();
+    await flush();
+    await walkToConfirm(input);
+    await flush(); // 目录效应落地
+
+    const select = screen.getByLabelText('挖掘算法') as HTMLSelectElement;
+    const optionTexts = Array.from(select.options).map((o) => o.textContent ?? '');
+    expect(optionTexts.some((t) => t.includes('RD-Agent 因子演化'))).toBe(true);
+    expect(optionTexts.some((t) => t.includes('统计量价挖掘'))).toBe(false);
+    expect(optionTexts.some((t) => t.startsWith('默认'))).toBe(false);
+    expect(select.value).toBe('rdagent');
+
+    fireEvent.click(screen.getByRole('button', { name: /开始挖掘/ }));
+    expect(onStartMining).toHaveBeenCalledWith(expect.objectContaining({
+      algorithm: 'rdagent',
+      algorithmName: 'RD-Agent 因子演化',
+    }));
   });
 
   test('长文采样整理挂提示（truncated）', async () => {

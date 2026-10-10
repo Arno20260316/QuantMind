@@ -17,7 +17,7 @@ import {
 import type { BatchDispatchResult, DecomposeCard } from '../services-v2/api';
 import { useTaskContext } from '../context-v2/TaskContext';
 import { getStoredQualityGateEnabled } from '../utils-v2/miningDirections';
-import type { Task } from '../types-v2';
+import type { MiningConfigSelection, Task } from '../types-v2';
 
 /** 种子（父本）因子引用：id 用于下发，name 用于卡片徽章展示 */
 export interface SeedFactorRef {
@@ -36,6 +36,12 @@ export interface DecomposeRequest {
   universe: string;
   /** 父本种子（≤3）：拆解围绕其做受控变异（T-MV-01） */
   seeds?: SeedFactorRef[];
+  /**
+   * 首页「区间/数据集」的自定义挖掘配置（移植 P1，仅 A 股）：
+   * 批量派发与单条 evolve 同一套字段——不带上，用户会以为设置过的
+   * 窗口/数据集对这批卡片也生效了。
+   */
+  miningConfig?: MiningConfigSelection;
 }
 
 /** ChatInput「智能拆解」按钮交给 HomePage 的载荷（key 由 HomePage 补） */
@@ -173,6 +179,8 @@ export const DecomposePanel: React.FC<DecomposePanelProps> = ({
         loopN: DECOMPOSE_LOOP_N,
         // 入库闸门（T-MV-05）：派发时读设置页开关（关闭 → 任务带 off）
         qualityGateEnabled: getStoredQualityGateEnabled(),
+        // 首页选的挖掘配置随卡片一起派发（全空 = 不产生键）
+        miningConfig: request.miningConfig,
       });
       if (!res.success || !res.data) throw new Error(res.error || '派发失败');
       // 回执 index 对齐派发顺序（请求级错误整包 400，不存在错位半批）
@@ -200,12 +208,12 @@ export const DecomposePanel: React.FC<DecomposePanelProps> = ({
       setDispatchError(errorDetailOf(err));
       setPhase('preview');
     }
-  }, [cards, request.market, request.universe, adoptDispatchedTasks]);
+  }, [cards, request.market, request.universe, request.miningConfig, adoptDispatchedTasks]);
 
   const failures = (result?.items ?? []).filter((it) => it.status === 'failed');
 
   return (
-    <div className="w-full max-w-4xl mx-auto rounded-2xl border border-indigo-100 bg-white/95 backdrop-blur-xl shadow-sm overflow-hidden">
+    <div className="w-full max-w-5xl mx-auto rounded-2xl border border-indigo-100 bg-white/95 backdrop-blur-xl shadow-sm overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-2.5 px-4 py-3 border-b border-slate-100 bg-gradient-to-r from-indigo-50/80 to-purple-50/60">
         <Sparkles className="h-4 w-4 text-indigo-500 shrink-0" />

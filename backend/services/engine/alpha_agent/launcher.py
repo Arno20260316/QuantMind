@@ -17,24 +17,57 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:  # 运行期不 import：task_store 拉 DB 栈，launcher 单测不碰库
+    from backend.services.engine.alpha_agent.task_store import DuplicateActiveTask
+
+from backend.services.engine.alpha_agent.algorithm_registry import (
+    PROGRESS_KIND_JSONL,
+    PROGRESS_KIND_WORKDIR,
+    REPO_ROOT as _ALGO_REPO_ROOT,
+    AlgorithmError,
+    MiningAlgorithm,
+    load_algorithm,
+    normalize_algorithm,
+    resolve_algorithm,
+)
+from backend.services.engine.alpha_agent.data_snapshot import snapshot_data_versions
+from backend.services.engine.alpha_agent.mining_config import (
+    ENV_FREQ,
+    ENV_TASK_FINGERPRINT,
+    FREQ_MINUTE,
+    Window,
+    normalize_freq,
+    parse_window,
+    resolve_windows,
+    task_env,
+)
+from backend.services.engine.alpha_agent.task_fingerprint import (
+    canonical_params,
+    fingerprint_of,
+)
+from backend.services.engine.rd_agent.mining_datasets import (
+    SUPPORTED_DATASETS,
+    resolve_datasets,
+)
 from backend.shared.utc_datetime import UTC, to_utc_iso
 
 logger = logging.getLogger(__name__)
 
 
-def _created_at_iso(ts: Any) -> str | None:
-    """任务创建时刻 → ISO-8601 UTC（带 Z）；取不到就是 None。
+def _epoch_iso(ts: Any) -> str | None:
+    """epoch 秒 → ISO-8601 UTC（带 Z）；取不到就是 None。
 
     `created_at` 在 `EvolutionTask` 里是 `time.time()` 的 epoch 秒。前端那个全局进度
     面板靠它回答「这个任务是刚刚起的、还是我去吃饭前就挂着的那一个」，所以**绝不能**
-    在缺失时回落到 `now()`——那会把一个几小时前的僵尸任务显示成刚提交的。
+    在缺失时回落到 `now()`——那会把一个几小时前的僵尸任务显示成刚提交的。同一纪律
+    适用于 runner 进度事件的 `ts`（取不到就是不写 end_time，不伪造时刻）。
     """
     try:
         return to_utc_iso(datetime.fromtimestamp(float(ts), UTC))
@@ -52,6 +85,13 @@ class TaskStatus(str, Enum):
 
 class QueueFullError(RuntimeError):
     """排队深度已达上限：批量派发路径据此逐卡片回可操作错误（不落任务行）。"""
+
+
+#: 去重（移植 P3）认定的「活跃」：与 task_store.ACTIVE_STATUSES 同口径——
+#: queued 也算「这个配置还在路上」，同配置再提交应当复用既有任务而不是再排一个。
+#: 与并发上限的活跃集（pending/running）**不是**一回事：容量不数排队任务，
+#: 去重必须数（否则同一配置能排进队列 N 次）。
+_ACTIVE_FOR_DEDUPE = (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING)
 
 
 #: 并发/排队上限的环境变量名与默认值（**唯一读取点**：路由 429 判定与排队
@@ -181,6 +221,165 @@ class QueueReceipt:
     task_id: str
     status: str  # "running"（已派发子进程）| "queued"
     queue_position: int | None = None
+    #: 命中去重（移植 P3）：本次提交**没有新建任务**——上面的 task_id/status/
+    #: 位次都是既有任务的实况，调用方据此提示「同配置已在跑/已在排」。
+    deduplicated: bool = False
+
+
+@dataclass(frozen=True)
+class MinuteScope:
+    """分钟挖掘的可用范围（分钟 provider 事实 → 配置层口径，单一出处）。
+
+    ``usable`` 是**末端连续块**（跨过数据空洞的那一段），它就是分钟模式的默认
+    挖掘窗与允许区间；``data_end`` 直接取 ``usable.end``——provider 的 day 层比
+    1min 层更长（含次日与更长历史），qlib 回测的 t+1 取数天然满足，不需要像日线
+    那样再退让一天。``coverage`` 是 provider 全区间（含断层之前），只在报错消息
+    里用来区分"超覆盖"与"跨断层"。
+    """
+
+    usable: Window
+    coverage: Window
+    days: int
+    gaps: tuple[tuple[date, date], ...] = ()
+
+    @property
+    def data_end(self) -> date:
+        """回测可用末端 = 可用块终点（day 层已留 t+1 缓冲）。"""
+        return self.usable.end
+
+    def gap_text(self) -> str:
+        """空洞摘要（错误消息用）：``2026-01-06 ~ 2026-03-04``，多段顿号连接。"""
+        return "、".join(f"{a.isoformat()} ~ {b.isoformat()}" for a, b in self.gaps)
+
+
+def minute_scope() -> MinuteScope | None:
+    """读分钟 provider 的可用范围（未构建回 ``None``，不抛）。
+
+    未构建在这里不抛：状态/配置接口要能如实回 ``ready=false``；挖掘入口
+    （:func:`normalize_mining_config`）把它转成显式 ValueError（→ 400）。
+    """
+    from backend.services.engine import minute_qlib_provider as MP
+
+    facts = MP.minute_data_facts(MP.resolve_minute_provider_dir())
+    if facts is None:
+        return None
+    return MinuteScope(
+        usable=Window(facts.usable_start, facts.coverage.end),
+        coverage=Window(facts.coverage.start, facts.coverage.end),
+        days=facts.usable_days,
+        gaps=facts.gaps,
+    )
+
+
+def require_minute_window(
+    window: Window | None, scope: MinuteScope, *, label: str
+) -> None:
+    """分钟窗口必须整体落在末端连续块内（覆盖内但跨断层/落在断层之前也拒）。"""
+    if window is None:
+        return
+    if window.start >= scope.usable.start and window.end <= scope.usable.end:
+        return
+    gaps = scope.gap_text()
+    raise ValueError(
+        f"{label} {window.start.isoformat()} ~ {window.end.isoformat()}"
+        f" 不在分钟可用连续块内（数据断层：{gaps or '无'}）；可用区间 "
+        f"{scope.usable.start.isoformat()} ~ {scope.usable.end.isoformat()}"
+        f"，共 {scope.days} 个交易日"
+    )
+
+
+def normalize_mining_config(
+    mining_start: str | None,
+    mining_end: str | None,
+    valid_start: str | None,
+    valid_end: str | None,
+    datasets: Sequence[str] | None,
+    *,
+    freq: str | None = None,
+    market: str = "a_share",
+    coverage: Window | None = None,
+    data_end: date | None = None,
+) -> MiningConfig:
+    """校验并归一自定义挖掘配置（ISO 字符串进出，ValueError → 路由回 400）。
+
+    **所有创建路径共用这一处**（evolve / 批量派发 / 队列补位），避免出现
+    「evolve 校验了、其它入口没校验」的旁路。语义：
+
+    - 挖掘区间两端都空 = 不指定（默认窗口）；只填一端即拒。
+    - 检验区间两端都空 = 不启用；只填一端、或与挖掘区间重叠即拒（样本外）。
+    - 检验区间不得单独存在——没有挖掘窗就无从判定"样本外"。
+    - 数据集空/None = 全选（迁移前行为）；未登记 key 即拒；**分钟模式显式拒**
+      （1min 数据面只有 OHLCV/amount/vwap，不叠日线富化列——静默忽略会让用户
+      以为选的数据集生效了）。
+    - ``freq`` 空/None = 日线（**迁移前行为逐位一致**）；``"1min"`` = 分钟原生
+      挖掘（只有 A 股有分钟数据底座，其它市场显式拒——见
+      ``mining_config.normalize_freq``）。
+    - ``coverage`` 给定时两个窗口都须落在数据覆盖内（路由层从 QuantDB
+      分区目录现读）；不给（数据源不可用/排队补位）不拦——不做假校验。
+    - ``data_end``（回测可用末端）给定时两个窗口终点退让到该日——终点压在
+      数据末端最后一根 bar 上会让 qlib 回测崩在 t+1 时间步（见
+      ``mining_config.clamp_to_data_end``）。任务行因此存的是**可跑的**端点。
+    - **分钟模式**：调用方传的日线覆盖/末端保护一律作废，改用 provider 的可用
+      连续块（日线覆盖 2016→2026 与 1min 断层不是一回事）；不指定窗口时默认
+      窗 = 可用连续块（分钟只有 ~4 个月数据，4+1 年默认窗毫无意义）。
+
+    返回 :class:`MiningConfig`；未指定的部分回空串/全选元组/空频率。
+    """
+    freq_value = normalize_freq(freq, market=market)
+    scope: MinuteScope | None = None
+    if freq_value == FREQ_MINUTE:
+        scope = minute_scope()
+        if scope is None:
+            raise ValueError(
+                "分钟数据面未构建或不可读：请先构建 1min provider"
+                "（backend.services.engine.minute_qlib_provider）"
+            )
+        if datasets and [d for d in datasets if str(d or "").strip()]:
+            raise ValueError(
+                "分钟挖掘不支持数据集选择（1min 数据面只有 OHLCV/amount/vwap，"
+                "不叠加日线富化列）；请清空数据集选项或切回日线"
+            )
+        coverage, data_end = scope.coverage, scope.data_end
+
+    mining, validation = resolve_windows(
+        mining_start,
+        mining_end,
+        valid_start,
+        valid_end,
+        coverage=coverage,
+        data_end=data_end,
+    )
+    if scope is not None:
+        if mining is None:
+            mining = scope.usable  # 分钟默认窗 = 可用连续块
+        require_minute_window(mining, scope, label="挖掘数据区间")
+        require_minute_window(validation, scope, label="因子检验区间")
+    resolved = () if scope is not None else resolve_datasets(datasets)
+    # 分钟任务不落数据集（上面已拒显式选择；空元组 = 任务行/子进程 env 都不留痕，
+    # 不把"全选"这个日线语义伪装成分钟任务的配置）
+    if freq_value == "day":
+        freq_value = ""  # 未指定 = 日线：任务行不留参数痕迹
+    if mining is None:
+        return MiningConfig(datasets=resolved, freq=freq_value)
+    v_start, v_end = validation.iso() if validation else ("", "")
+    return MiningConfig(*mining.iso(), v_start, v_end, resolved, freq_value)
+
+
+@dataclass(frozen=True)
+class MiningConfig:
+    """已校验的挖掘配置（任务行/子进程 env 的唯一来源）。
+
+    空串语义：窗口空 = 未指定（默认窗口路径）；``freq`` 空 = 日线（与迁移前
+    行为一致）；``datasets`` 全选元组 = 未限定。
+    """
+
+    mining_start: str = ""
+    mining_end: str = ""
+    valid_start: str = ""
+    valid_end: str = ""
+    datasets: tuple[str, ...] = SUPPORTED_DATASETS
+    #: 挖掘频率：``""``（日线，默认）/ ``"1min"``（分钟原生挖掘，仅 A 股）
+    freq: str = ""
 
 
 @dataclass
@@ -201,6 +400,31 @@ class EvolutionTask:
     #: 入库闸门请求意图（T-MV-05）：'off'/'soft'/'hard'；''=未指定
     #: （入池时再叠 env ALPHA_GATE_MODE 解析生效模式）→ 落库为 NULL
     quality_gate_mode: str = ""
+    #: 自定义挖掘数据区间（ISO，移植 P1）：''=未指定 → 默认窗口
+    #: （行为与迁移前逐位一致）。非空时经 task_env 注入子进程，驱动 h5 数据面、
+    #: 逐因子 IC 评估与 qlib 实验分段。
+    mining_start: str = ""
+    mining_end: str = ""
+    #: 因子检验区间（样本外，ISO）：''=未启用（无检验段，实验按挖掘窗三分）
+    valid_start: str = ""
+    valid_end: str = ""
+    #: 挖掘数据集选择（登记序，如 ("features_daily","l1_factors")）：()=全选
+    datasets: tuple[str, ...] = ()
+    #: 挖掘频率（移植 P1.5）：''=日线（默认，行为与迁移前逐位一致）
+    #: / '1min'=分钟原生挖掘（数据面换 1min h5 + conf 换分钟 provider，仅 A 股）
+    freq: str = ""
+    #: 挖掘算法 key（移植 P2）：**已解析**的 manifest key（''=未指定由入口
+    #: resolve 成默认 rdagent）。运行时能力（runner/uses_llm/requires_gpu/
+    #: stages）一律从 manifest 现读——这里只存身份，不复制能力面。
+    algorithm: str = ""
+    #: 去重指纹（移植 P3）：决定这次挖掘跑什么的请求参数规范哈希（见
+    #: ``task_fingerprint``）。''=没算（迁移前写盘的 state）→ 不参与去重
+    fingerprint: str = ""
+    #: 提交时刻的参数快照（移植 P3）：指纹入参的规范字典原样留档（任务行 JSON）
+    params_snapshot: dict[str, Any] | None = None
+    #: 提交时刻的数据版本快照（移植 P3）：这份结果是在哪份数据上挖的——
+    #: 数据日更后回看历史任务，不能拿今天的覆盖解释昨天的结果（见 data_snapshot）
+    data_versions: dict[str, Any] | None = None
     status: TaskStatus = TaskStatus.PENDING
     progress: str = ""
     phase: str = "pending"
@@ -218,12 +442,103 @@ class EvolutionTask:
     _last_db_sync: float = 0.0
 
 
-class AlphaAgentLauncher:
-    """Launches factor evolution tasks via the RD-Agent runner."""
+def _build_runner_cmd(
+    task: EvolutionTask,
+    algo: MiningAlgorithm,
+    *,
+    loop_n: int,
+    direction: str,
+    log_dir: Path,
+) -> list[str]:
+    """子进程命令行的唯一构造点（runner 由 manifest 声明，参数按能力面裁剪）。
 
-    _RD_AGENT_RUNNER_SCRIPT = str(
-        Path(__file__).resolve().parent.parent.parent.parent.parent / "scripts" / "alpha_agent" / "run_rd_agent.py"
+    ``--loop-n``/``--direction`` 只发给消费它们的 runner（``uses_llm``）：统计派
+    argparse 不认这两个旗标，无条件带上会让子进程在解析参数时就退出（exit 2）。
+    单测直接钉这里，不必真起子进程。
+    """
+    cmd = [
+        sys.executable,
+        "-X",
+        "faulthandler",  # 段错误时输出 Python traceback 便于定位
+        str(_ALGO_REPO_ROOT / algo.runner),
+        "--task-id",
+        task.task_id,
+        "--user-id",
+        task.user_id,
+        "--log-dir",
+        str(log_dir),
+        "--universe",
+        task.universe,
+        "--market",
+        task.market,
+    ]
+    if algo.uses_llm:
+        cmd += ["--loop-n", str(loop_n), "--direction", direction]
+    return cmd
+
+
+def _fingerprint_params(
+    *,
+    algo_key: str,
+    market: str,
+    universe: str,
+    data_source: str | None,
+    direction: str | None,
+    direction_mode: str | None,
+    quality_gate_mode: str | None,
+    loop_n: int,
+    cfg: MiningConfig,
+    source: str,
+    doc_id: str | None,
+) -> dict[str, Any]:
+    """指纹入参的规范字典（**两条提交路径的唯一构造点**：指纹与快照同源）。
+
+    ``cfg`` 必须是 :func:`normalize_mining_config` 的产物——用归一后的值算，
+    「任务行登记的窗口/数据集」与「指纹哈希的内容」才是同一份，事后能从
+    任务行的 params_snapshot 自证为什么这次没去重。``algo_key`` 同理：传已
+    resolve 的 manifest key，不传请求原文。
+    """
+    return canonical_params(
+        algorithm=algo_key,
+        market=market,
+        universe=universe,
+        data_source=data_source,
+        direction=direction,
+        direction_mode=direction_mode,
+        quality_gate_mode=quality_gate_mode,
+        loop_n=loop_n,
+        freq=cfg.freq,
+        mining_start=cfg.mining_start,
+        mining_end=cfg.mining_end,
+        valid_start=cfg.valid_start,
+        valid_end=cfg.valid_end,
+        datasets=cfg.datasets,
+        source=source,
+        doc_id=doc_id,
     )
+
+
+def _json_text(value: Any) -> str:
+    """快照 dict → JSON 文本（任务行 TEXT 列）；空/None → ''（落 NULL）。"""
+    if not value:
+        return ""
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _progress_kind_of(algorithm_key: str | None) -> str:
+    """任务行 → 进度面形状（现读 manifest，不落任务行：能力面只存身份）。
+
+    读不到（老任务 key 合法但 manifest 被删/改坏）按 ``workdir`` 兜底——
+    那是迁移前的唯一形状，前端据此退化显示不报错。
+    """
+    try:
+        return load_algorithm(normalize_algorithm(algorithm_key)).progress_kind
+    except AlgorithmError:
+        return PROGRESS_KIND_WORKDIR
+
+
+class AlphaAgentLauncher:
+    """挖掘任务启动器：runner 由算法 manifest 声明（不再有硬编码单一路径）。"""
 
     def __init__(self) -> None:
         self._tasks: dict[str, EvolutionTask] = {}
@@ -251,6 +566,13 @@ class AlphaAgentLauncher:
         direction_meta: str | None = None,
         quality_gate_mode: str | None = None,
         data_source: str | None = None,
+        mining_start: str | None = None,
+        mining_end: str | None = None,
+        valid_start: str | None = None,
+        valid_end: str | None = None,
+        datasets: Sequence[str] | None = None,
+        freq: str | None = None,
+        algorithm: str | None = None,
         source: str = "text",
         doc_id: str | None = None,
         llm_overrides: dict[str, str] | None = None,
@@ -264,29 +586,106 @@ class AlphaAgentLauncher:
         direction_meta: 加权抽样的复现凭证（JSON 文本，T-MV-03）；None=没抽样。
         quality_gate_mode: 入库闸门请求意图（'off'/'soft'/'hard'，T-MV-05）；
         None=未指定，落库为 NULL（入池时由 resolve_admission_gate_mode 解析）。
+        mining_*/valid_*/datasets/freq: 自定义挖掘配置（移植 P1/P1.5），
+        语义与校验见 :func:`normalize_mining_config`；非法配置抛 ValueError
+        （由路由翻成 400），绝不静默退回默认窗口。
+        algorithm: 挖掘算法 key（移植 P2）；None/''=默认 rdagent（迁移前唯一
+        路径，行为逐位一致）。经算法注册表全量闸门（存在→启用→市场→频率→
+        数据集），非法组合抛 :class:`AlgorithmError`（路由翻 400）——绝不
+        「按默认算法跑出一份不是用户要的东西」。已解析的 key 落任务行，
+        运行期能力面（runner/uses_llm/requires_gpu）从 manifest 现读。
         llm_overrides: 用户级 LLM 环境变量覆盖（如个人中心配置的 API Key），
-        优先于容器全局 env 注入子进程。
+        优先于容器全局 env 注入子进程（``uses_llm=false`` 的算法不注入）。
 
         **永不排队**：并发上限的 429 背压契约在路由层（前端「原文上屏」）；
         需要「满了自动排队」的批量派发路径走 :meth:`start_or_queue`。
+        **同配置去重（P3）**：同用户已有**活跃**的同指纹任务时，不新建——
+        直接返回既有 task_id（双击「开始挖掘」、前端重放都不该再烧一份
+        token/GPU）。任务收终态后同配置重跑是正当行为，不拦。
         """
-        from backend.services.engine.alpha_agent.hw_lock import assert_factor_mining_hardware
+        from backend.services.engine.alpha_agent.hw_lock import (
+            assert_factor_mining_hardware,
+        )
 
-        assert_factor_mining_hardware()
+        algo = resolve_algorithm(
+            algorithm, market=market, freq=freq, datasets=list(datasets or [])
+        )
+        cfg = normalize_mining_config(
+            mining_start, mining_end, valid_start, valid_end, datasets,
+            freq=freq, market=market,
+        )
+        params = _fingerprint_params(
+            algo_key=algo.key,
+            market=market,
+            universe=universe,
+            data_source=data_source,
+            direction=direction,
+            direction_mode=direction_mode,
+            quality_gate_mode=quality_gate_mode,
+            loop_n=loop_n,
+            cfg=cfg,
+            source=source,
+            doc_id=doc_id,
+        )
+        fingerprint = fingerprint_of(params)
+        existing = self.find_active_duplicate(user_id, fingerprint)
+        if existing is not None:
+            logger.info(
+                "[alpha-agent] 同配置活跃任务复用：user=%s task=%s",
+                user_id,
+                existing.task_id,
+            )
+            return existing.task_id
+
+        # 硬件锁按能力面收窄：统计派纯 CPU（占用的是 CPU 不是显卡），
+        # 拿 GPU 锁拦它是错的——判据是 manifest 的 requires_gpu，不是算法名。
+        # 顺序有意如此：去重先判——「同一配置已经在跑」比「硬件忙」更接近
+        # 用户想问的问题（占着 GPU 的往往正是那个任务）。
+        if algo.requires_gpu:
+            assert_factor_mining_hardware()
 
         task_id = uuid.uuid4().hex[:16]
         task = EvolutionTask(
-            task_id=task_id, user_id=user_id, tenant_id=tenant_id or "default",
-            market=market, universe=universe, loop_n=loop_n,
-            data_source=data_source or "", direction=direction or "",
+            task_id=task_id,
+            user_id=user_id,
+            tenant_id=tenant_id or "default",
+            market=market,
+            universe=universe,
+            loop_n=loop_n,
+            data_source=data_source or "",
+            direction=direction or "",
             direction_mode=direction_mode or "",
             direction_meta=direction_meta or "",
             quality_gate_mode=quality_gate_mode or "",
+            mining_start=cfg.mining_start,
+            mining_end=cfg.mining_end,
+            valid_start=cfg.valid_start,
+            valid_end=cfg.valid_end,
+            datasets=cfg.datasets,
+            freq=cfg.freq,
+            algorithm=algo.key,
+            fingerprint=fingerprint,
+            params_snapshot=params,
+            data_versions=snapshot_data_versions(
+                market=market, freq=cfg.freq, datasets=cfg.datasets
+            ),
         )
         self._tasks[task_id] = task
 
+        from backend.services.engine.alpha_agent.task_store import (
+            DuplicateActiveTask,
+        )
+
         # 记录层落行（失败只告警）：历史页第一秒就要能看见这个任务
-        await self._db_create(task, source=source, doc_id=doc_id)
+        try:
+            await self._db_create(
+                task, source=source, doc_id=doc_id, algorithm_version=algo.version
+            )
+        except DuplicateActiveTask as dup:
+            # 预检之后的竞态窗口（同一进程两路并发提交）：本次撤回，复用赢家
+            reuse = self._withdraw_duplicate(task, dup)
+            if reuse is not None:
+                return reuse.task_id
 
         self._launch(
             task,
@@ -311,6 +710,13 @@ class AlphaAgentLauncher:
         direction_meta: str | None = None,
         quality_gate_mode: str | None = None,
         data_source: str | None = None,
+        mining_start: str | None = None,
+        mining_end: str | None = None,
+        valid_start: str | None = None,
+        valid_end: str | None = None,
+        datasets: Sequence[str] | None = None,
+        freq: str | None = None,
+        algorithm: str | None = None,
         source: str = "text",
         doc_id: str | None = None,
         llm_overrides: dict[str, str] | None = None,
@@ -322,12 +728,58 @@ class AlphaAgentLauncher:
         正常提交**——只有排队深度上限（``ALPHA_AGENT_MAX_QUEUED_*``）才抛
         :class:`QueueFullError`，供批量端点逐卡片回可操作错误。
 
+        ``algorithm`` 语义与校验同 :meth:`start_evolution`（同一处 resolve，
+        两条入口一种口径）；非法组合同样抛 :class:`AlgorithmError`。
+
         并发安全的关键：名额判定与占位（PENDING 入内存表）是同一次同步执行，
         中间没有任何 await——并发提交看到的是同一份计数，不会双开超额。
-        """
-        from backend.services.engine.alpha_agent.hw_lock import assert_factor_mining_hardware
 
-        assert_factor_mining_hardware()
+        **同配置去重（P3）**：同用户已有活跃的同指纹任务时回执既有任务
+        （``deduplicated=True``，status/位次是它的实况），不新建、不排队、
+        不占名额——批量派发里重了卡片不该把队列堵满。
+        """
+        from backend.services.engine.alpha_agent.hw_lock import (
+            assert_factor_mining_hardware,
+        )
+
+        algo = resolve_algorithm(
+            algorithm, market=market, freq=freq, datasets=list(datasets or [])
+        )
+        cfg = normalize_mining_config(
+            mining_start, mining_end, valid_start, valid_end, datasets,
+            freq=freq, market=market,
+        )
+        params = _fingerprint_params(
+            algo_key=algo.key,
+            market=market,
+            universe=universe,
+            data_source=data_source,
+            direction=direction,
+            direction_mode=direction_mode,
+            quality_gate_mode=quality_gate_mode,
+            loop_n=loop_n,
+            cfg=cfg,
+            source=source,
+            doc_id=doc_id,
+        )
+        fingerprint = fingerprint_of(params)
+        existing = self.find_active_duplicate(user_id, fingerprint)
+        if existing is not None:
+            logger.info(
+                "[alpha-agent] 同配置活跃任务复用：user=%s task=%s",
+                user_id,
+                existing.task_id,
+            )
+            return QueueReceipt(
+                existing.task_id,
+                existing.status.value,
+                self._queue_position(existing),
+                deduplicated=True,
+            )
+
+        # 硬件锁按能力面收窄（同 start_evolution）：统计派纯 CPU 不该被 GPU 锁拦
+        if algo.requires_gpu:
+            assert_factor_mining_hardware()
 
         counts = self.count_running()
         max_per_user, max_global = self.running_capacity()
@@ -340,18 +792,52 @@ class AlphaAgentLauncher:
 
         task_id = uuid.uuid4().hex[:16]
         task = EvolutionTask(
-            task_id=task_id, user_id=user_id, tenant_id=tenant_id or "default",
-            market=market, universe=universe, loop_n=loop_n,
-            data_source=data_source or "", direction=direction or "",
+            task_id=task_id,
+            user_id=user_id,
+            tenant_id=tenant_id or "default",
+            market=market,
+            universe=universe,
+            loop_n=loop_n,
+            data_source=data_source or "",
+            direction=direction or "",
             direction_mode=direction_mode or "",
             direction_meta=direction_meta or "",
             quality_gate_mode=quality_gate_mode or "",
+            mining_start=cfg.mining_start,
+            mining_end=cfg.mining_end,
+            valid_start=cfg.valid_start,
+            valid_end=cfg.valid_end,
+            datasets=cfg.datasets,
+            freq=cfg.freq,
+            algorithm=algo.key,
+            fingerprint=fingerprint,
+            params_snapshot=params,
+            data_versions=snapshot_data_versions(
+                market=market, freq=cfg.freq, datasets=cfg.datasets
+            ),
             status=TaskStatus.PENDING if has_slot else TaskStatus.QUEUED,
         )
         self._tasks[task_id] = task
-        await self._db_create(task, source=source, doc_id=doc_id)
 
-        if not has_slot:
+        from backend.services.engine.alpha_agent.task_store import (
+            DuplicateActiveTask,
+        )
+
+        try:
+            await self._db_create(
+                task, source=source, doc_id=doc_id, algorithm_version=algo.version
+            )
+        except DuplicateActiveTask as dup:
+            reuse = self._withdraw_duplicate(task, dup)
+            if reuse is not None:
+                return QueueReceipt(
+                    reuse.task_id,
+                    reuse.status.value,
+                    self._queue_position(reuse),
+                    deduplicated=True,
+                )
+
+        if task.status == TaskStatus.QUEUED:
             self._persist_task(task)
             return QueueReceipt(task_id, "queued", self._queue_position(task))
 
@@ -468,6 +954,58 @@ class AlphaAgentLauncher:
                 "请等待当前任务完成或先取消已排队的任务。"
             )
 
+    def find_active_duplicate(
+        self, user_id: str, fingerprint: str
+    ) -> EvolutionTask | None:
+        """同用户×同指纹的活跃任务（P3 去重的第一道闸；无则 None）。
+
+        只看内存表：本部署 engine 单 worker（``ENGINE_WORKERS=1``——多 worker
+        时排队/并发上限本来就已塌），内存表就是「在跑/在排」的唯一事实源。
+        DB 里的活跃行可能是上次进程留下的孤儿（启动对账之外还有崩在收尾前
+        的窗口），拿它复用等于把一个永远不动的任务回执给用户。
+        预检之后的竞态窗口由任务行的部分唯一索引兜底（见 ``_db_create``）。
+        """
+        if not fingerprint:
+            return None
+        for task in self._tasks.values():
+            if (
+                task.user_id == user_id
+                and task.fingerprint == fingerprint
+                and task.status in _ACTIVE_FOR_DEDUPE
+            ):
+                return task
+        return None
+
+    def _withdraw_duplicate(
+        self, task: EvolutionTask, dup: DuplicateActiveTask
+    ) -> EvolutionTask | None:
+        """撞唯一索引的本次提交 → 撤回内存占位；返回可复用的赢家（无则 None）。
+
+        返回 None 的两条路（调用方都按「没命中去重」继续，fail-open）：
+        赢家不在内存（活跃行来自别的进程/重启前的孤儿行——复用它会回执一个
+        死任务）；或本次提交在 DB 往返窗口里已被排水启动（已经跑起来了，
+        撤回才是真的错：宁可多跑一个也不杀活任务，只记 error）。
+        """
+        winner = self._tasks.get(dup.existing_task_id)
+        if winner is None or winner.status not in _ACTIVE_FOR_DEDUPE:
+            logger.warning(
+                "[alpha-agent] 去重索引撞行 %s，但内存里没有对应活跃任务"
+                "（多为重启前的孤儿行）：本次提交 %s 照常继续，仅记录行缺席",
+                dup.existing_task_id,
+                task.task_id,
+            )
+            return None
+        if task.process is not None or task.status == TaskStatus.RUNNING:
+            logger.error(
+                "[alpha-agent] 去重竞态：本次提交 %s 已被排水启动，"
+                "与既有任务 %s 同配置并行（不再撤回，避免杀活任务）",
+                task.task_id,
+                winner.task_id,
+            )
+            return None
+        self._tasks.pop(task.task_id, None)
+        return winner
+
     def _queue_position(self, task: EvolutionTask) -> int | None:
         """本用户队列内位次（1-based，最旧=1）；不在队列里返回 None。"""
         queued = sorted(
@@ -512,6 +1050,7 @@ class AlphaAgentLauncher:
         if not provider_uri:
             try:
                 from backend.services.engine.rd_agent.market_adapters import get_adapter
+
                 adapter = get_adapter(task.market)
                 provider_uri = adapter.get_qlib_provider_uri()
             except Exception:
@@ -521,11 +1060,17 @@ class AlphaAgentLauncher:
         if task.data_source:
             ds = task.data_source.lower().strip()
             if ds == "parquet":
-                from backend.services.engine.rd_agent.rd_loop_wrapper import RDLoopWrapper
+                from backend.services.engine.rd_agent.rd_loop_wrapper import (
+                    RDLoopWrapper,
+                )
+
                 quantdb_dir = RDLoopWrapper._resolve_quantdb_dir()
                 if quantdb_dir:
                     # 从 QuantDB parquet 构建或更新 Qlib 缓存
-                    from backend.services.engine.qlib_data_builder import ensure_qlib_cache
+                    from backend.services.engine.qlib_data_builder import (
+                        ensure_qlib_cache,
+                    )
+
                     provider_uri = ensure_qlib_cache(quantdb_dir)
                 else:
                     provider_uri = "/app/db/feature_snapshots"
@@ -555,13 +1100,18 @@ class AlphaAgentLauncher:
             "user_id": task.user_id,
             # 前端全局进度面板据此排序并显示「开始于」；此前这个字段只在磁盘
             # task_state.json 里有，状态接口不返回，前端只能拿不到就填 now()。
-            "created_at": _created_at_iso(task.created_at),
+            "created_at": _epoch_iso(task.created_at),
             "status": task.status.value,
             "progress": task.progress,
             "phase": task.phase,
             "progress_pct": task.progress_pct,
             "current_loop": task.current_loop,
             "loop_n": task.loop_n,
+            # 挖掘算法（移植 P2）：已解析的 manifest key（老任务/未指定 = rdagent）
+            "algorithm": normalize_algorithm(task.algorithm),
+            # 进度面形状（现读 manifest）：workdir=演化轮（前端渲染 Round x/y），
+            # jsonl=单流水线（不分轮——前端不编造演化轮语义）
+            "progress_kind": _progress_kind_of(task.algorithm),
             "market": task.market,
             "universe": task.universe,
             "data_source": task.data_source,
@@ -570,12 +1120,21 @@ class AlphaAgentLauncher:
             "result": task.result,
             "timeline": task.timeline,
             "token_usage": task.token_usage,
+            # 自定义挖掘配置快照（移植 P1）：任务详情页据此回显
+            # 「这批因子是按哪个区间/哪些数据集挖的」；未指定 → None（默认语义）
+            "mining_config": {
+                "mining_start": task.mining_start or None,
+                "mining_end": task.mining_end or None,
+                "valid_start": task.valid_start or None,
+                "valid_end": task.valid_end or None,
+                "datasets": list(task.datasets) or None,
+                # 频率：'' → None（日线默认语义，"没有的值"不伪装成显式 day）
+                "freq": task.freq or None,
+            },
             # 排队位次（本用户队列内，1-based）；非排队状态恒为 None。
             # 前端「排队中（第 N 位）」直接渲染，不用自己数队列。
             "queue_position": (
-                self._queue_position(task)
-                if task.status == TaskStatus.QUEUED
-                else None
+                self._queue_position(task) if task.status == TaskStatus.QUEUED else None
             ),
         }
 
@@ -583,7 +1142,11 @@ class AlphaAgentLauncher:
         task = self._tasks.get(task_id)
         if not task:
             return False
-        if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.QUEUED):
+        if task.status not in (
+            TaskStatus.RUNNING,
+            TaskStatus.PENDING,
+            TaskStatus.QUEUED,
+        ):
             return False
         task._cancel_requested = True
         # 排队任务还没有进程，杀掉这一步天然跳过
@@ -598,7 +1161,9 @@ class AlphaAgentLauncher:
                     await asyncio.sleep(0.5)
                 if task.process.poll() is None:
                     os.killpg(pgid, signal.SIGKILL)
-                    logger.warning("Force-killed process group %d for task %s", pgid, task_id)
+                    logger.warning(
+                        "Force-killed process group %d for task %s", pgid, task_id
+                    )
             except ProcessLookupError:
                 pass
             except Exception as e:
@@ -656,8 +1221,21 @@ class AlphaAgentLauncher:
     # ------------------------------------------------------------------
 
     async def _db_create(
-        self, task: EvolutionTask, *, source: str = "text", doc_id: str | None = None
+        self,
+        task: EvolutionTask,
+        *,
+        source: str = "text",
+        doc_id: str | None = None,
+        algorithm_version: str = "",
     ) -> None:
+        """落任务行。普通失败只告警（记录层不拦挖掘主链）；撞去重索引（P3）时
+        **上抛** :class:`DuplicateActiveTask`——那不是写失败，是并发竞态下的
+        正确拒绝，调用方必须撤回本次提交（见 ``_withdraw_duplicate``）。
+        """
+        from backend.services.engine.alpha_agent.task_store import (
+            DuplicateActiveTask,
+        )
+
         try:
             await _task_store().create_task(
                 task_id=task.task_id,
@@ -675,10 +1253,26 @@ class AlphaAgentLauncher:
                 direction_meta=task.direction_meta or None,
                 # 未指定（''）→ NULL：任务行存请求意图，不冻结入池时点的 env
                 quality_gate_mode=task.quality_gate_mode or None,
+                # 自定义挖掘配置（P1）：'' → NULL，数据集存逗号分隔 TEXT
+                mining_start=task.mining_start,
+                mining_end=task.mining_end,
+                valid_start=task.valid_start,
+                valid_end=task.valid_end,
+                datasets=",".join(task.datasets),
+                freq=task.freq,
+                algorithm=normalize_algorithm(task.algorithm),
                 loop_n=task.loop_n,
                 source=source,
                 doc_id=doc_id,
+                # 去重指纹 + 参数/数据版本快照（P3）：指纹与 params_snapshot 同源
+                # （同一份 canonical 字典），事后能从任务行自证为什么没去重
+                fingerprint=task.fingerprint,
+                algorithm_version=algorithm_version,
+                params_snapshot=_json_text(task.params_snapshot),
+                data_versions=_json_text(task.data_versions),
             )
+        except DuplicateActiveTask:
+            raise
         except Exception as e:
             logger.warning("mining task row create failed for %s: %s", task.task_id, e)
 
@@ -749,6 +1343,21 @@ class AlphaAgentLauncher:
                 "data_source": task.data_source,
                 "universe": task.universe,
                 "direction": task.direction,
+                # 自定义挖掘配置随盘持久化：重启后幸存的排队任务必须按原窗口/
+                # 数据集补位，否则「排了 2 小时、重启后按默认窗口挖」是哑故障
+                "mining_start": task.mining_start,
+                "mining_end": task.mining_end,
+                "valid_start": task.valid_start,
+                "valid_end": task.valid_end,
+                "datasets": list(task.datasets),
+                # 频率随盘：重启后幸存的排队分钟任务必须仍按分钟补位
+                "freq": task.freq,
+                # 算法随盘：重启后幸存的排队任务必须仍按原算法补位（补位时
+                # 从 manifest 现读能力面/runnner——这里存的只是身份 key）
+                "algorithm": normalize_algorithm(task.algorithm),
+                # 指纹随盘：重启后幸存的活跃任务必须仍参与去重——否则
+                # 「重启一次，同配置再点一下」就会双开一份同参挖掘
+                "fingerprint": task.fingerprint,
                 "status": task.status.value,
                 "progress": task.progress,
                 "phase": task.phase,
@@ -783,6 +1392,17 @@ class AlphaAgentLauncher:
                         data_source=data.get("data_source", ""),
                         universe=data.get("universe", "csi300"),
                         direction=data.get("direction", ""),
+                        mining_start=data.get("mining_start", "") or "",
+                        mining_end=data.get("mining_end", "") or "",
+                        valid_start=data.get("valid_start", "") or "",
+                        valid_end=data.get("valid_end", "") or "",
+                        datasets=tuple(data.get("datasets") or ()),
+                        freq=data.get("freq", "") or "",
+                        # 缺字段 = 迁移前写盘的 state（当时唯一算法）：默认 rdagent
+                        algorithm=data.get("algorithm", "") or "",
+                        # 缺字段 = 本特性前写盘的 state → ''（不参与去重，
+                        # 「未知」不伪装成「无重复」）
+                        fingerprint=data.get("fingerprint", "") or "",
                         status=TaskStatus(data.get("status", "pending")),
                         progress=data.get("progress", ""),
                         phase=data.get("phase", "pending"),
@@ -812,11 +1432,20 @@ class AlphaAgentLauncher:
     # ------------------------------------------------------------------
 
     def _default_seed_path(self) -> str:
-        in_container = Path("/app/alphaagent/scenarios/qlib/experiment/factor_data_template")
+        in_container = Path(
+            "/app/alphaagent/scenarios/qlib/experiment/factor_data_template"
+        )
         if in_container.exists():
             return str(in_container)
         project = os.getenv("HOST_PROJECT_PATH", "/opt/quantmind")
-        template = Path(project) / "alphaagent" / "scenarios" / "qlib" / "experiment" / "factor_data_template"
+        template = (
+            Path(project)
+            / "alphaagent"
+            / "scenarios"
+            / "qlib"
+            / "experiment"
+            / "factor_data_template"
+        )
         return str(template)
 
     async def _run_evolution(
@@ -840,120 +1469,193 @@ class AlphaAgentLauncher:
         task_log_dir = self._log_dir / task.task_id
         task_log_dir.mkdir(parents=True, exist_ok=True)
 
+        # 算法 manifest 现读（任务行只存 key）：runner 路径 / 能力面 / 阶段表
+        # 全部来自 manifest。装载失败（被删/改坏）= 任务记录不可执行：显式失败
+        # 并给可操作报错，绝不「默默换一个 runner 跑」。
+        try:
+            algo = load_algorithm(normalize_algorithm(task.algorithm))
+        except AlgorithmError as exc:
+            task.status = TaskStatus.FAILED
+            task.error_message = f"挖掘算法不可用：{exc}"
+            task.progress = task.error_message
+            self._persist_task(task)
+            await self._db_finish(task)
+            logger.error("Task %s 算法装载失败: %s", task.task_id, exc)
+            return
+
         # 因子池检索注入（单通道：只写提示词文件，零运行时副作用——绝不碰
         # base_factors.json，否则 LLM 会把历史摘要当可用基础特征送进因子代码
         # 运行时，理由见 pool_service 模块 docstring）。任何失败都空注入，
-        # 绝不拦住一次挖矿。
-        from backend.services.engine.mining_plugins import pool_service
+        # 绝不拦住一次挖矿。只对消费提示词的算法（uses_llm）注入：往统计派
+        # 的日志目录写一份没人读的提示词文件，只会污染审计面。
+        injection = None
+        if algo.uses_llm:
+            from backend.services.engine.mining_plugins import pool_service
 
-        injection = await pool_service.prepare_injection(
-            user_id=task.user_id,
-            market=task.market,
-            universe=task.universe,
-            task_id=task.task_id,
-            log_dir=task_log_dir,
-        )
+            injection = await pool_service.prepare_injection(
+                user_id=task.user_id,
+                market=task.market,
+                universe=task.universe,
+                task_id=task.task_id,
+                log_dir=task_log_dir,
+            )
 
         # Build environment
-        openai_base = (
-            os.getenv("OPENAI_BASE_URL")
-            or os.getenv("OPENAI_API_BASE")
-            or ""
-        )
-        openai_api_key = (
-            os.getenv("AI_IDE_LLM_API_KEY")
-            or os.getenv("AI_IDE_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or ""
-        )
-        chat_model = os.getenv("CHAT_MODEL", "")
-        system_prompt = os.getenv("ALPHA_AGENT_SYSTEM_PROMPT", "")
-
-        # 用户级 LLM 配置（如个人中心「AI 服务配置」）优先于容器全局 env
-        if llm_overrides:
-            openai_base = llm_overrides.get("OPENAI_BASE_URL", openai_base)
-            openai_api_key = llm_overrides.get("OPENAI_API_KEY", openai_api_key)
-            chat_model = llm_overrides.get("CHAT_MODEL", chat_model)
-
-        # CoSTEER 经验记忆（知识库）：跨任务累积「因子代码怎么写才过评测」的经验。
-        # 读写路径、绝对路径约束与 filelock 的理由见 rd_agent/kb_env.py。
-        from backend.services.engine.rd_agent.kb_env import knowledge_base_env
-
         env = {
             **os.environ,
             "PYTHONPATH": os.getenv("PYTHONPATH") or "/app",
             "LOG_TRACE_PATH": str(task_log_dir),
             "QLIB_PROVIDER_URI": provider_uri,
             "QLIB_FACTOR_UNIVERSE": task.universe,
-            "REASONING_MODEL": chat_model,
-            "CHAT_STREAM": "false",
-            **knowledge_base_env(),
             # 回测数据从 2016 年开始 (默认 2008 太慢)
-            "QLIB_FACTOR_TRAIN_START": os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"),
-            "QLIB_FACTOR_VALID_START": os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"),
+            "QLIB_FACTOR_TRAIN_START": os.getenv(
+                "QLIB_FACTOR_TRAIN_START", "2016-01-01"
+            ),
+            "QLIB_FACTOR_VALID_START": os.getenv(
+                "QLIB_FACTOR_VALID_START", "2021-01-01"
+            ),
             "QLIB_FACTOR_VALID_END": os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"),
             "QLIB_FACTOR_TEST_START": os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"),
             "QLIB_FACTOR_TEST_END": os.getenv("QLIB_FACTOR_TEST_END", "2025-12-31"),
             # 因子处理并行数
             "MULTI_PROC_N": os.getenv("MULTI_PROC_N", "4"),
         }
-        if system_prompt:
-            env["DEFAULT_SYSTEM_PROMPT"] = system_prompt
-        if openai_base:
-            env["OPENAI_BASE_URL"] = openai_base
-        if openai_api_key:
-            env["OPENAI_API_KEY"] = openai_api_key
-        if chat_model:
-            env["CHAT_MODEL"] = chat_model
-        if injection.path is not None:
-            # rd_loop_wrapper._build_prompt_suffix 读这个文件追加「历史挖掘记忆」段
-            env["QMF_POOL_CONTEXT_PATH"] = str(injection.path)
 
-        # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
-        if llm_overrides:
-            # 显式写入 LITELLM_ 覆盖，绕开 build_llm_env 里 os.getenv 的 mock 占位符链
-            for _k in ("LITELLM_OPENAI_API_KEY", "LITELLM_OPENAI_API_BASE"):
-                if llm_overrides.get(_k):
-                    env[_k] = llm_overrides[_k]
+        # LLM 链路只对消费提示词的算法（uses_llm）铺设：供应商变量、CoSTEER
+        # 知识库、用户级 Key/向量检索覆盖、提示词池上下文。统计派子进程根本不
+        # 读它们——把用户 API Key 注入一个不消费 LLM 的进程是白扩凭据暴露面。
+        if algo.uses_llm:
+            openai_base = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or ""
+            openai_api_key = (
+                os.getenv("AI_IDE_LLM_API_KEY")
+                or os.getenv("AI_IDE_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or ""
+            )
+            chat_model = os.getenv("CHAT_MODEL", "")
+            system_prompt = os.getenv("ALPHA_AGENT_SYSTEM_PROMPT", "")
 
-        from backend.services.engine.rd_agent.llm_env import (
-            build_llm_env,
-            embedding_overrides,
-        )
+            # 用户级 LLM 配置（如个人中心「AI 服务配置」）优先于容器全局 env
+            if llm_overrides:
+                openai_base = llm_overrides.get("OPENAI_BASE_URL", openai_base)
+                openai_api_key = llm_overrides.get("OPENAI_API_KEY", openai_api_key)
+                chat_model = llm_overrides.get("CHAT_MODEL", chat_model)
 
-        # 用户级向量检索配置（个人中心「向量检索」）——与 chat 是**独立通道**，
-        # 必须单独透传：漏掉这一步，界面显示「已保存」而挖掘始终用容器级 .env。
-        # 键清单与理由见 llm_env.embedding_overrides。
-        env.update(embedding_overrides(llm_overrides))
+            # CoSTEER 经验记忆（知识库）：跨任务累积「因子代码怎么写才过评测」的经验。
+            # 读写路径、绝对路径约束与 filelock 的理由见 rd_agent/kb_env.py。
+            from backend.services.engine.rd_agent.kb_env import knowledge_base_env
 
-        build_llm_env(env)
+            env.update(knowledge_base_env())
+            env["REASONING_MODEL"] = chat_model
+            env["CHAT_STREAM"] = "false"
+            if system_prompt:
+                env["DEFAULT_SYSTEM_PROMPT"] = system_prompt
+            if openai_base:
+                env["OPENAI_BASE_URL"] = openai_base
+            if openai_api_key:
+                env["OPENAI_API_KEY"] = openai_api_key
+            if chat_model:
+                env["CHAT_MODEL"] = chat_model
+            if injection is not None and injection.path is not None:
+                # rd_loop_wrapper._build_prompt_suffix 读这个文件追加「历史挖掘记忆」段
+                env["QMF_POOL_CONTEXT_PATH"] = str(injection.path)
+
+            # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
+            if llm_overrides:
+                # 显式写入 LITELLM_ 覆盖，绕开 build_llm_env 里 os.getenv 的 mock 占位符链
+                for _k in ("LITELLM_OPENAI_API_KEY", "LITELLM_OPENAI_API_BASE"):
+                    if llm_overrides.get(_k):
+                        env[_k] = llm_overrides[_k]
+
+            from backend.services.engine.rd_agent.llm_env import (
+                build_llm_env,
+                embedding_overrides,
+            )
+
+            # 用户级向量检索配置（个人中心「向量检索」）——与 chat 是**独立通道**，
+            # 必须单独透传：漏掉这一步，界面显示「已保存」而挖掘始终用容器级 .env。
+            # 键清单与理由见 llm_env.embedding_overrides。
+            env.update(embedding_overrides(llm_overrides))
+
+            build_llm_env(env)
 
         # Add market adapter env overrides (RD-Agent runner used for all markets)
         try:
             from backend.services.engine.rd_agent.market_adapters import get_adapter
+
             adapter = get_adapter(task.market)
             adapter_env = adapter.get_env_overrides()
             env.update(adapter_env)
         except Exception as e:
             logger.warning("Failed to get market adapter env: %s", e)
 
-        # RD-Agent runner for all markets
-        runner_script = self._RD_AGENT_RUNNER_SCRIPT
+        # 自定义挖掘窗口/数据集（移植 P1）：以**任务参数**为准注入
+        # 子进程 env（QM_* 主契约 + 旧 QLIB_FACTOR_* 同源），排在适配器 env 之后
+        # ——任务选择必须压过市场默认。参数解析失败 = 任务记录不可信：fail 任务，
+        # 绝不静默退回默认窗口去挖一批错区间的因子。
+        if task.mining_start or task.valid_start:
+            try:
+                # 覆盖校验不在这里做：任务行是请求入口按当时覆盖校验过的
+                # 事实，重启补位时数据可能又长了几天，拿新覆盖反咬旧任务没有意义。
+                # 末端保护（data_end）要现算现用：数据每天都在长，服务器重启后
+                # 补位执行的老任务同样不能把回测终点压在最后一根 bar 上。
+                from backend.services.engine.rd_agent.rd_loop_wrapper import (
+                    qlib_backtest_data_end,
+                )
 
-        cmd = [
-            sys.executable,
-            "-X", "faulthandler",  # 段错误时输出 Python traceback 便于定位
-            runner_script,
-            "--task-id", task.task_id,
-            "--user-id", task.user_id,
-            "--loop-n", str(loop_n),
-            "--log-dir", str(task_log_dir),
-            "--direction", direction,
-            "--universe", task.universe,
-            "--market", task.market,
-        ]
+                data_end = qlib_backtest_data_end()
+                mining, validation = resolve_windows(
+                    task.mining_start,
+                    task.mining_end,
+                    task.valid_start,
+                    task.valid_end,
+                    data_end=data_end,
+                )
+                if mining is not None:
+                    # 分钟任务不落数据集（空元组 → task_env 直接不发该键）：把空元组
+                    # 补成"全选"会让子进程以为用户选了一堆日线富化列并记 warning。
+                    # 不消费数据集的算法（统计派）同理：不发该键，而不是发一份
+                    # 没人读的"全选"——env 里出现的每个键都该有人消费。
+                    if not algo.uses_datasets:
+                        selected: tuple[str, ...] = ()
+                    elif task.freq:
+                        selected = task.datasets
+                    else:
+                        selected = task.datasets or SUPPORTED_DATASETS
+                    env.update(
+                        task_env(mining, validation, selected, data_end=data_end)
+                    )
+            except ValueError as exc:
+                task.status = TaskStatus.FAILED
+                task.error_message = f"挖掘配置非法：{exc}"
+                task.progress = task.error_message
+                self._persist_task(task)
+                await self._db_finish(task)
+                logger.error("Task %s 挖掘配置非法，拒绝启动: %s", task.task_id, exc)
+                return
 
-        logger.info("Starting factor mining: market=%s, script=%s", task.market, runner_script)
+        # 挖掘频率：与窗口**独立**注入。分钟任务缺窗口时由 wrapper 响亮失败
+        # （MinuteDataError），但频率标记必须先到——否则子进程按日线默认跑完，
+        # 产出一批"自称分钟因子"的东西，正是 P1.5 要消灭的失败态。
+        if task.freq:
+            env[ENV_FREQ] = task.freq
+
+        # P3 任务指纹：统计派落库的稳定因子 id 靠它定身份（同配置重跑幂等刷新
+        # 同一行）。空指纹不注入——runner 会如实退回任务级身份，而不是拿空串
+        # 把所有任务的身份撞成一个。
+        if task.fingerprint:
+            env[ENV_TASK_FINGERPRINT] = task.fingerprint
+
+        cmd = _build_runner_cmd(
+            task, algo, loop_n=loop_n, direction=direction, log_dir=task_log_dir
+        )
+
+        logger.info(
+            "Starting factor mining: market=%s, algorithm=%s, script=%s",
+            task.market,
+            algo.key,
+            algo.runner,
+        )
         logger.info("Command: %s", " ".join(cmd))
 
         stdout_log = task_log_dir / "subprocess_stdout.log"
@@ -975,7 +1677,7 @@ class AlphaAgentLauncher:
 
             # spawn 成功才记检索疲劳（提示词已随子进程启动送达）；
             # mark_retrieved 自身吞异常，失败最多少计一次，绝不影响挖掘
-            if injection.factor_ids:
+            if algo.uses_llm and injection is not None and injection.factor_ids:
                 await pool_service.mark_retrieved(injection.factor_ids)
 
             while process.poll() is None:
@@ -986,12 +1688,15 @@ class AlphaAgentLauncher:
                     except ProcessLookupError:
                         pass
                     break
-                self._update_progress(task, task_log_dir)
+                self._refresh_progress(task, task_log_dir, algo)
                 await self._db_sync_progress_throttled(task)
                 await asyncio.sleep(3)
 
             if process.poll() is None:
                 process.wait(timeout=30)
+
+            # 收尾前最后一次刷新：把子进程写出的末几个阶段收进时间线
+            self._refresh_progress(task, task_log_dir, algo, finished=True)
 
             try:
                 log_fh.close()
@@ -1007,8 +1712,14 @@ class AlphaAgentLauncher:
             else:
                 task.status = TaskStatus.FAILED
                 error_output = self._tail_error_log(task_log_dir)
-                task.error_message = f"Process exited with code {process.returncode}: {error_output}"
-                logger.error("Factor mining failed for task %s: %s", task.task_id, task.error_message)
+                task.error_message = (
+                    f"Process exited with code {process.returncode}: {error_output}"
+                )
+                logger.error(
+                    "Factor mining failed for task %s: %s",
+                    task.task_id,
+                    task.error_message,
+                )
 
             self._persist_task(task)
             await self._db_finish(task)
@@ -1065,12 +1776,173 @@ class AlphaAgentLauncher:
                     best = (newest, (sub_name, key, label))
         return best[1] if best[0] > 0 else None
 
+    #: 单流水线 runner（统计派等 manifest 声明的算法）的进度文件：每行一个
+    #: JSON 事件 ``{stage, detail, ts}``，阶段 key 由 manifest ``stages`` 翻译。
+    _JSONL_PROGRESS_FILE = "progress.jsonl"
+
+    def _refresh_progress(
+        self,
+        task: EvolutionTask,
+        log_dir: Path,
+        algo: MiningAlgorithm,
+        *,
+        finished: bool = False,
+    ) -> None:
+        """按 manifest ``progress_kind`` 分派进度读取器（契约显式声明，不嗅探）。"""
+        if algo.progress_kind == PROGRESS_KIND_JSONL:
+            self._update_jsonl_progress(task, log_dir, algo, finished=finished)
+        else:
+            self._update_progress(task, log_dir)
+
+    @staticmethod
+    def _jsonl_events(path: Path) -> list[dict[str, Any]]:
+        """读 progress.jsonl；坏行/半截行跳过（**正在写入**的末行不是错误）。"""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        events: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _update_jsonl_progress(
+        self,
+        task: EvolutionTask,
+        log_dir: Path,
+        algo: MiningAlgorithm,
+        *,
+        finished: bool = False,
+    ) -> None:
+        """``progress.jsonl`` → 阶段/百分比/时间线（无 loop 概念的单流水线算法）。
+
+        百分比按 manifest stages 的序位线性推进并**封顶 99**——100 只由收尾
+        路径置（完成度的终点是落库收尾，不是最后一个业务阶段）。时间线沿用
+        RD-Agent 的同一外形（loop → phases），前端一套渲染器吃两种算法。
+        manifest 声明的**全部**阶段一开始就摆进时间线（未到的 = pending，
+        用户一眼看到完整流水线，前端分母不再靠猜）；未在 manifest 声明的
+        阶段如实追加（不硬编码算法名/阶段名）。无任何事件时不动任务状态
+        （runner 还没开口，不产假时间线）。
+        """
+        events = self._jsonl_events(log_dir / self._JSONL_PROGRESS_FILE)
+        if not events:
+            return
+        labels = {s.key: s.label for s in algo.stages}
+        order = {s.key: i for i, s in enumerate(algo.stages)}
+
+        def _pending(key: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "label": labels.get(key, key),
+                "status": "pending",
+                "start_time": None,
+                "end_time": None,
+                "detail": "",
+                "duration_s": None,
+            }
+
+        nodes: dict[str, dict[str, Any]] = {}
+        seen: list[str] = []  # 出现顺序（状态收口与 pct 只看它，pending 不参与）
+        extra: list[str] = []  # 未在 manifest 声明的 stage：如实追加在最后
+        #: stage → [start_epoch, end_epoch]，只由**真实事件时刻**推 duration——
+        #: 不借「读文件时刻」凑数（这里存的是过程量，不进前端字典）
+        spans: dict[str, list[float | None]] = {}
+
+        def _close(prev_key: str, ts: float | None, iso: str | None) -> None:
+            """给上一阶段补 end_time（只在还没有结束证据时）。"""
+            node = nodes[prev_key]
+            if node["end_time"] is not None or iso is None:
+                return
+            node["end_time"] = iso
+            spans[prev_key][1] = ts
+
+        for event in events:
+            stage = str(event.get("stage") or "").strip()
+            if not stage:
+                continue
+            raw_ts = event.get("ts")
+            ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else None
+            iso = _epoch_iso(raw_ts)
+            node = nodes.get(stage)
+            if node is None:
+                # 新阶段开始 = 上一阶段结束：单流水线顺序执行，下一个阶段的
+                # 首个事件就是前一阶段结束的唯一真实证据（不伪造收尾时刻）。
+                if seen:
+                    _close(seen[-1], ts, iso)
+                node = {
+                    "key": stage,
+                    "label": labels.get(stage, stage),
+                    "status": "running",
+                    "start_time": iso,
+                    "end_time": None,
+                    "detail": "",
+                }
+                nodes[stage] = node
+                spans[stage] = [ts, None]
+                seen.append(stage)
+                if stage not in order:
+                    extra.append(stage)
+            elif iso:
+                # 同阶段多次上报（如 evaluate 逐个候选）：末次事件即阶段终点
+                node["end_time"] = iso
+                spans[stage][1] = ts
+            detail = str(event.get("detail") or "").strip()
+            if detail:
+                node["detail"] = detail
+
+        # 阶段收口：最后出现的阶段在跑（finished → 已完成），更早的已完成
+        for key in seen[:-1]:
+            nodes[key]["status"] = "completed"
+        if finished:
+            nodes[seen[-1]]["status"] = "completed"
+
+        # 组装：manifest 声明序打底 + 未声明阶段按出现序追加
+        phases = [nodes.get(s.key) or _pending(s.key) for s in algo.stages]
+        phases += [nodes[key] for key in extra]
+
+        # duration 与 RD-Agent 时间线同形（前端一套渲染器吃两种算法）
+        for node in phases:
+            start_ts, end_ts = spans.get(node["key"]) or (None, None)
+            node["duration_s"] = (
+                round(end_ts - start_ts, 1)
+                if start_ts is not None and end_ts is not None
+                else None
+            )
+
+        last_stage = seen[-1]
+        stage_idx = order.get(last_stage)
+        if stage_idx is not None:
+            frac = (stage_idx + 1) / len(algo.stages)
+            task.progress_pct = max(task.progress_pct, min(99, int(frac * 100)))
+        task.phase = last_stage
+        detail = nodes[last_stage]["detail"]
+        label = labels.get(last_stage, last_stage)
+        task.progress = f"{label} — {detail}" if detail else label
+        task.timeline = [
+            {
+                "loop": 0,
+                "label": algo.name,
+                "status": "completed" if finished else "running",
+                "phases": phases,
+            }
+        ]
+
     def _update_progress(self, task: EvolutionTask, log_dir: Path) -> None:
         r_dir = log_dir / "r"
         d_dir = log_dir / "d"
         loop_dirs = sorted(
             [p for p in log_dir.glob("Loop_*") if p.is_dir()],
-            key=lambda p: int(p.name.split("_", 1)[1]) if p.name.split("_", 1)[1].isdigit() else 0,
+            key=lambda p: (
+                int(p.name.split("_", 1)[1]) if p.name.split("_", 1)[1].isdigit() else 0
+            ),
         )
 
         candidates: list[tuple[int, Path]] = []
@@ -1161,6 +2033,7 @@ class AlphaAgentLauncher:
     def _load_pkl(path: Path) -> Any:
         try:
             import pickle
+
             with open(path, "rb") as f:
                 return pickle.load(f)
         except Exception:
@@ -1172,7 +2045,9 @@ class AlphaAgentLauncher:
 
         loop_dirs = sorted(
             [p for p in log_dir.glob("Loop_*") if p.is_dir()],
-            key=lambda p: int(p.name.split("_", 1)[1]) if p.name.split("_", 1)[1].isdigit() else 0,
+            key=lambda p: (
+                int(p.name.split("_", 1)[1]) if p.name.split("_", 1)[1].isdigit() else 0
+            ),
         )
 
         for loop_dir in loop_dirs:
@@ -1191,7 +2066,10 @@ class AlphaAgentLauncher:
             # direct_exp_gen 下有 hypothesis generation + experiment generation
             deg = loop_dir / "direct_exp_gen"
             if deg.is_dir():
-                for phase_dir_name in ("hypothesis generation", "experiment generation"):
+                for phase_dir_name in (
+                    "hypothesis generation",
+                    "experiment generation",
+                ):
                     phase_dir = deg / phase_dir_name
                     if phase_dir.is_dir():
                         phase_info = self._extract_phase_info(phase_dir, phase_dir_name)
@@ -1222,7 +2100,10 @@ class AlphaAgentLauncher:
                     loop_entry["phases"].append(phase_info)
 
             # 判断 loop 状态
-            has_feedback = any(p.get("key") == "feedback" and p.get("status") == "completed" for p in loop_entry["phases"])
+            has_feedback = any(
+                p.get("key") == "feedback" and p.get("status") == "completed"
+                for p in loop_entry["phases"]
+            )
             has_runner = any(p.get("key") == "runner" for p in loop_entry["phases"])
             if has_feedback:
                 loop_entry["status"] = "completed"
@@ -1235,7 +2116,9 @@ class AlphaAgentLauncher:
 
         return timeline
 
-    def _extract_phase_info(self, phase_dir: Path, dir_name: str) -> dict[str, Any] | None:
+    def _extract_phase_info(
+        self, phase_dir: Path, dir_name: str
+    ) -> dict[str, Any] | None:
         """从阶段目录提取时间信息"""
         key, label = self._PHASE_DIR_MAP.get(dir_name, (dir_name, dir_name))
 
@@ -1258,8 +2141,12 @@ class AlphaAgentLauncher:
             try:
                 files = sorted(phase_dir.rglob("*"), key=lambda f: f.stat().st_mtime)
                 if files:
-                    start_time = datetime.fromtimestamp(files[0].stat().st_mtime, tz=timezone.utc)
-                    end_time = datetime.fromtimestamp(files[-1].stat().st_mtime, tz=timezone.utc)
+                    start_time = datetime.fromtimestamp(
+                        files[0].stat().st_mtime, tz=timezone.utc
+                    )
+                    end_time = datetime.fromtimestamp(
+                        files[-1].stat().st_mtime, tz=timezone.utc
+                    )
                     duration_s = (end_time - start_time).total_seconds()
             except Exception:
                 pass
@@ -1317,6 +2204,7 @@ class AlphaAgentLauncher:
         for pkl_path in log_dir.glob("**/token_cost/**/*.pkl"):
             try:
                 import pickle
+
                 with open(pkl_path, "rb") as f:
                     data = pickle.load(f)
                 if isinstance(data, dict):
@@ -1354,7 +2242,11 @@ class AlphaAgentLauncher:
     @staticmethod
     def _tail_error_log(log_dir: Path, max_chars: int = 2000) -> str:
         try:
-            logs = sorted(log_dir.rglob("common_logs.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            logs = sorted(
+                log_dir.rglob("common_logs.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
             if not logs:
                 return ""
             with open(logs[0], errors="replace") as f:

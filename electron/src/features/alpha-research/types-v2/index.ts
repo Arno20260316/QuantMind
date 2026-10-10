@@ -81,6 +81,29 @@ export interface DataSummary {
   error?: string;
 }
 
+/**
+ * 自定义挖掘配置选择（移植 P1/P1.5，目前仅 A 股）。
+ *
+ * 全 null = 未自定义 → 后端默认窗口 + 全数据集（任务行不留参数痕迹，
+ * h5 缓存沿用旧文件名）。检验区间两端成对（只给一端后端 400）；
+ * `datasets` 为空数组同样归一为 null（全选）——「一个都不选」语义上
+ * 不是一种数据集面，前端禁用该操作，不下发空列表。
+ */
+export interface MiningConfigSelection {
+  miningStart: string | null;
+  miningEnd: string | null;
+  validStart: string | null;
+  validEnd: string | null;
+  /** null = 全选（不写参数）；非空数组 = 显式选择的登记序 key */
+  datasets: string[] | null;
+  /**
+   * 挖掘频率（P1.5，仅 A 股）：null/'' = 日线（默认语义，提交不写参数）；
+   * '1min' = 分钟原生挖掘。分钟模式下窗口必须落在分钟数据面的**可用连续块**
+   * 内（跨数据断层会被后端 400），且不携带数据集（1min 面不叠日线富化列）。
+   */
+  freq: string | null;
+}
+
 // Task configuration
 export interface TaskConfig {
   // Basic configuration
@@ -110,6 +133,27 @@ export interface TaskConfig {
 
   // Data source selection
   dataSource?: 'qlib_bin' | 'parquet';
+
+  /**
+   * 自定义挖掘区间 / 检验区间 / 数据集选择（移植 P1，仅 A 股）。
+   * 缺席或全 null = 未自定义（走后端默认窗口与全数据集，行为与迁移前一致）。
+   */
+  miningConfig?: MiningConfigSelection;
+
+  /**
+   * 挖掘算法 key（移植 P2）。缺席/'' = 注册表默认（rdagent，迁移前唯一路径）。
+   * 可选值与能力面（markets/freqs/uses_llm/uses_datasets）由
+   * GET /alpha-agent/algorithms 下发，前端不硬编码算法名。
+   */
+  algorithm?: string;
+  /** 算法名（提交那一刻的快照，任务卡展示用；不进 wire） */
+  algorithmName?: string;
+  /**
+   * 该算法是否消费方向文本。false 时 TaskContext 不代填默认方向、不下发
+   * directions——后端对「不消费方向文本」的算法收到方向是 400（显式拒绝，
+   * 不是静默忽略），前端必须从源头不产生它。
+   */
+  carriesDirection?: boolean;
 
   // Backtest configuration
   market?: 'csi300' | 'csi500' | 'sp500';
@@ -360,6 +404,14 @@ export interface Task {
   factors?: Factor[];
   /** 排队位次（本用户队列内 1-based，仅 status==='queued' 时有值） */
   queuePosition?: number | null;
+  /** 本任务实际使用的算法 key（后端随状态下发；缺席 = 迁移前的任务） */
+  algorithm?: string;
+  /**
+   * 进度面形状（后端随状态下发，现读 manifest）：'workdir' = 演化轮目录扫描
+   * （Round x/y 语义），'jsonl' = 单流水线阶段流（不分轮）。
+   * 缺席/未知一律按 workdir 退化渲染——迁移前只有那一种形状。
+   */
+  progressKind?: string;
 }
 
 // API Response

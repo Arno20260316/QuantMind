@@ -4,21 +4,33 @@ import { Badge } from './ui/Badge';
 import { ExecutionProgress, TimelineLoop, TimelinePhase, TokenUsage } from '../types-v2';
 import {
   Sparkles, Brain, Code2, TrendingUp, CheckCircle2, Clock,
-  Zap, Loader2, BarChart3,
+  Zap, Loader2, BarChart3, Database, Filter, LineChart, ListChecks,
 } from 'lucide-react';
 
 interface ProgressSidebarProps {
   progress: ExecutionProgress;
   timeline?: TimelineLoop[];
   tokenUsage?: TokenUsage;
+  /**
+   * 进度面形状（任务状态里后端现读 manifest 下发）：'jsonl' = 单流水线
+   * 阶段流（不分轮——不能拿演化轮的 Round x/y 去套它）。缺席/未知按
+   * workdir（演化轮）渲染——迁移前只有那一种形状。
+   */
+  progressKind?: string;
 }
 
 const phaseConfig: Record<string, { icon: typeof Sparkles; color: string; bg: string }> = {
+  // 演化轮（rdagent / progress_kind=workdir）
   hypothesis: { icon: Brain, color: 'text-purple-400', bg: 'bg-purple-500/10' },
   experiment: { icon: Sparkles, color: 'text-blue-400', bg: 'bg-blue-500/10' },
   coder:      { icon: Code2, color: 'text-amber-400', bg: 'bg-amber-500/10' },
   runner:     { icon: BarChart3, color: 'text-green-400', bg: 'bg-green-500/10' },
   feedback:   { icon: TrendingUp, color: 'text-cyan-400', bg: 'bg-cyan-500/10' },
+  // 单流水线（statistical / progress_kind=jsonl；key 与 manifest stages 对齐）
+  data:       { icon: Database, color: 'text-sky-400', bg: 'bg-sky-500/10' },
+  filter:     { icon: Filter, color: 'text-teal-400', bg: 'bg-teal-500/10' },
+  evaluate:   { icon: LineChart, color: 'text-indigo-400', bg: 'bg-indigo-500/10' },
+  select:     { icon: ListChecks, color: 'text-emerald-400', bg: 'bg-emerald-500/10' },
 };
 
 const statusIcon = (status: string) => {
@@ -40,9 +52,15 @@ const formatTokens = (n: number) => {
 };
 
 export const ProgressSidebar: React.FC<ProgressSidebarProps> = ({
-  progress, timeline, tokenUsage,
+  progress, timeline, tokenUsage, progressKind,
 }) => {
-  const totalPhases = (progress.totalRounds || 1) * 5;
+  // 单流水线（jsonl）：分母 = 后端声明的阶段数（时间线已把未到的阶段以
+  // pending 补齐），不是「轮数 × 5」——统计派没有演化轮，套轮数会显示成
+  // 「1/15 步完成」这种不存在的刻度。演化轮（workdir）口径保持不变。
+  const isSinglePass = progressKind === 'jsonl';
+  const totalPhases = isSinglePass
+    ? (timeline?.[0]?.phases.length ?? 0)
+    : (progress.totalRounds || 1) * 5;
   const completedPhases = timeline
     ? timeline.reduce((sum, l) => sum + l.phases.filter(p => p.status === 'completed').length, 0)
     : 0;
@@ -59,9 +77,12 @@ export const ProgressSidebar: React.FC<ProgressSidebarProps> = ({
               </div>
               <div>
                 <div className="text-sm font-bold">{progress.message || '准备中...'}</div>
-                <div className="text-[10px] text-muted-foreground">
-                  Round {progress.currentRound + 1}/{progress.totalRounds}
-                </div>
+                {/* 单流水线不显示 Round x/y：那是演化轮的语义，套上去是编造 */}
+                {!isSinglePass && (
+                  <div className="text-[10px] text-muted-foreground">
+                    Round {progress.currentRound + 1}/{progress.totalRounds}
+                  </div>
+                )}
               </div>
             </div>
             <Badge variant="default" className="text-xs font-mono">

@@ -1,5 +1,9 @@
 """挖掘任务中心 store —— ``rd_agent_mining_tasks``（机构级 P0 / T-FM-01）。
 
+P3 增补：任务行携带**去重指纹**（同用户×同指纹的活跃任务受部分唯一索引
+约束，见 :data:`DEDUPE_INDEX`）、**算法版本**与**参数/数据版本快照**
+（JSON 文本列）——历史任务的口径不再随 manifest 改版或数据日更被改写。
+
 任务状态此前只在进程内存 + `/tmp/alpha_agent_logs/<task_id>/task_state.json`：
 engine 一重启就失忆、任务列表上限 20 条、direction 从不落库。本模块给出
 PG 权威的任务记录行，让「每次挖了什么 / 挖出几个因子 / 什么状态」可回看。
@@ -18,11 +22,13 @@ PG 权威的任务记录行，让「每次挖了什么 / 挖出几个因子 / �
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.utc_datetime import to_utc_iso, utc_now
@@ -61,7 +67,22 @@ CREATE TABLE IF NOT EXISTS rd_agent_mining_tasks (
   direction_mode TEXT,
   direction_meta TEXT,
   quality_gate_mode TEXT,
+  mining_start TEXT,
+  mining_end TEXT,
+  valid_start TEXT,
+  valid_end TEXT,
+  datasets TEXT,
+  freq TEXT,
+  algorithm TEXT,
   loop_n INTEGER,
+  -- 去重指纹（P3）：同用户×同指纹的活跃任务只有一个（见部分唯一索引）。
+  -- 老行为 NULL（迁移前无指纹）——不参与去重，读取方按「未知」解释。
+  fingerprint TEXT,
+  -- 提交时刻的算法 manifest 版本（P3 参数快照）：manifest 改版不改写历史任务。
+  algorithm_version TEXT,
+  -- 参数快照 / 数据版本快照（P3）：JSON 文本，见 launcher 建行处。
+  params_snapshot TEXT,
+  data_versions TEXT,
   source TEXT NOT NULL DEFAULT 'text',
   doc_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -76,6 +97,59 @@ CREATE TABLE IF NOT EXISTS rd_agent_mining_tasks (
 CREATE INDEX IF NOT EXISTS idx_rd_mining_tasks_user ON rd_agent_mining_tasks (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_rd_mining_tasks_status ON rd_agent_mining_tasks (status);
 """
+# 去重唯一索引（P3）**不进上面这段**：本常量会先于「老库补列」执行，老表在
+# ADD COLUMN 之前没有 fingerprint 列，索引会把这整段 DDL 打挂（实测：老库上
+# 建表语句整批失败，历史页凭空缺任务）。它只由 ensure_tables 在补列之后建。
+# 另：常量末尾不要留纯注释片段——`split(';')` 会把它当一条语句交给 asyncpg，
+# 注释-only 语句在参数解析里直接 TypeError。
+
+
+#: 活跃状态（去重指纹的唯一索引谓词与查重查询共用这一份口径）。
+#: pending/queued/running = 「这个配置还在跑（或即将跑）」——同指纹再提交
+#: 应当复用既有任务而不是再建一个；终态（completed/failed/cancelled）
+#: 不拦重跑。
+ACTIVE_STATUSES = ("pending", "queued", "running")
+
+#: 去重部分唯一索引名（建索引 / 识别冲突 / 测试断言共用）。
+DEDUPE_INDEX = "uq_rd_mining_tasks_active_fingerprint"
+
+#: JSON 列（TEXT 存 JSON 文本）：row_to_dict 统一解析，读取方不用各自 json.loads。
+_JSON_FIELDS = ("params_snapshot", "data_versions")
+
+
+class DuplicateActiveTask(RuntimeError):
+    """同用户 × 同指纹的活跃任务已存在（含并发竞态落行失败）。
+
+    ``existing_task_id`` = 既有任务 id——调用方（launcher）据此把本次提交
+    **撤回**（不留内存占位、不启动子进程）并复用既有任务回执。
+    """
+
+    def __init__(self, existing_task_id: str) -> None:
+        super().__init__(f"active task with same fingerprint exists: {existing_task_id}")
+        self.existing_task_id = existing_task_id
+
+
+def _is_dedupe_conflict(exc: IntegrityError) -> bool:
+    """IntegrityError 是否撞的**去重索引**（其它唯一冲突不在此列，要原样抛）。"""
+    constraint = getattr(getattr(exc, "orig", None), "constraint_name", None)
+    if constraint:
+        return constraint == DEDUPE_INDEX
+    return DEDUPE_INDEX in str(exc)
+
+
+def parse_json_field(value: Any) -> Any:
+    """TEXT 里的 JSON 文本 → 对象；NULL → None；坏文本**原样返回**（不假装没有）。
+
+    坏文本只可能来自手改库（写入端恒为 json.dumps）；原样保留让界面/排查能
+    看见坏在哪，静默吞成 None 会把它伪装成「这个任务没有快照」。
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        logger.warning("任务行 JSON 列解析失败（原样返回）：%.80s", value)
+        return value
 
 
 def clamp_direction(value: str | None) -> str:
@@ -125,15 +199,38 @@ def _history_where(
     return where, params
 
 
+def split_datasets(value: Any) -> list[str] | None:
+    """``datasets`` 列（逗号分隔 TEXT）→ 列表；空/None → None。
+
+    与 ``QM_MINING_DATASETS`` env 同一种编码（写入端 ``normalize_mining_config``
+    产出的登记序元组 join）。接口层返回列表、DB 存 TEXT：历史页与任务详情
+    的字段形态一致（都可能是 list|None），前端不用分辨两种形状。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value) or None
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return parts or None
+
+
 def row_to_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     """DB 行 → API 字典：三列时间统一 ISO-8601 UTC（带 Z）。
 
     未知列原样透传（前向兼容）；缺列不补——接口对「没有的值」必须诚实。
+    ``datasets`` 由逗号分隔 TEXT 归一为列表（见 :func:`split_datasets`）；
+    ``params_snapshot``/``data_versions`` 由 JSON 文本解析为对象（坏文本原样
+    保留，见 :func:`parse_json_field`）。
     """
     out = dict(row)
     for field in _TS_FIELDS:
         if field in out:
             out[field] = to_utc_iso(out[field])
+    if "datasets" in out:
+        out["datasets"] = split_datasets(out["datasets"])
+    for field in _JSON_FIELDS:
+        if field in out:
+            out[field] = parse_json_field(out[field])
     return out
 
 
@@ -145,20 +242,46 @@ class MiningTaskStore:
 
         ``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列——老库（列进
         CREATE 语句之前建的）缺 ``direction_mode``/``direction_meta``/
-        ``quality_gate_mode`` 时，create_task 的 INSERT 引用该列会整行失败
-        （记录层失败只告警 → 表现为「历史页凭空缺任务」）。补列走
+        ``quality_gate_mode``/``mining_*`` 时，create_task 的 INSERT 引用该列
+        会整行失败（记录层失败只告警 → 表现为「历史页凭空缺任务」）。补列走
         ``ADD COLUMN IF NOT EXISTS``（同 doc_store 先例）。
         """
         async with get_session() as session:
             for stmt in [s.strip() for s in _CREATE_TABLE_SQL.split(";") if s.strip()]:
                 await session.execute(text(stmt))
-            for column in ("direction_mode", "direction_meta", "quality_gate_mode"):
+            for column in (
+                "direction_mode",
+                "direction_meta",
+                "quality_gate_mode",
+                "mining_start",
+                "mining_end",
+                "valid_start",
+                "valid_end",
+                "datasets",
+                "freq",
+                "algorithm",
+                # P3：去重指纹 / 算法版本 / 参数快照 / 数据版本快照
+                "fingerprint",
+                "algorithm_version",
+                "params_snapshot",
+                "data_versions",
+            ):
                 await session.execute(
                     text(
                         "ALTER TABLE rd_agent_mining_tasks "
                         f"ADD COLUMN IF NOT EXISTS {column} TEXT"
                     )
                 )
+            # 部分唯一索引（老库补建）：老行 fingerprint 全 NULL，不参与谓词，
+            # 建索引不会与存量数据冲突。
+            await session.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {DEDUPE_INDEX} "
+                    "ON rd_agent_mining_tasks (user_id, fingerprint) "
+                    "WHERE fingerprint IS NOT NULL "
+                    f"AND status IN {ACTIVE_STATUSES}"
+                )
+            )
         logger.info("rd_agent_mining_tasks table ensured")
 
     async def create_task(
@@ -174,9 +297,20 @@ class MiningTaskStore:
         direction_mode: str | None = None,
         direction_meta: str | None = None,
         quality_gate_mode: str | None = None,
+        mining_start: str = "",
+        mining_end: str = "",
+        valid_start: str = "",
+        valid_end: str = "",
+        datasets: str = "",
+        freq: str = "",
+        algorithm: str = "",
         loop_n: int = 5,
         source: str = "text",
         doc_id: str | None = None,
+        fingerprint: str = "",
+        algorithm_version: str = "",
+        params_snapshot: str = "",
+        data_versions: str = "",
     ) -> None:
         """落任务行。task_id 撞键是无操作（重放/重试不该把首次写入覆盖掉）。
 
@@ -185,7 +319,15 @@ class MiningTaskStore:
         的复现凭证（JSON 文本），没抽样就是 NULL。``quality_gate_mode``
         （T-MV-05）存**请求意图**：显式 off/soft/hard 才落值，未指定 =
         NULL（入池时由 ``resolve_admission_gate_mode`` 再叠 env 决定生效
-        模式——任务行不冻结当时的 env）。
+        模式——任务行不冻结当时的 env）。``freq`` 同理：显式 ``1min`` 才落值，
+        未指定（日线）= NULL。``algorithm`` 由 launcher 传**已解析的 key**
+        （不是请求原文）：任务行记录"实际跑了哪个算法"；NULL 只会出现在
+        迁移前的老行（当时唯一算法 = rdagent），读取方按此解释。
+
+        **去重（P3）**：``fingerprint`` 非空且撞上「同用户×同指纹的活跃任务」
+        的部分唯一索引时，抛 :class:`DuplicateActiveTask`（带既有任务 id）——
+        这不是写失败，是**并发竞态下的正确拒绝**，调用方必须撤回本次提交。
+        其它写入异常原样上抛（调用方照旧只告警，不拦挖掘主链）。
         """
         if status not in _INITIAL_STATUSES:
             raise ValueError(
@@ -193,37 +335,99 @@ class MiningTaskStore:
                 "running 由心跳/对账到来，终态请走 mark_terminal"
             )
         now = utc_now()
+        params = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "status": status,
+            "market": market or "a_share",
+            "universe": universe or "",
+            "data_source": data_source or "",
+            "direction": clamp_direction(direction),
+            "direction_mode": direction_mode,
+            "direction_meta": direction_meta,
+            "quality_gate_mode": quality_gate_mode or None,
+            # 自定义挖掘配置（P1）：未指定一律 NULL（"没有的值"必须诚实，
+            # 前端据此区分「默认窗口」与「显式等于默认的窗口」）
+            "mining_start": mining_start or None,
+            "mining_end": mining_end or None,
+            "valid_start": valid_start or None,
+            "valid_end": valid_end or None,
+            "datasets": datasets or None,
+            # 未指定（日线）→ NULL；显式 1min 才落值
+            "freq": freq or None,
+            # launcher 传已解析的算法 key（老行 NULL = 迁移前 rdagent）
+            "algorithm": algorithm or None,
+            "loop_n": int(loop_n),
+            "source": source or "text",
+            "doc_id": doc_id,
+            # P3：空串 → NULL（老行语义一致：没有的值不伪装）
+            "fingerprint": fingerprint or None,
+            "algorithm_version": algorithm_version or None,
+            "params_snapshot": params_snapshot or None,
+            "data_versions": data_versions or None,
+            "now": now,
+        }
         async with get_session() as session:
-            await session.execute(
-                text("""
-                    INSERT INTO rd_agent_mining_tasks
-                      (task_id, user_id, market, universe, data_source, direction,
-                       direction_mode, direction_meta, quality_gate_mode, loop_n,
-                       source, doc_id, status,
-                       progress_pct, current_loop, created_at, updated_at)
-                    VALUES
-                      (:task_id, :user_id, :market, :universe, :data_source, :direction,
-                       :direction_mode, :direction_meta, :quality_gate_mode, :loop_n,
-                       :source, :doc_id, :status,
-                       0, 0, :now, :now)
-                    ON CONFLICT (task_id) DO NOTHING
-                    """),
-                {
-                    "task_id": task_id,
-                    "user_id": user_id,
-                    "status": status,
-                    "market": market or "a_share",
-                    "universe": universe or "",
-                    "data_source": data_source or "",
-                    "direction": clamp_direction(direction),
-                    "direction_mode": direction_mode,
-                    "direction_meta": direction_meta,
-                    "quality_gate_mode": quality_gate_mode or None,
-                    "loop_n": int(loop_n),
-                    "source": source or "text",
-                    "doc_id": doc_id,
-                    "now": now,
-                },
+            try:
+                await session.execute(
+                    text("""
+                        INSERT INTO rd_agent_mining_tasks
+                          (task_id, user_id, market, universe, data_source, direction,
+                           direction_mode, direction_meta, quality_gate_mode,
+                           mining_start, mining_end, valid_start, valid_end, datasets,
+                           freq, algorithm, loop_n, source, doc_id, status,
+                           fingerprint, algorithm_version, params_snapshot, data_versions,
+                           progress_pct, current_loop, created_at, updated_at)
+                        VALUES
+                          (:task_id, :user_id, :market, :universe, :data_source, :direction,
+                           :direction_mode, :direction_meta, :quality_gate_mode,
+                           :mining_start, :mining_end, :valid_start, :valid_end, :datasets,
+                           :freq, :algorithm, :loop_n, :source, :doc_id, :status,
+                           :fingerprint, :algorithm_version, :params_snapshot, :data_versions,
+                           0, 0, :now, :now)
+                        ON CONFLICT (task_id) DO NOTHING
+                        """),
+                    params,
+                )
+            except IntegrityError as exc:
+                if not _is_dedupe_conflict(exc):
+                    raise
+                existing = await self._find_active_by_fingerprint(
+                    session, user_id=user_id, fingerprint=fingerprint
+                )
+                if existing is None:
+                    # 撞了指纹索引却查不到活跃行：唯一可能是在本事务间隙里
+                    # 既有任务恰好收终态（索引项消失前的边界）——如实上抛，
+                    # 由调用方按普通写失败处理（只告警），不假装去重成功。
+                    raise
+                raise DuplicateActiveTask(existing) from exc
+
+    @staticmethod
+    async def _find_active_by_fingerprint(
+        session: Any, *, user_id: str, fingerprint: str
+    ) -> str | None:
+        """活跃（pending/queued/running）同指纹任务 id；无则 None。"""
+        result = await session.execute(
+            text(
+                "SELECT task_id FROM rd_agent_mining_tasks "
+                "WHERE user_id = :user_id AND fingerprint = :fingerprint "
+                f"AND status IN {ACTIVE_STATUSES} "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"user_id": user_id, "fingerprint": fingerprint},
+        )
+        row = result.fetchone()
+        return row[0] if row else None
+
+    async def find_active_by_fingerprint(
+        self, *, user_id: str, fingerprint: str
+    ) -> str | None:
+        """公开版查重（launcher 提交前的第一道闸）；查库失败上抛，调用方吞。"""
+        if not fingerprint:
+            return None
+        async with get_session() as session:
+            return await self._find_active_by_fingerprint(
+                session, user_id=user_id, fingerprint=fingerprint
             )
 
     async def update_progress(

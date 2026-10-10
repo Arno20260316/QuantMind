@@ -233,6 +233,41 @@ def _near_one_year_window() -> tuple[str, str]:
     return (end_ts - pd.DateOffset(years=1)).strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d")
 
 
+def _resolve_ic_window(market: str) -> tuple[tuple[str, str] | None, str]:
+    """逐因子 IC 的评估窗口 → ``((start, end) | None, kind)``。
+
+    优先级（移植 P1，让「回测区间」在挖掘当场就生效）：
+
+    1. ``QM_VALIDATION_WINDOW_*``（用户选的**因子检验区间**）= 样本外评估；
+    2. ``QM_MINING_WINDOW_*``（只选了挖掘区间）= 挖掘区间的 test 段
+       （70/85 自然日切分的最后 15%，与 qlib 实验分段同源）；
+    3. 都没有 = 旧默认「近一年」（仅 A 股；其他市场全样本，行为不变）。
+
+    ``kind`` 落进因子 metadata（``ic_window_kind``）——IC 数值的含义必须
+    可追溯：同一张卡片上「近一年 IC」和「样本外检验 IC」不是一回事。
+    """
+    if market != "a_share":
+        return None, "full_sample"
+    try:
+        from backend.services.engine.alpha_agent.mining_config import (
+            qlib_segments,
+            window_from_env,
+        )
+
+        parsed = window_from_env()
+    except ValueError as exc:
+        # 请求入口已校验；走到这里说明进程 env 被手工改坏/半截——显式可见地
+        # 退回默认窗口，绝不按错误区间静默算 IC。
+        logger.error("QM_MINING_WINDOW_* 非法，IC 退回近一年: %s", exc)
+        parsed = None
+    if parsed is None:
+        return _near_one_year_window(), "recent_1y"
+    mining, validation = parsed
+    if validation is not None:
+        return validation.iso(), "validation"
+    return qlib_segments(mining, None)["test"], "mining_test"
+
+
 def compute_factor_ic(
     factor_code: str,
     data_path: str,
@@ -544,12 +579,14 @@ def main():
             )
         logger.info("IC data path resolved: %s (exists=%s)", data_path, Path(data_path).exists())
 
-        # 回测窗口默认近一年（仅 A 股；其他市场数据日历不同，保持全样本）
-        if args.market == "a_share":
-            ic_start, ic_end = _near_one_year_window()
-            logger.info("IC window (recent 1y): %s ~ %s", ic_start, ic_end)
-        else:
+        # IC 评估窗口：检验区间 > 挖掘区间 test 段 > 近一年（旧默认；其他市场全样本）
+        ic_window, ic_window_kind = _resolve_ic_window(args.market)
+        if ic_window is None:
             ic_start, ic_end = None, None
+            logger.info("IC window: full sample (market=%s)", args.market)
+        else:
+            ic_start, ic_end = ic_window
+            logger.info("IC window (%s): %s ~ %s", ic_window_kind, ic_start, ic_end)
 
         import hashlib
 
@@ -609,6 +646,10 @@ def main():
                                 "icir": metrics.get("icir", 0),
                                 "rank_icir": metrics.get("rank_icir", 0),
                                 "data_source": "task_h5",
+                                # IC 口径可追溯：近一年 / 挖掘段 test / 样本外检验
+                                "ic_window_kind": ic_window_kind,
+                                "ic_window_start": ic_start,
+                                "ic_window_end": ic_end,
                             })
                             logger.info(
                                 "  %s: IC=%.4f, RankIC=%.4f, ICIR=%.4f",

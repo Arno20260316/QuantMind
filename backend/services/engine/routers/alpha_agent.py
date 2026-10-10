@@ -10,9 +10,11 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+import time
+from collections.abc import Sequence
+from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:  # pandas 在函数内按需 import；这里只为字符串注解提供名字
     import pandas as pd
@@ -22,6 +24,12 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from backend.services.engine.alpha_agent import profile_gateway
+from backend.services.engine.alpha_agent.algorithm_registry import (
+    DEFAULT_ALGORITHM_KEY,
+    AlgorithmError,
+    list_algorithms,
+    resolve_algorithm,
+)
 from backend.services.engine.alpha_agent.direction_decompose import (
     MAX_CARDS_DEFAULT,
     MAX_CARDS_LIMIT,
@@ -33,7 +41,19 @@ from backend.services.engine.alpha_agent.direction_sampling import (
 from backend.services.engine.alpha_agent.doc_gate import require_doc_mining
 from backend.services.engine.alpha_agent.doc_store import get_doc_store
 from backend.services.engine.alpha_agent.hw_lock import HardwareLockError
-from backend.services.engine.alpha_agent.launcher import QueueFullError, get_launcher
+from backend.services.engine.alpha_agent.launcher import (
+    QueueFullError,
+    get_launcher,
+    minute_scope,
+    normalize_mining_config,
+    require_minute_window,
+)
+from backend.services.engine.alpha_agent.mining_config import (
+    FREQ_MINUTE,
+    SUPPORTED_FREQS,
+    Window,
+    normalize_freq,
+)
 from backend.services.engine.alpha_agent.task_store import get_mining_task_store
 from backend.services.engine.auth_context import (
     assert_identity_not_spoofed,
@@ -62,6 +82,13 @@ MAX_SUBMIT_DIRECTION_CHARS = 8000
 #: 请求是误用（且会瞬间占满排队深度），整包先拒而不是逐条失败。
 MAX_BATCH_DISPATCH_ITEMS = 20
 
+#: 挖掘频率目录的中文标签（值域与 mining_config.SUPPORTED_FREQS 同源：加频率只
+#: 改那处常量，这里补标签，不会出现"前端能选、后端拒收"）。
+_FREQ_LABELS: dict[str, str] = {
+    "day": "日线（默认）",
+    "1min": "分钟 1min（仅 A 股）",
+}
+
 
 class EvolveRequest(BaseModel):
     """evolve 的 JSON body 变体（T-FM-10）。
@@ -86,6 +113,22 @@ class EvolveRequest(BaseModel):
     #: 文档血统：来自文档链的挖掘任务带上它（写 rd_agent_mining_tasks.doc_id +
     #: 回写 rd_agent_docs.task_id）；需 ENABLE_DOC_MINING=true
     doc_id: str | None = None
+    #: 自定义挖掘数据区间（移植 P1）：ISO 日期；None/空 = 不指定
+    #: （默认窗口，行为与迁移前逐位一致）。两端须成对。
+    mining_start: str | None = None
+    mining_end: str | None = None
+    #: 因子检验区间（样本外，可选）：起点须 ≥ 挖掘终点；只填一端即 400
+    valid_start: str | None = None
+    valid_end: str | None = None
+    #: 挖掘数据集选择（登记序 key，见 /mining/config-options）：None/[] = 全选
+    datasets: list[str] | None = None
+    #: 挖掘频率（移植 P1.5）：None/"" = 日线（默认）；"1min" = 分钟
+    #: 原生挖掘（仅 A 股；窗口锚定分钟可用连续块，见 /mining/config-options）
+    freq: str | None = None
+    #: 挖掘算法（移植 P2）：None/"" = 默认 rdagent（迁移前唯一路径）；
+    #: 可选值见 GET /algorithms（如 statistical=统计量价挖掘，不消费
+    #: 方向文本/数据集选择/loop_n）
+    algorithm: str | None = None
 
 
 class DecomposeRequest(BaseModel):
@@ -128,6 +171,18 @@ class MiningBatchRequest(BaseModel):
     quality_gate_mode: str | None = Field(
         None, description="入库闸门模式: off/soft/hard；空=未指定（回落默认软闸）"
     )
+    #: 自定义挖掘配置（移植 P1），语义同 evolve 的 body 字段：
+    #: 卡片批量派发与单条 evolve 走同一套校验/落库/注入，不许两条入口两种口径。
+    mining_start: str | None = None
+    mining_end: str | None = None
+    valid_start: str | None = None
+    valid_end: str | None = None
+    datasets: list[str] | None = None
+    #: 挖掘频率（P1.5）：None/"" = 日线；"1min" = 分钟原生（仅 A 股；不指定
+    #: 窗口时自动锚定分钟可用连续块——整批同窗，与 evolve 同一套归一）
+    freq: str | None = None
+    #: 挖掘算法（P2）：None/"" = 默认 rdagent；整批同一算法（与其它字段同语义）
+    algorithm: str | None = None
 
 
 def _normalize_pool_ref(universe: str) -> str:
@@ -525,6 +580,24 @@ async def list_markets():
     return {"code": 200, "data": {"markets": markets, "total": len(markets)}}
 
 
+@router.get("/algorithms")
+async def list_mining_algorithms():
+    """挖掘算法目录（移植 P2）——前端下拉的唯一数据源。
+
+    与提交路径同一份 manifest（``algorithm_registry``）：**能力面字段随目录
+    一起下发**（markets/freqs/uses_datasets/uses_llm/requires_gpu/stages），
+    前端按它决定显示哪些配置控件（数据集选择/演化轮数/方向输入），不硬编码
+    算法名。坏 manifest 如实带 ``valid=false`` + 原因，不拖垮列表。
+    """
+    return {
+        "code": 200,
+        "data": {
+            "algorithms": list_algorithms(),
+            "default": DEFAULT_ALGORITHM_KEY,
+        },
+    }
+
+
 async def _resolve_multi_picks(
     clean_dirs: list[str],
     num_directions: int,
@@ -562,6 +635,120 @@ async def _resolve_multi_picks(
         ]
 
 
+#: QuantDB 数据覆盖缓存时长（秒）。覆盖只随日更变化，按请求现读分区目录
+#: （2000+ 个 dt= 目录）没必要；TTL 内复用同一份 Window。
+_COVERAGE_TTL_S = 300.0
+
+#: ``(读取时刻 monotonic, Window | None)``；``(0.0, None)`` = 尚未读过，
+#: ``(ts, None)`` = 读过但读不到（读不到也缓存，防每次请求刷日志）。
+_coverage_cache: tuple[float, Window | None] = (0.0, None)
+
+
+def _quantdb_coverage() -> Window | None:
+    """QuantDB 日线数据覆盖窗口 → ``mining_config.Window``；读不到回 None。
+
+    覆盖 = ``1_kline_data/daily_forward``（挖掘 h5 实际读取的库）分区目录
+    ``dt=YYYYMMDD`` 的 min/max——与数据面同源，不用交易日历冒充数据覆盖。
+    ``None`` 的语义是「不做覆盖校验」（``validate_coverage`` 契约：宁可放行
+    由引擎侧失败，也不做假校验）。结果（含失败）按 :data:`_COVERAGE_TTL_S`
+    缓存：覆盖只随日更变化，按请求现读 2000+ 个分区目录没有必要。
+    """
+    global _coverage_cache
+    now = time.monotonic()
+    ts, cached = _coverage_cache
+    if ts and now - ts < _COVERAGE_TTL_S:  # ts=0 → 从未读过
+        return cached
+    coverage = None
+    try:
+        from backend.services.engine.rd_agent.rd_loop_wrapper import (
+            RDLoopWrapper,
+            quantdb_coverage_from_dir,
+        )
+
+        coverage = quantdb_coverage_from_dir(RDLoopWrapper._resolve_quantdb_dir())
+    except Exception as exc:  # noqa: BLE001 - 覆盖读不到不拦请求（只记一笔）
+        logger.warning("[alpha-agent] QuantDB 覆盖读取失败，跳过窗口覆盖校验: %s", exc)
+    _coverage_cache = (now, coverage)
+    return coverage
+
+
+def _backtest_guard(coverage: Window | None) -> date | None:
+    """回测可用末端（qlib 日历倒数第二个交易日 ∩ 覆盖末端）；读不到回 None。
+
+    自定义窗口的终点必须退让到这一天：qlib 回测按 t+1 成交需要次日行情，
+    终点压在日历最后一根 bar 上必崩（见 ``rd_loop_wrapper
+    .qlib_backtest_data_end`` 的实证记录）。单独抽一层是为了让测试能像
+    ``_quantdb_coverage`` 一样整体替换（本函数会读 provider 日历目录）。
+    """
+    from backend.services.engine.rd_agent.rd_loop_wrapper import (
+        qlib_backtest_data_end,
+    )
+
+    return qlib_backtest_data_end(coverage)
+
+
+def _normalize_request_mining_config(
+    *,
+    market: str,
+    mining_start: str | None,
+    mining_end: str | None,
+    valid_start: str | None,
+    valid_end: str | None,
+    datasets: Sequence[str] | None,
+    freq: str | None = None,
+) -> tuple[
+    str | None, str | None, str | None, str | None, tuple[str, ...] | None, str | None
+]:
+    """请求级挖掘配置归一 + 覆盖校验（evolve / mining/batch / config-options 共用）。
+
+    非法配置抛 ``ValueError``（调用方转 400——静默回默认窗会让用户以为自定义
+    区间生效了）。返回值可直接展开为 launcher 的挖掘配置 kwargs，未指定/全选
+    一律回 ``None``（launcher 契约：None=默认窗口、None=全选数据集、None=日线），
+    保证「用户没动过挖掘配置」的任务行不留参数痕迹。
+
+    ``freq`` = ``"1min"`` 时：市场闸（只有 A 股）与覆盖/末端校验都在 launcher 里
+    按**分钟可用连续块**重算——日线 QuantDB 覆盖（2016→2026）与 1min 断层不是
+    一回事，这里不读 QuantDB；分钟默认窗 = 可用连续块，因此返回的挖掘区间
+    一定非空（任务行/子进程 env 拿到的都是显式日期）。
+    """
+    freq_value = normalize_freq(freq, market=market)
+    is_minute = freq_value == FREQ_MINUTE
+    has_window = any(
+        str(v or "").strip() for v in (mining_start, mining_end, valid_start, valid_end)
+    )
+    has_datasets = bool(datasets and [d for d in datasets if str(d or "").strip()])
+    if (has_window or has_datasets) and market != "a_share":
+        raise ValueError(
+            "自定义挖掘区间与数据集目前仅支持 A 股（a_share）市场："
+            f"{market} 的数据面不走 QuantDB，暂无对应时间窗/数据集口径"
+        )
+    # 覆盖校验只在真给了窗口时做（默认窗口由 default_windows 锚定覆盖，无需再验）；
+    # 末端保护则与覆盖无关——覆盖读不到不等于放弃保护（日历读得到就照退让）。
+    coverage = _quantdb_coverage() if (has_window and not is_minute) else None
+    data_end = _backtest_guard(coverage) if (has_window and not is_minute) else None
+    cfg = normalize_mining_config(
+        mining_start,
+        mining_end,
+        valid_start,
+        valid_end,
+        datasets,
+        freq=freq_value,
+        market=market,
+        coverage=coverage,
+        # 任务行存**退让后**的窗口：任务详情/预览/实跑看到的是同一组日期，
+        # 不在存储层留一个"好看但会崩"的端点
+        data_end=data_end,
+    )
+    return (
+        cfg.mining_start or None,
+        cfg.mining_end or None,
+        cfg.valid_start or None,
+        cfg.valid_end or None,
+        cfg.datasets if has_datasets else None,
+        cfg.freq or None,
+    )
+
+
 async def _dispatch_direction_items(
     launcher,
     user_id: str,
@@ -574,12 +761,23 @@ async def _dispatch_direction_items(
     direction_mode: str | None,
     data_source: str | None = None,
     quality_gate_mode: str | None = None,
+    mining_start: str | None = None,
+    mining_end: str | None = None,
+    valid_start: str | None = None,
+    valid_end: str | None = None,
+    datasets: Sequence[str] | None = None,
+    freq: str | None = None,
+    algorithm: str | None = None,
     overrides: dict | None = None,
 ) -> tuple[list[dict], int, int, int]:
     """逐条 ``start_or_queue`` 派发的单源派发环（/mining/batch 与 evolve N>1 共用）。
 
     运行期错误（排队满/硬件锁/意外异常）逐条回传、**绝不拖垮整批**；
     items 顺序 = picks 顺序。返回 ``(items, started, queued, failed)``。
+
+    ``mining_start`` 等 = 已归一的自定义挖掘配置（``_normalize_request_mining_config``
+    产物）：校验在请求入口一次做完，派发环只负责原样下发（``freq`` 含在其中，
+    分钟任务的窗口是入口物化后的显式日期；``algorithm`` 亦已过 resolve 闸门）。
     """
     items: list[dict] = []
     started = queued = failed = 0
@@ -597,6 +795,13 @@ async def _dispatch_direction_items(
                 data_source=data_source,
                 llm_overrides=overrides,
                 tenant_id=tenant_id,
+                mining_start=mining_start,
+                mining_end=mining_end,
+                valid_start=valid_start,
+                valid_end=valid_end,
+                datasets=datasets,
+                freq=freq,
+                algorithm=algorithm,
             )
         except (QueueFullError, HardwareLockError) as exc:
             items.append(
@@ -639,6 +844,9 @@ async def _dispatch_direction_items(
                 "task_id": receipt.task_id,
                 "status": receipt.status,
                 "queue_position": receipt.queue_position,
+                # 命中去重（P3）：task_id 是既有任务的——同配置已在跑/已在排，
+                # 本次没新建；前端据此提示「复用」而不是「又起了一个」
+                "deduplicated": bool(receipt.deduplicated),
                 "direction": direction,
                 "direction_preview": direction[:80],
                 "direction_meta": meta_json,
@@ -682,6 +890,31 @@ async def start_evolution(
     data_source: str = Query(
         "", description="数据源: qlib_bin, parquet, pg (留空使用默认)"
     ),
+    mining_start: str = Query(
+        "", description="自定义挖掘数据区间起点（YYYY-MM-DD；留空=默认窗口）"
+    ),
+    mining_end: str = Query("", description="自定义挖掘数据区间终点（YYYY-MM-DD）"),
+    valid_start: str = Query(
+        "", description="因子检验区间起点（样本外，须 ≥ 挖掘终点；留空=不启用）"
+    ),
+    valid_end: str = Query("", description="因子检验区间终点"),
+    datasets: list[str] | None = Query(
+        None, description="挖掘数据集（可重复；留空=全选，见 /mining/config-options）"
+    ),
+    freq: str = Query(
+        "",
+        description=(
+            "挖掘频率: 留空/day=日线（默认）；"
+            "1min=分钟原生挖掘（仅 A 股；窗口自动锚定分钟可用连续块）"
+        ),
+    ),
+    algorithm: str = Query(
+        "",
+        description=(
+            "挖掘算法: 留空=rdagent（默认）；可选值见 GET /algorithms"
+            "（statistical=统计量价挖掘，不消费方向文本/数据集/loop_n）"
+        ),
+    ),
     payload: EvolveRequest | None = Body(
         default=None, description="JSON body 变体（新前端；含 doc_id 血统）"
     ),
@@ -714,6 +947,20 @@ async def start_evolution(
             quality_gate_mode = payload.quality_gate_mode
         if payload.data_source is not None:
             data_source = payload.data_source
+        if payload.mining_start:
+            mining_start = payload.mining_start
+        if payload.mining_end:
+            mining_end = payload.mining_end
+        if payload.valid_start:
+            valid_start = payload.valid_start
+        if payload.valid_end:
+            valid_end = payload.valid_end
+        if payload.datasets is not None:
+            datasets = payload.datasets
+        if payload.freq is not None:
+            freq = payload.freq
+        if payload.algorithm:
+            algorithm = payload.algorithm
     doc_id = ((payload.doc_id or "").strip() or None) if payload is not None else None
 
     # 入库闸门模式（T-MV-05）：纯参数校验先做——非法值显式 400（静默当
@@ -724,6 +971,28 @@ async def start_evolution(
         from backend.services.engine.mining_plugins.config import normalize_gate_mode
 
         gate_mode = normalize_gate_mode(quality_gate_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 自定义挖掘配置（移植 P1）：与闸门模式同一条纪律——纯参数
+    # 先算完，非法区间/未登记数据集在烧 token 前显式 400（也绝不静默回默认窗）。
+    try:
+        (
+            mining_start,
+            mining_end,
+            valid_start,
+            valid_end,
+            datasets,
+            freq,
+        ) = _normalize_request_mining_config(
+            market=market,
+            mining_start=mining_start,
+            mining_end=mining_end,
+            valid_start=valid_start,
+            valid_end=valid_end,
+            datasets=datasets,
+            freq=freq,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -769,6 +1038,16 @@ async def start_evolution(
             ),
         )
 
+    # 挖掘算法闸门（移植 P2）：在类别/方向解析与 LLM 解析之前定下算法——
+    # 非法组合（未知/停用/不支持该市场或频率/不消费数据集选择）在烧任何成本
+    # 之前显式 400；同时决定后续走不走 LLM 链路（统计派不该被 412 拦）。
+    try:
+        algo = resolve_algorithm(
+            algorithm, market=market, freq=freq, datasets=list(datasets or [])
+        )
+    except AlgorithmError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # 类别方向下发：前端传多选类别 + 模式，服务端解析成方向
     # （放在长度闸与 LLM 解析之前：纯函数先算完，超长在烧 token 前就被拒）。
     # 方向历史（T-MV-02）：只有类别选择真正参与时才记录生效模式；自由文本/
@@ -779,6 +1058,20 @@ async def start_evolution(
     # （selected=按序取前 N；random=空白度加权抽 N 条互不相同）。自由文本/
     # 文档血统路径 N 不适用——单方向是它们的事实（文档 task_id 反写单列）。
     clean_dirs = [d.strip() for d in directions if isinstance(d, str) and d.strip()]
+
+    # 方向文本闸（P2）：不消费提示词的算法（uses_llm=false）收下方向就是**沉默
+    # 丢弃**——用户以为「按我写的研究方向挖」，实际跑的是固定候选目录。显式
+    # 400 要求清空输入或换算法（与 datasets 闸同一纪律：收下再忽略比报错更坏）。
+    if not algo.uses_llm and ((direction or "").strip() or clean_dirs):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"挖掘算法 {algo.key}（{algo.name}）不消费方向文本："
+                "它按固定候选目录逐日检验，与研究方向无关。"
+                "请清空方向输入后重试，或改用其他算法。"
+            ),
+        )
+
     multi_dispatch = bool(clean_dirs) and num_directions > 1 and doc_id is None
     record_mode: str | None = None
     direction_meta_json: str | None = None
@@ -851,21 +1144,31 @@ async def start_evolution(
             ),
         )
 
-    llm_config, llm_source, embedding_env = await _resolve_effective_llm_config(
-        auth_user_id, auth_tenant_id
-    )
-    if llm_config is None:
-        raise HTTPException(
-            status_code=412,
-            detail="未配置 LLM API Key：可在个人中心「其他设置 → AI 服务配置」填写（与 AI-IDE 共用），"
-            "或在服务器 .env 配置 DEEPSEEK_API_KEY / AI_IDE_LLM_API_KEY / OPENAI_API_KEY。",
+    # LLM 配置只对消费提示词的算法解析（P2）：统计派不需要 Key——拿 412 拦它
+    # 是错的（用户没配 Key 也能跑纯统计挖掘）。overrides 只在这条分支产出，
+    # 不消费 LLM 的算法不注入任何用户级密钥。
+    llm_config = None
+    llm_source = "not_required"
+    overrides: dict | None = None
+    if algo.uses_llm:
+        llm_config, llm_source, embedding_env = await _resolve_effective_llm_config(
+            auth_user_id, auth_tenant_id
         )
-    logger.info(
-        "[alpha-agent] evolve llm source=%s model=%s embedding=%s",
-        llm_source,
-        llm_config.model,
-        "user_profile" if embedding_env else "container",
-    )
+        if llm_config is None:
+            raise HTTPException(
+                status_code=412,
+                detail="未配置 LLM API Key：可在个人中心「其他设置 → AI 服务配置」填写（与 AI-IDE 共用），"
+                "或在服务器 .env 配置 DEEPSEEK_API_KEY / AI_IDE_LLM_API_KEY / OPENAI_API_KEY。",
+            )
+        logger.info(
+            "[alpha-agent] evolve llm source=%s model=%s embedding=%s",
+            llm_source,
+            llm_config.model,
+            "user_profile" if embedding_env else "container",
+        )
+        overrides = build_subprocess_overrides(llm_config, embedding_env)
+    else:
+        logger.info("[alpha-agent] evolve algorithm=%s（不消费 LLM）", algo.key)
 
     launcher = get_launcher()
     if multi_dispatch:
@@ -883,7 +1186,14 @@ async def start_evolution(
             direction_mode=record_mode,
             data_source=data_source or None,
             quality_gate_mode=gate_mode or None,
-            overrides=build_subprocess_overrides(llm_config, embedding_env),
+            mining_start=mining_start,
+            mining_end=mining_end,
+            valid_start=valid_start,
+            valid_end=valid_end,
+            datasets=datasets,
+            freq=freq,
+            algorithm=algo.key,
+            overrides=overrides,
         )
         first_task_id = next((it["task_id"] for it in items if it["task_id"]), None)
         logger.info(
@@ -901,6 +1211,7 @@ async def start_evolution(
                 "queued": queued,
                 "failed": failed,
                 "direction_mode": record_mode,
+                "algorithm": algo.key,
                 "market": market,
                 "universe": universe,
                 "market_name": adapter.market_name,
@@ -941,16 +1252,28 @@ async def start_evolution(
             direction_meta=direction_meta_json,
             quality_gate_mode=gate_mode or None,
             data_source=data_source or None,
+            mining_start=mining_start,
+            mining_end=mining_end,
+            valid_start=valid_start,
+            valid_end=valid_end,
+            datasets=datasets,
+            freq=freq,
+            algorithm=algo.key,
             # 文档血统：落 rd_agent_mining_tasks.source/doc_id（历史页可见出处）
             source="doc" if doc_id else "text",
             doc_id=doc_id,
             # embedding 独立于 chat 的来源：chat 走容器 env 时，用户在个人中心
             # 配的向量检索同样要下发（否则配置页显示「已保存」，挖掘却按容器
             # 默认供应商检索）。两组变量同源时值相同，覆盖幂等。
-            llm_overrides=build_subprocess_overrides(llm_config, embedding_env),
+            # 不消费 LLM 的算法 → overrides=None（不注入任何用户密钥）。
+            llm_overrides=overrides,
         )
     except HardwareLockError as exc:
         raise HTTPException(status_code=412, detail=str(exc)) from exc
+    except AlgorithmError as exc:
+        # launcher 二次 resolve 与上面的闸门同一份 manifest；此处兜底并发改动
+        # （manifest 在两次读取之间被改坏）——仍按请求错误回 400，不 500。
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 血统回写（T-FM-10）：doc → task 的反向指针，供文档列表显示「已挖掘」。
     # 回写失败只告警——它是审计面，不是主链；任务已经起来了。
@@ -964,13 +1287,14 @@ async def start_evolution(
         "code": 200,
         "data": {
             "task_id": task_id,
+            "algorithm": algo.key,
             "market": market,
             "universe": universe,
             "market_name": adapter.market_name,
             "status": "pending",
             "source": "doc" if doc_id else "text",
             "doc_id": doc_id,
-            "message": f"{adapter.market_name} 因子挖掘任务已启动",
+            "message": f"{adapter.market_name} 因子挖掘任务已启动（{algo.name}）",
         },
     }
 
@@ -1079,6 +1403,28 @@ async def dispatch_mining_batch(request: Request, payload: MiningBatchRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 自定义挖掘配置（移植 P1）：与 evolve 同一处归一/覆盖校验——
+    # 卡片批量派发和单条提交必须是同一份窗口语义（整包 400，不半批派）。
+    try:
+        (
+            mining_start,
+            mining_end,
+            valid_start,
+            valid_end,
+            datasets,
+            freq,
+        ) = _normalize_request_mining_config(
+            market=payload.market,
+            mining_start=payload.mining_start,
+            mining_end=payload.mining_end,
+            valid_start=payload.valid_start,
+            valid_end=payload.valid_end,
+            datasets=payload.datasets,
+            freq=payload.freq,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         from backend.services.engine.rd_agent.market_adapters import (
             get_adapter,
@@ -1102,16 +1448,42 @@ async def dispatch_mining_batch(request: Request, payload: MiningBatchRequest):
             ),
         )
 
-    llm_config, llm_source, embedding_env = await _resolve_effective_llm_config(
-        auth_user_id, auth_tenant_id
-    )
-    if llm_config is None:
-        raise HTTPException(
-            status_code=412,
-            detail="未配置 LLM API Key：可在个人中心「其他设置 → AI 服务配置」填写（与 AI-IDE 共用），"
-            "或在服务器 .env 配置 DEEPSEEK_API_KEY / AI_IDE_LLM_API_KEY / OPENAI_API_KEY。",
+    # 挖掘算法闸门（P2）：与 evolve 同一处 resolve、同一套 400 口径
+    try:
+        algo = resolve_algorithm(
+            payload.algorithm,
+            market=payload.market,
+            freq=freq,
+            datasets=list(datasets or []),
         )
-    overrides = build_subprocess_overrides(llm_config, embedding_env)
+    except AlgorithmError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 方向文本闸（P2）：批量契约里每条方向必填（上面已校验非空）——统计派这种
+    # 不消费方向的算法整批 400（不半批派、也不是把 20 条方向都静默丢掉）
+    if not algo.uses_llm:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"挖掘算法 {algo.key}（{algo.name}）不消费方向文本，"
+                "无法用于按方向批量派发；请改用其他算法。"
+            ),
+        )
+
+    llm_config = None
+    llm_source = "not_required"
+    overrides: dict | None = None
+    if algo.uses_llm:
+        llm_config, llm_source, embedding_env = await _resolve_effective_llm_config(
+            auth_user_id, auth_tenant_id
+        )
+        if llm_config is None:
+            raise HTTPException(
+                status_code=412,
+                detail="未配置 LLM API Key：可在个人中心「其他设置 → AI 服务配置」填写（与 AI-IDE 共用），"
+                "或在服务器 .env 配置 DEEPSEEK_API_KEY / AI_IDE_LLM_API_KEY / OPENAI_API_KEY。",
+            )
+        overrides = build_subprocess_overrides(llm_config, embedding_env)
 
     launcher = get_launcher()
     loop_n = payload.loop_n or 5
@@ -1127,13 +1499,21 @@ async def dispatch_mining_batch(request: Request, payload: MiningBatchRequest):
         picks=[(d, None) for d in directions],
         direction_mode=None,
         quality_gate_mode=gate_mode or None,
+        mining_start=mining_start,
+        mining_end=mining_end,
+        valid_start=valid_start,
+        valid_end=valid_end,
+        datasets=datasets,
+        freq=freq,
+        algorithm=algo.key,
         overrides=overrides,
     )
 
     logger.info(
-        "[alpha-agent] batch dispatch source=%s model=%s n=%d started=%d queued=%d failed=%d",
+        "[alpha-agent] batch dispatch source=%s model=%s algorithm=%s n=%d started=%d queued=%d failed=%d",
         llm_source,
-        llm_config.model,
+        getattr(llm_config, "model", "-"),
+        algo.key,
         len(directions),
         started,
         queued,
@@ -1146,6 +1526,7 @@ async def dispatch_mining_batch(request: Request, payload: MiningBatchRequest):
             "started": started,
             "queued": queued,
             "failed": failed,
+            "algorithm": algo.key,
             "market": payload.market,
             "universe": payload.universe,
             "market_name": adapter.market_name,
@@ -2230,6 +2611,158 @@ async def get_data_summary():
         return {"code": 200, "data": {"available": False, "error": str(e)[:200]}}
 
 
+@router.get("/mining/config-options")
+async def mining_config_options(
+    request: Request,
+    mining_start: str = Query("", description="预览挖掘区间起点（YYYY-MM-DD，可选）"),
+    mining_end: str = Query("", description="预览挖掘区间终点（可选）"),
+    valid_start: str = Query("", description="预览检验区间起点（可选）"),
+    valid_end: str = Query("", description="预览检验区间终点（可选）"),
+    freq: str = Query(
+        "",
+        description=(
+            "预览挖掘频率: 留空/day=日线；"
+            "1min=分钟原生（仅 A 股，覆盖/默认窗换成分钟可用连续块）"
+        ),
+    ),
+):
+    """挖掘配置目录与默认值（前端挖掘表单初始化 / 分段预览）。
+
+    各段返回，全部与提交路径同源（同一组归一函数）：
+
+    - ``datasets``：可选挖掘数据集（key + 中文标签，登记序）；
+    - ``algorithms`` + ``default_algorithm``：可选挖掘算法目录（P2，含能力面
+      字段——前端按 uses_datasets/uses_llm 决定数据集选择/演化轮数控件是否生效）；
+    - ``freqs``：可选挖掘频率目录；``freq`` 回显本次预览口径；
+    - ``coverage``：数据实际覆盖区间（前端据此限位日期选择器）；
+    - ``defaults``：默认挖掘/检验窗口（日线锚定覆盖末端 4+1 年）；
+    - ``windows`` + ``segments``：**生效窗口**与 train/valid/test 分段——
+      给了窗口参数即预览该组合（校验与提交同一口径，非法即 400），
+      没给则预览默认窗口。
+
+    ``windows.validation`` 为 ``None`` = 不启用样本外检验（分段退化为
+    挖掘区间内的 70/15/15 切分），不是"检验窗为空"。
+
+    ``freq=1min`` 时 ``coverage``/``defaults``/``backtest_end_guard`` 全部换成
+    分钟口径（provider 覆盖 + 可用连续块），并额外回 ``minute`` 段（可用区间、
+    断层表、就绪态）。分钟只有 ~4 个月数据，默认窗 = 可用连续块且**必然显式
+    落到任务行**（子进程要求显式窗口，前端不传也一样——见 launcher
+    ``normalize_mining_config``）。
+    """
+    from backend.services.engine.alpha_agent.mining_config import (
+        dataset_catalog,
+        default_windows,
+        qlib_segments,
+        resolve_windows,
+    )
+
+    get_authenticated_identity(request)
+
+    try:
+        freq_value = normalize_freq(freq)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    is_minute = freq_value == FREQ_MINUTE
+    scope = None
+    minute_error: str | None = None
+    if is_minute:
+        try:
+            scope = minute_scope()
+        except Exception as exc:  # noqa: BLE001 —— 目录接口不炸：坏 provider 如实上屏
+            logger.warning("[alpha-agent] 分钟 provider 事实读取失败: %s", exc)
+            minute_error = str(exc)
+
+    if is_minute:
+        coverage = scope.coverage if scope else None
+        guard = scope.data_end if scope else None
+        default_mining, default_validation = (scope.usable, None) if scope else (None, None)
+    else:
+        coverage = _quantdb_coverage()
+        guard = _backtest_guard(coverage)
+        default_mining, default_validation = default_windows(coverage, data_end=guard)
+    try:
+        mining, validation = resolve_windows(
+            mining_start,
+            mining_end,
+            valid_start,
+            valid_end,
+            coverage=coverage,
+            data_end=guard,
+        )
+        if scope is not None:
+            require_minute_window(mining, scope, label="挖掘数据区间")
+            require_minute_window(validation, scope, label="因子检验区间")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    is_default = mining is None
+    eff_mining = default_mining if is_default else mining
+    eff_validation = default_validation if is_default else validation
+    # 分钟数据面未就绪：eff_mining 为 None（前端置灰提交），不产分段而不是产假分段
+    segments = qlib_segments(eff_mining, eff_validation) if eff_mining else {}
+
+    def _window_json(win: Window | None) -> dict[str, str] | None:
+        if win is None:
+            return None
+        return {"start": win.start.isoformat(), "end": win.end.isoformat()}
+
+    minute_block: dict | None = None
+    if is_minute:
+        from backend.services.engine import minute_qlib_provider as MP
+
+        minute_block = {
+            "ready": scope is not None,
+            "provider_dir": str(MP.resolve_minute_provider_dir()),
+            "error": minute_error,
+            # 覆盖 = provider 全区间（含断层之前的碎片）；usable = 真正可挖的
+            # 末端连续块。前端在分钟模式下用 usable 限位日期选择器。
+            "coverage": _window_json(scope.coverage) if scope else None,
+            "usable": _window_json(scope.usable) if scope else None,
+            "usable_days": scope.days if scope else None,
+            "gaps": [
+                {"start": a.isoformat(), "end": b.isoformat()}
+                for a, b in (scope.gaps if scope else ())
+            ],
+        }
+
+    return {
+        "code": 200,
+        "data": {
+            "datasets": dataset_catalog(),
+            # 挖掘算法目录（P2）：与 GET /algorithms 同源同一份 manifest 摘要；
+            # 面板一次拉取即可渲染「算法下拉 + 该算法支持哪些配置控件」。
+            "algorithms": list_algorithms(),
+            "default_algorithm": DEFAULT_ALGORITHM_KEY,
+            "freqs": [
+                {"value": item, "label": _FREQ_LABELS.get(item, item)}
+                for item in SUPPORTED_FREQS
+            ],
+            "freq": freq_value,
+            "minute": minute_block,
+            "coverage": _window_json(coverage),
+            "defaults": {
+                "mining": _window_json(default_mining),
+                "validation": _window_json(default_validation),
+            },
+            "windows": {
+                "mining": _window_json(eff_mining),
+                "validation": _window_json(eff_validation),
+                "is_default": is_default,
+            },
+            # 回测可用末端（数据末端前一个交易日）：填到这一天的窗口会被原地退让
+            # 到该日（qlib 回测按 t+1 成交，终点须留次日行情）。前端用它给日期
+            # 选择器设上限并解释"为什么不是覆盖末端"。
+            "backtest_end_guard": guard.isoformat() if guard else None,
+            "segments": {
+                name: {"start": span[0], "end": span[1]}
+                for name, span in segments.items()
+            },
+            # 自定义窗口/数据集目前仅 A 股可用（其他市场数据面不走 QuantDB）
+            "scopes": ["a_share"],
+        },
+    }
+
+
 @router.get("/factor-categories")
 async def get_factor_categories():
     """返回 L1 因子类别（feature catalog）+ 因子值库目录（T-MV-06）。
@@ -2905,8 +3438,30 @@ def _parse_logic_score(text: str) -> tuple[str, int | None]:
     return text, score
 
 
+#: qlib 表达式字符白名单：字段引用（$）、字面量、算子名、四则/比较运算符、
+#: 括号与逗号。这是**保守路由**的判据（见 ``_looks_like_qlib_expression``），
+#: 不是安全校验——真正的合法性由子进程里的 qlib 求值裁决。
+_QLIB_EXPRESSION_CHARS = re.compile(r"^[\w\s$.,()+\-*/%<>=!&|]+$")
+
+
+def _looks_like_qlib_expression(factor_code: str) -> bool:
+    """统计派因子的落库形态：单行 qlib 表达式（``$字段`` + 算子调用）。
+
+    判据从严：出现换行、引号、方括号、注释等一律**不**算表达式，保持
+    「Python 代码走 AST 判型」的原行为（报语法错误），把可疑文本拦在求值
+    路径之外；``$`` 字段引用必须存在——没有它就只是坏 Python，不是表达式。
+    判真也只管**路由**：求不动的表达式会按回测失败落库（带 qlib 原始报错），
+    这里不假装验证过。
+    """
+    if not factor_code or "\n" in factor_code or "\r" in factor_code:
+        return False
+    if "$" not in factor_code:
+        return False
+    return bool(_QLIB_EXPRESSION_CHARS.fullmatch(factor_code))
+
+
 def _detect_factor_kind(factor_code: str) -> str:
-    """AST 预检：判断是 Qlib Factor 类还是 RD-Agent 函数式。
+    """AST 预检：判断 Qlib Factor 类 / RD-Agent 函数式 / qlib 表达式。
 
     不执行因子代码，只解析语法树。函数式含**两种入口样式**（与
     ``_run_functional_factor_subprocess`` 的优先级注释一一对应）：
@@ -2915,6 +3470,10 @@ def _detect_factor_kind(factor_code: str) -> str:
     误判成函数式（进错执行器），而只有守卫没有类/calculate_ 的代码此前直接
     「unknown」拒跑——补码评估实测踩中（2026-10-09，LLM 按自执行契约产出的
     Amihud ILLIQ 因检测缺口报「未找到可调用的 Factor 类或 calculate_*」）。
+
+    ``expression``（统计派）不是 Python——``$close``/``Ref(...)`` 按 Python
+    解析必然 SyntaxError，故放在 SyntaxError 分支里保守识别；求值走 qlib
+    原生路径（子进程，理由见 ``_run_expression_factor_subprocess``）。
     """
     import ast
 
@@ -2923,6 +3482,10 @@ def _detect_factor_kind(factor_code: str) -> str:
     try:
         tree = ast.parse(factor_code)
     except SyntaxError as e:
+        # 统计派因子是 qlib 表达式：只有通过文件头的字符白名单才路由到
+        # expression，其余 SyntaxError 文本维持原行为（报错，不送进求值路径）。
+        if _looks_like_qlib_expression(factor_code):
+            return "expression"
         raise RuntimeError(f"因子代码语法错误: {e.msg} (line {e.lineno})") from e
 
     has_class = False
@@ -3121,6 +3684,15 @@ async def _run_factor_backtest(
         kind = _detect_factor_kind(factor_code)
         if kind == "unknown":
             raise RuntimeError("因子代码中未找到可调用的 Factor 类或 calculate_* 函数")
+
+        # 表达式因子是 qlib 原生形态（统计派产出），h5 执行器只认 Python 代码
+        # 契约——直接切回二进制数据面，不是能力缺失而是数据面归属
+        if kind == "expression" and data_source != "qlib_bin":
+            logger.warning(
+                "[alpha-backtest] 表达式因子走 Qlib 原生求值，data_source=%s 不适用，自动切到 qlib_bin",
+                data_source,
+            )
+            data_source = "qlib_bin"
 
         # H5 路径: 多市场 H5 不全，自动回退
         if data_source == "h5":
@@ -3504,12 +4076,10 @@ async def _backtest_via_qlib(
     from backend.shared.qlib_paths import resolve_qlib_provider_uri
 
     provider_uri = resolve_qlib_provider_uri(market_upper)
+    region = "cn" if market_upper in ("CN", "HK", "FUTURES", "CRYPTO") else "us"
     # 幂等 init：qlib.init 多次调用是安全的，第二次会快速返回
     try:
-        qlib.init(
-            provider_uri=provider_uri,
-            region="cn" if market_upper in ("CN", "HK", "FUTURES", "CRYPTO") else "us",
-        )
+        qlib.init(provider_uri=provider_uri, region=region)
     except Exception as e:
         logger.warning("qlib.init(%s) raised: %s", provider_uri, e)
 
@@ -3538,11 +4108,21 @@ async def _backtest_via_qlib(
 
     # 计算因子值（LLM 生成/用户提交的代码一律 subprocess 隔离执行，
     # 严禁在 engine 主进程 exec——主进程持有 DB 凭证与全部服务状态）
-    if kind == "functional":
+    if kind == "expression":
+        # 统计派 qlib 表达式：子进程里 qlib 原生求值（必须子进程的理由见被调函数
+        # docstring——qlib 求值实现是主进程内 eval，同样受「严禁主进程 exec」约束）
+        factor_series = await _run_expression_factor_subprocess(
+            factor_id, factor_code, provider_uri, region, instruments, start, end
+        )
+    elif kind == "functional":
         # RD-Agent calculate_* 函数式：用 subprocess 跑（隔离 + 捕获 traceback）。
         # 优先喂**挖掘侧同源**的富化数据（39 列）：因子代码是照着挖掘时的列写的，
         # 只给它 6 列量价，读到 $netflow_5 这类富化列就是 KeyError。
-        mining_source = _resolve_mining_source_h5(market)
+        # 回测窗口从 Qlib 特征索引取（与因子产出对齐时的同一份窗口），
+        # 用于挑选覆盖该窗口的挖掘数据面缓存
+        _dt_level = _detect_datetime_level(df.index)
+        _dts = df.index.get_level_values(_dt_level)
+        mining_source = _resolve_mining_source_h5(market, (_dts.min(), _dts.max()))
         if mining_source:
             logger.info(
                 "[alpha-backtest] %s 使用挖掘同源富化数据: %s", factor_id, mining_source
@@ -3710,14 +4290,60 @@ async def _backtest_via_qlib(
 _MINING_H5_KEY = "data"
 
 
-def _resolve_mining_source_h5(market: str) -> str | None:
+_MINING_H5_KEYED_RE = re.compile(
+    r"^daily_pv_all__(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})__[a-z0-9+]+\.h5$"
+)
+
+
+def _mining_h5_candidates(cache_dir: str) -> list[tuple[str, str, str]]:
+    """已存在的挖掘数据面缓存 → [(path, 覆盖起, 覆盖止)]。
+
+    两类：默认缓存（``daily_pv_all.h5``，生成器默认跨度）与自定义窗口/数据集
+    的任务缓存（``daily_pv_all__<起>_<止>__<数据集短码>.h5``，跨度即文件名）。
+    文件名不可解析的一律忽略——宁可回退旧路径，不拿认不出跨度的文件赌。
+    """
+    out: list[tuple[str, str, str]] = []
+    try:
+        from backend.services.engine.rd_agent.rd_loop_wrapper import (
+            _H5_DEFAULT_END,
+            _H5_DEFAULT_START,
+        )
+
+        default = os.path.join(cache_dir, "daily_pv_all.h5")
+        if os.path.exists(default):
+            out.append(
+                (default, _H5_DEFAULT_START.isoformat(), _H5_DEFAULT_END.isoformat())
+            )
+    except Exception:  # noqa: BLE001 - 常量导入失败即放弃默认缓存候选
+        pass
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return out
+    for name in names:
+        m = _MINING_H5_KEYED_RE.match(name)
+        if not m:
+            continue
+        path = os.path.join(cache_dir, name)
+        if os.path.exists(path):
+            out.append((path, m.group(1), m.group(2)))
+    return out
+
+
+def _resolve_mining_source_h5(
+    market: str, window: tuple[Any, Any] | None = None
+) -> str | None:
     """挖掘侧喂给 RD-Agent 的那份富化 h5；没有就返回 None。
 
     挖掘走 ``RDLoopWrapper._generate_h5_from_parquet`` →
-    ``<quantdb_dir>/.h5_cache/daily_pv_all.h5``（契约：MultiIndex[datetime,
-    instrument] + $open/$high/$low/$close/$volume/$amount/$factor 再拼 QuantDB
-    富化列）。回测此前从 Qlib 二进制现拼 6 列，富化列全缺，因子一读到
-    ``$netflow_5`` 就是 KeyError。
+    ``<quantdb_dir>/.h5_cache/``（契约：MultiIndex[datetime, instrument] +
+    $open/$high/$low/$close/$volume/$amount/$factor 再拼 QuantDB 富化列）。回测
+    此前从 Qlib 二进制现拼 6 列，富化列全缺，因子一读到 ``$netflow_5`` 就是
+    KeyError。
+
+    ``window`` = 本次回测的 (起, 止)（可选）：给定时只挑**能覆盖该窗口**的缓存，
+    否则 ``_write_mining_input`` 会筛出 0 行而报「筛不出任何行」。默认缓存优先
+    （列最全），其次窗口化缓存按 mtime 新→旧。
 
     只认**已存在**的缓存：生成一份要读全市场日线（分钟级到 40 分钟），回测绝不
     自己触发；没有就返回 None，由调用方退回旧路径（HK/US 等市场本就没有这份缓存）。
@@ -3736,8 +4362,36 @@ def _resolve_mining_source_h5(market: str) -> str | None:
         return None
     if not quantdb_dir:
         return None
-    cache_path = os.path.join(quantdb_dir, ".h5_cache", "daily_pv_all.h5")
-    return cache_path if os.path.exists(cache_path) else None
+    candidates = _mining_h5_candidates(os.path.join(quantdb_dir, ".h5_cache"))
+    if not candidates:
+        return None
+    if window is not None:
+        import pandas as _pd
+
+        lo = _pd.Timestamp(window[0]).normalize()
+        hi = _pd.Timestamp(window[1]).normalize()
+        covered = [
+            c
+            for c in candidates
+            if _pd.Timestamp(c[1]) <= lo and _pd.Timestamp(c[2]) >= hi
+        ]
+        if not covered:
+            logger.warning(
+                "[alpha-backtest] %d 份挖掘数据面缓存均不覆盖回测窗口 %s~%s",
+                len(candidates),
+                lo.date(),
+                hi.date(),
+            )
+            return None
+        candidates = covered
+    default_name = "daily_pv_all.h5"
+    candidates.sort(
+        key=lambda c: (
+            os.path.basename(c[0]) != default_name,
+            -os.path.getmtime(c[0]),
+        )
+    )
+    return candidates[0][0]
 
 
 def _write_mining_input(src_h5: str, dest_h5: str, df) -> None:
@@ -4008,6 +4662,81 @@ except Exception:
         s = result_df.stack()
     # 同上：层序按值判定并归位，绝不按下标改名。
     return _canonicalize_multiindex(s)
+
+
+async def _run_expression_factor_subprocess(
+    factor_id: str,
+    expression: str,
+    provider_uri: str,
+    region: str,
+    instruments,
+    start: str,
+    end: str,
+) -> "pd.Series | None":
+    """qlib 表达式因子（统计派）：subprocess 内 qlib 原生求值，主进程只读结果。
+
+    **为什么必须子进程**：qlib 对表达式的求值实现是 ``eval(parse_field(field))``
+    （容器内实测 ``qlib/data/data.py``：直接 eval，无 ``__builtins__`` 限制）。
+    在主进程调用 ``D.features(fields=[表达式])`` 等于把因子文本当 Python 执行，
+    与「因子代码一律 subprocess 隔离，严禁在 engine 主进程 exec」是同一条纪律
+    ——表达式只是换了种语言，不是豁免理由。
+
+    求值走 qlib 原生路径，与落库表达式/等价性金样（test_statistical_candidates）
+    同一实现：算子窗口/暖机语义由 qlib 自己保证，回测与挖掘不会两说。窗口头部
+    由 qlib 自动扩展历史（``get_extended_window_size``）补齐暖机，不依赖调用方
+    多取数据。
+
+    ``instruments`` 原样透传主进程解析出的股票池（list 或 qlib config dict），
+    两边取数口径必须一致——在子进程里重解析会出现「回测的池子与价格面不同」。
+    """
+    import uuid
+
+    run_id = uuid.uuid4().hex[:8]
+    out_path = f"/tmp/_expr_result_{run_id}.h5"
+    tb_path = f"/tmp/_expr_tb_{run_id}.txt"
+    Path(tb_path).unlink(missing_ok=True)
+    Path(out_path).unlink(missing_ok=True)
+
+    script = f"""
+import sys, traceback
+try:
+    import qlib
+    from qlib.data import D
+
+    qlib.init(provider_uri={provider_uri!r}, region={region!r})
+    _df = D.features(
+        {instruments!r}, [{expression!r}],
+        start_time={start!r}, end_time={end!r}, freq="day",
+    )
+    if _df is None or _df.empty:
+        print("EMPTY_EXPRESSION_RESULT"); sys.exit(1)
+    _df.to_hdf({out_path!r}, key="data", mode="w")
+    print("FACTOR_DONE")
+except Exception as _e:
+    with open({tb_path!r}, "w") as _f:
+        traceback.print_exc(file=_f)
+    print(f"ERROR: {{_e}}")
+    sys.exit(1)
+"""
+    returncode, stdout, stderr = await _run_subprocess_tracked(
+        factor_id, [sys.executable, "-c", script], timeout=600
+    )
+    if returncode != 0:
+        tb = Path(tb_path).read_text() if Path(tb_path).exists() else ""
+        raise RuntimeError(
+            f"表达式因子执行失败 (exit={returncode}): {((stdout or '') + stderr)[-300:]}\n{tb[-1000:]}"
+        )
+
+    try:
+        import pandas as _pd
+
+        result_df = _pd.read_hdf(out_path)
+    except Exception as e:
+        raise RuntimeError(f"读取表达式结果失败: {e}") from e
+
+    # 层序归位与其他 kind 同一入口：D.features 给 (instrument, datetime)，
+    # _canonicalize_factor_series 按**值**判日期层并归位成挖掘侧层序。
+    return _canonicalize_factor_series(result_df)
 
 
 async def _backtest_via_h5(

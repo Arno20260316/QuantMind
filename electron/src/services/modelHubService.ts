@@ -118,6 +118,24 @@ class ModelHubService {
   }
 
   /**
+   * 读操作经平台网关代理到模型广场（回退通道）。
+   * SERVICE_ENDPOINTS.API_GATEWAY 已含 /api/v1 前缀（Web 下为相对路径，
+   * 桌面端为 <base>/api/v1），path 只传 /hub/... 部分，避免双前缀 404。
+   */
+  private async gatewayGet<T>(path: string, params?: Record<string, unknown>): Promise<T> {
+    const headers: Record<string, string> = {};
+    const token = authService.getAccessToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const resp = await axios.get<T>(`${SERVICE_ENDPOINTS.API_GATEWAY}${path}`, {
+      params,
+      headers,
+    });
+    return resp.data;
+  }
+
+  /**
    * 获取广场模型列表
    */
   async listModels(params: {
@@ -129,32 +147,28 @@ class ModelHubService {
     page?: number;
     page_size?: number;
   }): Promise<HubModelListResponse> {
+    const query = {
+      market: params.market && params.market !== 'ALL' ? params.market : undefined,
+      algorithm: params.algorithm && params.algorithm !== 'ALL' ? params.algorithm : undefined,
+      sort_by: params.sort_by || 'sharpe',
+      q: params.query || undefined,
+      author: params.author || undefined,
+      page: params.page || 1,
+      page_size: params.page_size || 20,
+    };
     try {
-      const resp = await this.axiosInstance.get('/api/v1/hub/models', {
-        params: {
-          market: params.market && params.market !== 'ALL' ? params.market : undefined,
-          algorithm: params.algorithm && params.algorithm !== 'ALL' ? params.algorithm : undefined,
-          sort_by: params.sort_by || 'sharpe',
-          q: params.query || undefined,
-          author: params.author || undefined,
-          page: params.page || 1,
-          page_size: params.page_size || 20,
-        },
-      });
+      const resp = await this.axiosInstance.get('/api/v1/hub/models', { params: query });
       return resp.data;
     } catch (err: any) {
+      // 浏览器跨域直连云端恒被 CORS 拦（云端响应缺 Access-Control-Allow-Origin），
+      // 桌面端同理；回退走本地网关（后端注入 API Key 服务端转发）。
       console.warn('请求 QuantDB 模型广场失败，尝试使用本地网关回退:', err);
-      // 回退使用统一网关
-      const fallbackUrl = `${SERVICE_ENDPOINTS.API_GATEWAY}/api/v1/hub/models`;
-      const fallbackResp = await axios.get(fallbackUrl, {
-        params,
-        headers: {
-          Authorization: `Bearer ${authService.getAccessToken() || ''}`,
-        },
-      }).catch(() => null);
+      const fallbackResp = await this.gatewayGet<HubModelListResponse>('/hub/models', query).catch(
+        () => null,
+      );
 
-      if (fallbackResp?.data) {
-        return fallbackResp.data;
+      if (fallbackResp) {
+        return fallbackResp;
       }
       throw err;
     }
@@ -208,8 +222,18 @@ class ModelHubService {
    * 获取下载直链（仅作备用；常规导入应走后端 importRemoteModel 落库）
    */
   async getDownloadTicket(modelId: string): Promise<DownloadTicketResponse> {
-    const resp = await this.axiosInstance.get(`/api/v1/hub/models/${modelId}/download-ticket`);
-    return resp.data;
+    try {
+      const resp = await this.axiosInstance.get(`/api/v1/hub/models/${modelId}/download-ticket`);
+      return resp.data;
+    } catch (err) {
+      const fallbackResp = await this.gatewayGet<DownloadTicketResponse>(
+        `/hub/models/${modelId}/download-ticket`,
+      ).catch(() => null);
+      if (fallbackResp) {
+        return fallbackResp;
+      }
+      throw err;
+    }
   }
 
   /**

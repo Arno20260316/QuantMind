@@ -246,9 +246,13 @@ def _select_train_meta(metadata: Any) -> dict[str, Any]:
 
 
 def _slugify_hub_name(raw: str, max_len: int = 32) -> str:
-    """把广场公开名转成可读 slug（保留中英数，空格/-转下划线）。
+    """把广场公开名转成可读 slug（仅 ASCII 字母数字，其余转下划线并压缩）。
 
-    中文的 str.isalnum() 为 True，会被保留；其余符号转下划线并压缩。
+    中文的 str.isalnum() 为 True，但 model_id 的允许字符集是 ``[A-Za-z0-9._-]``
+    （滚动训练派生配方处 ``model_recipe._SAFE_MODEL_ID`` 强校验）——中文只能经
+    ``metadata.display_name`` 保留展示，不能进 model_id。2026-10-09 修：此前
+    中文被当字母数字保留，导入出的 model_id 含「选股」等汉字，滚动训练直接
+    报「非法 model_id」。
     """
     import re
 
@@ -256,7 +260,9 @@ def _slugify_hub_name(raw: str, max_len: int = 32) -> str:
     if not s:
         return ""
     s = s.replace("-", "_").replace(" ", "_")
-    s = "".join(c if c.isalnum() or c == "_" else "_" for c in s)
+    s = "".join(
+        c if (c.isascii() and c.isalnum()) or c == "_" else "_" for c in s
+    )
     s = re.sub(r"_+", "_", s).strip("_")
     return s[:max_len].strip("_")
 
@@ -270,7 +276,7 @@ def _build_import_model_id(
     如 mdl_cn_hub_L2_CatBoost_T5_3f9a2c；无公开名时回退旧规则保证幂等。
     """
     hub_id = hub_model_id.strip()
-    short = "".join(c for c in hub_id if c.isalnum())[-6:].lower() or "hub"
+    short = "".join(c for c in hub_id if c.isascii() and c.isalnum())[-6:].lower() or "hub"
     slug = _slugify_hub_name(hub_name)
     if not slug:
         # 回退旧规则（兼容存量幂等）：基于 hub_model_id 全量派生
@@ -289,7 +295,8 @@ def _build_legacy_import_model_id(*, hub_model_id: str, market: str) -> str:
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
     # 复用统一命名规则：mdl_{market}_hub_{sanitized}_{digest}
     sanitized = "".join(
-        c if c.isalnum() or c in {"_", "-"} else "_" for c in hub_model_id.strip()
+        c if (c.isascii() and c.isalnum()) or c in {"_", "-"} else "_"
+        for c in hub_model_id.strip()
     )
     sanitized = sanitized[:24].strip("_") or "hub"
     market_prefix = str(market or "CN").upper().strip()[:8] or "CN"
@@ -979,5 +986,6 @@ async def proxy_model_hub(path: str, request: Request):
                     "content-type": resp.headers.get("content-type", "application/json")
                 },
             )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("模型广场代理失败 %s /%s: %s", method, path, exc)
         return PlainTextResponse("模型广场服务不可达", status_code=502)

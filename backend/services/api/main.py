@@ -431,11 +431,14 @@ app.include_router(public_sync_router, prefix="/api/v1")
 # 常量做「未登记即拒绝」，两边不能各写一份。
 app.include_router(external_router, prefix=EXT_API)
 app.include_router(admin_router, prefix="/api/v1/admin")
+# 具体前缀的 router 必须先注册：model_training 带 `GET /{model_id}` 参数兜底，
+# 先注册会把 `/api/v1/models/rollouts` 当成 model_id="rollouts" → 404 "Model not found"
+# （2026-10-09 修：晋升流程列表被遮蔽，FastAPI 按注册顺序先中先赢）
+app.include_router(model_rollouts_router)  # 晋升流程（/api/v1/models/rollouts/*）
+app.include_router(model_rolling_router)  # 滚动训练用户态（/api/v1/models/rolling/*，P1）
 app.include_router(
     model_training_router, prefix="/api/v1/models", tags=["ModelTraining"]
 )
-app.include_router(model_rollouts_router)  # 晋升流程（/api/v1/models/rollouts/*）
-app.include_router(model_rolling_router)  # 滚动训练用户态（/api/v1/models/rolling/*，P1）
 app.include_router(
     build_per_model_router(get_current_user),
     prefix="/api/v1/models",

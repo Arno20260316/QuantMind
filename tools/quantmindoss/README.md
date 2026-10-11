@@ -13,9 +13,9 @@ pip install quantmindoss
 
 ## AK/SK 获取
 
-1. 登录管理后台 → API Keys → 新建 Key
+1. 打开前端模拟交易设置页 → 接入凭证 / API 密钥选项卡
 2. `permissions` 填 `["news.read", "inference.read", "paper.read"]`（缺省全开）
-3. `secret_key`（`sk_` 开头）仅显示一次，请妥善保存
+3. `Access Key` 直接展示；`Secret Key`（`sk_` 开头）点重新生成，仅显示一次，请妥善保存
 
 ## 快速开始
 

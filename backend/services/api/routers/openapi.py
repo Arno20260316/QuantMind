@@ -33,6 +33,7 @@ from backend.services.api.routers.model_training import (
     get_model_inference_latest,
     get_model_inference_run_detail,
     get_stock_inference_history,
+    list_batch_inferences,
 )
 from backend.services.api.routers.news import enrichment_stats, list_articles
 from backend.services.api.user_app.middleware.openapi_auth import (
@@ -162,6 +163,66 @@ async def open_stock_history(
     user: dict = Depends(require_openapi_scope(SCOPE_INFERENCE_READ)),
 ):
     return _ok(await get_stock_inference_history(symbol, days, model_id, end_date, user))
+
+
+@router.get("/inference/models", summary="用户训练模型列表（SDK）")
+async def open_inference_models(
+    user: dict = Depends(require_openapi_scope(SCOPE_INFERENCE_READ)),
+):
+    """SDK 可发现性入口：返回该 AK 用户的模型（model_id/status/is_default），
+    拿到 model_id 后再调 latest/runs/history。只读 qm_user_models，不扫服务器目录。"""
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    tenant_id = str(user.get("tenant_id") or "default")
+    user_id = str(user.get("user_id") or "")
+    try:
+        async with get_session(read_only=True) as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT model_id, status, is_default, created_at, updated_at "
+                        "FROM qm_user_models "
+                        "WHERE tenant_id = :tid AND user_id = :uid "
+                        "ORDER BY updated_at DESC"
+                    ),
+                    {"tid": tenant_id, "uid": user_id},
+                )
+            ).mappings().all()
+    except Exception as exc:
+        logger.warning("open models query failed: %s", exc)
+        return _ok({"items": [], "total": 0})
+    items = []
+    for r in rows:
+        d = dict(r or {})
+        for k in ("created_at", "updated_at"):
+            if d.get(k) is not None:
+                try:
+                    d[k] = d[k].isoformat()
+                except Exception:
+                    d[k] = str(d[k])
+        items.append(d)
+    return _ok({"items": items, "total": len(items)})
+
+
+@router.get("/inference/batches", summary="批量推理历史（SDK）")
+async def open_inference_batches(
+    model_id: str | None = Query(None),
+    status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    user: dict = Depends(require_openapi_scope(SCOPE_INFERENCE_READ)),
+):
+    return _ok(
+        await list_batch_inferences(
+            model_id=model_id,
+            status=status,
+            page=page,
+            page_size=page_size,
+            current_user=user,
+        )
+    )
 
 
 @router.get("/paper/positions", summary="模拟盘持仓（SDK）")

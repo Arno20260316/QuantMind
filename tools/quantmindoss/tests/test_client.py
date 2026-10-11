@@ -103,3 +103,21 @@ def test_get_latest_signals_reads_items():
     qm = _client(handler)
     sigs = qm.inference.get_latest_signals()
     assert [s["symbol"] for s in sigs] == ["600036.SH", "600519.SH"]
+    assert [s["display_rank"] for s in sigs] == [1, 2]
+
+
+def test_list_models_and_batches():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/open/auth/token":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"token": "T", "token_type": "bearer", "expires_in": 1, "scopes": []}})
+        if request.url.path == "/api/v1/open/inference/models":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"items": [{"model_id": "m1", "status": "ready", "is_default": True}], "total": 1}})
+        if request.url.path == "/api/v1/open/inference/batches":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"items": [{"batch_id": "b1"}], "page": 1, "total": 1}})
+        return httpx.Response(404, json={"code": 404, "message": "no"})
+
+    qm = _client(handler)
+    models = qm.inference.list_models()
+    assert [m["model_id"] for m in models] == ["m1"]
+    batches = qm.inference.list_batches(model_id="m1")
+    assert batches["total"] == 1

@@ -52,6 +52,8 @@ qm.paper.get_positions(market="CN")          # CN/HK/US/FUTURES/CRYPTO
 | news | `get_stats(tickers, sentiment, since, until)` | 标签频次统计 |
 | news | `iter_sentiment(page_size, **同上)` | 自动翻页迭代 |
 | inference | `get_latest(model_id)` | 当前生效批次 |
+| inference | `list_models()` | 用户训练模型列表（含 model_id） |
+| inference | `list_batches(model_id, status, page, page_size)` | 批量推理历史 |
 | inference | `get_run(run_id)` | 批次明细 + items 信号 |
 | inference | `get_latest_signals(model_id)` | 当前信号列表（两次请求合并） |
 | inference | `get_stock_history(symbol, days, model_id, end_date)` | 个股历史分数 |

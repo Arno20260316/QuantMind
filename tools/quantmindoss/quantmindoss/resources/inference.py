@@ -17,6 +17,26 @@ class InferenceResource:
             "GET", "/api/v1/open/inference/latest", params={"model_id": model_id}
         )
 
+    def list_models(self) -> list[dict[str, Any]]:
+        """当前用户的训练模型列表。每项 {model_id, status, is_default,
+        created_at, updated_at}，拿到 model_id 后再查推理结果。"""
+        data = self._c._request("GET", "/api/v1/open/inference/models")
+        return list((data or {}).get("items") or [])
+
+    def list_batches(
+        self,
+        model_id: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        """批量推理历史（分页原样返回）。"""
+        return self._c._request(
+            "GET",
+            "/api/v1/open/inference/batches",
+            params={"model_id": model_id, "status": status, "page": page, "page_size": page_size},
+        )
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         """推理批次明细。返回 {summary, total, items[]}，
         每行 {symbol, fusion_score, signal_side, score_rank, ...}。"""
@@ -38,7 +58,10 @@ class InferenceResource:
         )
 
     def get_latest_signals(self, model_id: str | None = None) -> list[dict[str, Any]]:
-        """便捷方法：当前生效批次的信号列表（latest → run 明细一次取全）。"""
+        """便捷方法：当前生效批次的信号列表（latest → run 明细一次取全）。
+
+        返回已按 fusion_score 降序排列；每项附带 display_rank（1 起，
+        因服务端 score_rank 恒为 NULL，排名以列表顺序为准）。"""
         latest = self.get_latest(model_id)
         run_id = (latest or {}).get("run_id") or ""
         if not run_id:
@@ -47,4 +70,9 @@ class InferenceResource:
         items = (detail or {}).get("items")
         if items is None:  # 兼容 signals 键
             items = (detail or {}).get("signals") or []
-        return list(items or [])
+        ranked = []
+        for i, item in enumerate(items or [], start=1):
+            row = dict(item or {})
+            row.setdefault("display_rank", i)
+            ranked.append(row)
+        return ranked

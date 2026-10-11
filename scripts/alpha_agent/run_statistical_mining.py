@@ -16,7 +16,7 @@
 
 不做的事（都要写在明面上）：
 
-- **不查名称重**：候选是固定目录（28 个 key 恒定），按名去重会把「同候选的
+- **不查名称重**：候选是固定目录（32 个 key 恒定），按名去重会把「同候选的
   新一次实验」全部判重拒掉。统计派的落库身份走 P3 任务指纹（launcher 注入
   ``QM_MINING_TASK_FINGERPRINT``）：``factor_id = md5(statistical:user:market
   :universe:candidate_key:指纹)``——同一份配置重跑**幂等刷新**同一行

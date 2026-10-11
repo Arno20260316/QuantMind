@@ -157,7 +157,13 @@ def _resi64(
 
 
 def _skew(series: pd.Series, window: int) -> pd.Series:
-    """qlib `Skew` 节点输出的两段式复刻（float64 计算 → float32）。"""
+    """qlib `Skew` 节点输出的两段式复刻（float64 计算 → float32）。
+
+    float32 对齐的是 **qlib 输出列**口径；qlib 表达式树内部节点仍是
+    float64（转换只发生在数据边界），闸门阈值（``|skew|>1``）在 qlib 里
+    比较未舍入值、在本实现比较已舍入值——贴边样本差 ≤ ~1e-7，由等价性
+    测试容差兜底（实测四候选 A 臂命中率 18.7%~42.9%，无空转盲区）。
+    """
     return (
         series.astype(np.float64)
         .rolling(window, min_periods=1)
@@ -167,7 +173,12 @@ def _skew(series: pd.Series, window: int) -> pd.Series:
 
 
 def _kurt(series: pd.Series, window: int) -> pd.Series:
-    """qlib `Kurt` 节点输出的两段式复刻（float64 计算 → float32）。"""
+    """qlib `Kurt` 节点输出的两段式复刻（float64 计算 → float32）。
+
+    float32 对齐的是 **qlib 输出列**口径；闸门阈值（``kurt<3``）在 qlib
+    内部树上是 float64 比较、本实现是已舍入值比较——口径差 ≤ ~1e-7，
+    由等价性测试容差兜底（同上，见 :func:`_skew`）。
+    """
     return (
         series.astype(np.float64)
         .rolling(window, min_periods=1)

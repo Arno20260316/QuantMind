@@ -1,23 +1,18 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { Sparkles, Activity, Layers, Network, TrendingUp, BarChart3, Clock, RefreshCw, Zap } from 'lucide-react';
-import { DatePicker, Spin, message } from 'antd';
+import React, { useState, useEffect } from 'react';
+import { Sparkles, Activity, Layers, Network, TrendingUp, Clock, RefreshCw, Zap } from 'lucide-react';
+import { DatePicker, message } from 'antd';
 import dayjs from 'dayjs';
 import { BroadMarketHeader, IndexItem } from '../components/BroadMarketHeader';
 import { ShenwanHeatmapChart } from '../components/ShenwanHeatmapChart';
-import { CapitalFlowSankeyChart } from '../components/CapitalFlowSankeyChart';
 import { StockMoneyFlowTable, StockMoneyFlowItem } from '../components/StockMoneyFlowTable';
 import { MarketBreadthCard } from '../components/MarketBreadthCard';
-import { TagLookupPanel } from '../components/TagLookupPanel';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
-import { CapitalFlowHorizontalBarChart, FlowItem } from '../components/CapitalFlowHorizontalBarChart';
 import { FactorBoardPanel } from '../components/FactorBoardPanel';
-import { Tag as TagIcon } from 'lucide-react';
+import { FlowPanoramaPanel } from '../components/FlowPanoramaPanel';
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import { PAGE_LAYOUT } from '../../../config/pageLayout';
 
 const MARKET_ANALYSIS_API = `${SERVICE_ENDPOINTS.USER_SERVICE}/market-analysis`;
-/** 归一化代码（去分隔符、大写）供本地匹配 */
-const normSymbol = (s: string): string => s.replace(/[^0-9A-Za-z]/g, '').toUpperCase();
 
 interface MarketBreadthData {
   trade_date: string;
@@ -40,20 +35,9 @@ export const MarketAnalysisPage: React.FC = () => {
   const [breadth, setBreadth] = useState<MarketBreadthData | null>(null);
   const [dataDate, setDataDate] = useState<string>('');
   const [heatmapData, setHeatmapData] = useState<any[]>([]);
-  const [sankeyData, setSankeyData] = useState<{ nodes: any[]; links: any[] } | null>(null);
   const [updateTime, setUpdateTime] = useState<string>('');
-  const [treemapData, setTreemapData] = useState<any[]>([]);
-
-  // 🎯 多周期资金流向专属状态
-  const [period, setPeriod] = useState<'1d' | '3d' | '5d' | '10d' | '20d'>('5d');
-  const [flowDimension, setFlowDimension] = useState<'sector' | 'stock'>('sector');
-  const [categoryMode, setCategoryMode] = useState<'shenwan' | 'concept'>('shenwan');
-  const [chartViewMode, setChartViewMode] = useState<'bar' | 'treemap'>('bar');
-  const [selectedFlowItem, setSelectedFlowItem] = useState<FlowItem | null>(null);
-  // 🎯 全局搜索 + 排序口径（Phase 3 迁移自官网 Dashboard）
-  const [allStocks, setAllStocks] = useState<StockMoneyFlowItem[]>([]);
-  const [focusStock, setFocusStock] = useState<StockMoneyFlowItem | null>(null);
-  const [sortMode, setSortMode] = useState<'absolute' | 'relative'>('absolute');
+  // 🎯 个股资金流聚焦（顶栏搜索 / 排行榜下钻 → 资金流全景内打开个股详情卡）
+  const [focusSymbol, setFocusSymbol] = useState<string | null>(null);
 
   // 🎯 快照历史日期（Phase 3 后端 /snapshot/dates）
   const [snapDate, setSnapDate] = useState<string | undefined>();
@@ -73,18 +57,6 @@ export const MarketAnalysisPage: React.FC = () => {
     const s = p.toString();
     return s ? `?${s}` : '';
   };
-
-  // 矩形树图数据：随分类模式切换拉取对应热力图
-  useEffect(() => {
-    if (activeTab !== 'flow-bar' || chartViewMode !== 'treemap') return;
-    const token = localStorage.getItem('access_token') || '';
-    const qs = buildQS(snapDate, realtime);
-    const suffix = qs ? qs.replace('?', '&') : '';
-    fetch(`${MARKET_ANALYSIS_API}/heatmap?category=${categoryMode}${suffix}`, { headers: { Authorization: `Bearer ${token}` } })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((d) => setTreemapData(d?.items && d.items.length > 0 ? d.items : []))
-      .catch(() => setTreemapData([]));
-  }, [activeTab, chartViewMode, categoryMode, snapDate, realtime]);
 
   // 加载可用快照日期 + 快照模式；切换日期重取
   useEffect(() => {
@@ -117,12 +89,11 @@ export const MarketAnalysisPage: React.FC = () => {
     const qsWithAmp = qs ? qs.replace('?', '&') : '';
 
     try {
-      const [resIdx, resStock, resBreadth, resHeatmap, resSankey] = await Promise.all([
+      const [resIdx, resStock, resBreadth, resHeatmap] = await Promise.all([
         fetch(`${MARKET_ANALYSIS_API}/indices/overview${qs}`, { headers }),
         fetch(`${MARKET_ANALYSIS_API}/money-flow/stocks?limit=20${qsWithAmp}`, { headers }),
         fetch(`${MARKET_ANALYSIS_API}/breadth${qs}`, { headers }),
         fetch(`${MARKET_ANALYSIS_API}/heatmap?category=shenwan${qsWithAmp}`, { headers }),
-        fetch(`${MARKET_ANALYSIS_API}/money-flow/sankey${qs}`, { headers }),
       ]);
 
       if (resIdx.ok) {
@@ -150,12 +121,6 @@ export const MarketAnalysisPage: React.FC = () => {
           setHeatmapData(hData.items);
         }
       }
-      if (resSankey.ok) {
-        const sData = await resSankey.json();
-        if (sData && sData.nodes && sData.nodes.length > 0) {
-          setSankeyData(sData);
-        }
-      }
 
       const now = new Date();
       setUpdateTime(now.toTimeString().split(' ')[0]);
@@ -166,57 +131,10 @@ export const MarketAnalysisPage: React.FC = () => {
     }
   };
 
-  // 🎯 全市场个股资金流（供全局搜索本地过滤，不触发服务端计算）
-  useEffect(() => {
-    let cancelled = false;
-    const token = localStorage.getItem('access_token') || '';
-    fetch(`${MARKET_ANALYSIS_API}/money-flow/stocks/full${realtime ? '?realtime=1' : ''}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((d) => { if (!cancelled && Array.isArray(d)) setAllStocks(d); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [realtime]);
-
-  // 个股资金流「筹码四分结构」柱状图
-  const renderFourBarChart = (s: StockMoneyFlowItem) => {
-    const items = [
-      { label: '超大单', key: 'super_large', color: '#e11d48', cls: 'text-rose-700' },
-      { label: '大单', key: 'large', color: '#ea580c', cls: 'text-orange-700' },
-      { label: '中单', key: 'medium', color: '#d97706', cls: 'text-amber-700' },
-      { label: '小单', key: 'small', color: '#059669', cls: 'text-emerald-700' },
-    ] as const;
-    const maxAbs = Math.max(1, ...items.map((i) => Math.abs((s as any)[i.key] ?? 0)));
-    return (
-      <div className="flex flex-col gap-2.5">
-        {items.map((i) => {
-          const v = ((s as any)[i.key] as number) ?? 0;
-          const yi = v / 1e8;
-          const pct = Math.max(4, (Math.abs(v) / maxAbs) * 100);
-          return (
-            <div key={i.key} className="flex items-center gap-3">
-              <span className={`w-14 text-xs font-bold ${i.cls} flex-shrink-0`}>{i.label}</span>
-              <div className="flex-1 h-6 bg-slate-100 rounded-full overflow-hidden">
-                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: i.color }} />
-              </div>
-              <span className={`w-24 text-right font-mono text-xs font-extrabold flex-shrink-0 ${yi >= 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
-                {yi >= 0 ? '+' : ''}{yi.toFixed(2)} 亿
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    );
-  };
-
-  // 点击个股 → 打开资金流详情(四分结构)并切到个股资金流 tab / 滚动到详情
+  // 点击个股 → 资金流全景 tab 打开个股详情卡（聚焦个股 + 板块归因可回跳板块视角）
   const openStockDetail = (item: StockMoneyFlowItem) => {
-    setFocusStock(item);
-    setActiveTab('stock-flow');
-    setTimeout(() => {
-      document.getElementById('focus-stock-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 60);
+    setFocusSymbol(item.symbol);
+    setActiveTab('flow-panorama');
   };
 
   /** 手动触发读取 QuantDB 数据，SSE 逐步流式推送，边分析边渲染 */
@@ -261,11 +179,6 @@ export const MarketAnalysisPage: React.FC = () => {
           case 'heatmap':
             if (Array.isArray(data?.heatmap) && data.heatmap.length > 0) {
               setHeatmapData(data.heatmap);
-            }
-            break;
-          case 'sankey':
-            if (data?.sankey && data.sankey.nodes && data.sankey.nodes.length > 0) {
-              setSankeyData(data.sankey);
             }
             break;
           case 'stock_flow':
@@ -323,17 +236,8 @@ export const MarketAnalysisPage: React.FC = () => {
 
   const navTabs = [
     { id: 'panorama', label: '大盘全景看板', icon: Activity },
-    { id: 'flow-bar', label: '多周期资金流向', icon: BarChart3 },
-    { id: 'money-flow', label: '板块资金链', icon: Network },
-    { id: 'stock-flow', label: '个股资金流向', icon: TrendingUp },
+    { id: 'flow-panorama', label: '资金流全景', icon: Network },
     { id: 'factor-board', label: '因子概率板', icon: Sparkles },
-    { id: 'tag-lookup', label: '标签双向查询', icon: TagIcon },
-  ];
-
-  const periodOptions: Array<{ id: '1d' | '5d' | '20d'; label: string }> = [
-    { id: '1d', label: '1日' },
-    { id: '5d', label: '5日' },
-    { id: '20d', label: '20日' },
   ];
 
   return (
@@ -357,19 +261,16 @@ export const MarketAnalysisPage: React.FC = () => {
             </div>
           </div>
 
-          {/* 全局搜索（行业或股票）：顶栏空白处居中；选中个股 → 弹出个股终端浮窗联动 */}
+          {/* 全局搜索（行业或股票）：顶栏空白处居中；选中个股 → 资金流全景内打开个股详情卡 */}
           <div className="flex-1 min-w-0 flex justify-center px-4">
             <StockTerminalSearchBox
               market="CN"
               widthClass="w-full max-w-[520px]"
               hint="温馨提示：请先下载完整行情数据包并保持每日更新，否则可能搜不到标的、K线或推理分为空。"
               onPick={(symbol) => {
-                // 与资金流聚焦联动：命中本地资金流榜时同步聚焦，关闭浮窗后仍在聚焦位
-                const local = allStocks.find((s) => normSymbol(s.symbol) === normSymbol(symbol));
-                if (local) {
-                  setFocusStock(local);
-                  setActiveTab('stock-flow');
-                }
+                // 聚焦个股 → 资金流全景内打开详情卡（含板块归因，可回跳板块视角）
+                setFocusSymbol(symbol);
+                setActiveTab('flow-panorama');
               }}
             />
           </div>
@@ -457,355 +358,58 @@ export const MarketAnalysisPage: React.FC = () => {
         </div>
 
         {/* 📈 主内容区：全景看板禁用外部滚动条，保证 100% 紧凑铺满 */}
-        <div className={`flex-1 min-h-0 ${activeTab === 'panorama' || activeTab === 'tag-lookup' ? 'overflow-hidden p-4' : 'overflow-y-auto p-6 pb-20'} flex flex-col gap-3.5 bg-[#f8fafc] custom-scrollbar`}>
-          {/* 📊 资金流向全景主功能页 (含 1日/3日/5日/10日/20日 横向柱状图) */}
-      {activeTab === 'flow-bar' && (
-        <div className="flex flex-col gap-4">
-          {/* 🛠️ 控制中心工具栏 Toolbar */}
-          <div className="bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-xs flex flex-wrap items-center justify-between gap-4">
-            {/* 1. 周期选择器 (1日, 3日, 5日, 10日, 20日) */}
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-extrabold text-slate-700 flex items-center gap-1">
-                <Clock className="w-3.5 h-3.5 text-purple-600" />
-                <span>统计周期:</span>
-              </span>
-              <div className="flex items-center bg-slate-100/90 border border-slate-200/60 p-1 rounded-full gap-1 shadow-2xs">
-                {periodOptions.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => setPeriod(p.id)}
-                    className={`px-3.5 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                      period === p.id
-                        ? 'bg-purple-600 text-white shadow-md shadow-purple-600/20 scale-[1.02]'
-                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
-                    }`}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* 2. 维度与分类选择 */}
-            <div className="flex items-center gap-3">
-              <div className="flex items-center bg-purple-50/90 border border-purple-200/70 rounded-full p-1 gap-1 shadow-2xs">
-                <button
-                  onClick={() => setFlowDimension('sector')}
-                  className={`px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                    flowDimension === 'sector'
-                      ? 'bg-purple-600 text-white shadow-md shadow-purple-600/20 scale-[1.02]'
-                      : 'text-purple-700 hover:text-purple-900 hover:bg-purple-100/60'
-                  }`}
-                >
-                  板块/行业流向
-                </button>
-                <button
-                  onClick={() => setFlowDimension('stock')}
-                  className={`px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                    flowDimension === 'stock'
-                      ? 'bg-purple-600 text-white shadow-md shadow-purple-600/20 scale-[1.02]'
-                      : 'text-purple-700 hover:text-purple-900 hover:bg-purple-100/60'
-                  }`}
-                >
-                  个股流向
-                </button>
-              </div>
-
-              {flowDimension === 'sector' && (
-                <div className="flex items-center bg-slate-100/90 border border-slate-200/60 rounded-full p-1 gap-1 shadow-2xs">
-                  <button
-                    onClick={() => setCategoryMode('shenwan')}
-                    className={`px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                      categoryMode === 'shenwan'
-                        ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80 font-black'
-                        : 'text-slate-500 hover:text-slate-800'
-                    }`}
-                  >
-                    通达信二级(80)
-                  </button>
-                  <button
-                    onClick={() => setCategoryMode('concept')}
-                    className={`px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                      categoryMode === 'concept'
-                        ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80 font-black'
-                        : 'text-slate-500 hover:text-slate-800'
-                    }`}
-                  >
-                    热门概念(50)
-                  </button>
-                </div>
-              )}
-
-              {/* 3. 视图模式 (柱状图 vs TreeMap 树图) */}
-              <div className="flex items-center bg-slate-100/90 border border-slate-200/60 rounded-full p-1 gap-1 shadow-2xs">
-                <button
-                  onClick={() => setChartViewMode('bar')}
-                  className={`flex items-center gap-1.5 px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                    chartViewMode === 'bar'
-                      ? 'bg-purple-600 text-white shadow-md shadow-purple-600/20 scale-[1.02]'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <BarChart3 className="w-3.5 h-3.5" />
-                  <span>横向柱图</span>
-                </button>
-                <button
-                  onClick={() => setChartViewMode('treemap')}
-                  className={`flex items-center gap-1.5 px-4 py-1 rounded-full text-xs font-extrabold transition-all duration-200 ${
-                    chartViewMode === 'treemap'
-                      ? 'bg-purple-600 text-white shadow-md shadow-purple-600/20 scale-[1.02]'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                  <span>矩形树图</span>
-                </button>
-              </div>
-
-              {/* 4. 排序口径 (绝对净值 vs 相对涨跌) */}
-              <div className="flex items-center bg-amber-50/90 border border-amber-200/70 rounded-full p-1 gap-1 shadow-2xs">
-                <button
-                  onClick={() => setSortMode('absolute')}
-                  className={`px-3 py-1 rounded-full text-xs font-extrabold transition-all ${sortMode === 'absolute' ? 'bg-amber-600 text-white shadow' : 'text-amber-700'}`}
-                >
-                  绝对(亿)
-                </button>
-                <button
-                  onClick={() => setSortMode('relative')}
-                  className={`px-3 py-1 rounded-full text-xs font-extrabold transition-all ${sortMode === 'relative' ? 'bg-amber-600 text-white shadow' : 'text-amber-700'}`}
-                >
-                  相对(%)
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* 📈 主图表展现区 */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-            <div
-              className={`${
-                selectedFlowItem ? 'lg:col-span-8' : 'lg:col-span-12'
-              } bg-white/95 backdrop-blur-md rounded-3xl p-5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col gap-3 transition-all duration-300`}
-            >
-              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                <div className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-purple-600 animate-pulse" />
-                  <h3 className="text-sm font-extrabold text-slate-900">
-                    {period.toUpperCase()} 资金净流入/净流出{flowDimension === 'sector' ? '板块' : '个股'}排行榜
-                  </h3>
-                </div>
-                <span className="text-xs text-slate-400 font-mono">
-                  右侧红色: 资金净流入  |  左侧绿色: 资金净流出
-                </span>
-              </div>
-
-              {chartViewMode === 'bar' ? (
-                <CapitalFlowHorizontalBarChart
-                  period={period}
-                  dimension={flowDimension}
-                  categoryMode={categoryMode}
-                  height={940}
-                  onItemClick={(item) => setSelectedFlowItem(item)}
-                  sortMode={sortMode}
-                  realtime={realtime}
+        <div className={`flex-1 min-h-0 ${activeTab === 'panorama' ? 'overflow-hidden p-4' : 'overflow-y-auto p-6 pb-20'} flex flex-col gap-3.5 bg-[#f8fafc] custom-scrollbar`}>
+          {activeTab === 'panorama' && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch flex-1 min-h-0 overflow-hidden">
+              <div className="lg:col-span-5 flex flex-col justify-between gap-3 min-h-0">
+                <MarketBreadthCard
+                  advanceCount={breadth?.advance_count}
+                  declineCount={breadth?.decline_count}
+                  flatCount={breadth?.flat_count}
+                  limitUpCount={breadth?.limit_up_count}
+                  limitDownCount={breadth?.limit_down_count}
+                  totalTurnoverYi={breadth?.total_turnover_yi}
+                  profitEffect={breadth?.profit_effect}
+                  limitUpBrokenRatio={breadth?.limit_up_broken_ratio}
                 />
-              ) : (
-                <ShenwanHeatmapChart data={treemapData} height={780} />
-              )}
-            </div>
-
-            {/* 🎯 点击下钻卡片 Panel */}
-            {selectedFlowItem && (
-              <div className="lg:col-span-4 bg-white/95 backdrop-blur-md rounded-3xl p-5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col gap-4 animate-in fade-in slide-in-from-right-4 duration-300">
-                <div className="flex items-center justify-between border-b border-purple-100 pb-3">
-                  <div>
-                    <h4 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
-                      <span>{selectedFlowItem.name}</span>
-                      {selectedFlowItem.symbol && (
-                        <span className="text-xs font-mono text-purple-600 bg-purple-50 px-2 py-0.5 rounded-md border border-purple-200">
-                          {selectedFlowItem.symbol}
-                        </span>
-                      )}
-                    </h4>
-                    <p className="text-[11px] text-slate-400 mt-0.5">下钻资金流与主力动向拆解</p>
+                <div className="flex flex-col gap-2 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 min-h-0 flex-1 justify-between">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
+                      <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
+                      <span>主力资金净流入 Top 5 股票</span>
+                    </h3>
+                    <span
+                      onClick={() => setActiveTab('flow-panorama')}
+                      className="text-[11px] text-purple-600 font-extrabold hover:underline cursor-pointer flex items-center"
+                    >
+                      资金流全景 ➔
+                    </span>
                   </div>
-                  <button
-                    onClick={() => setSelectedFlowItem(null)}
-                    className="text-slate-400 hover:text-slate-700 text-xs font-bold px-2 py-1 bg-slate-100 rounded-lg"
-                  >
-                    关闭 ✕
-                  </button>
-                </div>
-
-                <div className="flex flex-col gap-3">
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="bg-purple-50/60 rounded-2xl p-3 border border-purple-100">
-                      <span className="text-[11px] text-slate-500">区间累计净流入</span>
-                      <div className={`text-base font-extrabold font-mono mt-1 ${selectedFlowItem.net_inflow >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                        {selectedFlowItem.net_inflow >= 0 ? '+' : ''}
-                        {(selectedFlowItem.net_inflow / 100000000).toFixed(2)} 亿元
-                      </div>
-                    </div>
-
-                    <div className="bg-purple-50/60 rounded-2xl p-3 border border-purple-100">
-                      <span className="text-[11px] text-slate-500">主力净占比</span>
-                      <div className="text-base font-extrabold font-mono text-purple-700 mt-1">
-                        {selectedFlowItem.main_ratio}%
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-2 pt-2 border-t border-slate-100">
-                    <span className="text-xs font-bold text-slate-700">筹码四分结构 (元):</span>
-                    <div className="space-y-1.5 text-xs font-mono">
-                      <div className="flex justify-between items-center bg-rose-50/80 px-3 py-1.5 rounded-xl border border-rose-100">
-                        <span className="text-rose-700 font-bold">🔴 超大单 (主力)</span>
-                        <span className="font-extrabold text-rose-800">
-                          {(selectedFlowItem.super_large / 100000000).toFixed(2)} 亿
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center bg-orange-50/80 px-3 py-1.5 rounded-xl border border-orange-100">
-                        <span className="text-orange-700 font-bold">🟠 大单 (游资)</span>
-                        <span className="font-extrabold text-orange-800">
-                          {(selectedFlowItem.large / 100000000).toFixed(2)} 亿
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center bg-amber-50/80 px-3 py-1.5 rounded-xl border border-amber-100">
-                        <span className="text-amber-700 font-bold">🟡 中单</span>
-                        <span className="font-extrabold text-amber-800">
-                          {(selectedFlowItem.medium / 100000000).toFixed(2)} 亿
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center bg-emerald-50/80 px-3 py-1.5 rounded-xl border border-emerald-100">
-                        <span className="text-emerald-700 font-bold">🟢 小单 (散户)</span>
-                        <span className="font-extrabold text-emerald-800">
-                          {(selectedFlowItem.small / 100000000).toFixed(2)} 亿
-                        </span>
-                      </div>
-                    </div>
-                  </div>
+                  <StockMoneyFlowTable items={stockFlows.slice(0, 5)} isMini={true} onStockClick={openStockDetail} />
                 </div>
               </div>
-            )}
-          </div>
-        </div>
-      )}
 
-      {/* ── 原有其他页面内容维持完备 ── */}
-      {activeTab === 'panorama' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch flex-1 min-h-0 overflow-hidden">
-          <div className="lg:col-span-5 flex flex-col justify-between gap-3 min-h-0">
-            <MarketBreadthCard
-              advanceCount={breadth?.advance_count}
-              declineCount={breadth?.decline_count}
-              flatCount={breadth?.flat_count}
-              limitUpCount={breadth?.limit_up_count}
-              limitDownCount={breadth?.limit_down_count}
-              totalTurnoverYi={breadth?.total_turnover_yi}
-              profitEffect={breadth?.profit_effect}
-              limitUpBrokenRatio={breadth?.limit_up_broken_ratio}
-            />
-            <div className="flex flex-col gap-2 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 min-h-0 flex-1 justify-between">
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                  <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
-                  <span>主力资金净流入 Top 5 股票</span>
-                </h3>
-                <span
-                  onClick={() => setActiveTab('stock-flow')}
-                  className="text-[11px] text-purple-600 font-extrabold hover:underline cursor-pointer flex items-center"
-                >
-                  完整排行榜 ➔
-                </span>
-              </div>
-              <StockMoneyFlowTable items={stockFlows.slice(0, 5)} isMini={true} onStockClick={openStockDetail} />
-            </div>
-          </div>
-
-          <div className="lg:col-span-7 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col min-h-0 justify-between">
-            <div className="flex items-center justify-between border-b border-purple-100/60 pb-2 mb-1 shrink-0">
-              <h3 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-purple-600" />
-                <span>通达信二级分类热力矩形图谱</span>
-              </h3>
-              <span className="text-[10px] text-slate-400 font-mono">市值权重 vs 涨跌幅</span>
-            </div>
-            <div className="flex-1 min-h-0">
-              <ShenwanHeatmapChart data={heatmapData} height="100%" />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeTab === 'money-flow' && (
-        <div className="bg-white/90 backdrop-blur-md rounded-2xl p-5 border border-slate-200/80 shadow-sm flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-              <Network className="w-3.5 h-3.5 text-purple-600" />
-              <span>主力与散户资金流动全景桑基图 (Sankey Diagram)</span>
-            </h3>
-            <span className="text-xs text-slate-400">资金实时划转链条</span>
-          </div>
-          <CapitalFlowSankeyChart
-            nodes={sankeyData?.nodes}
-            links={sankeyData?.links}
-            height={480}
-          />
-        </div>
-      )}
-
-      {activeTab === 'stock-flow' && (
-        <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
-          {focusStock && (
-            <div id="focus-stock-detail" className="flex-shrink-0 bg-white/95 backdrop-blur-md rounded-3xl p-5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col gap-4 scroll-mt-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                  <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
-                  <span>个股资金流详情</span>
-                  <span className="font-mono text-purple-600 bg-purple-50 px-2 py-0.5 rounded-md border border-purple-200">
-                    {focusStock.name} ({focusStock.symbol})
-                  </span>
-                </h3>
-                <span className="text-xs text-slate-400 font-mono">{breadth?.trade_date || dataDate}</span>
-              </div>
-              <div className="grid grid-cols-3 gap-4">
-                <div className="bg-purple-50/60 rounded-2xl p-4 border border-purple-100 flex flex-col items-center justify-center text-center">
-                  <span className="text-[11px] text-slate-500">当日净流入</span>
-                  <div className={`text-base font-extrabold font-mono mt-1 ${(focusStock.net_inflow ?? 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                    {(focusStock.net_inflow ?? 0) >= 0 ? '+' : ''}{((focusStock.net_inflow ?? 0) / 1e8).toFixed(2)} 亿元
-                  </div>
+              <div className="lg:col-span-7 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col min-h-0 justify-between">
+                <div className="flex items-center justify-between border-b border-purple-100/60 pb-2 mb-1 shrink-0">
+                  <h3 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-purple-600" />
+                    <span>通达信二级分类热力矩形图谱</span>
+                  </h3>
+                  <span className="text-[10px] text-slate-400 font-mono">市值权重 vs 涨跌幅</span>
                 </div>
-                <div className="bg-purple-50/60 rounded-2xl p-4 border border-purple-100 flex flex-col items-center justify-center text-center">
-                  <span className="text-[11px] text-slate-500">主力净占比</span>
-                  <div className="text-base font-extrabold font-mono text-purple-700 mt-1">{focusStock.main_ratio ?? 0}%</div>
-                </div>
-                <div className="bg-purple-50/60 rounded-2xl p-4 border border-purple-100 flex flex-col items-center justify-center text-center">
-                  <span className="text-[11px] text-slate-500">涨跌幅 / 最新价</span>
-                  <div className={`text-base font-extrabold font-mono mt-1 ${(focusStock.pct_change ?? 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                    {(focusStock.pct_change ?? 0) >= 0 ? '+' : ''}{focusStock.pct_change?.toFixed(2)}% / {focusStock.close_price ?? '—'}
-                  </div>
+                <div className="flex-1 min-h-0">
+                  <ShenwanHeatmapChart data={heatmapData} height="100%" />
                 </div>
               </div>
-              <div>{renderFourBarChart(focusStock)}</div>
             </div>
           )}
-          <div className="flex items-center justify-between flex-shrink-0">
-            <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-              <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
-              <span>个股主力资金净流入排行榜</span>
-            </h3>
-            <span className="text-xs text-slate-400">包含超大单、大单、中单、小单拆解</span>
-          </div>
-          <div className="flex-1 min-h-0 overflow-y-auto pb-2">
-            <StockMoneyFlowTable items={stockFlows} loading={loading} latestDate={breadth?.trade_date} onStockClick={openStockDetail} />
-          </div>
-        </div>
-      )}
 
-          {activeTab === 'tag-lookup' && (
-            <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-              <TagLookupPanel />
-            </div>
+          {activeTab === 'flow-panorama' && (
+            <FlowPanoramaPanel
+              date={snapDate}
+              focusSymbol={focusSymbol}
+              onClearFocus={() => setFocusSymbol(null)}
+            />
           )}
 
           {activeTab === 'factor-board' && <FactorBoardPanel />}
@@ -814,5 +418,3 @@ export const MarketAnalysisPage: React.FC = () => {
     </div>
   );
 };
-
-

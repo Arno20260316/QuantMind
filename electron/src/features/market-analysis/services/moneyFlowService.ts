@@ -1,0 +1,327 @@
+/** A 股市场分析 · 资金流全景 v2 取数层（/api/v1/market-analysis/money-flow/*）
+ *
+ * 契约（细案 v2 §4/§5/§8）：
+ * - panorama：4 层桑基（entity/size/sector/stock）+ 板块 master 榜；金额单位「元」；
+ * - sector：板块明细（20 日趋势 + 成分随窗口净额/贡献占比/板块内 rank）；
+ * - stock：个股 20 日五档序列（亿元 4 位小数）+ 1/5/20 日窗口（元）+ 板块归因。
+ * 展示纪律：展示面只说位置与流量（净流入/净流出、靠前/靠后），个股层不出现预测
+ * 徽章（实测否决，见 disclosures）；streak/证据一律来自离线产物，缺失为 null，
+ * 绝不回落成 0。
+ */
+
+import { SERVICE_ENDPOINTS } from '../../../config/services';
+
+const MA_API = `${SERVICE_ENDPOINTS.USER_SERVICE}/market-analysis`;
+
+export type FlowPeriod = '1d' | '3d' | '5d' | '10d' | '20d';
+export type FlowSectorSet = 'industry1' | 'industry2' | 'concept';
+export type FlowDirection = 'all' | 'inflow' | 'outflow';
+
+/** 条件统计（fwd=探针口径 t→t+3；exec=可执行口径 T+1 收盘建仓；样本不足时 null）。 */
+export interface FlowEvidenceStats {
+  n: number;
+  excess_bp: number | null;
+  excess_daily_bp: number | null;
+  hit: number | null;
+  base_hit: number | null;
+  yearly?: Record<string, { n: number; excess_bp: number | null }>;
+}
+
+/** P 级证据徽章（仅板块层；由后端 pick_badge 统一出口）。 */
+export interface FlowEvidenceBadge {
+  level: number;
+  horizon: number;
+  label: string;
+  fwd: FlowEvidenceStats;
+  exec: FlowEvidenceStats | null;
+  window: string[] | null;
+  min_n: number;
+}
+
+export interface FlowPanoramaNode {
+  name: string;
+  kind: 'entity' | 'size' | 'sector' | 'stock';
+  key: string;
+  layer: number;
+  net: number;
+  net_total?: number;
+  sign: number;
+  // sector 节点
+  streak?: number | null;
+  evidence?: FlowEvidenceBadge | null;
+  members?: number;
+  pct_change?: number | null;
+  net_ratio?: number | null;
+  // stock 节点
+  sector?: string;
+  inner_rank?: number;
+  inner_total?: number;
+  close?: number | null;
+}
+
+export interface FlowPanoramaLink {
+  source: string;
+  target: string;
+  value: number;
+  net: number;
+  sign: number;
+}
+
+export interface FlowSectorRow {
+  name: string;
+  net_main: number;
+  net_total: number;
+  net_ratio: number | null;
+  breadth: number | null;
+  pct_change: number | null;
+  members: number;
+  buy: number;
+  sell: number;
+  sign: number;
+  streak: number | null;
+  evidence: FlowEvidenceBadge | null;
+}
+
+/** 证据产物状态（meta.evidence）：缺失/陈旧一律为 null streak + 原因披露。 */
+export interface FlowEvidenceMeta {
+  applicable: boolean;
+  available: boolean;
+  trade_date: string | null;
+  window: string[] | null;
+  reason: 'ok' | 'not_applicable' | 'not_built' | 'stale' | null;
+  built_at?: string | null;
+}
+
+export interface FlowPanoramaMeta {
+  unit: string;
+  sector_set: FlowSectorSet;
+  sector_set_label: string;
+  sector_type: string;
+  period: FlowPeriod;
+  window_days: [string, string];
+  direction: FlowDirection;
+  coverage: { flow_symbols: number; covered_symbols: number; covered_pct: number | null };
+  evidence: FlowEvidenceMeta;
+  disclosure: string[];
+  generated_at: string;
+}
+
+export interface FlowPanoramaResponse {
+  available: boolean;
+  trade_date: string | null;
+  trade_date_raw: string | null;
+  period: FlowPeriod;
+  sector_set: FlowSectorSet;
+  direction: FlowDirection;
+  stocks_per_sector: number;
+  top_sectors: number;
+  nodes: FlowPanoramaNode[];
+  links: FlowPanoramaLink[];
+  sectors: FlowSectorRow[];
+  meta: FlowPanoramaMeta & { reason?: string };
+}
+
+export interface FlowSectorMember {
+  symbol: string;
+  name: string;
+  net_main: number;
+  net_total: number;
+  super: number;
+  large: number;
+  medium: number;
+  small: number;
+  share: number | null;
+  inner_rank: number;
+  inner_total: number;
+}
+
+export interface FlowSectorDetailResponse {
+  available: boolean;
+  name: string;
+  sector_set: FlowSectorSet;
+  sector_set_label: string;
+  period: FlowPeriod;
+  trade_date: string;
+  trade_date_raw: string;
+  summary: {
+    net_main: number;
+    net_total: number;
+    net_ratio: number | null;
+    super: number;
+    large: number;
+    medium: number;
+    small: number;
+    buy: number;
+    sell: number;
+    breadth: number | null;
+    pct_change: number | null;
+    members: number;
+    data_symbols: number;
+    streak: number | null;
+    evidence: FlowEvidenceBadge | null;
+  };
+  trend: { date: string; net_main: number; net_ratio: number | null }[];
+  members: FlowSectorMember[];
+  meta: { unit: string; window_days: [string, string]; evidence: FlowEvidenceMeta; disclosure: string[] };
+}
+
+export interface FlowStockSeriesPoint {
+  date: string;
+  super: number | null;
+  large: number | null;
+  medium: number | null;
+  small: number | null;
+  main: number | null;
+  retail: number | null;
+  net_ratio: number | null;
+  close: number | null;
+  pct_change: number | null;
+}
+
+export interface FlowStockAttribution {
+  name: string;
+  type: string;
+  sector_set: FlowSectorSet | null;
+  net_main: number;
+  share: number | null;
+  inner_rank: number;
+  inner_total: number;
+  streak: number | null;
+  evidence: FlowEvidenceBadge | null;
+  stock_net_main: number;
+}
+
+export interface FlowStockDetailResponse {
+  available: boolean;
+  symbol: string;
+  suffix: string;
+  name: string;
+  trade_date: string;
+  trade_date_raw: string;
+  close: number | null;
+  pct_change: number | null;
+  series: FlowStockSeriesPoint[];
+  windows: Record<
+    '1d' | '5d' | '20d',
+    { net_main: number; net_total: number; net_ratio: number | null; days: number } | null
+  >;
+  attribution: FlowStockAttribution[];
+  /** P3：因子概率板共振态（composite/model_rank/quadrant）；P1 恒 null。 */
+  factor: unknown | null;
+  meta: { unit: string; series_unit: string; window_days: [string, string]; disclosure: string[] };
+}
+
+export class MoneyFlowError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'MoneyFlowError';
+    this.status = status;
+  }
+}
+
+async function flowGet<T>(path: string): Promise<T> {
+  const token = localStorage.getItem('access_token') || '';
+  const res = await fetch(`${MA_API}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    const msg = typeof detail === 'string' ? detail : `资金流接口失败 ${res.status}`;
+    throw new MoneyFlowError(msg, res.status);
+  }
+  if (body === null || typeof body !== 'object') {
+    throw new MoneyFlowError('资金流接口结构异常（非对象）', res.status);
+  }
+  return body as T;
+}
+
+export interface FlowPanoramaParams {
+  period?: FlowPeriod;
+  sectorSet?: FlowSectorSet;
+  topSectors?: number;
+  stocksPerSector?: number;
+  direction?: FlowDirection;
+  date?: string;
+}
+
+export async function getFlowPanorama(params: FlowPanoramaParams = {}): Promise<FlowPanoramaResponse> {
+  const qs = new URLSearchParams();
+  qs.set('period', params.period || '1d');
+  qs.set('sectors', params.sectorSet || 'industry2');
+  if (params.topSectors) qs.set('top_sectors', String(params.topSectors));
+  if (params.stocksPerSector) qs.set('stocks_per_sector', String(params.stocksPerSector));
+  qs.set('direction', params.direction || 'all');
+  if (params.date) qs.set('date', params.date);
+  return flowGet<FlowPanoramaResponse>(`/money-flow/panorama?${qs.toString()}`);
+}
+
+export async function getFlowSector(
+  name: string,
+  params: { sectorSet?: FlowSectorSet; period?: FlowPeriod; top?: number; date?: string } = {},
+): Promise<FlowSectorDetailResponse> {
+  const qs = new URLSearchParams({ name });
+  qs.set('sectors', params.sectorSet || 'industry2');
+  qs.set('period', params.period || '1d');
+  if (params.top) qs.set('top', String(params.top));
+  if (params.date) qs.set('date', params.date);
+  return flowGet<FlowSectorDetailResponse>(`/money-flow/sector?${qs.toString()}`);
+}
+
+export async function getFlowStock(
+  symbol: string,
+  params: { days?: number; date?: string } = {},
+): Promise<FlowStockDetailResponse> {
+  const qs = new URLSearchParams({ symbol });
+  if (params.days) qs.set('days', String(params.days));
+  if (params.date) qs.set('date', params.date);
+  return flowGet<FlowStockDetailResponse>(`/money-flow/stock?${qs.toString()}`);
+}
+
+// ── 展示格式化（元/亿元口径统一出口；缺失一律 —，绝不显 0） ─────────────
+
+export const YI = 1e8;
+
+/** 元 → 亿元带符号文本（如 +12.34 亿 / -3.05 亿）。 */
+export function fmtYi(yuan: number | null | undefined, digits = 2): string {
+  if (yuan === null || yuan === undefined || Number.isNaN(yuan)) return '—';
+  const v = yuan / YI;
+  return `${v >= 0 ? '+' : ''}${v.toFixed(digits)} 亿`;
+}
+
+export function fmtPct(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}%`;
+}
+
+/** 净额比（主力净额/成交额，已为小数比例）→ 百分比文本。 */
+export function fmtRatio(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  return `${(v * 100).toFixed(digits)}%`;
+}
+
+/** A 股口径涨红跌绿（与全站一致；金额正负同此）。 */
+export function flowTextClass(v: number | null | undefined): string {
+  if (v === null || v === undefined || v === 0) return 'text-slate-500';
+  return v > 0 ? 'text-rose-600' : 'text-emerald-600';
+}
+
+/** 全景空态原因 → 用户文案（后端 meta.reason）。 */
+export function panoramaEmptyHint(reason: string | undefined): string {
+  switch (reason) {
+    case 'quantdb_unavailable':
+      return '本地 QuantDB 数据不可用，请先在「数据管理」完成行情同步';
+    case 'date_not_found':
+      return '所选快照日期没有资金流分区数据，请换一个日期';
+    case 'no_l2_data':
+      return '尚无 L2 资金流分区数据（6_ml_datasets/l2_factors），请先执行数据同步';
+    case 'no_flow_data':
+      return '窗口内没有可聚合的资金流数据';
+    case 'sector_set_empty':
+      return '该板块体系暂无成分数据';
+    default:
+      return '资金流全景数据不可用';
+  }
+}

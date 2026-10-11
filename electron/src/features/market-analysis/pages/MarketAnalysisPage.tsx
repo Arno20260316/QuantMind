@@ -10,6 +10,7 @@ import { MarketBreadthCard } from '../components/MarketBreadthCard';
 import { TagLookupPanel } from '../components/TagLookupPanel';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
 import { CapitalFlowHorizontalBarChart, FlowItem } from '../components/CapitalFlowHorizontalBarChart';
+import { FactorBoardPanel } from '../components/FactorBoardPanel';
 import { Tag as TagIcon } from 'lucide-react';
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import { PAGE_LAYOUT } from '../../../config/pageLayout';
@@ -325,6 +326,7 @@ export const MarketAnalysisPage: React.FC = () => {
     { id: 'flow-bar', label: '多周期资金流向', icon: BarChart3 },
     { id: 'money-flow', label: '板块资金链', icon: Network },
     { id: 'stock-flow', label: '个股资金流向', icon: TrendingUp },
+    { id: 'factor-board', label: '因子概率板', icon: Sparkles },
     { id: 'tag-lookup', label: '标签双向查询', icon: TagIcon },
   ];
 
@@ -805,6 +807,8 @@ export const MarketAnalysisPage: React.FC = () => {
               <TagLookupPanel />
             </div>
           )}
+
+          {activeTab === 'factor-board' && <FactorBoardPanel />}
         </div>
       </div>
     </div>

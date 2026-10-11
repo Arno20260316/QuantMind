@@ -19,6 +19,8 @@ from fastapi.responses import StreamingResponse
 
 from backend.services.api.user_app.middleware.auth import get_current_user
 from backend.shared.database_manager_v2 import get_session
+from backend.shared.factor_board import board_io as _fb_board_io
+from backend.shared.factor_board import config as _fb_config
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +298,51 @@ async def get_snapshot_dates(
     """列出所有可用快照日期（YYYY-MM-DD 降序），供前端日期选择器枚举。"""
     _ = current_user
     return {"dates": _snap.available_dates(), "latest": _snap.trade_date()}
+
+
+# ---- 因子概率板（市场分析 · 细案 §六，P1 只读面） ----
+
+@router.get("/factor-board")
+async def get_factor_board(
+    date: str | None = Query(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="决策日 YYYY-MM-DD（产物文件名口径），默认最新",
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """因子概率板产物：读 JSON 原样返回，另附 `available_dates`（供日期切换）。
+
+    语义（细案 §6.3）：无产物或指定决策日无文件 → 404（detail 含
+    available_dates）；文件存在但损坏、非对象、或内容 meta.decision_date
+    与请求日不符 → 409。目录与产板同源（resolve_board_dir：env >
+    容器 /data > 仓库 data，无需另行注入）。
+    """
+    _ = current_user
+    out_dir = _fb_config.resolve_board_dir()
+    dates = _fb_board_io.available_dates(out_dir)
+    board = _fb_board_io.load_board(out_dir, date)
+    if board is None:
+        target = out_dir / f"{date}.json" if date else out_dir / "latest.json"
+        if target.exists():
+            raise HTTPException(status_code=409, detail=f"因子概率板产物损坏（{target.name}），请检查生成任务")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "因子概率板尚未生成" if not date else f"决策日 {date} 无产物",
+                "available_dates": dates,
+            },
+        )
+    if not isinstance(board, dict):
+        raise HTTPException(status_code=409, detail="因子概率板产物格式异常（顶层非对象）")
+    meta = board.get("meta") if isinstance(board.get("meta"), dict) else {}
+    decision = str((meta or {}).get("decision_date") or "")
+    if date and decision != date:
+        raise HTTPException(
+            status_code=409,
+            detail=f"产物内容 decision_date={decision or '缺失'} 与请求 {date} 不符",
+        )
+    return {**board, "available_dates": dates}
 
 
 @router.get("/indices/overview")

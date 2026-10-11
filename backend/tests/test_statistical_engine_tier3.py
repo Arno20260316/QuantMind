@@ -43,6 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.services.engine.alpha_agent.statistical import candidates as cand  # noqa: E402
+from backend.services.engine.alpha_agent.statistical import complexity as cplx  # noqa: E402
 from backend.services.engine.alpha_agent.statistical import costs as sc  # noqa: E402
 from backend.services.engine.alpha_agent.statistical import engine as eng  # noqa: E402
 from backend.services.engine.alpha_agent.statistical import serialize as ser  # noqa: E402
@@ -248,9 +249,17 @@ class TestFoldConsistencyGate:
         # 审计量照记：early 命中 0/3、late 命中 3/3——旧闸按率判决恰好反向
         assert early.reselect_hits == 0 and early.reselect_checkpoints == 3
         assert late.reselect_rate == pytest.approx(1.0)
-        # 选择分 = |RankIC| × 折间一致性：即便将来两闸都过，排序也不单向看幅度
-        assert late.selection_score == pytest.approx(abs(late.rank_ic_mean) * 0.25)
-        assert early.selection_score == pytest.approx(abs(early.rank_ic_mean))
+        # 选择分 = |RankIC| × 折间一致性 × 简单性因子（T-FE-05）：即便将来
+        # 两闸都过，排序也不单向看幅度；同分同稳定下，结构越简越靠前
+        assert late.selection_score == pytest.approx(
+            abs(late.rank_ic_mean)
+            * 0.25
+            * cplx.simplicity_factor(late.op_count, late.literal_count)
+        )
+        assert early.selection_score == pytest.approx(
+            abs(early.rank_ic_mean)
+            * cplx.simplicity_factor(early.op_count, early.literal_count)
+        )
 
         # 单闸隔离（稳定性关、FDR 关）：只剩「整窗 |RankIC| 排序」——late
         # 当选，证明它输掉 gated 局不是别的原因。
@@ -601,3 +610,69 @@ class TestTradeEvidenceNumericPins:
         assert info["factor_autocorr_days"] == 1
         assert np.isnan(info["factor_autocorr"]), "证据不足不许出 ±1 的假精度"
         assert info["rebalance_days"] is None
+
+
+class TestComplexityPenalty:
+    """T-FE-05：复杂度进选择分——同 IC/稳定下，表达式越简越靠前。
+
+    口径 = ``complexity.py``（范围受限字符串计数：FM-DSL 解析不了统计派
+    的中缀算术）；简单性因子 = 1/(1 + op×log1p(lit)) 只乘不拒（排序偏好，
+    不是闸）；同分再比结构（``_rank_eligible`` 排序键尾两项）。
+    """
+
+    def test_selection_score_multiplies_simplicity(self):
+        best = eng.HorizonStats(
+            horizon=1,
+            n_days=60,
+            ic_mean=0.03,
+            rank_ic_mean=-0.04,
+            icir=-0.8,
+            rank_ic_t=-2.5,
+            rank_ic_p=0.015,
+            rank_ic_win_rate=0.42,
+        )
+        assert eng._selection_score(best, None, 0.5) == pytest.approx(0.02)
+        # 不给简单性（旧调用口径）→ 权重 1，行为与 T-FE-05 前一致
+        assert eng._selection_score(best, None) == pytest.approx(0.04)
+
+    def test_rank_eligible_prefers_simpler_on_tie(self, monkeypatch):
+        import dataclasses  # noqa: PLC0415
+
+        panel = _make_panel()
+        _registry(monkeypatch, EARLY, WEAK)
+        result = _run(panel, _metadata(panel), _cfg())
+        base = _report(result, "early")
+
+        def _tie(key, *, ops, lits):
+            return dataclasses.replace(
+                base,
+                key=key,
+                selection_score=0.5,
+                rank_ic_mean=0.04,
+                reject_reason="",
+                op_count=ops,
+                literal_count=lits,
+            )
+
+        assert eng._rank_eligible(
+            [_tie("complex", ops=9, lits=6), _tie("simple", ops=1, lits=0)]
+        ) == ["simple", "complex"], "同分同 |IC|：算子少的靠前"
+        # 分量次序：算子数相同再看字面量数
+        assert eng._rank_eligible(
+            [_tie("more_lits", ops=3, lits=8), _tie("fewer_lits", ops=3, lits=1)]
+        ) == ["fewer_lits", "more_lits"]
+
+    def test_draft_carries_complexity_counts_from_expression(self, monkeypatch):
+        """草稿上的 (op_count, literal_count) 是**表达式字符串**的单源计数——
+        与落库 metadata 同口径，改口径必须同时过 complexity 单元测试。"""
+        panel = _make_panel()
+        _registry(monkeypatch, EARLY, WEAK)
+        result = _run(panel, _metadata(panel), _cfg())
+
+        early = _report(result, "early")
+        expected = cplx.expression_complexity(YESTERDAY_EXPR)
+        assert (early.op_count, early.literal_count) == (
+            expected.op_count,
+            expected.literal_count,
+        )
+        assert 0.0 < cplx.simplicity_factor(early.op_count, early.literal_count) <= 1.0

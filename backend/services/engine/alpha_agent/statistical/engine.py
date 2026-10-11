@@ -53,6 +53,7 @@ from backend.shared.market_regime import STATES as _REGIME_STATES
 from backend.shared import regime_buckets as _rb
 
 from . import candidates as _candidates
+from . import complexity as _cplx
 from . import composite as _composite
 from . import costs as _costs
 from . import dedup as _dedup
@@ -185,6 +186,11 @@ class CandidateReport:
     spread_mean: float
     selected: bool
     reject_reason: str = ""
+    # ── T-FE-05 结构复杂度（表达式字符串级的范围受限计数，口径唯一实现见
+    #    statistical/complexity.py；简单性因子进 selection_score，同分取简
+    #    由 _rank_eligible 排序键尾两项兜底）──
+    op_count: int = 0
+    literal_count: int = 0
     # ── Tier 3 证据（不可判定一律 NaN/空，语义见 stability/dedup 模块）──
     fold_ics: tuple[float, ...] = ()  # 逐折 RankIC 均值（stability_folds 个）
     fold_sign_consistency: float = float("nan")  # 与全窗同号的折占比（闸取它）
@@ -553,6 +559,9 @@ def run_statistical_mining(
     for candidate in _candidates.CANDIDATES:
         stats = horizon_stats[candidate.key]
         best = _best_horizon(stats)
+        # T-FE-05：结构复杂度从表达式字符串计入（口径单源 complexity.py）；
+        # 简单性因子只乘进选择分（排序偏好），不进任何闸
+        cx = _cplx.expression_complexity(candidate.expression)
         fdr_horizons = tuple(s.horizon for s in stats if s.fdr_pass)
         oos = oos_stats[candidate.key]
         oos_pass, oos_reason = _oos_verdict(best, oos, cfg)
@@ -604,11 +613,17 @@ def run_statistical_mining(
                 spread_mean=np.nan,
                 selected=False,
                 reject_reason="；".join(reasons),
+                op_count=cx.op_count,
+                literal_count=cx.literal_count,
                 fold_ics=stability.fold_ics if stability else (),
                 fold_sign_consistency=(
                     stability.sign_consistency if stability else np.nan
                 ),
-                selection_score=_selection_score(best, stability),
+                selection_score=_selection_score(
+                    best,
+                    stability,
+                    _cplx.simplicity_factor(cx.op_count, cx.literal_count),
+                ),
                 reselect_rate=stability.reselect_rate if stability else np.nan,
                 reselect_hits=stability.reselect_hits if stability else 0,
                 reselect_checkpoints=stability.reselect_checkpoints if stability else 0,
@@ -789,13 +804,19 @@ def run_statistical_mining(
 
 
 def _selection_score(
-    best: HorizonStats | None, stability: _stab.ReselectStats | None
+    best: HorizonStats | None,
+    stability: _stab.ReselectStats | None,
+    simplicity: float = 1.0,
 ) -> float:
-    """选择分 = |RankIC| × 折间符号一致性（无稳定性证据 → 权重取中性 1）。
+    """选择分 = |RankIC| × 折间符号一致性 × 简单性因子（T-FE-05）。
 
     幅度与稳定同权（FactorEngine 的 FS 适应度同思路）：防「整窗 |RankIC| 大、
     但一半折反向」的候选在纯幅度排序下霸榜。折结构不足 / 未算稳定性
     （``require_stability=False``）时不加权——没有证据不罚，也不假装稳定。
+
+    ``simplicity``（∈(0,1]，``complexity.simplicity_factor``）：同 IC/稳定下
+    表达式越简越靠前——参数空间（字面量）越大、算子越多，过拟合税越高。
+    只乘进排序分，**不进任何闸**；不给（旧调用口径）→ 权重 1。
     """
     if best is None:
         return float("nan")
@@ -806,17 +827,26 @@ def _selection_score(
         and np.isfinite(stability.sign_consistency)
     ):
         weight = float(stability.sign_consistency)
-    return abs(float(best.rank_ic_mean)) * weight
+    return abs(float(best.rank_ic_mean)) * weight * float(simplicity)
 
 
 def _rank_eligible(drafts: list[CandidateReport]) -> list[str]:
     """过闸候选按选择分降序排**全序**（拒因已在草稿上记好，这里不改状态）。
 
     K 截断不在这里做——选择期去重的贪心步行需要 K 外的递补者（去重被拒者
-    不占席）；步行走完自然凑满 K。同分以 |RankIC| 兜底，再平按登记序（稳定排序）。
+    不占席）；步行走完自然凑满 K。同分以 |RankIC| 兜底，再平按结构简单性
+    取简（T-FE-05：算子数少者先、再比字面量数），最后按登记序（稳定排序）。
     """
     eligible = [r for r in drafts if r.best_horizon is not None and not r.reject_reason]
-    eligible.sort(key=lambda r: (r.selection_score, abs(r.rank_ic_mean)), reverse=True)
+    eligible.sort(
+        key=lambda r: (
+            r.selection_score,
+            abs(r.rank_ic_mean),
+            -r.op_count,
+            -r.literal_count,
+        ),
+        reverse=True,
+    )
     return [r.key for r in eligible]
 
 

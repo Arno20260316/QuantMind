@@ -12,7 +12,8 @@
 0.75）、值级去重（论文口径 0.5/0.4 与仓库口径 0.9/0.8 分别跑，
 ``greedy_select`` 席位递补）、与另一侧全部因子的跨库逐日 Rank 相关
 （论文×仓库全矩阵 → 每论文因子 max|ρ| 与最近邻）。另出**算子谱**与
-**复杂度分布**（T-FM-06 结构性原创闸 / T-FE-05 复杂度惩罚的直接输入）。
+**复杂度分布**（AST 级，T-FM-06 结构性原创闸的输入；T-FE-05 统计派简单性
+因子另走字符串级口径 ``statistical.complexity``，本测的 AST 复杂度不进选择分）。
 
 口径（写在明面上，避免与生产报告误比）：
 
@@ -251,8 +252,12 @@ def _best(horizons: list[dict]) -> dict | None:
 def _selection_score(
     best: dict | None, sign_consistency: float, *, eligible: bool
 ) -> float:
-    """|RankIC| × 折间符号一致性（与引擎 ``_selection_score`` 同式：
-    折结构不足 / 未算稳定性时不加权——没有证据不罚，也不假装稳定）。"""
+    """|RankIC| × 折间符号一致性（与引擎 ``_selection_score`` 同为稳定性
+    加权口径：折结构不足 / 未算稳定性时不加权——没有证据不罚，也不假装
+    稳定）。**口径分叉（T-FE-05）**：统计派引擎此后另乘简单性因子（qlib
+    中缀式的字符串级复杂度）；本运行器未启用复杂度惩罚——FM 因子的 AST
+    复杂度（``factorminer.dsl.complexity``）只进报告/原创性闸，不进选择
+    分，与引擎不再逐式相同。"""
     if best is None:
         return float("nan")
     weight = 1.0

@@ -357,13 +357,15 @@ def _tier3_report(runner):
         selected=True,
         fold_ics=(0.05, 0.04, 0.03, 0.05),
         fold_sign_consistency=1.0,
-        selection_score=0.031,
+        selection_score=0.031,  # 任意透传值（本测试只钉序列化，不重算公式）
         reselect_rate=2 / 3,
         reselect_hits=2,
         reselect_checkpoints=3,
         ic_half_life=float("nan"),
         ic_decay_slope=-0.12,
         max_abs_corr=0.31,
+        op_count=3,
+        literal_count=2,
     )
 
 
@@ -420,9 +422,13 @@ class TestTier3Metadata:
 
         assert meta["fold_ics"] == [0.05, 0.04, 0.03, 0.05]
         assert meta["selection_score"] == pytest.approx(0.031), (
-            "选择分（|RankIC|×折间符号一致性）是 Top-K 排序与去重步行序的依据，"
-            "必须落库可审计"
+            "选择分（|RankIC|×折间符号一致性×简单性因子）是 Top-K 排序与"
+            "去重步行序的依据，必须落库可审计（夹具值为任意透传，本测试只"
+            "钉序列化；公式乘法由 tier3 复杂度惩罚测试另行钉住）"
         )
+        # T-FE-05：结构复杂度计数随行落库——选择分里的简单性因子可复算
+        assert meta["op_count"] == 3
+        assert meta["literal_count"] == 2
         assert meta["reselect_rate"] == pytest.approx(2 / 3)
         assert meta["reselect_checkpoints"] == 3
         assert meta["ic_decay_slope"] == pytest.approx(-0.12)

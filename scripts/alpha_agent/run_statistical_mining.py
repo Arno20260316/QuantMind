@@ -239,6 +239,10 @@ def _factor_metadata(
             "ic_decay_slope": report.ic_decay_slope,
             "max_abs_corr": report.max_abs_corr,
             "corr_warn": report.corr_warn or None,
+            # T-FE-05 结构复杂度计数（选择分里简单性因子的可复算输入；
+            # 口径单源 statistical/complexity.py）
+            "op_count": report.op_count,
+            "literal_count": report.literal_count,
             # T-FE-03 交易性证据（自相关→调仓建议 / 换手·扣费净 IC / 分状态 IC）
             **_trade_metadata_fields(report),
             "window": audit.get("window"),

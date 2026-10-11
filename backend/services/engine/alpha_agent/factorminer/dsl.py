@@ -320,7 +320,11 @@ def min_history(node: Node) -> int:
 
 @dataclass(frozen=True)
 class Complexity:
-    """结构复杂度指标（T-FM-06 结构原创性闸 / T-FE-05 复杂度惩罚共用）。"""
+    """AST 级结构复杂度指标——T-FM-06 结构原创性闸专用。
+
+    T-FE-05 统计派选择分的简单性因子**不用**本口径（FM-DSL 解析不了
+    qlib 中缀算术），其单源是 ``statistical.complexity``（字符串级计数）。
+    """
 
     node_count: int
     op_count: int

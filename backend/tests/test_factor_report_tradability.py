@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
+import pandas as pd
 import pytest
 
 from backend.services.engine.factor_report import tradability as TB
@@ -19,7 +22,9 @@ from backend.services.engine.factor_report import tradability as TB
 class _Bar:
     """DailyBar 的最小替身：只带本模块读取的字段。"""
 
-    def __init__(self, close, limit_up=np.inf, limit_down=0.0, volume=1e6, is_st=False):  # fidelity: allow-limit-threshold — 夹具默认值：替身 bar 的非 ST 字段（用例逐条覆盖）
+    def __init__(
+        self, close, limit_up=np.inf, limit_down=0.0, volume=1e6, is_st=False
+    ):  # fidelity: allow-limit-threshold — 夹具默认值：替身 bar 的非 ST 字段（用例逐条覆盖）
         self.close = close
         self.limit_up = limit_up
         self.limit_down = limit_down
@@ -30,9 +35,9 @@ class _Bar:
 
 def test_涨停挡多头_跌停挡空头_停牌两腿都挡():
     bars = {
-        "600000.SH": _Bar(11.0, limit_up=11.0, limit_down=9.0),      # 涨停
-        "600001.SH": _Bar(9.0, limit_up=11.0, limit_down=9.0),       # 跌停
-        "600002.SH": _Bar(10.0, limit_up=11.0, limit_down=9.0),      # 正常
+        "600000.SH": _Bar(11.0, limit_up=11.0, limit_down=9.0),  # 涨停
+        "600001.SH": _Bar(9.0, limit_up=11.0, limit_down=9.0),  # 跌停
+        "600002.SH": _Bar(10.0, limit_up=11.0, limit_down=9.0),  # 正常
         "600003.SH": _Bar(10.0, limit_up=11.0, limit_down=9.0, volume=0),  # 停牌
     }
     rows = {r[1]: (r[2], r[3]) for r in TB.blocked_rows_for_date(bars, 20260101)}
@@ -46,10 +51,14 @@ def test_ST_标的整票不入掩码():
     """ST 名单是静态快照（前视偏差），且其历史限价被按 ±5% 折减会误判涨停。"""
     bars = {
         "600000.SH": _Bar(11.0, limit_up=11.0, limit_down=9.0, is_st=True),
-        "600001.SH": _Bar(11.0, limit_up=11.0, limit_down=9.0, is_st=False),  # fidelity: allow-limit-threshold — 夹具字段：该票非 ST（上一条即 is_st=True 的反例）
+        "600001.SH": _Bar(
+            11.0, limit_up=11.0, limit_down=9.0, is_st=False
+        ),  # fidelity: allow-limit-threshold — 夹具字段：该票非 ST（上一条即 is_st=True 的反例）
     }
     rows = TB.blocked_rows_for_date(bars, 20260101)
-    assert [r[1] for r in rows] == ["600001.SH"], "ST 标的必须缺席（既不当阻挡也不假装可交易）"
+    assert [r[1] for r in rows] == ["600001.SH"], (
+        "ST 标的必须缺席（既不当阻挡也不假装可交易）"
+    )
 
 
 def test_新股首日无昨收_不是涨跌停():
@@ -84,10 +93,14 @@ def test_掩码读写往返(tmp_path):
         "600000.SH": _Bar(11.0, limit_up=11.0, limit_down=9.0),
         "600001.SH": _Bar(9.0, limit_up=11.0, limit_down=9.0),
     }
-    df = __import__("pandas").DataFrame(TB.blocked_rows_for_date(bars, 20260101), columns=list(TB.MASK_COLUMNS))
+    df = __import__("pandas").DataFrame(
+        TB.blocked_rows_for_date(bars, 20260101), columns=list(TB.MASK_COLUMNS)
+    )
     path = tmp_path / "trade_mask.parquet"
     stat = TB.write_mask(df, path)
-    assert stat["rows"] == 2 and stat["blocked_long"] == 1 and stat["blocked_short"] == 1
+    assert (
+        stat["rows"] == 2 and stat["blocked_long"] == 1 and stat["blocked_short"] == 1
+    )
     back = TB.load_mask(path)
     assert back[20260101][0] == frozenset({"600000.SH"})
     assert back[20260101][1] == frozenset({"600001.SH"})
@@ -95,6 +108,109 @@ def test_掩码读写往返(tmp_path):
 
 def test_掩码路径不存在返回空字典():
     assert TB.load_mask("/nonexistent/trade_mask.parquet") == {}
+
+
+# ═══════════════════ 2b. 增量合并：区间替换语义（P2-d） ═══════════════════
+
+
+def _mask_df(rows: list[tuple[int, str, bool, bool]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"dt": dt, "symbol": s, "blocked_long": bl, "blocked_short": bs}
+            for dt, s, bl, bs in rows
+        ],
+        columns=list(TB.MASK_COLUMNS),
+    )
+
+
+def test_合并_区间内替换_区间外原样保留():
+    # Arrange：旧产物跨三个月；本月重扫（区间 01-01 ~ 01-31）覆盖 01-01 并新增 01-15
+    old = _mask_df(
+        [
+            (20251201, "600000.SH", True, False),
+            (20260101, "600000.SH", True, False),
+            (20260101, "600001.SH", False, True),
+            (20260201, "600002.SH", True, False),
+        ]
+    )
+    new = _mask_df(
+        [
+            (20260101, "600000.SH", False, True),  # 同键重扫 → 覆盖旧行
+            (20260115, "600003.SH", True, False),  # 区间内新日 → 追加
+        ]
+    )
+
+    # Act
+    out = TB.merge_mask_frames(old, new, 20260101, 20260131)
+
+    # Assert：区间外两日原样；01-01 整日以新产物为准（600001.SH 旧行一并清除）
+    assert out["dt"].tolist() == [20251201, 20260101, 20260115, 20260201]
+    got = out[out["dt"] == 20260101].set_index("symbol")
+    assert got.index.tolist() == ["600000.SH"]
+    assert bool(got.loc["600000.SH", "blocked_short"]) is True
+    assert bool(got.loc["600000.SH", "blocked_long"]) is False
+
+
+def test_合并_区间内无新行_该段旧行一并清空():
+    # 区间替换语义：重扫后没产出 ≠ 保留旧行（缺口在构建器日志显形）
+    old = _mask_df(
+        [(20260101, "600000.SH", True, False), (20260201, "600002.SH", True, False)]
+    )
+    out = TB.merge_mask_frames(old, _mask_df([]), 20260101, 20260131)
+    assert out["dt"].tolist() == [20260201]
+
+
+def test_合并_区间为闭区间_首尾两天都被替换():
+    old = _mask_df(
+        [(20260101, "600000.SH", True, False), (20260131, "600001.SH", True, False)]
+    )
+    out = TB.merge_mask_frames(old, _mask_df([]), 20260101, 20260131)
+    assert out.empty
+
+
+def test_合并_旧产物缺失_等价于只取新区间():
+    new = _mask_df(
+        [(20251215, "600000.SH", True, False), (20260110, "600001.SH", False, True)]
+    )
+    for old in (None, pd.DataFrame()):
+        out = TB.merge_mask_frames(old, new, 20260101, 20260131)
+        assert out["dt"].tolist() == [20260110]  # 区间外的新行也过滤掉
+
+
+def test_合并_同键去重_以末行为准():
+    # drop_duplicates(keep="last") 兜底：重扫修正行排后 → 末行胜
+    old = _mask_df([(20260105, "600000.SH", True, False)])
+    new = _mask_df(
+        [
+            (20260105, "600000.SH", True, False),
+            (20260105, "600000.SH", False, True),  # 修正行
+        ]
+    )
+    out = TB.merge_mask_frames(old, new, 20260101, 20260131)
+    assert len(out) == 1
+    assert bool(out.iloc[0]["blocked_long"]) is False
+    assert bool(out.iloc[0]["blocked_short"]) is True
+
+
+def test_合并_出口dtype与列序与build_mask产物一致():
+    new = _mask_df(
+        [(20260110, "600002.SH", True, False), (20260105, "600001.SH", False, False)]
+    )
+    out = TB.merge_mask_frames(None, new, 20260101, 20260131)
+    assert list(out.columns) == list(TB.MASK_COLUMNS)
+    assert out["dt"].dtype == np.int32
+    assert str(out["symbol"].dtype) == "string"
+    assert out["blocked_long"].dtype == bool
+    assert out["blocked_short"].dtype == bool
+    # 按 (dt, symbol) 排序（下游 load_mask 按日分组依赖可比性）
+    assert out["dt"].tolist() == [20260105, 20260110]
+
+
+def test_合并_多余列被规范化丢弃():
+    new = _mask_df([(20260110, "600001.SH", True, False)])
+    new["extra"] = ["x"]
+    out = TB.merge_mask_frames(None, new, 20260101, 20260131)
+    assert list(out.columns) == list(TB.MASK_COLUMNS)
 
 
 # ═══════════════════ 3. 可交易轨：从理想轨的计数里减掉被挡成员 ═══════════════════
@@ -114,11 +230,11 @@ def test_剔掉被挡成员后组均值按剩余成员重算():
     """
     idx = np.array([0, 0, 1, 1, 1, 1])
     yv = np.array([0.01, 0.01, 0.10, 0.20, 0.30, 0.50])
-    blk = np.array([False, False, False, False, False, True])   # 挡掉最高的 0.50
+    blk = np.array([False, False, False, False, False, True])  # 挡掉最高的 0.50
     cnt, ssum = _ideal(idx, yv, 2)
     q, n = TB.exclude_blocked(idx, yv, blk, cnt, ssum, n_quantiles=2)
     assert q[0] == pytest.approx(0.01), "未被挡的组分毫不动"
-    assert q[1] == pytest.approx(np.mean([0.10, 0.20, 0.30]))    # 理想轨是 0.275
+    assert q[1] == pytest.approx(np.mean([0.10, 0.20, 0.30]))  # 理想轨是 0.275
     assert n.tolist() == [0.0, 1.0]
 
 
@@ -151,36 +267,52 @@ def test_可交易轨不得优于理想轨():
     yv = np.array([0.01, 0.01, 0.01, 5.0])
     cnt, ssum = _ideal(idx, yv, 2)
     q_all, _ = TB.exclude_blocked(idx, yv, np.zeros(4, bool), cnt, ssum, n_quantiles=2)
-    q_tr, _ = TB.exclude_blocked(idx, yv, np.array([False, False, False, True]), cnt, ssum, n_quantiles=2)
+    q_tr, _ = TB.exclude_blocked(
+        idx, yv, np.array([False, False, False, True]), cnt, ssum, n_quantiles=2
+    )
     assert q_tr[1] < q_all[1], "剔掉被挡的高收益成员后，多头组均值只能更低"
     # 只挡了 G1 的成员时，G2 必须原封不动
-    q_g1, _ = TB.exclude_blocked(idx, yv, np.array([True, False, False, False]), cnt, ssum, n_quantiles=2)
+    q_g1, _ = TB.exclude_blocked(
+        idx, yv, np.array([True, False, False, False]), cnt, ssum, n_quantiles=2
+    )
     assert q_g1[1] == q_all[1]
 
 
 def test_空截面返回全_NaN_而不是_0():
     """零项即失败：没有任何成员参与时不能静默返回 0（0 是个『真实观测』）。"""
-    q, n = TB.exclude_blocked(np.array([], dtype=int), np.array([]), np.array([], bool),
-                              np.zeros(3), np.zeros(3), n_quantiles=3)
+    q, n = TB.exclude_blocked(
+        np.array([], dtype=int),
+        np.array([]),
+        np.array([], bool),
+        np.zeros(3),
+        np.zeros(3),
+        n_quantiles=3,
+    )
     assert np.isnan(q).all() and (n == 0).all()
 
 
 def test_形状不符即报错():
     cnt, ssum = np.zeros(2), np.zeros(2)
     with pytest.raises(ValueError):
-        TB.exclude_blocked(np.zeros(3, int), np.zeros(2), np.zeros(3, bool), cnt, ssum, n_quantiles=2)
+        TB.exclude_blocked(
+            np.zeros(3, int), np.zeros(2), np.zeros(3, bool), cnt, ssum, n_quantiles=2
+        )
     with pytest.raises(ValueError):
-        TB.exclude_blocked(np.zeros(3, int), np.zeros(3), np.zeros(2, bool), cnt, ssum, n_quantiles=2)
+        TB.exclude_blocked(
+            np.zeros(3, int), np.zeros(3), np.zeros(2, bool), cnt, ssum, n_quantiles=2
+        )
 
 
 def test_组编号越界不会污染其他组():
     """bincount 返回的长度可能大于 nq（脏索引）—— 截断必须发生，否则会串组。"""
-    idx = np.array([0, 1, 9])          # 9 是非法组号
+    idx = np.array([0, 1, 9])  # 9 是非法组号
     yv = np.array([0.01, 0.02, 100.0])
     cnt = np.bincount(idx, minlength=2).astype(float)
     ssum = np.bincount(idx, weights=yv, minlength=2)
     q, _ = TB.exclude_blocked(idx, yv, np.zeros(3, bool), cnt, ssum, n_quantiles=2)
-    assert q.tolist() == [pytest.approx(0.01), pytest.approx(0.02)], "越界项不得回流到任何组"
+    assert q.tolist() == [pytest.approx(0.01), pytest.approx(0.02)], (
+        "越界项不得回流到任何组"
+    )
 
 
 # ═══════════════════ 4. 诊断计数 ═══════════════════
@@ -192,10 +324,10 @@ def _fixture():
     group = np.full((n, k), -1, dtype=np.int16)
     y = np.zeros(n)
     for i in range(n):
-        g = i // 5                      # 0..3
+        g = i // 5  # 0..3
         group[i, 0] = g
         group[i, 1] = 3 - g
-        y[i] = 0.01 * (g + 1)           # G1=1% … G4=4%
+        y[i] = 0.01 * (g + 1)  # G1=1% … G4=4%
     return group, y
 
 
@@ -215,7 +347,9 @@ def test_诊断计数的分母是逐因子有效样本而不是_行数乘因子�
 
 
 def test_诊断计数在零项时给_0_而不是抛():
-    n_valid, n_blocked = TB.blocked_summary(np.full((3, 1), -1), np.full(3, np.nan), np.zeros(3, bool))
+    n_valid, n_blocked = TB.blocked_summary(
+        np.full((3, 1), -1), np.full(3, np.nan), np.zeros(3, bool)
+    )
     assert n_valid.tolist() == [0.0] and n_blocked.tolist() == [0.0]
 
 
@@ -224,3 +358,25 @@ def test_诊断计数形状不符即报错():
         TB.blocked_summary(np.zeros(5), np.zeros(5), np.zeros(5, bool))
     with pytest.raises(ValueError):
         TB.blocked_summary(np.zeros((5, 1)), np.zeros(4), np.zeros(5, bool))
+
+
+# ═══════════════════ 4. 构建器 CLI：空区间 no-op 与市场守卫（P2-d） ═══════════════════
+
+
+def test_cli_空区间_no_op_退0_产物不动(monkeypatch):
+    from backend.scripts import build_trade_mask as BTM
+
+    monkeypatch.setattr(BTM, "list_trading_days", lambda s, e: [])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["build_trade_mask.py", "--start", "2026-10-10", "--end", "2026-10-11"],
+    )
+    assert BTM.main() == 0  # 周末/假日触发 → no-op 成功，不是失败
+
+
+def test_cli_非CN市场_退2(monkeypatch):
+    from backend.scripts import build_trade_mask as BTM
+
+    monkeypatch.setattr(sys, "argv", ["build_trade_mask.py", "--market", "HK"])
+    assert BTM.main() == 2  # 涨跌停规则仅 A 股有 —— 拒绝静默产错掩码

@@ -13,6 +13,7 @@ import {
   CalendarDays,
   Gauge,
   Grid3x3,
+  History,
   Layers,
   ListOrdered,
   ShieldCheck,
@@ -20,9 +21,11 @@ import {
 } from 'lucide-react';
 import { DateBadge, EmptyHint, NumText, PeriodChips, RankRow, SectionCard, fmtInt } from '../../market-analysis-shared/ui';
 import { signalPositionLabel } from '../../shared/signalVocabulary';
-import { verdictMeta } from '../factorBoardVocabulary';
+import type { VerdictMeta } from '../factorBoardVocabulary';
+import { decayMeta, regimeNoteMeta, verdictMeta } from '../factorBoardVocabulary';
 import {
   FactorBoardError,
+  FactorBoardMaskInfo,
   FactorBoardResponse,
   FactorBoardSectorItem,
   FactorBoardStock,
@@ -61,6 +64,42 @@ function VerdictChip({ verdict }: { verdict: string }) {
       {meta.label}
     </span>
   );
+}
+
+/** 表格内小号状态 chip（衰减/制度注记等，词表见 factorBoardVocabulary）。 */
+function StateChip({ meta }: { meta: VerdictMeta }) {
+  return (
+    <span
+      title={meta.hint}
+      className={`inline-flex items-center px-1 py-0.5 rounded-md border text-[9px] font-extrabold whitespace-nowrap ${meta.cls}`}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
+/** 掩码 chip 三态（命中当日 / 缺当日行 / 陈旧超限）；数据缺失 → null 不渲染。 */
+function maskChip(mask: FactorBoardMaskInfo | null | undefined): { cls: string; label: string; hint: string } | null {
+  if (!mask) return null;
+  if (!mask.missing && mask.mask_date !== null) {
+    return {
+      cls: 'bg-emerald-50 border-emerald-200/80 text-emerald-700',
+      label: `掩码 ${mask.mask_date}（当日命中）`,
+      hint: '可交易掩码命中决策日：涨跌停挡多头、跌停挡空头、停牌两腿都挡（名单层过滤口径）',
+    };
+  }
+  if (mask.stale_days !== null && mask.stale_days > 7) {
+    return {
+      cls: 'bg-red-50 border-red-200/80 text-red-700',
+      label: `掩码陈旧：截至 ${mask.mask_max_dt ?? '—'}（${mask.stale_days} 天）`,
+      hint: '掩码停更超 7 天：涨跌停/停牌是当日状态，无当日行一律不过滤（绝不沿用旧日行），此处显形以便排查停更',
+    };
+  }
+  return {
+    cls: 'bg-amber-50 border-amber-200/80 text-amber-700',
+    label: `掩码：缺当日行（最新 ${mask.mask_max_dt ?? '—'}）`,
+    hint: '掩码无决策日当天的行：名单层不过滤（涨跌停/停牌是当日状态，不沿用旧日行）',
+  };
 }
 
 function SectorRow({ item }: { item: FactorBoardSectorItem }) {
@@ -197,6 +236,13 @@ export const FactorBoardPanel: React.FC = () => {
   const stocks = board.stocks[stockList as keyof typeof board.stocks] ?? [];
   const bySide = meta.model.by_side ?? {};
   const sideEntries = Object.entries(bySide);
+  const regime = board.regime;
+  const dedup = board.dedup;
+  const mask = maskChip(meta.coverage.mask);
+  const rollingOos = validation.rolling_oos;
+  const dedupCut = dedup ? dedup.dropped.length + dedup.pruned.length : 0;
+  // 1.1 因子列（近 20 日 / 净 IC）：按行键探测——1.0 历史产物无键 → 整列隐藏
+  const hasNetCols = board.factors.some((f) => 'decay' in f || 'net_ic60' in f);
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -273,7 +319,52 @@ export const FactorBoardPanel: React.FC = () => {
               样本内自洽（入选窗=评估窗）
             </span>
           )}
+          {dedup && (
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-extrabold ${
+                dedup.warnings.length > 0
+                  ? 'bg-amber-50 border-amber-200/80 text-amber-700'
+                  : 'bg-slate-50 border-slate-200/80 text-slate-600'
+              }`}
+              title={`入选内二次去重：族头替补池 ${dedup.n_reserves}；|ρ|≥${dedup.reject} 判重、[${dedup.warn},${dedup.reject}) 记警 ${dedup.warnings.length} 对。ρ=快照窗内合成序列的逐日 Spearman（近重因子按 |IC60| 降序占席，被拒者由替补递补）`}
+            >
+              去重：池 {fmtInt(dedup.n_pool)} → 入选 {fmtInt(dedup.n_kept)}（剔 {fmtInt(dedupCut)}）
+            </span>
+          )}
+          {regime && (
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-extrabold font-mono ${
+                regime.weak_count > 0
+                  ? 'bg-amber-50 border-amber-200/80 text-amber-700'
+                  : 'bg-slate-50 border-slate-200/80 text-slate-600'
+              }`}
+              title={`制度状态 ${regime.state}@${regime.state_asof}${regime.state_lag_days > 0 ? `（滞后 ${regime.state_lag_days} 天取最近行）` : ''}；长窗 ${regime.lookback_days} 日 / 评估 ${regime.eval_days} 日。弱桶谓词=桶内方向对齐 IC 均值≤0 且 ≥15 日 → 权重 ×${regime.weak_mult}（只降不翻）`}
+            >
+              制度：{regime.state}（弱桶 {regime.weak_count} / 调整 {regime.adjusted_count}）
+            </span>
+          )}
+          {mask && (
+            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-extrabold font-mono ${mask.cls}`} title={mask.hint}>
+              {mask.label}
+            </span>
+          )}
         </div>
+        {rollingOos && (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono text-slate-500 pt-0.5">
+            <History className="w-3.5 h-3.5 text-purple-500" />
+            <span>
+              上月滚动验证（{rollingOos.month}）：OOS RankIC{' '}
+              <b className={rollingOos.rank_ic === null ? 'text-slate-400' : rollingOos.rank_ic >= 0 ? 'text-red-600' : 'text-green-600'}>
+                {rollingOos.rank_ic === null ? '—' : rollingOos.rank_ic.toFixed(4)}
+              </b>{' '}
+              / 胜率 {rollingOos.win === null ? '—' : `${(rollingOos.win * 100).toFixed(0)}%`} / {fmtInt(rollingOos.days)} 日
+            </span>
+            <span className="text-slate-400" title={rollingOos.note ?? '前窗选、后窗验：以当时快照的冻结 sgn/w 合成，后窗逐日对 fwd5 求 RankIC'}>
+              前窗选·后窗验
+              {rollingOos.excluded_no_fwd ? `（后窗排除 ${rollingOos.excluded_no_fwd} 日无前向）` : ''}
+            </span>
+          </div>
+        )}
       </SectionCard>
 
       {/* ── 板块三层共振 ─────────────────────────────────────── */}
@@ -379,9 +470,25 @@ export const FactorBoardPanel: React.FC = () => {
                 <th className="text-left font-extrabold py-1.5 px-1">族</th>
                 <th className="text-center font-extrabold py-1.5 px-1">方向</th>
                 <th className="text-right font-extrabold py-1.5 px-1">IC60</th>
+                {hasNetCols && (
+                  <th
+                    className="text-right font-extrabold py-1.5 px-1"
+                    title="尾窗 20 个有效日的方向对齐 IC 均值（sgn×RankIC，可负）。衰减谓词：均值<0→近期反向；|均值|<0.02→走弱；有效日<15→样本不足；否则同向"
+                  >
+                    近 20 日
+                  </th>
+                )}
+                {hasNetCols && (
+                  <th
+                    className="text-right font-extrabold py-1.5 px-1"
+                    title="净 IC：扣当日新进多头腿调仓成本后的 60 评估日 RankIC（只显形，不进闸门）。净与毛反号 → 侵蚀"
+                  >
+                    净 IC
+                  </th>
+                )}
                 <th className="text-right font-extrabold py-1.5 px-1" title="方向胜率（60 评估日 IC 同号占比）">胜率</th>
                 <th className="text-right font-extrabold py-1.5 px-1">ICIR</th>
-                <th className="text-right font-extrabold py-1.5 px-1" title="合成分权重（|IC60| clip [0.02, 0.15] 归一）">权重</th>
+                <th className="text-right font-extrabold py-1.5 px-1" title="合成分权重（|IC60| clip [0.02, 0.15] 归一 × regime 乘子）">权重</th>
                 <th className="text-right font-extrabold py-1.5 px-1" title="持有期画像（方向对齐 IC；评估窗 45 日，每 h 需 t+h 前向数据）">持有期 1/2/5/10/20</th>
               </tr>
             </thead>
@@ -399,12 +506,47 @@ export const FactorBoardPanel: React.FC = () => {
                     </span>
                   </td>
                   <td className="py-1.5 px-1 text-right"><NumText value={f.ic60} digits={3} /></td>
+                  {hasNetCols && (
+                    <td className="py-1.5 px-1 text-right whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1 justify-end">
+                        <span className={`font-mono ${f.ic20 == null ? 'text-slate-300' : f.ic20 >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                          {f.ic20 == null ? '—' : f.ic20.toFixed(3)}
+                        </span>
+                        <StateChip meta={decayMeta(f.decay)} />
+                      </span>
+                    </td>
+                  )}
+                  {hasNetCols && (
+                    <td className="py-1.5 px-1 text-right whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1 justify-end">
+                        <span className={`font-mono ${f.net_ic60 == null ? 'text-slate-300' : f.net_ic60 >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                          {f.net_ic60 == null ? '—' : f.net_ic60.toFixed(3)}
+                        </span>
+                        {f.eroded === true && (
+                          <StateChip
+                            meta={{
+                              label: '侵蚀',
+                              cls: 'bg-red-50 text-red-700 border-red-200/80',
+                              hint: '净 IC 与毛 IC 反号：当日新进多头腿的调仓成本已把净效应翻负（净轨只显形，不进闸门）',
+                            }}
+                          />
+                        )}
+                      </span>
+                    </td>
+                  )}
                   <td className="py-1.5 px-1 text-right font-mono text-slate-600">
                     {f.win60 === null ? '—' : `${(f.win60 * 100).toFixed(0)}%`}
                   </td>
                   <td className="py-1.5 px-1 text-right font-mono text-slate-600">{f.icir60 === null ? '—' : f.icir60.toFixed(2)}</td>
-                  <td className="py-1.5 px-1 text-right font-mono text-slate-600">
+                  <td className="py-1.5 px-1 text-right font-mono text-slate-600 whitespace-nowrap">
                     {f.weight === null ? '—' : `${(f.weight * 100).toFixed(1)}%`}
+                    {f.regime_mult != null && f.regime_mult !== 1 && (
+                      <span className="ml-1">
+                        <StateChip
+                          meta={{ ...regimeNoteMeta(f.regime_note), label: `×${f.regime_mult}` }}
+                        />
+                      </span>
+                    )}
                   </td>
                   <td className="py-1.5 px-1 text-right font-mono whitespace-nowrap">
                     {HORIZON_KEYS.map((h) => {

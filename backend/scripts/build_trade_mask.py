@@ -16,9 +16,16 @@ factor_defs 1536s）本身已经很长，再叠 7 分钟且每天重跑一遍没
 
 ## 用法
 
-    python3 backend/scripts/build_trade_mask.py                       # 2016 至今
+    python3 backend/scripts/build_trade_mask.py                       # 2016 至今（全量）
     python3 backend/scripts/build_trade_mask.py --start 2026-09-01    # 增量补一段
     python3 backend/scripts/build_trade_mask.py --limit-days 20       # 冒烟
+
+## 增量语义（2026-10-11 修）
+
+落盘前读旧产物 → ``tradability.merge_mask_frames`` **区间替换**：本次
+``[start, end]`` 段用新算行替换，段外旧行原样保留。此前「增量补一段」会把
+区间外的全部历史静默抹掉（只有全量重算才能幸免）。区间内无新交易日
+（如周末/假日触发 beat）→ **no-op 退码 0**（旧行为退码 1，假失败噪音）。
 
 ## 与报告构建的关系
 
@@ -68,21 +75,34 @@ def list_trading_days(start: str, end: str) -> list[int]:
 
 
 def default_out_path() -> Path:
-    return Path(resolve_quantdb_subdir("5_technical_derived", "trade_mask")) / "trade_mask.parquet"
+    return (
+        Path(resolve_quantdb_subdir("5_technical_derived", "trade_mask"))
+        / "trade_mask.parquet"
+    )
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     p = argparse.ArgumentParser(description="构建可交易性掩码（涨跌停/停牌）")
     p.add_argument("--start", default="2016-01-01", help="起始日 YYYY-MM-DD")
     p.add_argument("--end", default="2099-12-31", help="结束日 YYYY-MM-DD")
-    p.add_argument("--out", default=None, help="产物路径（默认 QuantDB 5_technical_derived/trade_mask/）")
+    p.add_argument(
+        "--out",
+        default=None,
+        help="产物路径（默认 QuantDB 5_technical_derived/trade_mask/）",
+    )
     p.add_argument("--limit-days", type=int, default=0, help="只跑最近 N 天（冒烟）")
-    p.add_argument("--market", default="CN", help="市场（目前只支持 CN：涨跌停规则仅 A 股有）")
+    p.add_argument(
+        "--market", default="CN", help="市场（目前只支持 CN：涨跌停规则仅 A 股有）"
+    )
     args = p.parse_args()
 
     if args.market.upper() != "CN":
-        log.error("可交易掩码目前只覆盖 CN（涨跌停/ST 规则是 A 股特有）；收到 %s", args.market)
+        log.error(
+            "可交易掩码目前只覆盖 CN（涨跌停/ST 规则是 A 股特有）；收到 %s", args.market
+        )
         return 2
 
     t0 = time.time()
@@ -90,8 +110,9 @@ def main() -> int:
     if args.limit_days:
         days = days[-args.limit_days :]
     if not days:
-        log.error("区间内没有交易日（看 valuation 分区）—— 不写空产物")
-        return 1
+        # 区间内无交易日（周末/假日 beat 触发）→ no-op 成功，不是失败
+        log.info("区间 %s ~ %s 内没有交易日 —— no-op，产物不动", args.start, args.end)
+        return 0
     log.info("区间 %s ~ %s：%d 个交易日", days[0], days[-1], len(days))
 
     df = TB.build_mask(days, market="CN")
@@ -101,21 +122,38 @@ def main() -> int:
         return 1
 
     out = Path(args.out) if args.out else default_out_path()
-    stat = TB.write_mask(df, out)
-    n_days = int(df["dt"].nunique())
+    old_df = None
+    if out.exists():
+        try:
+            old_df = pd.read_parquet(out, columns=list(TB.MASK_COLUMNS))
+            log.info("旧产物 %s：%d 行，将做区间替换合并", out, len(old_df))
+        except Exception as exc:  # noqa: BLE001 — 旧产物坏 → 按全量重建处理并显形
+            log.warning("旧产物读取失败（%s），按全量重建处理: %s", out, exc)
+    merged = TB.merge_mask_frames(old_df, df, days[0], days[-1])
+    stat = TB.write_mask(merged, out)
+    seg_days = int(df["dt"].nunique())
+    tot_days = int(merged["dt"].nunique())
     log.info(
-        "落盘 %s：%d 行 / %d 天（多头被挡 %d 只次、空头被挡 %d 只次，%.0fs）",
-        stat["path"], stat["rows"], n_days, stat["blocked_long"], stat["blocked_short"], time.time() - t0,
+        "落盘 %s：%d 行 / %d 天（本段 %d 天产出被挡行；多头被挡 %d 只次、"
+        "空头被挡 %d 只次，%.0fs）",
+        stat["path"],
+        stat["rows"],
+        tot_days,
+        seg_days,
+        stat["blocked_long"],
+        stat["blocked_short"],
+        time.time() - t0,
     )
     meta = {
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "elapsed_s": round(time.time() - t0, 1),
-        "range": [days[0], days[-1]],
-        "n_days": n_days,
+        "range": [int(merged["dt"].min()), int(merged["dt"].max())],
+        "segment": [days[0], days[-1]],
+        "n_days": tot_days,
         "rows": stat["rows"],
         "blocked_long": stat["blocked_long"],
         "blocked_short": stat["blocked_short"],
-        "coverage_frac": round(n_days / len(days), 4),
+        "coverage_frac": round(seg_days / len(days), 4),
         "st_policy": "静态快照含前视偏差 → ST 标的整票不入掩码（见 factor_report/tradability.py）",
         "source": "services/simulation/services/local_market_data.DailyBar（平台唯一权威实现）",
     }
@@ -123,8 +161,11 @@ def main() -> int:
     tmp = mp.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, mp)
-    if n_days < len(days):
-        log.warning("有 %d 天没有产出被挡行（该日可能全市场可交易，也可能行情缺失）", len(days) - n_days)
+    if seg_days < len(days):
+        log.warning(
+            "有 %d 天没有产出被挡行（该日可能全市场可交易，也可能行情缺失）",
+            len(days) - seg_days,
+        )
     return 0
 
 

@@ -128,6 +128,49 @@ def build_mask(
     )
 
 
+def merge_mask_frames(
+    old_df: pd.DataFrame | None,
+    new_df: pd.DataFrame,
+    start: int,
+    end: int,
+) -> pd.DataFrame:
+    """增量合并：``[start, end]``（闭区间，int YYYYMMDD）内的行用 ``new_df`` 替换。
+
+    掩码是「一次构建、增量补新日期」的单文件产物（见 ``build_trade_mask.py``）——
+    重扫某区间后必须与旧产物合并，否则区间外的历史被整段抹掉（此前依赖全量
+    重算才能幸免：慢，且中断即成半截产物）。
+
+    - ``old_df`` None/空 → 规范化后的 ``new_df``（含区间过滤）；
+    - 区间内某日重扫后无行（数据缺口等）→ 该日旧行**一并替换为空**（区间替换
+      语义，缺口在构建器日志显形）；
+    - 返回列序/dtype 与 ``build_mask`` 产物一致（dt int32 / symbol string /
+      两 bool），按 (dt, symbol) 排序（重扫行优先，同键去重兜底）。
+    """
+    cols = list(MASK_COLUMNS)
+
+    def _norm(d: pd.DataFrame) -> pd.DataFrame:
+        x = d.reindex(columns=cols).copy()
+        x["dt"] = x["dt"].astype("int64")
+        x["symbol"] = x["symbol"].astype(str)
+        x["blocked_long"] = x["blocked_long"].astype(bool)
+        x["blocked_short"] = x["blocked_short"].astype(bool)
+        return x
+
+    new_n = _norm(new_df)
+    new_n = new_n[(new_n["dt"] >= start) & (new_n["dt"] <= end)]
+    if old_df is None or len(old_df) == 0:
+        out = new_n
+    else:
+        old_n = _norm(old_df)
+        keep = old_n[(old_n["dt"] < start) | (old_n["dt"] > end)]
+        out = pd.concat([keep, new_n], ignore_index=True)
+    out = out.drop_duplicates(subset=["dt", "symbol"], keep="last")
+    out = out.sort_values(["dt", "symbol"], kind="stable").reset_index(drop=True)
+    return out.astype(
+        {"dt": "int32", "symbol": "string", **_SPARSE_DTYPE}, errors="ignore"
+    )
+
+
 def write_mask(df: pd.DataFrame, path: str | Path) -> dict[str, Any]:
     """原子写（临时文件 + ``os.replace``），中途失败不留半截产物。"""
     import os

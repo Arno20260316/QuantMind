@@ -1584,3 +1584,128 @@ def run_factor_board_build() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.exception("[FactorBoard] 失败: %s", e)
         return {"status": "failed", "error": str(e)}
+
+
+@celery_app.task(name="engine.tasks.trade_mask_refresh")
+def run_trade_mask_refresh() -> dict[str, Any]:
+    """可交易性掩码增量刷新（P2-d，2026-10-11）。
+
+    子进程跑 ``backend/scripts/build_trade_mask.py --start <今日-14天>``：重扫最近
+    约两周盘面（涨跌停/停牌；ST 整票不入），与旧产物做**区间替换合并**（段外
+    历史原样保留——此前增量模式会静默抹掉段外全史）。产物
+    ``5_technical_derived/trade_mask/trade_mask.parquet`` 供因子概率板名单层
+    过滤与因子报告可交易轨消费。
+
+    退码语义：0 = 成功或 no-op（区间内无交易日）；1 = 失败（逐日行情取不到/
+    空产物拒绝写）。区间晚于数据链当日落盘时，今日缺失由次日重扫自然补齐。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime, timedelta
+    from pathlib import Path as _Path
+
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("trade_mask_refresh")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = root / "backend" / "scripts" / "build_trade_mask.py"
+        start = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+        cmd = [sys.executable, str(script), "--start", start]
+        started = datetime.now()
+        logger.info("[TradeMask] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(
+            cmd, cwd=str(root), capture_output=True, text=True, timeout=1800
+        )
+        if proc.returncode != 0:
+            logger.error(
+                "[TradeMask] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info("[TradeMask] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:])
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[TradeMask] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}
+
+
+@celery_app.task(name="engine.tasks.factor_board_reselect")
+def run_factor_board_reselect() -> dict[str, Any]:
+    """因子概率板滚动重选 + OOS 回填（P2-f，细案 §七）。
+
+    子进程跑 ``backend/scripts/market_analysis/rolling_reselect.py``：月初首个
+    交易日以最近分区为 as_of 重跑选择管线 → 应用月台本 ``rolling/{YYYY-MM}.json``
+    + 回填上月 OOS。CLI 自带月初判据（最近分区在上一自然月），**非月首退码 0
+    静默跳过**——beat 排 1–12 日工作日，落在窗口外的日子只是心跳+跳过。
+
+    本任务**不做**月初预判（判据唯一实现在 CLI，避免两处漂移）；心跳每触发
+    日都刷（体检 TTL 32 天，覆盖月频节奏 + 假日窗）。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("factor_board_reselect")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = (
+            root / "backend" / "scripts" / "market_analysis" / "rolling_reselect.py"
+        )
+        data_dir = os.getenv("QM_QUANTDB_DATA_DIR", "/data/quantdb")
+        out_dir = os.getenv("QM_FACTOR_BOARD_DIR", "/data/market-analysis/factor_board")
+        _Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--data-dir",
+            data_dir,
+            "--board-dir",
+            out_dir,
+        ]
+        started = datetime.now()
+        logger.info("[FactorBoardReselect] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(
+            cmd, cwd=str(root), capture_output=True, text=True, timeout=1800
+        )
+        if proc.returncode != 0:
+            logger.error(
+                "[FactorBoardReselect] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info(
+            "[FactorBoardReselect] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:]
+        )
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[FactorBoardReselect] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}

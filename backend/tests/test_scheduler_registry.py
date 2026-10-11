@@ -194,6 +194,9 @@ def test_all_jobs_heartbeat_wired_in_source():
         "regime_persist",
         "fusion_refresh",
         "factor_board",
+        # P2-d/P2-f（2026-10-11）：掩码增量刷新 + 概率板滚动重选
+        "trade_mask_refresh",
+        "factor_board_reselect",
     ):
         assert f'_sched_heartbeat("{job_key}")' in celery_src, f"{job_key} 未接心跳"
 
@@ -210,6 +213,9 @@ def test_all_jobs_heartbeat_wired_in_source():
         "regime_persist",
         "fusion_refresh",
         "factor_board",
+        # P2-d/P2-f（2026-10-11）
+        "trade_mask_refresh",
+        "factor_board_reselect",
     }
     registry = {j.key for j in JOBS if j.heartbeat_ttl is not None}
     assert registry == wired, f"注册表与接线不一致: {registry ^ wired}"
@@ -259,6 +265,10 @@ def test_schedule_ctl_dispatch_covers_rerun_declared_jobs():
         "fusion_refresh",
         # 因子概率板（重跑 = 立刻按日更形态再构建一份；同日覆盖）
         "factor_board",
+        # P2-d 掩码刷新（重跑 = 立刻再扫一遍最近两周；区间替换合并，幂等）
+        "trade_mask_refresh",
+        # P2-f 滚动重选（重跑 = 立刻跑一次；--date=历史回填 as_of）
+        "factor_board_reselect",
         # P2-5 值班摘要（重跑 = 立刻生成并真的再推一条 QQ）
         "duty_summary",
         # P2-5 值班死手（重跑 = 核对一遍；--force 跳过非交易日闸门与封账键）

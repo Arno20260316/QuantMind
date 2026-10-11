@@ -17,5 +17,9 @@
     { "case": "均分居中", "fac": -0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": 0.9, "expect": "neutral" }
   ],
   "coverageGate": { "ramp": 0.7 },
-  "boardRequiredTop": ["schema_version", "meta", "factors", "horizon", "validation", "resonance", "sectors", "stocks"]
+  "boardRequiredTop": ["schema_version", "meta", "factors", "horizon", "validation", "resonance", "sectors", "stocks"],
+  "boardSchemaVersion": "factor_board/1.1",
+  "boardOptionalTop": ["regime", "dedup"],
+  "decayEnum": ["ok", "weak", "flipped", "insufficient"],
+  "regimeNoteEnum": ["ok", "weak", "insufficient", "unavailable"]
 }

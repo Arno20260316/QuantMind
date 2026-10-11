@@ -34,6 +34,77 @@ export interface FactorBoardFactor {
   kept_ic: number | null;
   weight: number | null;
   horizon: Record<string, number | null>;
+  // ── 1.1 增量（schema <1.1 的历史产物没有这些键 → 一律可选）──
+  /** 净 IC：扣当日新进多头腿成本后的 RankIC（只显形，不进闸门）。 */
+  net_ic60?: number | null;
+  net_win60?: number | null;
+  net_icir60?: number | null;
+  /** 成本侵蚀：净 IC 与毛 IC 反号（净轨有效日不足时 null）。 */
+  eroded?: boolean | null;
+  /** 尾窗 20 个有效日的方向对齐 IC 均值（sgn×RankIC；可负）。 */
+  ic20?: number | null;
+  win20?: number | null;
+  /** ok / weak / flipped / insufficient（见 DECAY_META）。 */
+  decay?: string | null;
+  /** regime 调权轨迹：原始权重 / 乘子 / 桶内对齐 IC / 桶有效日 / 注记。 */
+  w_raw?: number | null;
+  regime_mult?: number | null;
+  regime_ic?: number | null;
+  regime_n?: number | null;
+  regime_note?: string | null;
+}
+
+/** coverage.mask：可交易掩码命中信息（涨跌停/停牌为当日状态，无当日行不过滤）。 */
+export interface FactorBoardMaskInfo {
+  mask_date: number | null;
+  mask_max_dt: number | null;
+  stale_days: number | null;
+  missing: boolean;
+}
+
+/** 顶层 regime 块（P2-c；DB 不可用/样本不足时整块 null，权重全不动）。 */
+export interface FactorBoardRegime {
+  market: string;
+  state: string;
+  state_asof: string;
+  state_lag_days: number;
+  lookback_days: number;
+  eval_days: number;
+  bucket_n: number;
+  weak_count: number;
+  adjusted_count: number;
+  weak_mult: number;
+  by_family: Record<string, { state_ic: number | null; n_days: number; mult: number }>;
+}
+
+/** 顶层 dedup 块（P2-e；入选内二次去重：|ρ|≥reject 判重、[warn,reject) 记警）。 */
+export interface FactorBoardDedup {
+  n_pool: number;
+  n_reserves: number;
+  n_kept: number;
+  reject: number;
+  warn: number;
+  dropped: { key: string; matched_key: string; rho: number | null }[];
+  pruned: string[];
+  warnings: { key: string; matched_key: string; rho: number | null }[];
+}
+
+/** validation.rolling_oos：最近一期滚动重选台账的后窗验证（前窗选、后窗验）。 */
+export interface FactorBoardRollingOos {
+  month: string;
+  as_of: string | null;
+  since?: string;
+  until?: string;
+  horizon?: number;
+  rank_ic: number | null;
+  icir?: number | null;
+  t?: number | null;
+  win: number | null;
+  days: number;
+  excluded_no_fwd?: number;
+  note?: string;
+  filled_by_month?: string;
+  filled_at?: string;
 }
 
 export interface FactorBoardSectorItem {
@@ -87,7 +158,11 @@ export interface FactorBoardMeta {
     composite_n: number;
     model_cov_n: number;
     close_nonpos: number;
+    /** 1.1 增量（可选，历史产物无此键）。 */
+    mask?: FactorBoardMaskInfo | null;
   };
+  /** 1.1 阈值快照（含 cost_rate / DECAY_* / REGIME_* / DEDUP_*；可选）。 */
+  thresholds?: Record<string, unknown>;
   warnings: string[];
 }
 
@@ -96,6 +171,8 @@ export interface FactorBoardValidation {
   sector?: { rank_ic: number | null; icir: number | null; t: number | null; win: number | null; days: number } | null;
   in_sample?: boolean;
   note?: string;
+  /** 1.1：最近一期滚动 OOS（暂无已回填台账 → 键缺失或 null）。 */
+  rolling_oos?: FactorBoardRollingOos | null;
 }
 
 export interface FactorBoardResponse {
@@ -119,6 +196,9 @@ export interface FactorBoardResponse {
     resonant_long: FactorBoardStock[];
     resonant_short: FactorBoardStock[];
   };
+  /** 1.1 顶层块：键必须存在（可 null）；1.0 历史产物无键 → 可选，缺则隐藏。 */
+  regime?: FactorBoardRegime | null;
+  dedup?: FactorBoardDedup | null;
   available_dates: string[];
 }
 

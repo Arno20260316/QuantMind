@@ -52,3 +52,95 @@ export function verdictMeta(verdict: string): VerdictMeta {
     }
   );
 }
+
+/** 衰减四态（selection.py `decay` 字段；金样 `decayEnum` 双端共读防漂移）。
+ *
+ * 谓词（尾窗 20 个有效日，对齐量 = sgn×IC）：均值 <0 → flipped；
+ * |均值| <0.02 → weak；否则 ok；有效日 <15 → insufficient。
+ */
+export const DECAY_META: Record<string, VerdictMeta> = {
+  ok: {
+    label: '同向',
+    cls: 'bg-emerald-50 text-emerald-700 border-emerald-200/80',
+    hint: '尾窗 20 个有效日方向对齐 IC（sgn×RankIC）均值 ≥0.02：近 20 日方向与强度维持',
+  },
+  weak: {
+    label: '走弱',
+    cls: 'bg-amber-50 text-amber-700 border-amber-200/80',
+    hint: '尾窗方向对齐 IC 均值 |x|<0.02：近 20 日方向仍在、强度衰减（只显形，不影响入选闸门）',
+  },
+  flipped: {
+    label: '近期反向',
+    cls: 'bg-red-50 text-red-700 border-red-200/80',
+    hint: '尾窗方向对齐 IC 均值为负：近 20 日与 IC60 主方向相反（负值原样显形，不截断）',
+  },
+  insufficient: {
+    label: '样本不足',
+    cls: 'bg-slate-50 text-slate-500 border-slate-200/80',
+    hint: '尾窗有效日 <15 天：不硬判状态',
+  },
+};
+
+/** 衰减 chip 的未知/缺省出口（同 verdictMeta 纪律）。 */
+export function decayMeta(state: string | null | undefined): VerdictMeta {
+  if (!state) {
+    return {
+      label: '—',
+      cls: 'bg-slate-50 text-slate-400 border-slate-200/80',
+      hint: '无衰减统计（1.0 产物或尾窗缺失）',
+    };
+  }
+  return (
+    DECAY_META[state] ?? {
+      label: '未知',
+      cls: 'bg-slate-50 text-slate-400 border-slate-200/80',
+      hint: `未识别的衰减状态: ${state}`,
+    }
+  );
+}
+
+/** regime 注记四态（regime.py `regime_note` 字段；金样 `regimeNoteEnum` 双端共读）。
+ *
+ * 弱桶谓词（唯一实现 regime_buckets.is_weak_bucket）：制度桶内对齐 IC 均值 ≤0
+ * 且有效日 ≥15 → 权重 ×0.5（只降不翻）；其余恒 ×1.0。
+ */
+export const REGIME_NOTE_META: Record<string, VerdictMeta> = {
+  ok: {
+    label: '桶内正常',
+    cls: 'bg-emerald-50 text-emerald-700 border-emerald-200/80',
+    hint: '该因子在制度桶内对齐 IC 均值为正且样本充分：权重不调整',
+  },
+  weak: {
+    label: '弱桶降权',
+    cls: 'bg-amber-50 text-amber-700 border-amber-200/80',
+    hint: '制度桶内对齐 IC 均值 ≤0 且 ≥15 日：权重 ×0.5（只降不翻，绝不改方向）',
+  },
+  insufficient: {
+    label: '桶内样本不足',
+    cls: 'bg-slate-50 text-slate-500 border-slate-200/80',
+    hint: '当前制度桶内有效日 <15 天：样本不足，权重不调整',
+  },
+  unavailable: {
+    label: '制度不可用',
+    cls: 'bg-slate-50 text-slate-500 border-slate-200/80',
+    hint: '制度状态表/IC 配对不可用：整块降级，权重全不动',
+  },
+};
+
+/** regime 注记 chip 的未知/缺省出口。 */
+export function regimeNoteMeta(state: string | null | undefined): VerdictMeta {
+  if (!state) {
+    return {
+      label: '—',
+      cls: 'bg-slate-50 text-slate-400 border-slate-200/80',
+      hint: '无制度注记（1.0 产物或 regime 降级）',
+    };
+  }
+  return (
+    REGIME_NOTE_META[state] ?? {
+      label: '未知',
+      cls: 'bg-slate-50 text-slate-400 border-slate-200/80',
+      hint: `未识别的制度注记: ${state}`,
+    }
+  );
+}

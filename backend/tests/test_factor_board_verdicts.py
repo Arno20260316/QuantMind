@@ -9,8 +9,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from backend.shared.factor_board import board_io as IO
 from backend.shared.factor_board import composite as CP
+from backend.shared.factor_board import config as C
 from backend.shared.factor_board import sectors as S
+from backend.shared.factor_board import selection as SEL
 
 GOLDEN_PATH = Path(__file__).resolve().parent / "fixtures" / "factorBoardGolden.json"
 
@@ -162,3 +165,54 @@ def test_合成_反向因子低值加分_覆盖门槛剔除():
     assert comp["S1"] > comp["S2"]
     # S3 缺 fwd（1/3 权重 → 覆盖 2/3 < 70%）→ 被覆盖门槛剔除
     assert "S3" not in comp.index
+
+
+# ── 1.1 契约金样同步（§八：schema 演进；两侧测试共读防漂移） ─────────────
+
+
+@pytest.mark.unit
+def test_金样_schema版本与代码一致(golden):
+    # Assert：config.SCHEMA_VERSION 是唯一事实源，金样锁其对外形态
+    assert golden["boardSchemaVersion"] == C.SCHEMA_VERSION
+
+
+@pytest.mark.unit
+def test_金样_顶层键_必需与可选并集等于产板自校验全集(golden):
+    # Arrange
+    required = set(golden["boardRequiredTop"])
+    optional = set(golden["boardOptionalTop"])
+
+    # Assert：两集不交；并集 == board_io 产板自校验的顶层键（1.1 的 regime/dedup
+    # 键必须存在、值可为 null —— 前端只把 8 核心键当 REQUIRED，历史 1.0 仍可渲染）
+    assert required & optional == set()
+    assert required | optional == set(IO._REQUIRED_TOP)
+
+
+@pytest.mark.unit
+def test_金样_衰减枚举与状态机四态一一对应(golden):
+    # Arrange：尾窗 20 日；不足 15 日 → insufficient；对齐量 = sgn(ic60)×IC
+    cases = {
+        "insufficient": (pd.Series([0.1] * 10), 0.1),
+        "flipped": (pd.Series([-0.1] * 20), 0.1),
+        "weak": (pd.Series([0.01] * 20), 0.1),
+        "ok": (pd.Series([0.05] * 20), 0.1),
+    }
+
+    # Act
+    got = {SEL._decay_stat(s, ic60)["decay"] for s, ic60 in cases.values()}
+
+    # Assert：行为四态 == 金样枚举（前端 DECAY_META 以同一金样锁逐键映射）
+    assert got == set(golden["decayEnum"])
+
+
+@pytest.mark.unit
+def test_金样_制度注记枚举与代码字面量一致(golden):
+    # Assert：四分支行为断言在 test_factor_board_regime.py 各自成例
+    # （weak/ok/insufficient/unavailable）；此处锁金样字面量本身，
+    # 前端 REGIME_NOTE_META 以同一金样锁逐键映射。
+    assert set(golden["regimeNoteEnum"]) == {
+        "ok",
+        "weak",
+        "insufficient",
+        "unavailable",
+    }

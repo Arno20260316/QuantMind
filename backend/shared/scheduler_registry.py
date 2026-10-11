@@ -325,6 +325,29 @@ JOBS: tuple[JobSpec, ...] = (
         "硬门不过退码 1 且不落盘；重跑 = 立刻按日更形态再构建一份（同日覆盖，"
         "--date 指定决策日=模型信号目标交易日，不给则取 PG 最新批量信号）",
     ),
+    # P2-d 可交易性掩码增量刷新：收盘后 18:40 mon-fri；TTL 4 天（同 factor_board
+    # 的周末 72h 逻辑）。产物供概率板名单过滤 + 因子报告可交易轨。
+    JobSpec(
+        "trade_mask_refresh", "可交易性掩码刷新（概率板/因子报告）", "celery_beat", "celery",
+        "交易日 18:40（重扫最近约两周，区间替换合并）",
+        "TRADE_MASK_REFRESH_ENABLED", True, 345600,
+        "python backend/scripts/schedule_ctl.py run trade_mask_refresh [--date YYYY-MM-DD]",
+        "逐日扫盘面（涨跌停/停牌；ST 整票不入掩码）→ trade_mask.parquet 稀疏产物，"
+        "段外历史原样保留（区间替换）；区间无交易日 no-op 退码 0；"
+        "重跑 = 立刻再扫一遍（--date 指定重扫段尾，缺省=最近两周；确定性幂等）",
+    ),
+    # P2-f 因子概率板滚动重选：月频（beat 排每月 1–12 日工作日 08:50，任务体判
+    # 月首交易日）。心跳 TTL 32 天：beat 每触发日都刷，但窗口外日子不跑任务体
+    # ——留足「上月 12 日 → 本月首个工作日」的最大间隔（约 3 周）。
+    JobSpec(
+        "factor_board_reselect", "因子概率板滚动重选（P2-f）", "celery_beat", "celery",
+        "应用月首个交易日 08:50（beat 1–12 日工作日，月首判据在任务体）",
+        "FACTOR_BOARD_RESELECT_ENABLED", True, 2764800,
+        "python backend/scripts/schedule_ctl.py run factor_board_reselect [--date YYYY-MM-DD]",
+        "前窗选（重跑选择管线，同窗 85/65）→ 应用月台本 rolling/{YYYY-MM}.json，"
+        "并把上月台本 oos 段按后窗 RankIC 回填（前窗选后窗验）；非月首退码 0 跳过；"
+        "重跑 = 立刻跑一次（--date 指定训练窗尾 as_of=历史回填；--force 绕过月首判据）",
+    ),
 )
 
 JOBS_BY_KEY: dict[str, JobSpec] = {job.key: job for job in JOBS}

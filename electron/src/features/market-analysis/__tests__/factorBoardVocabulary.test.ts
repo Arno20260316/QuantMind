@@ -13,7 +13,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { VERDICT_META, verdictMeta } from '../factorBoardVocabulary';
+import {
+    DECAY_META,
+    REGIME_NOTE_META,
+    VERDICT_META,
+    decayMeta,
+    regimeNoteMeta,
+    verdictMeta,
+} from '../factorBoardVocabulary';
 import { REQUIRED_TOP_KEYS } from '../services/factorBoardService';
 
 /**
@@ -28,6 +35,10 @@ const GOLDEN_PATH = path.resolve(
 const golden: {
     verdictTruthTable: Array<{ case: string; expect: string }>;
     boardRequiredTop: string[];
+    boardSchemaVersion: string;
+    boardOptionalTop: string[];
+    decayEnum: string[];
+    regimeNoteEnum: string[];
 } = JSON.parse(readFileSync(GOLDEN_PATH, 'utf-8'));
 
 const BANNED_ADVICE_WORDS = ['买入', '卖出', '加仓', '减仓', '建仓', '清仓', '建议'];
@@ -45,9 +56,16 @@ describe('因子概率板词汇与契约', () => {
     });
 
     it('展示词不含买卖指令词（展示面纪律）', () => {
-        for (const [key, meta] of Object.entries(VERDICT_META)) {
-            for (const word of BANNED_ADVICE_WORDS) {
-                expect(`${meta.label}|${meta.hint}`, `${key} 含禁用词 ${word}`).not.toContain(word);
+        const maps: Array<[string, Record<string, { label: string; hint: string }>]> = [
+            ['VERDICT', VERDICT_META],
+            ['DECAY', DECAY_META],
+            ['REGIME_NOTE', REGIME_NOTE_META],
+        ];
+        for (const [mapName, map] of maps) {
+            for (const [key, meta] of Object.entries(map)) {
+                for (const word of BANNED_ADVICE_WORDS) {
+                    expect(`${meta.label}|${meta.hint}`, `${mapName}.${key} 含禁用词 ${word}`).not.toContain(word);
+                }
             }
         }
     });
@@ -60,5 +78,35 @@ describe('因子概率板词汇与契约', () => {
 
     it('产物必需顶层键与后端金样一致', () => {
         expect([...REQUIRED_TOP_KEYS].sort()).toEqual([...golden.boardRequiredTop].sort());
+    });
+
+    it('1.1 可选顶层块（regime/dedup）与必需键不交', () => {
+        // 展示纪律：可选键缺省即隐藏（历史 1.0 产物仍按 8 核心键渲染）
+        expect([...golden.boardOptionalTop].sort()).toEqual(['dedup', 'regime']);
+        const required = new Set<string>(golden.boardRequiredTop);
+        for (const k of golden.boardOptionalTop) {
+            expect(required.has(k), `可选键 ${k} 与必需键重叠`).toBe(false);
+        }
+    });
+
+    it('衰减四态枚举与 DECAY_META 一一对应', () => {
+        expect(Object.keys(DECAY_META).sort()).toEqual([...golden.decayEnum].sort());
+    });
+
+    it('制度注记枚举与 REGIME_NOTE_META 一一对应', () => {
+        expect(Object.keys(REGIME_NOTE_META).sort()).toEqual([...golden.regimeNoteEnum].sort());
+    });
+
+    it('衰减/制度注记缺省与未知出口不猜语义', () => {
+        // 缺省（1.0 产物或降级）→ —；未知枚举 → 「未知」+ 原文显形
+        expect(decayMeta(null).label).toBe('—');
+        expect(decayMeta(undefined).label).toBe('—');
+        const unknownDecay = decayMeta('brand_new_decay');
+        expect(unknownDecay.label).toBe('未知');
+        expect(unknownDecay.hint).toContain('brand_new_decay');
+        expect(regimeNoteMeta(null).label).toBe('—');
+        const unknownNote = regimeNoteMeta('brand_new_note');
+        expect(unknownNote.label).toBe('未知');
+        expect(unknownNote.hint).toContain('brand_new_note');
     });
 });

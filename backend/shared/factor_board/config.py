@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-SCHEMA_VERSION = "factor_board/1.0"
+SCHEMA_VERSION = "factor_board/1.1"
 
 # ── 因子池 ──────────────────────────────────────────────────────────
 # kept-362 联合筛选清单里的日频库（factor_research 经典库为月频评估，不并入）
@@ -46,6 +46,36 @@ MIN_STOCK_SAMPLE = 800  # 单日 IC 计算的最小标的数
 # ── 权重与覆盖 ──────────────────────────────────────────────────────
 W_CLIP_LO, W_CLIP_HI = 0.02, 0.15
 COVERAGE_GATE = 0.7  # 已覆盖权重 <70% 总权重 → 该股合成置 null
+
+# ── 净 IC（成本口径，P2-a；语义对齐 statistical/costs.net_rank_ic，只显形不进闸） ──
+NET_IC_LONG_PCT = 0.7  # 多头名单 = 当日因子 rank_pct ≥ 0.7
+NET_IC_MIN_NAMES = 10  # 名单日最小样本（= ic_stats.DEFAULT_MIN_NAMES_PER_DAY）
+COST_RATE_FALLBACK = 0.002  # get_cost_rate 单源不可用时的兜底（双边）
+
+# ── IC 衰减告警（P2-b） ─────────────────────────────────────────────
+DECAY_WINDOW = 20  # 尾 N 个有效 IC 日
+DECAY_MIN_ABS_IC = 0.02  # 方向对齐均值 |IC20| 低于此值 = weak
+DECAY_MIN_DAYS = 15  # 有效日不足 → insufficient（不硬判）
+
+# ── regime 分桶权重（P2-c；qm_regime_daily 冻结表） ─────────────────
+REGIME_MARKET = "CN"
+REGIME_LOOKBACK = 250  # 长窗交易日数（仅对入选因子算对齐 IC 序列）
+REGIME_WEAK_MULT = 0.5  # 当前状态桶为弱桶 → 权重乘子（只降不翻）
+# 弱桶样本下限：判定走 regime_buckets.is_weak_bucket（唯一谓词），此值仅供阈值快照；
+# 测试钉住与 regime_buckets.MIN_BUCKET_DAYS 一致。
+REGIME_MIN_DAYS = 15
+
+# ── 入选内二次去重（P2-e） ──────────────────────────────────────────
+DEDUP_REJECT = 0.9  # |ρ| ≥ 此值 → 席位置换
+DEDUP_WARN = 0.8  # [warn, reject) → 保留记警
+# 池 = 入选（前列）∪ 各族 gated−sel 的 |ic60| 头 FAMILY_CAP 名替补
+
+# ── 可交易性掩码（P2-d） ────────────────────────────────────────────
+TRADE_MASK_REL = Path("5_technical_derived/trade_mask/trade_mask.parquet")
+MASK_STALE_DAYS = 7  # 掩码最大陈旧天数（超出一致注记，仍使用）
+
+# ── 滚动重选（P2-f） ────────────────────────────────────────────────
+ROLLING_DIRNAME = "rolling"  # 产物目录内子目录：{YYYY-MM}.json
 
 # ── 持有期画像 ──────────────────────────────────────────────────────
 HORIZON_DAYS: tuple[int, ...] = (1, 2, 5, 10, 20)
@@ -119,9 +149,13 @@ def resolve_board_dir(explicit: str | Path | None = None) -> Path:
     return _REPO_ROOT / "data" / "market-analysis" / "factor_board"
 
 
-def thresholds_snapshot() -> dict:
-    """写进产物 meta 的阈值快照（审计用，字段名稳定）。"""
-    return {
+def thresholds_snapshot(cost_rate: dict | None = None) -> dict:
+    """写进产物 meta 的阈值快照（审计用，字段名稳定）。
+
+    ``cost_rate``：P2-a 实际生效的成本率解析结果 ``{"rate","source"}``（见
+    ``selection.resolve_cost_rate``）；缺省不写该键（旧调用方零扰动）。
+    """
+    snap = {
         "window_dates": WINDOW_DATES,
         "eval_days": EVAL_DAYS,
         "ic_window": IC_WINDOW,
@@ -140,4 +174,22 @@ def thresholds_snapshot() -> dict:
         "mb_lo": MB_LO,
         "quadrant": [QUADRANT_LO, QUADRANT_HI],
         "close_source": "1_kline_data/daily_forward(qfq)",
+        "net_ic_long_pct": NET_IC_LONG_PCT,
+        "net_ic_min_names": NET_IC_MIN_NAMES,
+        "decay_window": DECAY_WINDOW,
+        "decay_min_abs_ic": DECAY_MIN_ABS_IC,
+        "decay_min_days": DECAY_MIN_DAYS,
+        "regime_market": REGIME_MARKET,
+        "regime_lookback": REGIME_LOOKBACK,
+        "regime_weak_mult": REGIME_WEAK_MULT,
+        "regime_min_days": REGIME_MIN_DAYS,
+        "dedup_reject": DEDUP_REJECT,
+        "dedup_warn": DEDUP_WARN,
+        "mask_stale_days": MASK_STALE_DAYS,
     }
+    if cost_rate is not None:
+        snap["cost_rate"] = {
+            "rate": float(cost_rate.get("rate", COST_RATE_FALLBACK)),
+            "source": str(cost_rate.get("source", "unknown")),
+        }
+    return snap

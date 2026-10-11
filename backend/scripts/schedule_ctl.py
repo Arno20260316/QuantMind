@@ -162,6 +162,56 @@ def _run_factor_board(date_str: str | None, force: bool) -> int:
     return 1
 
 
+def _run_trade_mask_refresh(date_str: str | None, force: bool) -> int:
+    """可交易性掩码「重跑」= 立刻按日更形态再扫一遍（区间替换合并，确定性幂等）。
+
+    ``--date`` = 重扫段尾（YYYY-MM-DD），段 = [段尾-14 天, 段尾]；缺省段尾=今天
+    （与 beat 任务口径一致）。``--force`` 无特殊语义（纯行情派生读侧产物）。
+    退码：0 成功/no-op（区间无交易日）/ 1 失败。
+    """
+    from datetime import date as _d
+    from datetime import timedelta as _td
+
+    script = os.path.join(PROJECT_ROOT, "backend", "scripts", "build_trade_mask.py")
+    end = date_str or _d.today().isoformat()
+    try:
+        end_d = _d.fromisoformat(end)
+    except ValueError:
+        print(f"--date 非法（要 YYYY-MM-DD）: {end}", file=sys.stderr)
+        return 2
+    start = (end_d - _td(days=14)).isoformat()
+    cmd = [sys.executable, script, "--start", start, "--end", end]
+    print(f"执行 {' '.join(cmd)}（输出直通）...")
+    completed = subprocess.run(cmd, check=False)
+    return 0 if completed.returncode == 0 else 1
+
+
+def _run_factor_board_reselect(date_str: str | None, force: bool) -> int:
+    """滚动重选「重跑」= 立刻跑一次月频重选（写当月台本 + 回填上月 OOS）。
+
+    ``--date`` = 训练窗尾 as_of（YYYY-MM-DD；给出即历史回填，同时绕过月初判据）；
+    ``--force`` = 绕过月初判据但仍用自动 as_of（调试）。退码透传 CLI：
+    0 成功/跳过（非月首）/ 1 失败（硬门）/ 2 参数错误。
+    """
+    script = os.path.join(
+        PROJECT_ROOT,
+        "backend",
+        "scripts",
+        "market_analysis",
+        "rolling_reselect.py",
+    )
+    cmd = [sys.executable, script]
+    if date_str:
+        cmd += ["--as-of", date_str]
+    elif force:
+        cmd += ["--force"]
+    print(f"执行 {' '.join(cmd)}（输出直通）...")
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode in (0, 2):
+        return completed.returncode
+    return 1
+
+
 def _run_retrain_dispatch(date_str: str | None, force: bool) -> int:
     """滚动重训「重跑」= 按配置试一轮（``--force`` 不看 enabled/到点/本期标记）。
 
@@ -601,6 +651,10 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     "training_reaper": _run_training_reaper,
     # P3 Regime 状态日更：纯台账写入且冻结幂等（重跑对已写生效日 = 0 新行）。
     "regime_persist": _run_regime_persist,
+    # P2-d 可交易性掩码刷新（重跑 = 立刻再扫一遍最近两周；区间替换合并，确定性幂等）
+    "trade_mask_refresh": _run_trade_mask_refresh,
+    # P2-f 因子概率板滚动重选（重跑 = 立刻跑一次；--date=历史回填 as_of）
+    "factor_board_reselect": _run_factor_board_reselect,
     # P1 滚动重训派发：重跑 = 按配置试一轮（--force 不看 enabled/到点/本期标记；
     # 真正提交在 API 进程，同窗口重复派发被 campaign 幂等键挡住）。
     "retrain_dispatch": _run_retrain_dispatch,

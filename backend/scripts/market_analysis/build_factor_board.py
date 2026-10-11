@@ -92,7 +92,10 @@ def main() -> int:
     log.info("data_dir=%s out_dir=%s", data_dir, out_dir)
     try:
         board = build_board(
-            data_dir, model_date=args.model_date, signals_csv=args.signals_csv
+            data_dir,
+            model_date=args.model_date,
+            signals_csv=args.signals_csv,
+            board_dir=out_dir,
         )
     except BuildError as exc:
         log.error("构建失败（硬门）: %s", exc)

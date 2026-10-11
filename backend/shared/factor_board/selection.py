@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,36 @@ import pyarrow.parquet as pq
 from backend.shared.factor_board import config as C
 
 log = logging.getLogger("factor_board.selection")
+
+
+def resolve_cost_rate() -> dict:
+    """净 IC 成本率（双边）解析：env ``QM_MINING_COST_RATE`` > mining_plugins 单源 > 兜底。
+
+    返回 ``{"rate": float, "source": str, "warning": str | None}``。单源
+    ``mining_plugins.config.get_cost_rate``（env > yaml > factor_research 常量）
+    不可用（宿主无依赖/配置损坏）时取 ``COST_RATE_FALLBACK`` 并显形——
+    成本源缺失绝不允许拖垮产板。
+    """
+    env = os.environ.get("QM_MINING_COST_RATE")
+    if env:
+        try:
+            return {"rate": float(env), "source": "env", "warning": None}
+        except ValueError:
+            log.warning("QM_MINING_COST_RATE=%r 非法，落单源解析", env)
+    try:
+        from backend.services.engine.mining_plugins.config import get_cost_rate
+
+        return {
+            "rate": float(get_cost_rate()),
+            "source": "mining_plugins",
+            "warning": None,
+        }
+    except Exception as exc:  # noqa: BLE001 — 成本源坏不拦产板，兜底 + 显形
+        return {
+            "rate": float(C.COST_RATE_FALLBACK),
+            "source": "fallback",
+            "warning": f"成本率单源不可用（{exc}），兜底 {C.COST_RATE_FALLBACK}",
+        }
 
 
 def load_candidates(quantdb_root: Path) -> tuple[pd.DataFrame, dict]:
@@ -120,25 +151,52 @@ def compute_ic_table(
     fwd_ranks: dict[str, pd.Series],
     *,
     horizon: int = 5,
-) -> dict[tuple[str, str], list[float]]:
+    fwd_ret: dict[str, pd.Series] | None = None,
+    cost_rate: float | None = None,
+) -> tuple[
+    dict[tuple[str, str], list[float]],
+    dict[tuple[str, str], list[float]] | None,
+    dict[str, list[str]],
+]:
     """逐评估日算每个候选因子对前向 ``horizon`` 日收益的截面 RankIC。
 
     ``fwd_ranks[dt]`` 为该日前向收益的 rank 序列（index=symbol）。
+
+    净 IC 轨（P2-a，``fwd_ret`` + ``cost_rate`` 同时给出时启用）：语义逐条对齐
+    ``statistical/costs.net_rank_ic``——多头名单 = 当日因子 ``rank_pct ≥ 0.7``
+    且样本 ≥ 10（``_long_membership``）；**当日新进**（对比上一评估日名单）从
+    原始前向收益扣 ``cost_rate`` 后再算 RankIC；**首日不扣费但照常计 IC**；
+    样本不足（<10，或整日跳过）的名单日不前进 prev（prev 跨过该日）。
+
+    返回 ``(gross_acc, net_acc | None, days_by_lib)``；两条轨同日同掩码、逐日
+    对齐；``days_by_lib[lib][i]`` 为 acc 第 i 个附加值的评估日（dt 分区名），
+    regime/滚动等按日配对消费方必须据此配对，**不得自建日期列表**（库分区
+    缺失会跳日，自建列表会错位）。
     """
     acc: dict[tuple[str, str], list[float]] = {
         (lib, n): [] for lib, n in zip(cand["lib"], cand["name"], strict=True)
     }
+    net_acc: dict[tuple[str, str], list[float]] | None = (
+        None
+        if fwd_ret is None or cost_rate is None
+        else {(lib, n): [] for lib, n in zip(cand["lib"], cand["name"], strict=True)}
+    )
+    days_by_lib: dict[str, list[str]] = {lib: [] for lib in cand.groupby("lib").groups}
+    prev_long: dict[tuple[str, str], frozenset] = {}
     by_lib = {lib: g["name"].tolist() for lib, g in cand.groupby("lib")}
     for dt in eval_dates:
         fr = fwd_ranks.get(dt)
         if fr is None or fr.notna().sum() < C.MIN_STOCK_SAMPLE:
             continue
+        raw = fwd_ret.get(dt) if net_acc is not None else None
         for lib, names in by_lib.items():
             p = quantdb_root / "6_ml_datasets" / lib / f"dt={dt}" / "data.parquet"
             if not p.exists():
                 continue
+            days_by_lib[lib].append(dt)
             d = pd.read_parquet(p, columns=["symbol"] + names).set_index("symbol")
             for n in names:
+                key = (lib, n)
                 v = d[n]
                 m = v.notna() & fr.notna()
                 val = (
@@ -146,14 +204,60 @@ def compute_ic_table(
                     if int(m.sum()) >= C.MIN_STOCK_SAMPLE
                     else np.nan
                 )
-                acc[(lib, n)].append(val)
-    return acc
+                acc[key].append(val)
+                if net_acc is None:
+                    continue
+                if raw is None:  # fwd_ret 与 fwd_ranks 同源同闸，正常不出现
+                    net_acc[key].append(np.nan)
+                    continue
+                long_now = _long_now(v)
+                nv = np.nan
+                if int(m.sum()) >= C.MIN_STOCK_SAMPLE:
+                    adj = raw
+                    prev = prev_long.get(key)
+                    if prev is not None and cost_rate and long_now is not None:
+                        fresh = long_now - prev
+                        if fresh:
+                            adj = raw.copy()
+                            sel = raw.index.isin(fresh)
+                            adj[sel] = adj[sel] - float(cost_rate)
+                    nv = float(v[m].rank().corr(adj[m].rank()))
+                    if not math.isfinite(nv):
+                        nv = np.nan
+                net_acc[key].append(nv)
+                if long_now is not None:  # 名单日（样本≥10）才前进 prev
+                    prev_long[key] = long_now
+    return acc, net_acc, days_by_lib
+
+
+def _long_now(v: pd.Series) -> frozenset | None:
+    """当日多头名单（``rank_pct ≥ NET_IC_LONG_PCT``）；样本 < NET_IC_MIN_NAMES → None。
+
+    与 ``costs._long_membership`` 同口径：rank 只在非 NaN 值间进行。
+    """
+    if int(v.notna().sum()) < C.NET_IC_MIN_NAMES:
+        return None
+    pct = v.rank(pct=True)
+    return frozenset(v.index[pct >= C.NET_IC_LONG_PCT])
 
 
 def summarize_ic(
-    ic_table: dict[tuple[str, str], list[float]], cand: pd.DataFrame
+    ic_table: dict[tuple[str, str], list[float]],
+    cand: pd.DataFrame,
+    *,
+    net_table: dict[tuple[str, str], list[float]] | None = None,
 ) -> pd.DataFrame:
-    """汇总每个候选的 IC60/胜率/ICIR60（不够 IC_WINDOW-… 天有效 IC 的不可评估）。"""
+    """汇总每个候选的 IC60/胜率/ICIR60（不够 IC_WINDOW-… 天有效 IC 的不可评估）。
+
+    P2 增量（新列全部随 stats 流向后段，旧列零变化）：
+    - ``ic20/win20/decay``：尾 ``DECAY_WINDOW`` 个有效日，方向对齐（``sgn×IC``，
+      与持有期画像同口径）后的衰减状态机——``flipped``（对齐均值<0）/
+      ``weak``（|均值|<``DECAY_MIN_ABS_IC``）/``insufficient``（有效日<
+      ``DECAY_MIN_DAYS``）/``ok``；``ic20``=对齐均值（可为负=翻转显形），
+      ``win20``=原始符号与 ``ic60`` 同号的占比（与 win60 同式仅窗不同）；
+    - ``net_ic60/net_win60/net_icir60/eroded``：净 IC 轨（``net_table`` 给出时）；
+      ``eroded`` = 成本把符号吃反（``sign(net) ≠ sign(gross)``），无净轨→None。
+    """
     meta = cand.drop_duplicates(["lib", "name"]).set_index(["lib", "name"])
     rows = []
     for (lib, n), ics in ic_table.items():
@@ -178,9 +282,57 @@ def summarize_ic(
                 "win60": float((np.sign(s) == np.sign(ic60)).mean()),
                 "n_days": int(len(s)),
                 "icir60": ic60 / sd * math.sqrt(len(s)) if sd > 0 else None,
+                **_decay_stat(s, ic60),
+                **_net_stat(net_table, (lib, n), ic60),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _decay_stat(s: pd.Series, ic60: float) -> dict:
+    """尾窗衰减状态机（细案 §三）：四态 ok/weak/flipped/insufficient。"""
+    tail = s.iloc[-C.DECAY_WINDOW :]
+    if len(tail) < C.DECAY_MIN_DAYS:
+        return {"ic20": None, "win20": None, "decay": "insufficient"}
+    aligned = float(np.sign(ic60)) * tail
+    ic20 = float(aligned.mean())
+    win20 = float((np.sign(tail) == np.sign(ic60)).mean())
+    if ic20 < 0:
+        decay = "flipped"
+    elif abs(ic20) < C.DECAY_MIN_ABS_IC:
+        decay = "weak"
+    else:
+        decay = "ok"
+    return {"ic20": ic20, "win20": win20, "decay": decay}
+
+
+def _net_stat(
+    net_table: dict[tuple[str, str], list[float]] | None,
+    key: tuple[str, str],
+    ic60: float,
+) -> dict:
+    """净 IC 统计（成本只扣当日新进多头腿；见 compute_ic_table 口径注记）。"""
+    empty = {
+        "net_ic60": None,
+        "net_win60": None,
+        "net_icir60": None,
+        "eroded": None,
+    }
+    if net_table is None or key not in net_table:
+        return empty
+    ns = pd.Series(net_table[key], dtype=float).dropna().iloc[-C.IC_WINDOW :]
+    if len(ns) < C.MIN_IC_DAYS:
+        return empty
+    net_ic60 = float(ns.mean())
+    if not math.isfinite(net_ic60):
+        return empty
+    nsd = float(ns.std())
+    return {
+        "net_ic60": net_ic60,
+        "net_win60": float((np.sign(ns) == np.sign(net_ic60)).mean()),
+        "net_icir60": net_ic60 / nsd * math.sqrt(len(ns)) if nsd > 0 else None,
+        "eroded": bool(np.sign(net_ic60) != np.sign(ic60)),
+    }
 
 
 def gate(stats: pd.DataFrame, min_win: float) -> pd.DataFrame:
@@ -223,5 +375,8 @@ def select_factors(stats: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "gated_short": int((gated["ic60"] < 0).sum()),
         "degraded": degraded,
         "families": int(sel["group"].nunique()),
+        # P2-e：完整过闸表（含降级分支镜像）——builder 由此组「族头池」做二次去重；
+        # 不落 JSON（meta.coverage 逐字段取数）。
+        "gated_table": gated,
     }
     return sel, info

@@ -31,6 +31,9 @@ def _valid_board(n_factors: int | None = None) -> dict:
         "resonance": {"spearman": None},
         "sectors": {"industry_l1": None, "industry_l2": None, "concept": None},
         "stocks": {"top": [], "bottom": [], "resonant_long": [], "resonant_short": []},
+        # 1.1：regime/dedup 两键可为 null，但键必须在（旧 1.0 客户端不受影响）
+        "regime": None,
+        "dedup": None,
     }
 
 
@@ -68,6 +71,22 @@ def test_validate_缺字段与硬门各自报错():
     assert "schema_version" in joined
     assert f"硬门 {C.MIN_SELECTED}" in joined
     assert "sectors.concept" in joined
+
+
+@pytest.mark.unit
+def test_validate_1_1_regime_dedup_键必须在_值可为null():
+    """1.1 的 regime/dedup：键缺失=红，值为 null=绿（前端 1.0 客户端向后兼容）。"""
+    # Act & Assert：骨架（值为 None）已过通过用例；删键必须报错
+    for key in ("regime", "dedup"):
+        bad = _valid_board()
+        del bad[key]
+        errors = BIO.validate_board(bad)
+        assert f"缺顶层字段: {key}" in "\n".join(errors), key
+    # 键在且值为真实块 → 依然过
+    ok = _valid_board()
+    ok["regime"] = {"state": "bull"}
+    ok["dedup"] = {"n_kept": 1}
+    assert BIO.validate_board(ok) == []
 
 
 @pytest.mark.unit
@@ -200,3 +219,177 @@ def test_factor_payload_无画像时horizon为空对象不落0():
     out = BIO.factor_payload(sel, pd.DataFrame())
     assert out[0]["sign"] == -1
     assert out[0]["horizon"] == {}
+
+
+@pytest.mark.unit
+def test_factor_payload_1_1新增列_缺列全null不落0():
+    """净 IC/衰减/regime 列缺失 → 一律 None（三态，绝不落成 0）。"""
+    sel = pd.DataFrame(
+        [
+            {
+                "name": "f",
+                "lib": "a",
+                "group": "a/s",
+                "display": "F",
+                "sgn": 1,
+                "ic60": 0.1,
+                "win60": 0.7,
+                "icir60": 1.5,
+                "kept_ic": 0.05,
+                "w": 0.1,
+            }
+        ]
+    )
+    item = BIO.factor_payload(sel, pd.DataFrame())[0]
+    for key in (
+        "net_ic60",
+        "net_win60",
+        "net_icir60",
+        "eroded",
+        "ic20",
+        "win20",
+        "decay",
+        "w_raw",
+        "regime_mult",
+        "regime_ic",
+        "regime_n",
+        "regime_note",
+    ):
+        assert item[key] is None, key
+    # JSON 化必须干净（None 不是 NaN）
+    json.dumps(item, allow_nan=False)
+
+
+@pytest.mark.unit
+def test_factor_payload_1_1新增列_有值时原样透传_eroded三态():
+    # Arrange：净 IC 为正（eroded=False）、衰减 flipped、regime 弱桶乘子
+    sel = pd.DataFrame(
+        [
+            {
+                "name": "f",
+                "lib": "a",
+                "group": "a/s",
+                "display": "F",
+                "sgn": 1,
+                "ic60": 0.1,
+                "win60": 0.7,
+                "icir60": 1.5,
+                "kept_ic": 0.05,
+                "w": 0.05,  # regime 降权后
+                "net_ic60": 0.08,
+                "net_win60": 0.66,
+                "net_icir60": 1.2,
+                "eroded": False,
+                "ic20": -0.03,  # 方向对齐后为负 = flipped 显形
+                "win20": 0.4,
+                "decay": "flipped",
+                "w_raw": 0.1,
+                "regime_mult": 0.5,
+                "regime_ic": 0.0,  # 0 是真实值（弱桶均值），必须原样保留
+                "regime_n": 30,
+                "regime_note": "weak",
+            }
+        ]
+    )
+
+    # Act
+    item = BIO.factor_payload(sel, pd.DataFrame())[0]
+
+    # Assert
+    assert item["net_ic60"] == pytest.approx(0.08)
+    assert item["eroded"] is False
+    assert item["ic20"] == pytest.approx(-0.03)
+    assert item["decay"] == "flipped"
+    assert item["w_raw"] == pytest.approx(0.1)
+    assert item["regime_mult"] == pytest.approx(0.5)
+    assert item["regime_ic"] == 0.0
+    assert item["regime_n"] == 30
+    assert item["regime_note"] == "weak"
+    # eroded 缺失（NaN）→ None 而不是 False
+    sel2 = sel.copy()
+    sel2["eroded"] = np.nan
+    assert BIO.factor_payload(sel2, pd.DataFrame())[0]["eroded"] is None
+
+
+@pytest.mark.unit
+def test_regime_payload_净化与三态():
+    # Arrange：by_family 里混 NaN（DB 缺失日算不出均值）
+    block = {
+        "market": "CN",
+        "state": "bull",
+        "state_asof": "2026-10-09",
+        "state_lag_days": 0,
+        "lookback_days": 250,
+        "eval_days": 245,
+        "bucket_n": 80,
+        "weak_count": 1,
+        "adjusted_count": 1,
+        "weak_mult": 0.5,
+        "by_family": {
+            "a/s": {"state_ic": float("nan"), "n_days": np.nan, "mult": 1.0},
+            "b/s": {"state_ic": 0.03, "n_days": 20, "mult": 0.5},
+        },
+    }
+
+    # Act
+    out = BIO.regime_payload(block)
+    encoded = json.dumps(out, ensure_ascii=False, allow_nan=False)
+
+    # Assert
+    assert "NaN" not in encoded
+    assert out["state"] == "bull"
+    assert out["by_family"]["a/s"] == {"state_ic": None, "n_days": 0, "mult": 1.0}
+    assert out["by_family"]["b/s"]["state_ic"] == pytest.approx(0.03)
+    assert out["by_family"]["b/s"]["mult"] == pytest.approx(0.5)
+    # 降级 → None（键在产物里为 null）
+    assert BIO.regime_payload(None) is None
+    # 不改原 block（纯函数）
+    assert (
+        block["by_family"]["a/s"]["state_ic"] != block["by_family"]["a/s"]["state_ic"]
+    )
+
+
+def _write_rolling(tmp_path: Path, month: str, payload: dict) -> None:
+    rdir = tmp_path / C.ROLLING_DIRNAME
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / f"{month}.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+@pytest.mark.unit
+def test_latest_rolling_oos_取最新非空_跳过空洞与杂项(tmp_path: Path):
+    # Arrange：09 未回填（oos=None）、10 已回填、11 损坏、杂项文件
+    _write_rolling(tmp_path, "2026-09", {"as_of": "2026-08-31", "oos": None})
+    _write_rolling(
+        tmp_path,
+        "2026-10",
+        {"as_of": "2026-09-30", "oos": {"rank_ic": 0.05, "days": 20, "win": 0.6}},
+    )
+    _write_rolling(
+        tmp_path, "2026-11", {"as_of": "2026-10-31", "oos": {"rank_ic": 0.7}}
+    )
+    (tmp_path / C.ROLLING_DIRNAME / "2026-11.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+    (tmp_path / C.ROLLING_DIRNAME / "notes.json").write_text("{}", encoding="utf-8")
+
+    # Act
+    got = BIO.latest_rolling_oos(tmp_path)
+
+    # Assert：取最新可读且有 rank_ic 的月份
+    assert got is not None
+    assert got["month"] == "2026-10"
+    assert got["as_of"] == "2026-09-30"
+    assert got["rank_ic"] == pytest.approx(0.05)
+    # 目录缺失 → None
+    assert BIO.latest_rolling_oos(tmp_path / "nope") is None
+
+
+@pytest.mark.unit
+def test_latest_rolling_oos_全部未回填返回None(tmp_path: Path):
+    _write_rolling(tmp_path, "2026-10", {"as_of": "2026-09-30", "oos": None})
+    _write_rolling(
+        tmp_path, "2026-09", {"as_of": "2026-08-31", "oos": {"rank_ic": None}}
+    )
+    assert BIO.latest_rolling_oos(tmp_path) is None

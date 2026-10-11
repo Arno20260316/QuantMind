@@ -46,12 +46,34 @@ def load_close_matrix(quantdb_root: Path, dates: list[str]) -> pd.DataFrame:
     return pd.DataFrame(cols)
 
 
-def fwd_rank(close: pd.DataFrame, i: int, h: int) -> pd.Series | None:
-    """第 i 列起、未来 h 日收益的 rank（前向收益口径 = qfq close(t+h)/close(t)-1）。"""
+def fwd_ret(close: pd.DataFrame, i: int, h: int) -> pd.Series | None:
+    """第 i 列起、未来 h 日**原始**收益（qfq close(t+h)/close(t)-1）。
+
+    净 IC 的成本必须扣在原始收益上（rank 不可逆，扣费发生在 rank 之前——
+    与 ``statistical/costs.net_rank_ic`` 同口径）。
+    """
     if i + h >= close.shape[1]:
         return None
     f = close.iloc[:, i + h] / close.iloc[:, i] - 1
-    return f.replace([np.inf, -np.inf], np.nan).rank()
+    return f.replace([np.inf, -np.inf], np.nan)
+
+
+def fwd_rank(close: pd.DataFrame, i: int, h: int) -> pd.Series | None:
+    """第 i 列起、未来 h 日收益的 rank（前向收益口径 = qfq close(t+h)/close(t)-1）。"""
+    f = fwd_ret(close, i, h)
+    return None if f is None else f.rank()
+
+
+def fwd_rets(
+    close: pd.DataFrame, dates: list[str], indices: range, h: int
+) -> dict[str, pd.Series]:
+    """``indices`` 范围内每个评估日的原始前向 h 日收益（净 IC 轨专用）。"""
+    out: dict[str, pd.Series] = {}
+    for i in indices:
+        fr = fwd_ret(close, i, h)
+        if fr is not None:
+            out[dates[i]] = fr
+    return out
 
 
 def fwd_ranks(

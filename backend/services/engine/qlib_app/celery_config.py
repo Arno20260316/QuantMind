@@ -256,6 +256,28 @@ if os.getenv("FACTOR_BOARD_ENABLED", "true").lower() == "true":
         "schedule": crontab(minute="40", hour="8", day_of_week="1-5"),
     }
 
+# 可交易性掩码增量刷新（P2-d，2026-10-11）：收盘数据落盘后 18:40 重扫最近两周
+# （脚本内区间替换合并，老日期原样保留），供因子概率板名单层过滤与因子报告
+# 可交易轨消费。只跑周一~五；区间内无交易日脚本 no-op 退码 0，不会白报失败。
+# 独立开关 TRADE_MASK_REFRESH_ENABLED（借别的开关会让体检把「本就没开」报成「停摆」）。
+if os.getenv("TRADE_MASK_REFRESH_ENABLED", "true").lower() == "true":
+    beat_schedule["trade-mask-refresh"] = {
+        "task": "engine.tasks.trade_mask_refresh",
+        "schedule": crontab(minute="40", hour="18", day_of_week="1-5"),
+    }
+
+# 因子概率板滚动重选（P2-f，细案 §七）：每月首个交易日 08:50（晚于 08:40 产板）
+# 以最近分区为 as_of 重跑选择管线 → 应用月台本 + 回填上月 OOS。
+# beat 排每月 1–12 日工作日（月首交易日可能晚到，如国庆后 10-08），任务体再判
+# 「最近可用分区在上一自然月」，非月首静默跳过（退码 0）。
+if os.getenv("FACTOR_BOARD_RESELECT_ENABLED", "true").lower() == "true":
+    beat_schedule["factor-board-reselect"] = {
+        "task": "engine.tasks.factor_board_reselect",
+        "schedule": crontab(
+            minute="50", hour="8", day_of_month="1-12", day_of_week="1-5"
+        ),
+    }
+
 celery_app.conf.update(
     # 序列化
     task_serializer="json",

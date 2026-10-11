@@ -1,9 +1,11 @@
-// 因子概率板 Tab 实机探针（P1 验收）：登录 → #/market-analysis → 点「因子概率板」
+// 因子概率板 Tab 实机探针（P1+P2 验收）：登录 → #/market-analysis → 点「因子概率板」
 // → 等 API 200 → 断言关键文案与数据 → 截图。
+// P2 增量：近 20 日 / 净 IC 两列、去重 / 制度 / 掩码三 chip、滚动 OOS 行。
 // 确定性等待：以 /factor-board 响应与目标文案可见为准，不用裸 timeout 判成功。
 import { chromium } from 'playwright';
 const BASE = 'http://localhost:3080';
 const OUT = '/tmp/factor_board.png';
+const OUT_FULL = '/tmp/factor_board_full.png';
 const browser = await chromium.launch({ executablePath: '/usr/bin/google-chrome-stable', args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1680, height: 1000 } });
 const logs = [];
@@ -58,30 +60,43 @@ else {
   await page.waitForTimeout(2500);
 }
 
-// ── 断言关键文案 ──
+// ── 断言关键文案（结构面；具体数值只记录不钉死，换日重跑不脆） ──
 const expectTexts = [
   '质检与口径', '决策日', '数据截面', '入选', '合成覆盖',
-  '板块共振', '个股四象限', '个股名单', '入选因子（28）', '持有期画像',
+  '板块共振', '个股四象限', '个股名单', '持有期画像',
   '共振 · 靠前', '共振 · 靠后',
+  '近 20 日', '净 IC', // P2 新列（1.1 产物才有；1.0 整列隐藏）
 ];
 const bodyText = ((await page.locator('body').innerText().catch(() => '')) || '').replace(/\s+/g, ' ');
 for (const t of expectTexts) {
   if (!bodyText.includes(t)) fails.push(`缺文案: ${t}`);
 }
+
+// ── P2 元素断言：三 chip + 滚动 OOS 行（regex 锚结构，数值进日志供目检） ──
+const p2Patterns = [
+  ['入选因子计数', /入选因子（(\d+)）/],
+  ['去重 chip', /去重：池 ([\d,]+) → 入选 ([\d,]+)（剔 ([\d,]+)）/],
+  ['制度 chip', /制度：(\S+?)（弱桶 (\d+) \/ 调整 (\d+)）/],
+  ['掩码 chip', /掩码[：: ](\S*)/],
+  ['滚动 OOS 行', /上月滚动验证（(\d{4}-\d{2})）：OOS RankIC ([\d.—-]+) \/ 胜率 ([\d.—%]+)/],
+];
+for (const [name, re] of p2Patterns) {
+  const m = bodyText.match(re);
+  if (!m) fails.push(`缺 P2 元素: ${name}（${re}）`);
+  else logs.push(`[P2] ${name}: ${m[0].slice(0, 90)}`);
+}
+
 // 展示词纪律：面板内不得出现买卖指令措辞。
 // 注：因子特征名（如「资金流 买入 成交额」）是特征本身的名字，不在此列；
 // 禁的是信号/建议形态的措辞（判定词映射由 factorBoardVocabulary 单测另行锁定）。
 for (const w of ['建议买入', '建议卖出', '买入信号', '卖出信号', '加仓', '减仓']) {
   if (bodyText.includes(w)) fails.push(`展示面出现禁用词: ${w}`);
 }
-// 数据面抽查
-for (const t of ['2026-10-12', 'ρ=', '28']) {
-  if (!bodyText.includes(t)) logs.push(`[warn] 未在页面文本中找到: ${t}`);
-}
 logs.push('[TEXT] ' + bodyText.slice(0, 700));
 
 await page.screenshot({ path: OUT, fullPage: false });
-logs.push('[SHOT] ' + OUT);
+await page.screenshot({ path: OUT_FULL, fullPage: true });
+logs.push('[SHOT] ' + OUT + ' / ' + OUT_FULL);
 console.log(logs.join('\n'));
 if (fails.length) { console.log('\n=== FAIL ===\n' + fails.join('\n')); process.exitCode = 1; }
 else console.log('\n=== PASS ===');

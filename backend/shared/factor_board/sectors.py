@@ -144,8 +144,22 @@ def stock_lists(q: pd.DataFrame, n: int = C.STOCK_LIST_N) -> dict[str, list[dict
     """产物名单：top/bottom（按 composite）+ 共振多/空（HH/LL，剔 ST）。
 
     每项字段固定：symbol/name/composite/model_rank/quadrant/sector_l2。
+
+    P2-d 掩码过滤（列缺失时恒不生效，旧调用方/测试零扰动）：多头侧名单
+    （top/共振多）剔除 ``blocked_long``（当日涨停/停牌等不可买入），空头侧
+    （bottom/共振空）剔除 ``blocked_short``；被剔数在
+    ``excluded_blocked_long/short`` 显形（**不落 0 之外的口径**：无行即无剔除）。
     """
     g = q[~q["st"].fillna(False)]
+    if "blocked_long" in g.columns:
+        bl_l = g["blocked_long"].fillna(False).astype(bool)
+    else:
+        bl_l = pd.Series(False, index=g.index)
+    if "blocked_short" in g.columns:
+        bl_s = g["blocked_short"].fillna(False).astype(bool)
+    else:
+        bl_s = pd.Series(False, index=g.index)
+    g_long, g_short = g[~bl_l], g[~bl_s]
 
     def _rows(frame: pd.DataFrame) -> list[dict]:
         out = []
@@ -165,15 +179,21 @@ def stock_lists(q: pd.DataFrame, n: int = C.STOCK_LIST_N) -> dict[str, list[dict
             )
         return out
 
-    top = g.sort_values("composite", ascending=False).head(n)
-    bottom = g.sort_values("composite").head(n)
-    hh = g[g["quadrant"] == "HH"].sort_values("composite", ascending=False).head(n)
-    ll = g[g["quadrant"] == "LL"].sort_values("composite").head(n)
+    top = g_long.sort_values("composite", ascending=False).head(n)
+    bottom = g_short.sort_values("composite").head(n)
+    hh = (
+        g_long[g_long["quadrant"] == "HH"]
+        .sort_values("composite", ascending=False)
+        .head(n)
+    )
+    ll = g_short[g_short["quadrant"] == "LL"].sort_values("composite").head(n)
     return {
         "top": _rows(top),
         "bottom": _rows(bottom),
         "resonant_long": _rows(hh),
         "resonant_short": _rows(ll),
+        "excluded_blocked_long": int(bl_l.sum()),
+        "excluded_blocked_short": int(bl_s.sum()),
     }
 
 

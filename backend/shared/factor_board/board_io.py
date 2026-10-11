@@ -1,4 +1,8 @@
-"""因子概率板：产物组包/校验/原子落盘/读取（schema ``factor_board/1.0``）。
+"""因子概率板：产物组包/校验/原子落盘/读取（schema ``factor_board/1.1``）。
+
+1.1 增量（P2）：顶层 ``regime``/``dedup`` 两键（**可为 null 但键必须在**）；
+``factors[]`` 新增净 IC/衰减/regime 列。前端 REQUIRED_TOP_KEYS 仍是 8 核心
+（1.0 客户端对 1.1 产物向后兼容）。
 
 落盘纪律：临时文件 + ``os.replace``（读到一半的 JSON 比没有更坏）；同日重跑覆盖；
 ``latest.json`` 与 ``{decision_date}.json`` 内容一致。缺失一律 JSON ``null``。
@@ -28,6 +32,8 @@ _REQUIRED_TOP = (
     "resonance",
     "sectors",
     "stocks",
+    "regime",  # 1.1：regime 分桶权重块（可为 null）
+    "dedup",  # 1.1：入选内二次去重块（可为 null）
 )
 
 
@@ -43,6 +49,30 @@ def _clean(x, nd: int = 4):
     except TypeError:
         return x
     return round(float(x), nd)
+
+
+def _bool_or_none(x):
+    """bool/None/NaN → 三态布尔（缺失绝不落成 False）。"""
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return bool(x)
+
+
+def _int_or_none(x):
+    """int/None/NaN → 三态整数。"""
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return int(x)
 
 
 def sector_payload(q: pd.DataFrame, members: pd.DataFrame, stype: str) -> dict | None:
@@ -79,7 +109,13 @@ def sector_payload(q: pd.DataFrame, members: pd.DataFrame, stype: str) -> dict |
 
 
 def factor_payload(sel: pd.DataFrame, horizon: pd.DataFrame) -> list[dict]:
-    """入选因子清单（按 |IC60| 降序），携带持有期画像。"""
+    """入选因子清单（按 |IC60| 降序），携带持有期画像。
+
+    1.1 增量列（缺失列→None，三态语义，**绝不为 0**）：净 IC（``net_ic60``/
+    ``net_win60``/``net_icir60``/``eroded``）、尾窗衰减（``ic20``/``win20``/
+    ``decay`` ∈ ok/weak/flipped/insufficient）、regime（``w_raw``/
+    ``regime_mult``/``regime_ic``/``regime_n``/``regime_note``）。
+    """
     out = []
     hz = horizon if horizon is not None else pd.DataFrame()
     for _, r in sel.sort_values(
@@ -96,6 +132,20 @@ def factor_payload(sel: pd.DataFrame, horizon: pd.DataFrame) -> list[dict]:
             "icir60": _clean(r["icir60"]),
             "kept_ic": _clean(r["kept_ic"]),
             "weight": _clean(r["w"]),
+            "net_ic60": _clean(r.get("net_ic60")),
+            "net_win60": _clean(r.get("net_win60")),
+            "net_icir60": _clean(r.get("net_icir60")),
+            "eroded": _bool_or_none(r.get("eroded")),
+            "ic20": _clean(r.get("ic20")),
+            "win20": _clean(r.get("win20")),
+            "decay": r.get("decay") if isinstance(r.get("decay"), str) else None,
+            "w_raw": _clean(r.get("w_raw")),
+            "regime_mult": _clean(r.get("regime_mult")),
+            "regime_ic": _clean(r.get("regime_ic")),
+            "regime_n": _int_or_none(r.get("regime_n")),
+            "regime_note": r.get("regime_note")
+            if isinstance(r.get("regime_note"), str)
+            else None,
             "horizon": {},
         }
         if (r["lib"], r["name"]) in hz.index:
@@ -103,6 +153,48 @@ def factor_payload(sel: pd.DataFrame, horizon: pd.DataFrame) -> list[dict]:
             item["horizon"] = {str(h): _clean(row.get(h)) for h in C.HORIZON_DAYS}
         out.append(item)
     return out
+
+
+def regime_payload(block: dict | None) -> dict | None:
+    """regime 块（builder 已组装）→ JSON 安全 dict（浮点净化 + 三态）。"""
+    if block is None:
+        return None
+    out = dict(block)
+    out["by_family"] = {
+        str(k): {
+            "state_ic": _clean(v.get("state_ic")),
+            "n_days": _int_or_none(v.get("n_days")) or 0,
+            "mult": _clean(v.get("mult")),
+        }
+        for k, v in (block.get("by_family") or {}).items()
+    }
+    return out
+
+
+def latest_rolling_oos(board_dir: Path) -> dict | None:
+    """最近一期滚动 OOS（``rolling/*.json`` 中 ``oos`` 非空的最新应用月）。
+
+    OOS = 该月快照按冻结 sgn/w 合成后、后窗逐日对 fwd5 的 RankIC（前窗选、
+    后窗验；见 rolling.py）。无目录/无已回填台账 → None。
+    """
+    rdir = Path(board_dir) / C.ROLLING_DIRNAME
+    if not rdir.is_dir():
+        return None
+    months = sorted(
+        p.stem
+        for p in rdir.glob("*.json")
+        if len(p.stem) == 7 and p.stem[4] == "-" and p.stem.replace("-", "").isdigit()
+    )
+    for m in reversed(months):
+        try:
+            led = json.loads((rdir / f"{m}.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("读取滚动台账失败 %s: %s", m, exc)
+            continue
+        oos = led.get("oos")
+        if isinstance(oos, dict) and oos.get("rank_ic") is not None:
+            return {"month": m, "as_of": led.get("as_of"), **oos}
+    return None
 
 
 def horizon_payload(horizon: pd.DataFrame, sel: pd.DataFrame) -> dict:

@@ -143,7 +143,7 @@ FAKE_CANDIDATES = (
 
 @pytest.fixture
 def fake_registry(monkeypatch):
-    """把引擎的候选集换成 5 个受控候选（真实 28 个由 candidates 测试覆盖）。"""
+    """把引擎的候选集换成 5 个受控候选（真实 32 个由 candidates 测试覆盖）。"""
     monkeypatch.setattr(cand, "CANDIDATES", FAKE_CANDIDATES)
     monkeypatch.setattr(
         cand, "CANDIDATE_BY_KEY", {c.key: c for c in FAKE_CANDIDATES}
@@ -403,8 +403,8 @@ class TestNeutralizeDowngrade:
 
 
 class TestRealRegistrySmoke:
-    def test_all_28_candidates_reported(self, monkeypatch):
-        """真实 28 候选小面板冒烟：全量报告 + 拒因完备 + 不抛异常。"""
+    def test_all_32_candidates_reported(self, monkeypatch):
+        """真实 32 候选小面板冒烟：全量报告 + 拒因完备 + 不抛异常。"""
         symbols = _symbols(12)
         dates = pd.bdate_range("2023-01-02", periods=300)
         rng = np.random.default_rng(11)
@@ -427,7 +427,7 @@ class TestRealRegistrySmoke:
             cfg=_cfg(top_k=3, min_valid_days=3, oos_min_days=3),
             price_panel=panel, metadata=meta,
         )
-        assert len(result.candidates) == len(cand.CANDIDATES) == 28
+        assert len(result.candidates) == len(cand.CANDIDATES) == 32
         assert {r.key for r in result.candidates} == {c.key for c in cand.CANDIDATES}
         assert set(result.selected) <= {r.key for r in result.candidates}
         for report in result.candidates:

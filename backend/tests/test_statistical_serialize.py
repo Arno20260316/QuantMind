@@ -40,7 +40,7 @@ from backend.tests.test_statistical_engine import (  # noqa: E402
 
 @pytest.fixture(scope="module")
 def audit() -> dict:
-    """真实跑一遍引擎（真实 28 候选目录）→ 审计字典。"""
+    """真实跑一遍引擎（真实 32 候选目录）→ 审计字典。"""
     panel = _make_panel()
     result = _run(panel, _metadata(panel), cfg=_cfg(top_k=3))
     return ser.result_to_dict(result)
@@ -76,7 +76,7 @@ class TestEngineResultIsJsonDumpable:
 
     def test_every_candidate_has_verdict(self, audit):
         """每个候选：入选或带拒因，二者必居其一（无静默落榜）。"""
-        assert len(audit["candidates"]) == 28
+        assert len(audit["candidates"]) == 32
         for item in audit["candidates"]:
             has_reason = bool(item.get("reject_reason"))
             assert item["selected"] != has_reason, item["key"]

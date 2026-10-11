@@ -2,7 +2,7 @@
 
 契约：
 
-1. **目录**：28 个候选，key 唯一且 snake_case，族标签齐全，原实现 7 个候选
+1. **目录**：32 个候选，key 唯一且 snake_case，族标签齐全，原实现 7 个候选
    全部在列（同 formulation）；``min_history`` 逐 key 金样（暖机口径改动即红）；
    表达式全目录唯一（重复表达式会静默并成一列）。
 2. **pandas 实现 == qlib 表达式**（本节是重点）：同一份 **qlib 取出的** OHLCV
@@ -81,6 +81,12 @@ EXPECTED_MIN_HISTORY = {
     "overnight_ret_20d": 21,
     "intraday_ret_20d": 20,
     "close_position_20d": 20,
+    # T-FM-05 自适应/状态切换族（论文 036-046/080-083/094-105 模板的 A 股适配；
+    # 口径 = 最深嵌套链 ΣN，算术取分支最大：81=1+20+60、21=1+20、20=无 Ref 的 20 窗）
+    "volreg_reversal_5d": 81,
+    "trend_r2_gate_20d": 20,
+    "skew_gate_momentum_20d": 21,
+    "vol_kurt_gate_10d": 81,
 }
 
 
@@ -97,7 +103,7 @@ def _frame(rows: list[tuple[float, ...]]) -> pd.DataFrame:
 class TestCatalog:
     def test_exact_set_and_key_style(self):
         keys = [c.key for c in cand.CANDIDATES]
-        assert len(keys) == 28, "候选集是显式清单，增删要同步改测试（金样纪律）"
+        assert len(keys) == 32, "候选集是显式清单，增删要同步改测试（金样纪律）"
         assert len(set(keys)) == len(keys), "key 必须唯一"
         assert set(keys) == set(EXPECTED_MIN_HISTORY)
         for key in keys:
@@ -215,7 +221,7 @@ class TestComputePanel:
 
 @lru_cache(maxsize=1)
 def _qlib_panel() -> pd.DataFrame:
-    """一次取齐：双标的 × (OHLCV+amount + 全 28 表达式)，索引 (trade_date, symbol)。"""
+    """一次取齐：双标的 × (OHLCV+amount + 全 32 表达式)，索引 (trade_date, symbol)。"""
     import qlib  # noqa: PLC0415
     import qlib.data as qd  # noqa: PLC0415
     from qlib.constant import REG_CN  # noqa: PLC0415
@@ -285,5 +291,5 @@ class TestQlibExpressionEquivalence:
 
     def test_expression_columns_did_not_collapse(self, qlib_panel):
         """重复表达式会在 D.features 返回里并列——取数前已由唯一性测试把关。"""
-        assert len(cand.CANDIDATES) == 28
+        assert len(cand.CANDIDATES) == 32
         assert all(c.expression in qlib_panel.columns for c in cand.CANDIDATES)

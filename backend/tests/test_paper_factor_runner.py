@@ -5,7 +5,7 @@ runner 本体在容器里对真 qlib 数据跑（csi300 × 4 年）；这里在 
 同一套注入约定），喂合成面板，钉住：
 
 - 取数字段 = 6 行情字段 + ``$factor``（一次取齐）、起点经 ``warmup_start``；
-- 报告结构：110 论文因子 + 28 仓库候选、两侧去重段、跨库相关段、
+- 报告结构：110 论文因子 + 32 仓库候选、两侧去重段、跨库相关段、
   算子谱 39 个、复杂度分布；
 - ``json_safe`` 之后是**严格 JSON**（不许裸 NaN/Infinity——Postgres json 列
   与 JSON.parse 都拒收）；
@@ -158,9 +158,9 @@ class TestRunPaperTestSmoke:
             assert item["complexity"]["node_count"] >= 1
             assert item["min_history"] >= 1
 
-    def test_house_side_is_28_with_metadata(self, report):
+    def test_house_side_is_32_with_metadata(self, report):
         factors = report["house"]["factors"]
-        assert len(factors) == 28
+        assert len(factors) == 32
         for item in factors:
             assert item["name"] and item["expression"]
 
@@ -199,7 +199,7 @@ class TestRunPaperTestSmoke:
         md = module.render_markdown(json_safe(report))
         assert md.startswith("# T-FM-01")
         assert "论文侧 110 因子" in md
-        assert "仓库侧 28 候选" in md
+        assert "仓库侧 32 候选" in md
 
 
 class TestVwapGuard:

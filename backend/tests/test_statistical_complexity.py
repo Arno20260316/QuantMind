@@ -1,6 +1,6 @@
 """统计派 · 表达式复杂度与简单性因子（T-FE-05）契约测试。
 
-输入是**qlib 中缀表达式字符串**（28 候选的 ``expression`` 形态）。
+输入是**qlib 中缀表达式字符串**（32 候选的 ``expression`` 形态）。
 FM-DSL（``factorminer.dsl``，附录 D 纯函数形式语法）不覆盖中缀算术，
 故此处字符串级计数是统计派候选的**范围受限唯一口径**：纯函数、无 eval、
 不依赖求值器。简单性因子进入 ``selection_score``（同分取简由排序兜底）。
@@ -68,7 +68,7 @@ class TestExpressionComplexity:
         assert cplx.expression_complexity(expr) == cplx.expression_complexity(expr)
 
     def test_all_real_candidates_counted(self):
-        """28 个真实候选的表达式全部可计数且 op ≥ 1——计数退化为 0 说明
+        """32 个真实候选的表达式全部可计数且 op ≥ 1——计数退化为 0 说明
         口径漏掉了真实语法形态（假全绿防线）。"""
         from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
             candidates as cand,

@@ -1,14 +1,18 @@
 """统计派 · 候选因子族（移植 P2 / Tier 2）。
 
-28 个只用 OHLCV+成交额的价量候选（含 原实现 7 个：5 日反转 / 20 日
-动量 / 放量 / 额突增 / 5 日非流动性 / 5 日振幅 / 5 日跳空），每个带：数学式、
+32 个只用 OHLCV+成交额的价量候选（含 原实现 7 个：5 日反转 / 20 日
+动量 / 放量 / 额突增 / 5 日非流动性 / 5 日振幅 / 5 日跳空；T-FM-05 增自适应族
+4 个：波动状态切换 / R² 门控 / 偏度门控 / 波动×峰度双门控），每个带：数学式、
 文献出处、pandas 实现与 **qlib 表达式**（factor_code 落库/回测形态）。
 
 双表示的纪律（比原实现的「pandas + qd.panel 代码体」更严）：
 
 - pandas 实现严格对齐 **qlib 算子语义**（`qlib/data/ops.py` 实测：滚动窗口
   ``min_periods=1``、`Std` 即 pandas ``std()``（ddof=1）、逐元素 max 是
-  ``Greater`` 而非 ``Max``（`Max` 只有滚动重载！）、`If(cond,a,b)`）；
+  ``Greater`` 而非 ``Max``（`Max` 只有滚动重载！）、条件用 `Gt`/`Lt` 比较算子
+  （NaN 经比较为假；`Greater` 是 max 不是比较）、`If(cond,a,b)` 为 `np.where`
+  语义；`Skew`/`Kurt` 输出是 float64 计算后投 float32 的两段式——口径详见
+  自适应族注释）；
 - 等价性由集成测试钉住：同一份 qlib 取出的 OHLCV 面板上，qlib 表达式求值 与
   ``compute`` 输出逐点对比（``test_statistical_candidates.py``）。表达式改了
   而实现没改（或反之）会直接红。
@@ -42,6 +46,7 @@ FAMILY_LABELS: dict[str, str] = {
     "liquidity": "流动性/量能",
     "price_volume": "量价关系",
     "intraday": "日内结构",
+    "adaptive": "自适应/状态切换",
 }
 
 
@@ -83,6 +88,120 @@ def _reversal(frame: pd.DataFrame, window: int) -> pd.Series:
 
 def _momentum(frame: pd.DataFrame, window: int) -> pd.Series:
     return frame["close"] / frame["close"].shift(window) - 1
+
+
+# ── 自适应族辅助（T-FM-05）── qlib 回归/矩算子的逐位复刻 ─────────────
+#
+# 论文附录 D 的「回归/条件算子」模板（036-046 波动状态、080-083 R² 门控、
+# 094-105 高阶矩切换）的 A 股适配。门控量是计算出来的状态（短长窗波动比、
+# 拟合优度、偏度/峰度），不是又一个固定窗——新逻辑而非窗口变体，且候选池
+# 只 +4（控制 FDR 膨胀）。
+#
+# 容器内对拍实测钉住的口径（test_statistical_candidates.py 逐点对拍兜底）：
+# - 条件一律 `Gt`/`Lt`（比较算子，NaN 经比较为假）；`Greater` 是逐元素 max，
+#   不能当比较用；组合条件走 `Mul`（对 0/1 值即布尔与），pandas 侧直接 ``&``。
+# - `Slope`/`Rsquare`/`Resi` 是 cython 滚动回归（窗口 y 对 x=0..n−1 最小二乘）：
+#   rsq = corr²，std≈0（atol=2e-05, min_periods=1）的窗口后处理成 NaN；
+#   resi 取**窗口末点**残差。下用 float64 闭式解复刻（实测 maxrel ~6e-8）。
+#   **暖机头部不对齐**（实测）：cython 首根 NaN、第 2 根起即出部分窗值
+#   （min_periods=1 风格），闭式解不足窗统一 NaN——两边都从 min_history
+#   起消费（引擎裁剪 + 对拍区域），头部差异不触达任何判定面。
+# - `Skew`/`Kurt` 节点输出是 **float64 计算后投 float32** 的两段式（本仓库
+#   qlib 逐位实测；直接对 float32 输入调 pandas rolling 会差 ~1e-7，在
+#   ``<3``/``>1`` 这类字面量闸上是潜在翻转点，故照两段式复刻；比较时
+#   numpy 弱标量按 float32 生效）。
+#
+# 与 T-FE-05 选择分的交互（如实记录，不设豁免）：本族表达式结构是全目录
+# 最复杂段（如 vol_kurt 一条 op=24 / 字面量=16），简单性因子 0.015–0.082
+# （对照：旧目录最复杂的 atr_14 ≈0.06、最简族 0.23/0.59）——同 |RankIC|·
+# 一致性下选择分只有最简族的约 1/3–1/40，拿席位需显著更高 IC 是简单性
+# 先验的预期折扣；要豁免应改 T-FE-05 口径本身（独立决策）。4 条候选照常
+# 全量进 IC/FDR/审计与论文对照。
+
+
+def _slope64(series: pd.Series, window: int) -> pd.Series:
+    """qlib `Slope` 复刻：窗口最小二乘斜率（尾点对齐当前 bar；不足窗处
+    NaN——与 cython 头部口径的差异见上方族注释，不触达消费面）。"""
+    y = series.astype(np.float64)
+    x = np.arange(window, dtype=np.float64)
+    xc = x - x.mean()
+    sxx = float((xc**2).sum())
+    sxy = sum(xc[window - 1 - d] * y.shift(d) for d in range(window))
+    return sxy / sxx
+
+
+def _rsq64(series: pd.Series, window: int) -> pd.Series:
+    """qlib `Rsquare` 复刻：corr(x, y)²；std≈0 窗口后处理成 NaN（qlib 算子
+    源码同款掩码，atol=2e-05）。"""
+    y = series.astype(np.float64)
+    x = np.arange(window, dtype=np.float64)
+    xc = x - x.mean()
+    sxx = float((xc**2).sum())
+    sxy = sum(xc[window - 1 - d] * y.shift(d) for d in range(window))
+    ysum = y.rolling(window, min_periods=window).sum()
+    syy = (y**2).rolling(window, min_periods=window).sum() - ysum**2 / window
+    rsq = sxy**2 / (sxx * syy)
+    return rsq.mask(np.isclose(y.rolling(window, min_periods=1).std(), 0, atol=2e-05))
+
+
+def _resi64(
+    series: pd.Series, window: int, *, slope: pd.Series | None = None
+) -> pd.Series:
+    """qlib `Resi` 复刻：窗口回归在末点的残差 y_t − ŷ_t（x 居中后末点
+    x=(n−1)/2）。``slope`` 传已算好的斜率可省一次闭式解（值恒同）。"""
+    y = series.astype(np.float64)
+    if slope is None:
+        slope = _slope64(series, window)
+    mean = y.rolling(window, min_periods=window).mean()
+    return y - mean - slope * (window - 1) / 2.0
+
+
+def _skew(series: pd.Series, window: int) -> pd.Series:
+    """qlib `Skew` 节点输出的两段式复刻（float64 计算 → float32）。"""
+    return (
+        series.astype(np.float64)
+        .rolling(window, min_periods=1)
+        .skew()
+        .astype(np.float32)
+    )
+
+
+def _kurt(series: pd.Series, window: int) -> pd.Series:
+    """qlib `Kurt` 节点输出的两段式复刻（float64 计算 → float32）。"""
+    return (
+        series.astype(np.float64)
+        .rolling(window, min_periods=1)
+        .kurt()
+        .astype(np.float32)
+    )
+
+
+def _volreg_reversal_5d(frame: pd.DataFrame) -> pd.Series:
+    vol_short = _std(_ret(frame), 20)
+    return _reversal(frame, 5).where(
+        vol_short > _mean(vol_short, 60), _momentum(frame, 5)
+    )
+
+
+def _trend_r2_gate_20d(frame: pd.DataFrame) -> pd.Series:
+    close = frame["close"]
+    slope = _slope64(close, 20)  # 两臂共用：resi 臂只要这一条斜率，不再重算
+    return (slope / close).where(
+        _rsq64(close, 20) > 0.5, _resi64(close, 20, slope=slope) / close
+    )
+
+
+def _skew_gate_momentum_20d(frame: pd.DataFrame) -> pd.Series:
+    return _reversal(frame, 20).where(
+        _skew(_ret(frame), 20).abs() > 1, _momentum(frame, 20)
+    )
+
+
+def _vol_kurt_gate_10d(frame: pd.DataFrame) -> pd.Series:
+    ret = _ret(frame)
+    vol_short = _std(ret, 20)
+    gate = (vol_short > _mean(vol_short, 60)) & (_kurt(ret, 24) < 3)
+    return _momentum(frame, 10).where(gate, _reversal(frame, 10))
 
 
 CANDIDATES: tuple[Candidate, ...] = (
@@ -402,6 +521,47 @@ CANDIDATES: tuple[Candidate, ...] = (
             / (frame["high"] - frame["low"] + 1e-12),
             20,
         ),
+    ),
+    # ── 自适应/状态切换族（T-FM-05；口径见族内辅助函数区注释）────────
+    Candidate(
+        key="volreg_reversal_5d",
+        name="波动状态门控 5 日反转/动量",
+        family="adaptive",
+        formulation="std(ret,20) > mean(std(ret,20),60) ? rev5 : mom5",
+        source="论文附录 D 036/046 波动状态切换模板（T-FM-05 A 股适配）",
+        expression="If(Gt(Std($close/Ref($close,1)-1,20),Mean(Std($close/Ref($close,1)-1,20),60)),Ref($close,5)/$close-1,$close/Ref($close,5)-1)",
+        min_history=81,
+        compute=_volreg_reversal_5d,
+    ),
+    Candidate(
+        key="trend_r2_gate_20d",
+        name="趋势拟合度门控动量/回归",
+        family="adaptive",
+        formulation="rsquare(close,20) > 0.5 ? slope/close : resi/close",
+        source="论文附录 D 080/081 R² 门控趋势模板（T-FM-05 A 股适配）",
+        expression="If(Gt(Rsquare($close,20),0.5),Slope($close,20)/$close,Resi($close,20)/$close)",
+        min_history=20,
+        compute=_trend_r2_gate_20d,
+    ),
+    Candidate(
+        key="skew_gate_momentum_20d",
+        name="偏度门控 20 日反转/动量",
+        family="adaptive",
+        formulation="|skew(ret,20)| > 1 ? rev20 : mom20",
+        source="论文附录 D 095/101 偏度门控模板（T-FM-05 A 股适配）",
+        expression="If(Gt(Abs(Skew($close/Ref($close,1)-1,20)),1),Ref($close,20)/$close-1,$close/Ref($close,20)-1)",
+        min_history=21,
+        compute=_skew_gate_momentum_20d,
+    ),
+    Candidate(
+        key="vol_kurt_gate_10d",
+        name="波动×峰度双门控 10 日动量",
+        family="adaptive",
+        formulation="(std 高 且 kurt(ret,24) < 3) ? mom10 : rev10",
+        source="论文附录 D 094 波动×峰度双门控模板（T-FM-05 A 股适配）",
+        expression="If(Gt(Mul(Gt(Std($close/Ref($close,1)-1,20),Mean(Std($close/Ref($close,1)-1,20),60)),Lt(Kurt($close/Ref($close,1)-1,24),3)),0),$close/Ref($close,10)-1,Ref($close,10)/$close-1)",
+        min_history=81,
+        compute=_vol_kurt_gate_10d,
     ),
 )
 

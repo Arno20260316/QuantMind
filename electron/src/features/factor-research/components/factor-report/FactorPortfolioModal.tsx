@@ -37,6 +37,14 @@ export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLa
     ? summary.composite_icir / summary.single_icir_avg
     : null;
 
+  // 精选子集（T-FE-02）：旧 JSON 无该字段（undefined）→ 整节不渲染；
+  // 有字段但降级（available:false）→ 显示原因，不用 0/空表冒充
+  const bs = data?.best_subset;
+  const best = bs && bs.available === true ? bs : null;
+  const degraded = bs && bs.available === false ? bs : null;
+  const sh = (v: number | null | undefined) =>
+    v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(2)}`;
+
   const copyJson = async () => {
     if (!data?.available) return;
     const payload = {
@@ -46,6 +54,7 @@ export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLa
       composite_ic: data.summary?.composite_ic,
       composite_icir: data.summary?.composite_icir,
       rule: data.rule,
+      best_subset: data.best_subset ?? undefined,
     };
     try {
       await navigator.clipboard.writeText(JSON.stringify(payload, null, 1));
@@ -120,6 +129,99 @@ export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLa
               </div>
             ))}
           </div>
+
+          {bs != null && (
+            <div className="rounded-2xl border border-slate-200 px-4 py-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-black text-slate-800">精选子集 · 组合 Sharpe 口径</span>
+                {best && (
+                  <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] font-bold">
+                    K* = {best.k}（区间 {best.k_range[0]}–{best.k_range[1]}）
+                  </span>
+                )}
+                {best?.overfit_warning && (
+                  <span className="rounded-full bg-amber-50 text-amber-700 px-2 py-0.5 text-[11px] font-bold">
+                    ⚠ train/holdout = {best.sharpe_ratio_train_holdout}，过拟合风险高
+                  </span>
+                )}
+                {best?.vs_benchmarks.beats_equal_weight != null && (
+                  <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${best.vs_benchmarks.beats_equal_weight ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                    留出窗 {best.vs_benchmarks.beats_equal_weight ? '>' : '≤'} 等权 1/N
+                  </span>
+                )}
+                {best?.vs_benchmarks.beats_current_rule != null && (
+                  <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${best.vs_benchmarks.beats_current_rule ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                    留出窗 {best.vs_benchmarks.beats_current_rule ? '>' : '≤'} 现行规则
+                  </span>
+                )}
+              </div>
+              {degraded && (
+                <div className="mt-1 text-[11px] text-slate-500">精选子集不可用：{degraded.reason}</div>
+              )}
+              {best && (
+                <>
+                  <div className="mt-1 text-[11px] text-slate-500 leading-5">
+                    按「对组合 Sharpe 的边际贡献」从 {best.universe.n_candidates} 个候选里选 {best.k} 个
+                    （贪心前向 + 1-swap，只看训练窗前 {Math.round(best.train_frac * 100)}%）。
+                    口径：T+{best.rule.holding_days} 调仓、带符号净日收益（已扣费）、年化 √{best.rule.annualization}。
+                    {best.universe.n_excluded_short_history > 0 && ` 已剔除 ${best.universe.n_excluded_short_history} 个短历史因子。`}
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {best.factors.map((f) => (
+                      <button
+                        key={f.name}
+                        onClick={() => { onPick(f.name); onClose(); }}
+                        className="rounded border border-slate-200 px-1.5 py-0.5 text-[11px] font-mono text-slate-600 hover:border-indigo-300 hover:text-indigo-600"
+                        title={`方向：${f.direction > 0 ? '正向' : '反向'}；点击在因子报告里打开`}
+                      >
+                        {f.name}
+                      </button>
+                    ))}
+                  </div>
+                  <table className="mt-2 w-full text-[11px] font-mono">
+                    <thead>
+                      <tr className="text-slate-400">
+                        <th className="text-left font-normal">Sharpe（年化）</th>
+                        <th className="text-right font-normal">train（{best.n_days.train} 天）</th>
+                        <th className="text-right font-normal">holdout（{best.n_days.holdout} 天）</th>
+                        <th className="text-right font-normal">full</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-slate-700">
+                      <tr>
+                        <td className="text-indigo-700 font-bold">精选子集 K*={best.k}</td>
+                        <td className="text-right">{sh(best.chosen.train_sharpe)}</td>
+                        <td className="text-right">{sh(best.chosen.holdout_sharpe)}</td>
+                        <td className="text-right">{sh(best.chosen.full_sharpe)}</td>
+                      </tr>
+                      <tr>
+                        <td>等权 1/N（{best.benchmarks.equal_weight_all.n_factors} 个）</td>
+                        <td className="text-right">{sh(best.benchmarks.equal_weight_all.train_sharpe)}</td>
+                        <td className="text-right">{sh(best.benchmarks.equal_weight_all.holdout_sharpe)}</td>
+                        <td className="text-right">{sh(best.benchmarks.equal_weight_all.full_sharpe)}</td>
+                      </tr>
+                      {best.benchmarks.current_rule && (
+                        <tr>
+                          <td>现行规则（{best.benchmarks.current_rule.n_factors} 个）</td>
+                          <td className="text-right">{sh(best.benchmarks.current_rule.train_sharpe)}</td>
+                          <td className="text-right">{sh(best.benchmarks.current_rule.holdout_sharpe)}</td>
+                          <td className="text-right">{sh(best.benchmarks.current_rule.full_sharpe)}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                  <div className="mt-1 text-[10px] text-slate-400 font-mono">
+                    K 扫描 train/holdout：{best.curve.map((c) => `${c.k} ${sh(c.train_sharpe)}/${sh(c.holdout_sharpe)}`).join(' · ')}
+                  </div>
+                  {best.notes.length > 0 && (
+                    <div className="mt-1 text-[11px] text-amber-600 leading-5">
+                      {best.notes.map((n) => <div key={n}>· {n}</div>)}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
 
           <div>
             <button onClick={() => setShowRejected(!showRejected)} className="text-[11px] font-bold text-slate-400 hover:text-slate-600">

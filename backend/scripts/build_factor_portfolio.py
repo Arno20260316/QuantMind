@@ -59,6 +59,27 @@ def main() -> int:
               f"（单因子平均 |ICIR| {s['single_icir_avg']:.3f}）")
         top = res["factors"][:5]
         print("   前 5 权重：" + "、".join(f"{f['name']}{f['weight']:+.2f}" for f in top))
+        bs = res.get("best_subset") or {}
+        if bs.get("available"):
+
+            def _f(v):
+                return f"{v:+.2f}" if isinstance(v, (int, float)) else "—"
+
+            ch = bs["chosen"]
+            benches = bs["benchmarks"]
+            cur = benches.get("current_rule")
+            print(
+                f"   精选子集 K*={bs['k']}（区间 {bs['k_range'][0]}–{bs['k_range'][1]}，贪心+交换）"
+                f"｜train/holdout Sharpe {_f(ch['train_sharpe'])}/{_f(ch['holdout_sharpe'])}"
+                f"｜等权 1/N holdout {_f(benches['equal_weight_all'].get('holdout_sharpe'))}"
+                f"｜现行规则 holdout {_f(cur.get('holdout_sharpe') if cur else None)}"
+            )
+            if bs.get("overfit_warning"):
+                print(
+                    f"   ⚠ train/holdout 比 {bs['sharpe_ratio_train_holdout']} > 3：过拟合旗标"
+                )
+        else:
+            print(f"   精选子集：不可用（{bs.get('reason', '缺 best_subset 块')}）")
         print(f"   → {portfolio_path(ds)}")
     return 0
 

@@ -635,6 +635,62 @@ export interface PortfolioFactor {
   net_daily?: number | null;
 }
 
+// ─────────────────── 精选子集（T-FE-02，组合 Sharpe 口径） ───────────────────
+
+/**
+ * 三个窗口的 Sharpe（年化 √252）。**口径是带符号净日收益**
+ * `dir·ls_h/h − 调仓扣费`——不是单因子体检页的 `|ls|/h`（那会把下行波动翻正）。
+ * train 70% / holdout 30% 时序切分：选择只看训练窗，留出窗只做披露。
+ */
+export interface BestSubsetSharpeRow {
+  train_sharpe: number | null;
+  holdout_sharpe: number | null;
+  full_sharpe: number | null;
+}
+
+export interface BestSubsetCurveRow {
+  k: number;
+  train_sharpe: number | null;
+  holdout_sharpe: number | null;
+}
+
+export interface BestSubsetBenchmark extends BestSubsetSharpeRow {
+  n_factors: number;
+}
+
+export interface BestSubsetBlock {
+  available: true;
+  /** 目前只有 'greedy_forward_swap'（贪心前向 + 1-swap best-improvement） */
+  method: string;
+  train_frac: number;
+  /** K 区间（候选数不足时会向小退化，与 k 一并如实展示） */
+  k_range: [number, number];
+  /** K* = 训练窗 Sharpe argmax（平票取小） */
+  k: number;
+  chosen: BestSubsetSharpeRow & { k: number };
+  /** 入选因子（按名排序；direction 同组合页语义：+1 正向 / −1 反向） */
+  factors: Array<{ name: string; direction: number }>;
+  curve: BestSubsetCurveRow[];
+  benchmarks: {
+    /** 等权 1/N 全体候选（论文基准：<1000 交易日时的稳健默认） */
+    equal_weight_all: BestSubsetBenchmark;
+    /** 现行规则（当前页面上方那套 max-ICIR 权重）；候选里没交集时为 null */
+    current_rule: BestSubsetBenchmark | null;
+  };
+  overfit_warning: boolean;
+  /** train/holdout Sharpe 比；holdout ≤ 0 时为 null（比值无意义），不亮旗标 */
+  sharpe_ratio_train_holdout: number | null;
+  /** 留出窗 Sharpe 是否高于基准；无法比较时为 null */
+  vs_benchmarks: {
+    beats_equal_weight: boolean | null;
+    beats_current_rule: boolean | null;
+  };
+  n_days: { train: number; holdout: number; total: number };
+  universe: { n_candidates: number; n_excluded_short_history: number };
+  notes: string[];
+  rule: { holding_days: number; round_trip_cost: number; annualization: number };
+}
+
 export interface FactorPortfolioResponse {
   available: boolean;
   dataset?: string;
@@ -652,4 +708,6 @@ export interface FactorPortfolioResponse {
   };
   factors?: PortfolioFactor[];
   rejected?: Array<{ name: string; reason: string }>;
+  /** 精选子集块（T-FE-02）。旧 JSON 无此字段（undefined）→ 不渲染该节；可用性降级见 DegradedBlock */
+  best_subset?: BestSubsetBlock | DegradedBlock | null;
 }

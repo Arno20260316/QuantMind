@@ -23,14 +23,18 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 
+from .best_subset import compute_best_subset, load_net_returns
 from .clusters import cluster_by_correlation
-from .optimize import composite_ic_series, max_icir_weights
+from .optimize import (
+    DEFAULT_HOLDING_DAYS,
+    DEFAULT_ROUND_TRIP_COST,
+    composite_ic_series,
+    max_icir_weights,
+    turnover_cost_daily,
+)
 from .service import dataset_dir, load_snapshot, normalize_dataset
 
 log = logging.getLogger(__name__)
-
-DEFAULT_ROUND_TRIP_COST = 0.00025 * 2 + 0.0005 + 0.0005 * 2   # ≈ 0.20%（佣金双边+印花税+滑点双边）
-DEFAULT_HOLDING_DAYS = 20                                      # 与 IC 峰位一致
 
 
 def portfolio_path(dataset: str = "alpha_library") -> Path:
@@ -52,10 +56,8 @@ def _series_stats(dataset: str, round_trip_cost: float, holding_days: int) -> di
     for c in ("turnover", "coverage", ls_col):
         if c in df.columns:
             df[c] = df[c].where(np.isfinite(df[c]))
-    d = df["turnover"].fillna(0.0).clip(0.0, 1.0)
-    # 持有 holding_days 的成员变动比例 ≈ 1−(1−日换手)^N；成本按 N 日摊到日均
-    turn_n = (1.0 - (1.0 - d) ** holding_days).clip(0.0, 1.0)
-    cost_daily = turn_n * round_trip_cost / holding_days
+    # 扣费公式收口在 optimize.turnover_cost_daily（与 best_subset 同口径，冻结对拍锁死）
+    cost_daily = turnover_cost_daily(df["turnover"], holding_days, round_trip_cost)
     if ls_col in df.columns:
         # 多空价差是"高分组 − 低分组"，组合按其方向使用时收益为正；这里取绝对值量级
         gross_daily = df[ls_col].abs().fillna(0.0) / holding_days
@@ -169,6 +171,40 @@ def build_portfolio(
                 comp_ic = comp["ic_mean"]
                 comp_icir = comp["icir"]
 
+    # ── 精选子集（T-FE-02）：按「组合 Sharpe 边际贡献」选 K∈[10,15] 个。
+    #    附加信息块：任何失败都降级为 available:false，绝不拖垮主 payload。
+    #    候选=通过门槛+去重后的 keep 集；现行规则基准直接复用上面的 w（同一权重口径）。
+    best: dict[str, Any]
+    try:
+        cand = sorted(keep)
+        dirs = {
+            n: (1 if float(metrics[n].get("ic_mean") or 0) >= 0 else -1) for n in cand
+        }
+        net_ret = load_net_returns(
+            ds,
+            cand,
+            directions=dirs,
+            holding_days=holding_days,
+            round_trip_cost=round_trip_cost,
+            series_path=dataset_dir(ds) / "report" / "factor_series.parquet",
+        )
+        if net_ret is None:
+            best = {
+                "available": False,
+                "reason": f"缺 ls_{holding_days} 列或无可用候选序列（快照未含该持有期）",
+            }
+        else:
+            best = compute_best_subset(
+                net_ret,
+                directions=dirs,
+                current_rule=(sel, w),
+                holding_days=holding_days,
+                round_trip_cost=round_trip_cost,
+            )
+    except Exception as e:  # noqa: BLE001 —— 附加块失败必须降级而非中断主链
+        log.exception("精选子集计算失败（dataset=%s）", ds)
+        best = {"available": False, "reason": f"精选子集计算失败：{e}"}
+
     def _clean(v):
         """NaN/Inf → None：JSON 不能带非有限数（FastAPI 序列化会直接 500）。"""
         if v is None:
@@ -222,6 +258,7 @@ def build_portfolio(
         },
         "factors": items,
         "rejected": rejected[:200],
+        "best_subset": best,
     }
     if persist:
         path = portfolio_path(ds)

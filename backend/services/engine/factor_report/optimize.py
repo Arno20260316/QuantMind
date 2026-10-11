@@ -1,4 +1,4 @@
-"""因子组合权重与合成 IC 的**唯一实现**。
+"""因子组合权重、合成 IC 与调仓扣费的**唯一实现**。
 
 收口自两处**参数完全一致**的重复实现：
   - ``services/engine/factor_report/portfolio.py``（推荐因子集权重）
@@ -6,6 +6,11 @@
 
 加上本次因子报告的组合块，不收口就是第三份。行为由
 ``test_factor_report_optimize.py`` 的**冻结旧实现逐位对拍**锁死。
+
+T-FE-02 起 ``turnover_cost_daily`` 与两个成本常量（``DEFAULT_ROUND_TRIP_COST`` /
+``DEFAULT_HOLDING_DAYS``）也收口在这里：``portfolio._series_stats`` 与
+``best_subset`` 的带符号净收益必须共用同一份扣费口径（行为由
+``test_factor_best_subset.py`` 的冻结旧实现逐位对拍锁死）。
 
 与两处内联旧实现的**三处有意的行为差异**（均为「旧实现静默产出垃圾 → 本实现显式
 失败或显式降级」，正常输入上不触发，逐位对拍可证）：
@@ -24,12 +29,39 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 DEFAULT_SHRINK = 0.3
 """协方差收缩系数：``(1-shrink)·Σ + shrink·I``。与两处旧实现一致，勿改。"""
 
 MIN_COMPOSITE_DAYS = 20
 """合成 IC 序列的最少有效天数，低于此不给 ICIR（避免小样本假数）。"""
+
+DEFAULT_ROUND_TRIP_COST = (
+    0.00025 * 2 + 0.0005 + 0.0005 * 2
+)  # ≈ 0.20%（佣金双边+印花税+滑点双边）
+"""单次往返交易成本假设：`_series_stats` 与 `best_subset` 的扣费口径唯一出处。"""
+
+DEFAULT_HOLDING_DAYS = 20
+"""调仓持有天数假设（与 IC 峰位一致）：扣费摊薄与 ls 列选择共用。"""
+
+
+def turnover_cost_daily(
+    turnover,
+    holding_days: int = DEFAULT_HOLDING_DAYS,
+    round_trip_cost: float = DEFAULT_ROUND_TRIP_COST,
+) -> np.ndarray:
+    """T+holding 调仓口径的**日均扣费**（与重构前 ``_series_stats`` 内联实现逐位一致）。
+
+    - 日换手 → 持有 N 日的成员变动比例 ``1−(1−clip(日换手,0,1))^N``，再 clip 回 [0,1]；
+    - 日均成本 = 变动比例 × 往返成本 / N；
+    - NaN → 0；±inf 由 clip 截断（+inf→1、−inf→0）。调用方若需把 ±inf 当缺失
+      处理，须先做 ``isfinite`` 预过滤（``_series_stats`` 即如此）。
+    """
+    d = pd.Series(turnover, dtype=float).fillna(0.0).clip(0.0, 1.0)
+    # 持有 holding_days 的成员变动比例 ≈ 1−(1−日换手)^N；成本按 N 日摊到日均
+    turn_n = (1.0 - (1.0 - d) ** holding_days).clip(0.0, 1.0)
+    return (turn_n * round_trip_cost / holding_days).to_numpy()
 
 
 def max_icir_weights(

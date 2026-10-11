@@ -17,17 +17,23 @@ from backend.scripts.rd_mined_materialize import (
     MANIFEST_NAME,
     _align_partition_schemas,
     _as_float,
+    _carry_supersede,
     _column_owners,
     _disambiguate_column,
     _eligible_row,
     _evaluate_gates,
     _execute_factor_code,
+    _gates_refresh_needed,
     _load_manifest,
     _max_abs_corr,
     _pick_sample_days,
+    _replacement_decision,
+    _rho_series,
     _save_manifest,
     _should_materialize,
+    _superseded_columns,
     _to_canonical,
+    feature_column_name,
 )
 from backend.shared.factor_identity import code_fingerprint
 
@@ -198,6 +204,142 @@ def test_max_abs_corr_excludes_own_old_column():
     # 排除列不存在于对照帧：静默忽略（不抛错）
     rho_miss, _ = _max_abs_corr(base, frame, exclude={"not_there"})
     assert rho_miss == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.unit
+def test_rho_series_is_signed_and_shares_max_abs_corr_backend():
+    """``_rho_series`` 是查重与增量闸的共同底层（T-FM-02 口径单源）。
+
+    ``_max_abs_corr`` 必须是「|有符号 ρ 列| 的最大值」——若某天两者各算一套，
+    查重拒的列与增量闸筛的基将出自不同口径，集成后互相打架且不报错。
+    """
+    base, controls = _corr_frame()
+
+    rho = _rho_series(base, controls)
+    neg = rho["neg"]
+
+    assert neg == pytest.approx(-1.0, abs=1e-9), "有符号：反秩列必须是 -1 而非 +1"
+    abs_rho = rho.abs().dropna()
+    rho_max, col_max = _max_abs_corr(base, controls)
+    assert rho_max == pytest.approx(float(abs_rho.max()), abs=1e-12)
+    assert col_max == str(abs_rho.idxmax())
+    # 无重叠 → 空系列（不是 0 值系列）
+    assert _rho_series(base, controls, sample_days={"1999-01-01"}).dropna().empty
+
+
+# ── 替换判据（T-FM-02）──────────────────────────────────────────────
+
+
+class TestReplacementDecision:
+    """台账 T-FM-02：命中**恰好 1 列** ∧ 该列属活跃因子 ∧
+    |新 IC| ≥ max(0.10, 1.3×|旧 IC|)。任何一条不满足都照旧拒入（fail-closed）。"""
+
+    _OWNERS = {"c_old": "fid_old"}
+    _ACTIVE = {"fid_old": {"status": "materialized", "column": "c_old"}}
+
+    def _decide(self, **over):
+        kwargs = {
+            "hit_columns": ["c_old"],
+            "owners": self._OWNERS,
+            "manifest": self._ACTIVE,
+            "new_ic": 0.20,
+            "incumbent_ic": 0.10,
+        }
+        kwargs.update(over)
+        return _replacement_decision(**kwargs)
+
+    @pytest.mark.unit
+    def test_requires_exactly_one_hit(self):
+        # 零命中不会走到这里（有独立分支）；多命中即使 IC 条件齐备也必须拒——
+        # 不做「挑相关性最强那个顶」的臆断，顶错列无法撤销。
+        assert self._decide(hit_columns=[]).reason == "not_single_hit"
+        multi = self._decide(
+            hit_columns=["c_old", "c_two"], owners={**self._OWNERS, "c_two": "fid2"}
+        )
+        assert multi.replace is False and multi.reason == "not_single_hit"
+
+    @pytest.mark.unit
+    def test_incumbent_must_be_owned_and_active(self):
+        assert self._decide(owners={}).reason == "not_owned"
+        # 已 superseded / 被拒 / 出错的列仍在数据集里参与查重，但不可再作
+        # 顶替对象——替换链不接力，避免连锁下架。
+        for status in ("superseded", "rejected_duplicate", "rejected_gate", "error"):
+            gone = {"fid_old": {"status": status, "column": "c_old"}}
+            v = self._decide(manifest=gone)
+            assert (v.replace, v.reason) == (False, "incumbent_not_active")
+            assert v.incumbent_factor_id == "fid_old", "拒了也要留审计出处"
+
+    @pytest.mark.unit
+    def test_missing_ic_never_passes(self):
+        assert self._decide(new_ic=None).reason == "new_ic_missing"
+        assert self._decide(incumbent_ic=None).reason == "incumbent_ic_missing"
+
+    @pytest.mark.unit
+    def test_absolute_floor_and_ratio(self):
+        # 绝对下限 0.10：严格小于即拒，恰等于放行（与台账「IC≥0.10」字面一致）
+        assert self._decide(new_ic=0.09, incumbent_ic=0.01).reason == "ic_below_floor"
+        assert self._decide(new_ic=0.10, incumbent_ic=0.01).replace is True
+        # 相对倍数 1.3×：0.25 vs 0.20（1.25×）拒；0.26 vs 0.20（1.30×）过
+        assert self._decide(new_ic=0.25, incumbent_ic=0.20).reason == "ratio_below"
+        assert self._decide(new_ic=0.26, incumbent_ic=0.20).replace is True
+
+    @pytest.mark.unit
+    def test_ic_compared_by_absolute_value(self):
+        # 方向由展示/执行面管，替换只看强弱——负 IC 因子同样可顶替
+        v = self._decide(new_ic=-0.30, incumbent_ic=-0.10)
+        assert v.replace is True and v.reason == "ok"
+        assert self._decide(new_ic=-0.05, incumbent_ic=-0.01).reason == "ic_below_floor"
+
+
+@pytest.mark.unit
+def test_superseded_columns_extraction():
+    manifest = {
+        "a": {"status": "superseded", "column": "c_a"},
+        "b": {"status": "materialized", "column": "c_b"},
+        "c": {"status": "superseded"},  # 无列名 → 不计
+        "d": {"status": "superseded", "column": ""},  # 空列名 → 不计
+        # 并集读（评审 H1）：状态被覆写成其它终态、但带下架标记的条目，
+        # 列仍算已下架——否则重跑一次就把下架决定洗没了
+        "e": {
+            "status": "rejected_duplicate",
+            "column": "c_e",
+            "superseded_by": "b",
+        },
+        "f": {
+            "status": "error",
+            "column": "c_f",
+            "superseded_by": "b",
+            "superseded_at": "2026-09-05T00:00:00Z",
+        },
+    }
+    assert _superseded_columns(manifest) == {"c_a", "c_e", "c_f"}
+    assert _superseded_columns({}) == set()
+
+
+@pytest.mark.unit
+def test_carry_supersede_marker_rules():
+    """``_carry_supersede``（评审 H1）：非 materialized 的条目重写必须随身
+    带下架标记；重新物化入账 = 重新激活，标记解除。"""
+    old = {"status": "superseded", "superseded_by": "fid_b", "superseded_at": "T1"}
+
+    carried = _carry_supersede(old, {"status": "rejected_duplicate", "column": "c_a"})
+    assert carried["superseded_by"] == "fid_b"
+    assert carried["superseded_at"] == "T1"
+    assert carried["status"] == "rejected_duplicate" and carried["column"] == "c_a"
+
+    # 重新物化入账 → 重新激活：旧标记绝不带入
+    assert _carry_supersede(old, {"status": "materialized"}) == {
+        "status": "materialized"
+    }
+    # 新条目自己就是被顶替终态 → 原样（可能顶替链换人）
+    fresh = {"status": "superseded", "superseded_by": "fid_c"}
+    assert _carry_supersede(old, dict(fresh)) == fresh
+    # 旧条目无标记 / 不存在 → 原样
+    assert _carry_supersede(None, {"status": "error"}) == {"status": "error"}
+    assert _carry_supersede({}, {"status": "error"}) == {"status": "error"}
+    assert _carry_supersede({"status": "materialized"}, {"status": "error"}) == {
+        "status": "error"
+    }
 
 
 # ── 执行结果规范化（_to_canonical）────────────────────────────────────
@@ -618,9 +760,12 @@ class TestMaterializeGates:
 class TestGatesRefreshSelection:
     @pytest.mark.unit
     def test_terminal_statuses_participate(self):
-        from backend.scripts.rd_mined_materialize import _gates_refresh_needed
-
-        for status in ("materialized", "rejected_duplicate", "rejected_gate"):
+        for status in (
+            "materialized",
+            "rejected_duplicate",
+            "rejected_gate",
+            "superseded",  # 被顶替下架的列同样要有门禁裁决（补历史缺口）
+        ):
             ok, reason = _gates_refresh_needed({"status": status}, force=False)
             assert ok and reason == "refresh", status
         # error 未定终局 → 留给常规物化重做，不在这里出裁决
@@ -630,8 +775,6 @@ class TestGatesRefreshSelection:
     @pytest.mark.unit
     def test_complete_gates_skip_but_partial_reevaluate(self):
         """含 skipped 的裁决非终态：补指标后默认轮次自动重评，无需 --force。"""
-        from backend.scripts.rd_mined_materialize import _gates_refresh_needed
-
         complete = {
             "status": "materialized",
             "gates": {
@@ -654,6 +797,40 @@ class TestGatesRefreshSelection:
             },
         }
         assert _gates_refresh_needed(partial, force=False) == (True, "gates_partial")
+
+    @pytest.mark.unit
+    def test_incremental_gate_skip_is_converged_not_partial(self):
+        """增量闸的 skipped 是复评结构性盲区（依赖因子值，只有常规物化能现算），
+        不得触发「再复评」——否则存量带着该 skipped 的条目会永久空转重刷。
+
+        反向防线：其他门禁的 skipped 仍必须判 gates_partial（补指标自动收敛）。
+        """
+        converged = {
+            "status": "materialized",
+            "gates": {
+                "rejected": False,
+                "gates": [
+                    {"key": "pfs_floor", "status": "pass"},
+                    {"key": "incremental_ic_ir_floor", "status": "skipped"},
+                ],
+            },
+        }
+        assert _gates_refresh_needed(converged, force=False) == (False, "has_gates")
+        # 同一条目若还带着别的门禁的 skipped → 仍需重评
+        still_partial = {
+            "status": "materialized",
+            "gates": {
+                "rejected": False,
+                "gates": [
+                    {"key": "rre_floor", "status": "skipped"},
+                    {"key": "incremental_ic_ir_floor", "status": "skipped"},
+                ],
+            },
+        }
+        assert _gates_refresh_needed(still_partial, force=False) == (
+            True,
+            "gates_partial",
+        )
 
     @pytest.mark.unit
     def test_cli_flag_parses_and_conflicts_rejected(self):
@@ -715,7 +892,7 @@ class TestGatesOnlyRun:
 
         monkeypatch.setattr(mod, "_query_candidates", fake_query)
 
-        async def fake_eval(row):
+        async def fake_eval(row, **kwargs):
             if evaluated is not None:
                 evaluated.append(dict(row))
             return decision
@@ -1046,6 +1223,46 @@ class TestGatesOnlyRun:
         assert "gates" not in _load_manifest(tmp_path)["fid1"]
 
     @pytest.mark.asyncio
+    async def test_saved_metrics_replayed_into_gates(self, monkeypatch, tmp_path):
+        """复评无法重算增量指标（依赖因子值），改从 manifest 存档回放——
+        缺存档则整条判 skipped，绝不按 0 判。"""
+        import backend.scripts.rd_mined_materialize as mod
+
+        manifest = {
+            "fid1": {
+                "status": "materialized",
+                "column": "c1",
+                "at": "t0",
+                "metrics": {"incremental_ic_ir": 0.55, "incremental_basis_n": 2},
+            },
+            "fid2": {"status": "materialized", "column": "c2", "at": "t0"},
+        }
+        rows = [
+            {"factor_id": fid, "market": "a_share", "universe": ""}
+            for fid in ("fid1", "fid2")
+        ]
+        captured: list = []
+        seen: dict = {}
+        env_mod, args = self._fake_env(
+            monkeypatch, tmp_path, manifest, rows, self._decision(False), captured
+        )
+
+        async def replay_eval(row, **kwargs):
+            seen[str(row["factor_id"])] = kwargs.get("extra_metrics")
+            return self._decision(False)
+
+        monkeypatch.setattr(env_mod, "_evaluate_gates", replay_eval)
+        rc = await env_mod._run_gates_only(args)
+        assert rc == 0
+        assert seen["fid1"] == {"incremental_ic_ir": 0.55, "incremental_basis_n": 2}
+        assert seen["fid2"] is None, "无存档 → extra_metrics=None（闸判 skipped）"
+        # 回放的指标同时落回 manifest 的 metrics，供下一轮继续回放
+        assert _load_manifest(tmp_path)["fid1"]["metrics"] == {
+            "incremental_ic_ir": 0.55,
+            "incremental_basis_n": 2,
+        }
+
+    @pytest.mark.asyncio
     async def test_evaluate_failure_keeps_entry_and_rc_nonzero(
         self, monkeypatch, tmp_path
     ):
@@ -1058,7 +1275,7 @@ class TestGatesOnlyRun:
             monkeypatch, tmp_path, manifest, rows, self._decision(False), captured
         )
 
-        async def raising_eval(row):
+        async def raising_eval(row, **kwargs):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(env_mod, "_evaluate_gates", raising_eval)
@@ -1066,3 +1283,364 @@ class TestGatesOnlyRun:
         assert rc == 1
         assert captured == []
         assert "gates" not in _load_manifest(tmp_path)["fid1"]
+
+
+# ── 主循环替换集成（T-FM-02 + T-FE-01）────────────────────────────────
+
+
+class TestMainLoopReplacementAndIncremental:
+    """值级查重命中单列 → 替换裁量 → 顶替落账 + 增量闸指标的**编排**回归。
+
+    统计口径本体在 ``test_statistical_incremental.py`` 与值级查重节钉死；
+    这里钉编排：谁被排除出基、落账写序（metadata 一律先行，manifest 落尾
+    是唯一提交点——新因子终态与被顶替者下架同一次落盘）、指标如何进闸、
+    失败路径不漏账不误账。``_rho_series``/IC 实测按替身注入。
+    """
+
+    def _env(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        new_ic=0.20,
+        incumbent_ic=0.10,
+        incumbent_meta_ok=True,
+        new_meta_ok=True,
+        retired=False,
+        manifest=None,
+        rho_map=None,
+        rows=None,
+        control_columns=("c_old", "c_other"),
+    ):
+        import backend.scripts.rd_mined_materialize as mod
+
+        calls: dict[str, object] = {
+            "meta": [],
+            "write": [],
+            "inc_kwargs": [],
+            "ic_calls": [],
+            "extra_metrics": [],
+            "rho_exclude": None,
+        }
+        if manifest is None:
+            manifest = {
+                "fid_old": {
+                    "status": "materialized",
+                    "column": "c_old",
+                    "name": "旧因子",
+                    "code_fp": code_fingerprint("old code"),
+                    "at": "2026-09-01T00:00:00Z",
+                }
+            }
+            if retired:
+                manifest["fid_dead"] = {
+                    "status": "superseded",
+                    "column": "c_dead",
+                    "name": "退役因子",
+                    "superseded_by": "fid_old",
+                    "superseded_at": "2026-09-05T00:00:00Z",
+                    "code_fp": code_fingerprint("dead code"),
+                    "at": "2026-09-01T00:00:00Z",
+                }
+        _save_manifest(tmp_path, manifest)
+
+        days = [f"2026-10-0{i}" for i in range(1, 7)]
+        syms = [f"SH60{i:04d}" for i in range(25)]
+        idx = pd.MultiIndex.from_product([days, syms], names=["trade_date", "symbol"])
+        rng = np.random.default_rng(11)
+        values = pd.Series(rng.normal(size=len(idx)), index=idx)
+        cols = {"close": pd.Series(rng.normal(size=len(idx)) * 0.02 + 10.0, index=idx)}
+        for c in control_columns:
+            cols[c] = pd.Series(rng.normal(size=len(idx)), index=idx)
+        if retired:
+            cols["c_dead"] = pd.Series(rng.normal(size=len(idx)), index=idx)
+        controls = pd.DataFrame(cols, index=idx)
+        if rows is None:
+            rows = [
+                {
+                    "factor_id": "fid_new",
+                    "factor_name": "新锐因子",
+                    "factor_code": "close - open",
+                    "market": "a_share",
+                    "universe": "",
+                }
+            ]
+
+        monkeypatch.setattr(mod, "_lib_root", lambda: tmp_path)
+        monkeypatch.setattr(mod, "_acquire_run_lock", lambda: object())
+        monkeypatch.setattr(mod, "_resolve_h5", lambda p: tmp_path / "fake.h5")
+
+        async def fake_candidates(_args):
+            return [dict(r) for r in rows]
+
+        monkeypatch.setattr(mod, "_load_candidates", fake_candidates)
+
+        def fake_compute(row, h5_path, timeout=None):
+            return values.copy()
+
+        monkeypatch.setattr(mod, "_compute_factor_values", fake_compute)
+        monkeypatch.setattr(
+            mod, "_load_controls", lambda lib_root, sample_days: controls.copy()
+        )
+
+        rho_values = (
+            dict(rho_map)
+            if rho_map is not None
+            else {
+                "c_old": -0.95,
+                "c_other": 0.05,
+            }
+        )
+        if retired and rho_map is None:
+            rho_values["c_dead"] = 0.5
+
+        def fake_rho(values_, controls_, *, sample_days=None, exclude=None):
+            calls["rho_exclude"] = exclude
+            return pd.Series(rho_values)
+
+        monkeypatch.setattr(mod, "_rho_series", fake_rho)
+
+        def fake_ic(series, fwd_ret, *, sample_days=None, **kwargs):
+            calls["ic_calls"].append(sample_days)
+            return (new_ic if len(calls["ic_calls"]) == 1 else incumbent_ic), 30
+
+        monkeypatch.setattr(mod.incremental_gate, "mean_abs_rank_ic", fake_ic)
+
+        def fake_incremental(values_, controls_, **kwargs):
+            calls["inc_kwargs"].append(kwargs)
+            return mod.incremental_gate.IncrementalResult(
+                "ok", 0.55, 0.05, 30, ("c_other",), 0.5
+            )
+
+        monkeypatch.setattr(mod.incremental_gate, "incremental_ic_ir", fake_incremental)
+
+        async def fake_gates(row, *, extra_metrics=None):
+            from backend.services.engine.mining_plugins import GateDecision
+
+            calls["extra_metrics"].append(extra_metrics)
+            return GateDecision(rejected=False, outcomes=())
+
+        monkeypatch.setattr(mod, "_evaluate_gates", fake_gates)
+
+        def fake_write(values_, column):
+            calls["write"].append(column)
+            return 100
+
+        monkeypatch.setattr(mod, "_write_factor", fake_write)
+        monkeypatch.setattr(mod, "_align_partition_schemas", lambda lib_root: {})
+
+        async def fake_meta(factor_id, entry):
+            calls["meta"].append((str(factor_id), dict(entry)))
+            if str(factor_id) == "fid_old":
+                return incumbent_meta_ok
+            return new_meta_ok
+
+        monkeypatch.setattr(mod, "_update_factor_meta", fake_meta)
+
+        args = mod._parse_args([])
+        return mod, args, calls
+
+    @pytest.mark.asyncio
+    async def test_replacement_accepts_and_supersedes_with_incumbent_excluded(
+        self, monkeypatch, tmp_path
+    ):
+        mod, args, calls = self._env(monkeypatch, tmp_path)
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        new_col = calls["write"][0]
+        assert manifest["fid_new"]["status"] == "materialized"
+        assert manifest["fid_new"]["column"] == new_col
+        # 受理顶替的裁量数字与拒入路径同账（评审 M6）
+        assert manifest["fid_new"]["replacement"] == {
+            "decision": "ok",
+            "hits": ["c_old"],
+            "new_ic": 0.20,
+            "incumbent_ic": 0.10,
+        }
+        incumbent = manifest["fid_old"]
+        assert incumbent["status"] == "superseded"
+        assert incumbent["superseded_by"] == "fid_new"
+        assert incumbent["column"] == "c_old", "列名保留：值还在数据集里"
+        assert incumbent["code_fp"], "原字段随 **entry 保留（审计链不断）"
+        assert _superseded_columns(manifest) == {"c_old"}
+
+        # 落账写序（评审 M1/M2）：挑战者 metadata 先行 → 被顶替者 metadata
+        # → manifest 单提交点。回写失败的被顶替者绝不下架（禁止幽灵下架），
+        # 挑战者未落账也绝不先动守擂者。
+        meta_fids = [fid for fid, _ in calls["meta"]]
+        assert meta_fids == ["fid_new", "fid_old"]
+        fid_old_meta = [e for fid, e in calls["meta"] if fid == "fid_old"]
+        assert len(fid_old_meta) == 1 and fid_old_meta[0]["status"] == "superseded"
+        assert fid_old_meta[0]["superseded_by"] == "fid_new"
+
+        # 值级查重的 exclude 必须含新列自身（--force 重做时排除旧列同理）
+        assert new_col in calls["rho_exclude"]
+
+        # 增量闸：替换受理 → 被顶替列排除出基（库沿替换后不含它），且不能
+        # 复用查重 rho（exclude 集合不同），必须现场重算。
+        kwargs = calls["inc_kwargs"][-1]
+        assert "c_old" in kwargs["basis_exclude"]
+        assert new_col in kwargs["basis_exclude"]
+        assert kwargs["rho"] is None
+        assert kwargs["fwd_ret"] is not None
+
+        # 进闸的指标来自增量口径；闸读到的就是它
+        extra = calls["extra_metrics"][-1]
+        assert extra["incremental_ic_ir"] == 0.55
+        assert extra["incremental_basis_n"] == 1
+        assert extra["incremental_ic_days"] == 30
+
+    @pytest.mark.asyncio
+    async def test_replacement_rejected_records_audit_and_keeps_incumbent(
+        self, monkeypatch, tmp_path
+    ):
+        mod, args, calls = self._env(
+            monkeypatch, tmp_path, new_ic=0.22, incumbent_ic=0.20
+        )
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        entry = manifest["fid_new"]
+        assert entry["status"] == "rejected_duplicate"
+        assert entry["replacement"] == {
+            "decision": "ratio_below",
+            "hits": ["c_old"],
+            "new_ic": 0.22,
+            "incumbent_ic": 0.20,
+        }, "拒入也要留替换裁量的审计出处"
+        assert manifest["fid_old"]["status"] == "materialized", "拒入不得动旧账"
+        assert "superseded_by" not in manifest["fid_old"]
+        # 拒入在查重处即 continue：不进增量闸（无谓计算）、不写数据集
+        assert calls["inc_kwargs"] == []
+        assert calls["write"] == [], "拒入的因子绝不能写数据集"
+
+    @pytest.mark.asyncio
+    async def test_supersede_meta_failure_keeps_both_columns_active(
+        self, monkeypatch, tmp_path
+    ):
+        """顶替的旧因子 metadata 回写失败 → 不落 superseded（避免目录禁用
+        一个面板仍显示活跃的列）；两列暂并存，--force 重跑自愈。"""
+        mod, args, _calls = self._env(monkeypatch, tmp_path, incumbent_meta_ok=False)
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        assert manifest["fid_new"]["status"] == "materialized"
+        assert manifest["fid_old"]["status"] == "materialized"
+        assert "superseded_by" not in manifest["fid_old"]
+        assert _superseded_columns(manifest) == set()
+
+    @pytest.mark.asyncio
+    async def test_materialized_meta_failure_defers_manifest_and_incumbent(
+        self, monkeypatch, tmp_path
+    ):
+        """新因子 metadata 回写失败 → 不落 manifest 终态（下轮重跑收敛，
+        评审 M1），且绝不在挑战者未落账时先下架守擂者——否则制造
+        「挑战者没账、守擂者被下架」的空库窗口。"""
+        mod, args, calls = self._env(monkeypatch, tmp_path, new_meta_ok=False)
+        rc = await mod._run(args)
+        assert rc == 1, "metadata 回写失败必须计入 errors（rc 非零）"
+
+        manifest = _load_manifest(tmp_path)
+        assert "fid_new" not in manifest, "终态未落：下轮 _should_materialize 重试"
+        assert manifest["fid_old"]["status"] == "materialized"
+        assert "superseded_by" not in manifest["fid_old"]
+        assert calls["write"], "值已写：孤立列由下轮重跑收敛，不误删"
+        meta_fids = [fid for fid, _ in calls["meta"]]
+        assert meta_fids == ["fid_new"], "挑战者未落账 → 被顶替者 metadata 不动"
+
+    @pytest.mark.asyncio
+    async def test_retired_column_excluded_from_incremental_basis(
+        self, monkeypatch, tmp_path
+    ):
+        """非替换路径：退役列经预筛 ρ 剔除后复用（与 active_cols 同口径，
+        评审 MEDIUM-①）——basis 不含它，也不整帧重算。"""
+        mod, args, calls = self._env(
+            monkeypatch,
+            tmp_path,
+            retired=True,
+            rho_map={"c_old": 0.2, "c_dead": 0.5},
+        )
+        rc = await mod._run(args)
+        assert rc == 0
+
+        kwargs = calls["inc_kwargs"][-1]
+        assert kwargs["basis_exclude"] == (), "复用预筛 ρ：不重算也不传排除集"
+        assert "c_dead" not in kwargs["rho"].index, "退役列不得作对照基"
+        assert "c_old" in kwargs["rho"].index, "活跃列照常参与"
+        manifest = _load_manifest(tmp_path)
+        assert manifest["fid_new"]["status"] == "materialized"
+
+    @pytest.mark.asyncio
+    async def test_replacement_basis_excludes_retired_columns_too(
+        self, monkeypatch, tmp_path
+    ):
+        """替换路径：basis_exclude = 自身旧列 ∪ 被顶替列 ∪ 全部退役列。"""
+        mod, args, calls = self._env(monkeypatch, tmp_path, retired=True)
+        rc = await mod._run(args)
+        assert rc == 0
+
+        kwargs = calls["inc_kwargs"][-1]
+        assert "c_old" in kwargs["basis_exclude"]
+        assert "c_dead" in kwargs["basis_exclude"], "退役列一并排除"
+        assert kwargs["rho"] is None
+        manifest = _load_manifest(tmp_path)
+        assert _superseded_columns(manifest) == {"c_old", "c_dead"}
+
+    @pytest.mark.asyncio
+    async def test_superseded_marker_survives_rejected_rerun(
+        self, monkeypatch, tmp_path
+    ):
+        """H1 回归：被顶替过的因子改码重跑、新代码被拒入 → 条目覆写为
+        rejected_duplicate，但 superseded_by/superseded_at 必须随身——
+        否则 _superseded_columns 看不到它，已下架列静默复活进目录与训练。"""
+        col_a = feature_column_name("A因子")
+        mod, args, _calls = self._env(
+            monkeypatch,
+            tmp_path,
+            manifest={
+                "fid_a": {
+                    "status": "superseded",
+                    "column": col_a,
+                    "name": "A因子",
+                    "superseded_by": "fid_b",
+                    "superseded_at": "2026-09-05T00:00:00Z",
+                    "code_fp": code_fingerprint("old code A"),
+                    "at": "2026-09-01T00:00:00Z",
+                },
+                "fid_b": {
+                    "status": "materialized",
+                    "column": "c_b",
+                    "name": "B因子",
+                    "code_fp": code_fingerprint("code B"),
+                    "at": "2026-09-02T00:00:00Z",
+                },
+            },
+            rho_map={"c_b": -0.95, "c_other": 0.05},
+            rows=[
+                {
+                    "factor_id": "fid_a",
+                    "factor_name": "A因子",
+                    "factor_code": "new code A",  # 与存档指纹不同 → code_changed
+                    "market": "a_share",
+                    "universe": "",
+                }
+            ],
+            control_columns=("c_b", "c_other"),
+            new_ic=0.12,
+            incumbent_ic=0.30,
+        )
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        entry = manifest["fid_a"]
+        assert entry["status"] == "rejected_duplicate"
+        assert entry["replacement"]["decision"] == "ratio_below"
+        assert entry["superseded_by"] == "fid_b", "下架标记必须随身（H1）"
+        assert entry["superseded_at"] == "2026-09-05T00:00:00Z"
+        assert _superseded_columns(manifest) == {col_a}, "已下架列不许复活"
+        assert manifest["fid_b"]["status"] == "materialized"

@@ -256,6 +256,25 @@ describe('FactorTable：物化 chip 与扩展列', () => {
     expect(chip.getAttribute('title')).toContain('rdm_x');
   });
 
+  test('已顶替 → 「已顶替」chip 明说退出活跃口径（不是失败、不诱导重跑）', () => {
+    const f = mkFactor({
+      factorId: 'ms',
+      factorName: 'MatSup',
+      materialization: {
+        status: 'superseded',
+        column: 'rdm_old',
+        supersededBy: 'f-new',
+        supersededAt: '2026-10-10T00:00:00Z',
+      },
+    });
+    renderTable([f]);
+
+    const chip = screen.getByText('已顶替');
+    const title = chip.getAttribute('title') ?? '';
+    expect(title).toContain('rdm_old');
+    expect(title).toContain('退出活跃口径');
+  });
+
   test('扩展列开关：localStorage 记住选择，默认只显示核心列', () => {
     renderTable([mkFactor({ factorId: 'x', factorName: 'X' })]);
     expect(screen.queryByTitle('按 PFS 排序')).toBeNull();

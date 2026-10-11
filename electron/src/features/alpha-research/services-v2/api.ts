@@ -209,6 +209,8 @@ function normalizeMaterialization(meta: any): Factor['materialization'] {
     at: typeof raw.at === 'string' ? raw.at : undefined,
     gates: raw.gates,
     error: typeof raw.error === 'string' ? raw.error : undefined,
+    supersededBy: typeof raw.superseded_by === 'string' ? raw.superseded_by : undefined,
+    supersededAt: typeof raw.superseded_at === 'string' ? raw.superseded_at : undefined,
   };
 }
 

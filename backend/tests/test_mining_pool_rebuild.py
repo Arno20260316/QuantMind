@@ -546,7 +546,7 @@ class TestMetricsRegistryGates:
         assert isinstance(data["metrics"], list) and data["metrics"]
         assert isinstance(data["gates"], list) and data["gates"]
         gate_keys = {g["key"] for g in data["gates"]}
-        # 与 gates/builtin.py 注册的内置五门禁一致
+        # 与 gates/builtin.py 注册的内置六门禁一致
         assert {
             "pfs_floor",
             "rre_floor",

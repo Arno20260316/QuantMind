@@ -319,7 +319,9 @@ def main(argv: list[str] | None = None) -> int:
             return rc
 
     if args.publish:
-        rc = _publish_catalog()
+        # 被顶替清单按 CLI 解析出的实际源根读（评审 M5）——不能内部再
+        # resolve_roots() 取默认，--source-root 指到别处时会读错清单
+        rc = _publish_catalog(source_root)
         if rc != 0:
             return rc
 
@@ -378,24 +380,93 @@ def _register_fields() -> int:
     return asyncio.run(_run())
 
 
-def _publish_catalog() -> int:
+def _publish_catalog(source_dataset_root: Path | None = None) -> int:
     """确保 CN 的 rd_mined 有一份**已发布**目录版本。
 
     发布是显式动作（``--publish``）：它决定这批因子是否真的进入 CN 训练口径。
     已有草稿则发布该草稿；没有草稿则新建 + 全量播种 + 发布。
+
+    **被顶替列（T-FM-02 替换机制）**：superseded 列的值随镜像原样进 CN（写值
+    不删），但目录面必须与 CUSTOM 侧的活跃口径一致——播种 / 既有草稿 / 已发布
+    修正三条路径都显式禁用它们。已发布版本不可改写：线上那份若仍启用被顶替列，
+    不静默放过，从线上克隆一份新草稿（保留手工勾选现状）、禁用后重新发布。被
+    顶替清单从**源侧**（CUSTOM）materialize manifest 读，那是替换机制的落账处；
+    ``source_dataset_root`` 缺省 = ``resolve_roots()`` 的默认源库，``main()``
+    会把 CLI 解析出的实际源根传进来——``--source-root`` 指到别处时被顶替清单
+    必须跟着走，否则会对默认库读清单、给指定库发版，两处口径劈叉（评审 M5）。
+
+    并发约定：本脚本按**单跑**使用（与 HTTP 发布端点并发时可产生同源双
+    published，消费方按 published_at 取最新一份；靠人工纪律而非 DB 锁，
+    T-FM-02 评审 M7 记录的残余风险）。
     """
     import asyncio
 
     async def _run() -> int:
         from sqlalchemy import text
 
+        from backend.scripts.rd_mined_materialize import (
+            _load_manifest as _load_materialize_manifest,
+            _superseded_columns,
+        )
         from backend.services.api.routers.admin.quantdb_factor_catalog import (
             _ensure_schema,
             create_catalog_draft,
+            disable_catalog_mappings,
             publish_catalog_version,
             seed_catalog_mappings,
+            seed_draft_from_published,
         )
         from backend.shared.database_manager_v2 import get_session
+
+        if source_dataset_root is None:
+            source_root, _target_root = resolve_roots()
+        else:
+            source_root = Path(source_dataset_root)
+        superseded = _superseded_columns(_load_materialize_manifest(source_root))
+        if superseded:
+            logger.info(
+                "CUSTOM 侧有 %d 个被顶替（superseded）列，目录发布将同步禁用",
+                len(superseded),
+            )
+
+        async def _enabled_columns(session, version_id: str) -> set[str]:
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT source_column FROM qm_training_factor_mapping "
+                            "WHERE version_id = :vid AND enabled"
+                        ),
+                        {"vid": version_id},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return {str(c) for c in rows}
+
+        async def _disable_and_verify(version_id: str) -> int | None:
+            """禁用被顶替列并复核确已生效；有残留 → 回滚并返回 None（评审 M3）。
+
+            发布不可逆（旧版本转 archived），禁用行数只写日志不够：UPDATE
+            因口径漂移等原因命中不全时，必须中止，而不是带着仍启用的已下架
+            列发布。复核用与「已是最新」判据同一条查询（口径单源）。
+            """
+            if not superseded:
+                return 0
+            disabled = await disable_catalog_mappings(
+                session, version_id, sorted(superseded)
+            )
+            still = superseded & await _enabled_columns(session, version_id)
+            if still:
+                logger.error(
+                    "版本 %s 禁用后仍启用被顶替列 %s：回滚并中止发布",
+                    version_id,
+                    sorted(still),
+                )
+                await session.rollback()
+                return None
+            return disabled
 
         async with get_session() as session:
             await _ensure_schema(session)
@@ -414,15 +485,65 @@ def _publish_catalog() -> int:
                 .first()
             )
             if row and str(row["status"]) == "published":
+                version_id = str(row["version_id"])
+                stale = superseded & await _enabled_columns(session, version_id)
+                if not stale:
+                    logger.info(
+                        "CN/%s 已有已发布目录版本 %s，无需发布。",
+                        DATASET,
+                        version_id,
+                    )
+                    return 0
                 logger.info(
-                    "CN/%s 已有已发布目录版本 %s，无需发布。",
+                    "已发布版本 %s 仍启用 %d 个被顶替列：克隆线上 → 禁用 → 重新发布",
+                    version_id,
+                    len(stale),
+                )
+                new_id = await create_catalog_draft(
+                    session,
                     DATASET,
-                    row["version_id"],
+                    f"{DATASET}（顶替下架修正）",
+                    TARGET_MARKET,
+                    created_by="promote_rd_mined",
+                )
+                cloned = await seed_draft_from_published(
+                    session,
+                    draft_id=new_id,
+                    market=TARGET_MARKET,
+                    source_dataset=DATASET,
+                )
+                if cloned == 0:
+                    # 线上明明启用着被顶替列却一行没抄到：发布会把旧版转
+                    # archived 且不可逆，宁可中止也不发布空版本。回滚丢掉
+                    # 这枚空草稿——不 rollback 的话 get_session 会把「正常
+                    # return」当成功提交，孤儿草稿被后续 promote 选中，
+                    # publish 又因 0 行失败，目录永久卡死（评审 M4）。
+                    logger.error(
+                        "克隆线上版本 %s 得到 0 行——中止发布，请人工检查目录版本表",
+                        version_id,
+                    )
+                    await session.rollback()
+                    return 1
+                disabled = await _disable_and_verify(new_id)
+                if disabled is None:
+                    return 1
+                await publish_catalog_version(session, new_id)
+                logger.info(
+                    "CN/%s 目录已重发布 %s（克隆 %d 行，禁用被顶替列 %d 个）",
+                    DATASET,
+                    new_id,
+                    cloned,
+                    disabled,
                 )
                 return 0
             if row:
                 version_id = str(row["version_id"])
-                logger.info("发布既有草稿 %s", version_id)
+                disabled = await _disable_and_verify(version_id)
+                if disabled is None:
+                    return 1
+                logger.info(
+                    "发布既有草稿 %s（禁用被顶替列 %d 个）", version_id, disabled
+                )
             else:
                 version_id = await create_catalog_draft(
                     session,
@@ -439,10 +560,14 @@ def _publish_catalog() -> int:
                         "market": TARGET_MARKET,
                     },
                 )
+                disabled = await _disable_and_verify(version_id)
+                if disabled is None:
+                    return 1
                 logger.info(
-                    "新建草稿 %s，播种 %s 条映射",
+                    "新建草稿 %s，播种 %s 条映射（禁用被顶替列 %d 个）",
                     version_id,
                     seeded.get("seeded_fields"),
+                    disabled,
                 )
             await publish_catalog_version(session, version_id)
         logger.info("CN/%s 目录已发布。", DATASET)

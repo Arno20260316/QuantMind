@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -238,3 +239,65 @@ def test_leaky_libraries_stay_unregisterable():
     """
     assert "features_daily" in EXCLUDED_FROM_TRAINING
     assert "alpha_library_labels" in EXCLUDED_FROM_TRAINING
+
+
+# ── 目录映射禁用（T-FM-02 顶替下架的目录面）────────────────────────────
+
+
+class _DisableSession:
+    """记录 UPDATE SQL 与参数的最小会话（rowcount 可注入）。"""
+
+    def __init__(self, rowcount: int):
+        self._rowcount = rowcount
+        self.sql: str | None = None
+        self.params: dict | None = None
+
+    async def execute(self, statement, params=None):
+        self.sql = str(statement)
+        self.params = params
+        return SimpleNamespace(rowcount=self._rowcount)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_disable_catalog_mappings_scopes_superseded_columns():
+    """只禁用指定版本里列出的 source_column，且只碰 enabled 行（幂等）。"""
+    session = _DisableSession(rowcount=2)
+
+    n = await qfc.disable_catalog_mappings(session, "v-1", ["c_dead", "c_dead2"])
+
+    assert n == 2
+    assert session.params == {"version_id": "v-1", "columns": ["c_dead", "c_dead2"]}
+    assert "enabled = FALSE" in session.sql
+    assert "source_column = ANY(:columns)" in session.sql
+    assert "AND enabled" in session.sql
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_disable_catalog_mappings_empty_is_noop():
+    """空列集/空串不触库——「没有要禁的」必须是零操作，不是全表 UPDATE。"""
+    session = _DisableSession(rowcount=9)  # 若误触库会被逮住
+
+    assert await qfc.disable_catalog_mappings(session, "v-1", []) == 0
+    assert await qfc.disable_catalog_mappings(session, "v-1", set()) == 0
+    assert await qfc.disable_catalog_mappings(session, "v-1", [""]) == 0
+
+    assert session.sql is None, "空列集绝不触库"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_disable_catalog_mappings_wraps_bare_string():
+    """裸字符串按**一个列名**处理（评审 L1）。
+
+    ``str`` 也是可迭代对象：不先包一层，``list("c_dead")`` 会得到
+    ``['c','_','d','e','a','d']`` 逐字符绑进 ``ANY``——一列也禁不掉，
+    且 UPDATE 静默命中 0 行（复核闸上线前完全无感）。
+    """
+    session = _DisableSession(rowcount=1)
+
+    n = await qfc.disable_catalog_mappings(session, "v-1", "c_dead")
+
+    assert n == 1
+    assert session.params == {"version_id": "v-1", "columns": ["c_dead"]}

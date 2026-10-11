@@ -284,10 +284,13 @@ export interface LogEntry {
 }
 
 // 物化状态（后端 metadata.materialization / manifest 条目，snake→camel 归一后）
+// superseded = 被更强的新因子顶替下架：值仍留在数据集，但已退出活跃口径、
+// 目录注册时禁用（替换机制，后端 manifest 同一状态名）。
 export type FactorMaterializationStatus =
   | 'materialized'
   | 'rejected_duplicate'
   | 'rejected_gate'
+  | 'superseded'
   | 'error'
   | 'none';
 
@@ -305,6 +308,10 @@ export interface FactorMaterialization {
   /** 门禁裁决明细（rejected_gate / materialized 都带） */
   gates?: any;
   error?: string;
+  /** 顶替它的新因子 factor_id（superseded 时由替换机制回写） */
+  supersededBy?: string;
+  /** 顶替发生时间（ISO） */
+  supersededAt?: string;
 }
 
 // Factor information

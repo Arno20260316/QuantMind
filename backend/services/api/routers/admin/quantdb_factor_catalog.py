@@ -1026,6 +1026,29 @@ async def seed_catalog_mappings(session, version: dict[str, Any]) -> dict[str, i
             "default_selected_fields": default_selected_count}
 
 
+async def disable_catalog_mappings(session, version_id: str, columns: Any) -> int:
+    """把给定 ``source_column`` 在指定版本的映射置 ``enabled=FALSE``，返回实际禁用行数。
+
+    ``seed_catalog_mappings`` 的来源是「已发现字段全量」——被顶替下架的
+    superseded 列值仍在数据集里，会被照常播种为启用；本函数在播种之后、
+    发布之前把目录面收敛回「库的活跃信息面」（T-FM-02 替换机制）。幂等：
+    已禁用的行不重复计数。空列集 = 0，不触库。
+
+    裸字符串按**一个列名**处理（评审 L1）：``str`` 也是可迭代对象，不先
+    包一层会被逐字符绑定进 ``ANY``，一列也禁不掉且不报错。
+    """
+    if isinstance(columns, str):
+        columns = [columns]
+    wanted = [str(c) for c in columns or [] if str(c)]
+    if not wanted:
+        return 0
+    result = await session.execute(text("""
+        UPDATE qm_training_factor_mapping SET enabled = FALSE
+        WHERE version_id = :version_id AND source_column = ANY(:columns) AND enabled
+    """), {"version_id": version_id, "columns": wanted})
+    return int(result.rowcount or 0)
+
+
 @router.post("/versions/{version_id}/publish")
 async def publish_factor_catalog(version_id: str, current_user: dict = Depends(require_admin)):
     _ = current_user

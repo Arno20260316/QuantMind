@@ -52,6 +52,8 @@ const PENDING_REASON_LABELS: Record<string, string> = {
 const SKIPPED_REASON_LABELS: Record<string, string> = {
   already_materialized: '已物化',
   rejected_duplicate: '值级重复被拒',
+  rejected_gate: '门禁拒入',
+  superseded: '已被顶替下架',
   no_code: '无代码',
   market_unsupported: '非 A 股市场',
 };

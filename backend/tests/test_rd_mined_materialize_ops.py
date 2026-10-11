@@ -204,6 +204,41 @@ async def test_overview_catalog_stale_when_columns_differ(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_overview_up_to_date_ignores_superseded_columns(
+    isolate_env, fake_panel_deps, fake_candidates
+):
+    """被顶替列的值还在盘上（写值不删）但目录已禁用——判「目录最新」时必须
+    扣除它，否则面板永报「未最新」、管理员被反复引导重发无意义的新版本。
+
+    与 ``_register_library`` 的跳过判据同源（同一座库的两种读法不许打架）。
+    """
+    fake_panel_deps(
+        columns=("symbol", "date", "close", "fac_a", "fac_dead"),
+        enabled={"fac_a"},
+    )
+    _MANIFEST["current"] = {
+        "f-old": {
+            "status": "superseded",
+            "column": "fac_dead",
+            "code_fp": code_fingerprint("close"),
+            "at": "2026-10-01T00:00:00Z",
+        },
+    }
+    fake_candidates([_row("f-old", code="close")])
+
+    overview = await mat.materialize_overview()
+
+    # 盘上两列因子列，但 fac_dead 已下架 → 活跃面 == 已发布 enabled → 最新
+    assert overview["library"]["factor_columns"] == 2
+    assert overview["manifest"]["by_status"] == {"superseded": 1}
+    assert overview["catalog"]["up_to_date"] is True
+    # 被顶替的因子不再进待物化桶（终态跳过，理由如实带出）
+    assert overview["candidates"]["pending"] == 0
+    assert overview["candidates"]["skipped"] == {"superseded": 1}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_overview_manifest_last_at_and_db_degrade(
     isolate_env, fake_panel_deps, fake_candidates, monkeypatch
 ):

@@ -150,6 +150,12 @@ export function materializationChip(factor: Factor, isMaterializing: boolean): C
         className: 'bg-rose-500/10 text-rose-500 border-rose-500/30',
         title: mat.error || '物化失败（可在下次物化自动重试）',
       };
+    case 'superseded':
+      return {
+        text: '已顶替',
+        className: 'bg-muted/40 text-muted-foreground border-border/60',
+        title: `已被更强的新因子顶替下架：列 ${mat.column ?? '—'} 仍保留在数据集，但已退出活跃口径（目录注册已禁用）`,
+      };
     default:
       return null;
   }

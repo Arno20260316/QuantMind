@@ -1,7 +1,7 @@
 """物化门禁插件（P1）——软告警默认、可逐条升级硬拦。
 
 用户裁决（写死在测试里）：**只有既有的 |ρ|≥0.9 值级查重保持硬拒**（不在本插件集，
-原逻辑原样保留）；本插件的五个门禁默认全 **soft**——失败只记录不拦截。
+原逻辑原样保留）；本插件的六个门禁默认全 **soft**——失败只记录不拦截。
 升级路径：yaml 逐条 `mode: hard`，或 env `QM_MINING_GATES_MODE=strict` 全局升级，
 `QM_MINING_GATES_DISABLED=key1,key2` 逐条关闭。
 
@@ -25,6 +25,7 @@ GOOD_METRICS = {
     "ann_turnover": 12.0,
     "ann_return_net": 0.14,
     "ic": 0.03,
+    "incremental_basis_n": 0,  # 无冗余基 → 增量闸视为通过
 }
 
 
@@ -58,6 +59,7 @@ def test_builtin_gates_registered_with_soft_defaults():
         "ic_pool_pct",
         "turnover_cap",
         "net_return_floor",
+        "incremental_ic_ir_floor",
     }
     for name in names:
         desc = get_registry().get_gate(name).descriptor
@@ -114,7 +116,7 @@ def test_missing_metric_is_skipped_even_in_hard_mode(monkeypatch):
     assert decision.rejected is False
 
 
-# ── 五个门禁各自的判定面 ──────────────────────────────────────────
+# ── 六个门禁各自的判定面 ──────────────────────────────────────────
 def test_rre_floor_fails_below_threshold():
     decision = _run(_ctx(metrics={"rre": 0.3}))
     assert _by_key(decision.outcomes)["rre_floor"].status == "fail"
@@ -138,6 +140,61 @@ def test_net_return_floor_fails_when_negative():
     assert _by_key(decision.outcomes)["net_return_floor"].status == "fail"
     ok = _run(_ctx(metrics={"ann_return_net": 0.0}))
     assert _by_key(ok.outcomes)["net_return_floor"].status == "pass"
+
+
+# ── 增量正交闸（T-FE-01）三态判定 ────────────────────────────────
+def test_incremental_gate_no_basis_passes():
+    """无 |ρ|≥0.3 的对照列 = 无冗余基，残差即原值——语义上通过，绝不算 fail。"""
+    decision = _run(_ctx(metrics={"incremental_basis_n": 0}))
+    outcome = _by_key(decision.outcomes)["incremental_ic_ir_floor"]
+    assert outcome.status == "pass"
+    assert "无冗余基" in outcome.message
+
+
+def test_incremental_gate_soft_fail_under_threshold():
+    decision = _run(
+        _ctx(metrics={"incremental_basis_n": 3, "incremental_ic_ir": 0.12})
+    )
+    outcome = _by_key(decision.outcomes)["incremental_ic_ir_floor"]
+    assert outcome.status == "fail" and outcome.mode == "soft"
+    assert outcome.observed == pytest.approx(0.12)
+    assert outcome.threshold == pytest.approx(0.3)
+    assert "对照 3 列" in outcome.message
+    assert decision.rejected is False
+
+
+def test_incremental_gate_pass_above_threshold():
+    decision = _run(
+        _ctx(metrics={"incremental_basis_n": 2, "incremental_ic_ir": 0.55})
+    )
+    assert _by_key(decision.outcomes)["incremental_ic_ir_floor"].status == "pass"
+
+
+def test_incremental_gate_unverifiable_skips(monkeypatch):
+    """有冗余基但残差 IC 窗口不足 → 不可验证 ≠ 差：skipped，硬模式也不拦。"""
+    monkeypatch.setenv("QM_MINING_GATES_MODE", "strict")
+    decision = _run(
+        _ctx(metrics={"incremental_basis_n": 2, "incremental_ic_ir": None})
+    )
+    outcome = _by_key(decision.outcomes)["incremental_ic_ir_floor"]
+    assert outcome.status == "skipped" and outcome.message
+    assert decision.rejected is False
+
+
+def test_incremental_gate_missing_metrics_skips():
+    """旧条目没算过增量口径（basis_n 缺失）→ skipped，不判不拦。"""
+    decision = _run(_ctx(metrics={"incremental_basis_n": None}))
+    outcome = _by_key(decision.outcomes)["incremental_ic_ir_floor"]
+    assert outcome.status == "skipped"
+
+
+def test_incremental_gate_hard_mode_rejects():
+    decision = _run_with_config(
+        {"gates": {"incremental_ic_ir_floor": {"mode": "hard"}}},
+        ctx=_ctx(metrics={"incremental_basis_n": 3, "incremental_ic_ir": 0.1}),
+    )
+    assert decision.rejected is True
+    assert _by_key(decision.outcomes)["incremental_ic_ir_floor"].mode == "hard"
 
 
 # ── 阈值可配 ─────────────────────────────────────────────────────

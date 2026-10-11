@@ -48,6 +48,32 @@ def _seeds_from_kept(kept_data: dict, without: set[str]) -> dict[str, set[str]]:
     return out
 
 
+def _drop_superseded(dataset: str, selected: set[str]) -> tuple[set[str], set[str]]:
+    """从推荐集剔除「已顶替下架」的列（T-FM-02 评审 M8）。
+
+    本脚本会把推荐集里的 ``source_column`` 重新 ``enabled = TRUE``——对
+    ``rd_mined`` 而言，被顶替下架的列只要仍留在推荐集里，就会被这一步
+    **复活**进训练口径（推荐集来自因子研究快照，快照重建前一直带着这些
+    列名）。故在入口处按物化清单剔除。
+
+    仅 ``rd_mined`` 有替换机制，其余数据集原样返回。清单不可读/缺失按
+    空处理（fail-open：宁可不剔，不可误剔——与 promote_rd_mined 读同一
+    份清单的口径一致）。
+    """
+    if dataset != "rd_mined":
+        return selected, set()
+    from backend.scripts.promote_rd_mined import resolve_roots
+    from backend.scripts.rd_mined_materialize import (
+        _load_manifest,
+        _superseded_columns,
+    )
+
+    source_root, _target_root = resolve_roots()
+    superseded = _superseded_columns(_load_manifest(source_root))
+    dropped = selected & superseded
+    return selected - dropped, dropped
+
+
 async def _apply_one(
     dataset: str,
     *,
@@ -67,6 +93,13 @@ async def _apply_one(
         selected = {f["name"] for f in payload.get("factors", [])}
     if not selected:
         return {"dataset": dataset, "ok": False, "reason": "推荐集为空"}
+    selected, dropped = _drop_superseded(dataset, selected)
+    if not selected:
+        return {
+            "dataset": dataset,
+            "ok": False,
+            "reason": "推荐集剔除已顶替下架列后为空",
+        }
 
     async with get_session() as session:
         # 必须带市场：l1_factors 在 CN/US/HK 等多市场各有目录版本，只按数据集查会命中别的市场
@@ -86,6 +119,7 @@ async def _apply_one(
             "from_version": pub["version_id"],
             "mappings": int(mapping_count),
             "selected": len(selected),
+            "superseded_dropped": sorted(dropped),
         }
         if dry_run:
             hit = (await session.execute(text("""
@@ -221,12 +255,16 @@ async def main() -> int:
             selected=seeds.get(ds) if seeds is not None else None,
         )
         if res.get("ok"):
+            extra = res.get("superseded_dropped") or []
+            suffix = f"｜剔除已下架列 {len(extra)} 个" if extra else ""
             if res.get("dry_run"):
-                print(f"[{ds}] 预演：目录 {res['mappings']} 条中命中推荐因子 {res['hit_in_catalog']} 个"
-                      f"（推荐集 {res['selected']} 个）｜来源版本 {res['from_version']}")
+                print(f"[{ds}] 预演：目录 {res['mappings']} 条中命中推荐因子 "
+                      f"{res['hit_in_catalog']} 个（推荐集 {res['selected']} 个）"
+                      f"｜来源版本 {res['from_version']}{suffix}")
             else:
                 print(f"[{ds}] 已发布 {res['new_version']}：勾选 {res['checked_after']} 个"
-                      f"（推荐集 {res['selected']} 个，来源 {res['from_version']}）")
+                      f"（推荐集 {res['selected']} 个，来源 {res['from_version']}）"
+                      f"{suffix}")
         else:
             failed += 1
             print(f"[{ds}] 失败：{res.get('reason')}")

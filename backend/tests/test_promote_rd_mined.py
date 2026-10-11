@@ -362,3 +362,354 @@ def test_register_fields_missing_dataset_writes_nothing(monkeypatch):
     monkeypatch.setattr(dbm, "get_session", _must_not_open_session)
 
     assert prm._register_fields() == 1
+
+
+# ---------------------------------------------------------------------------
+# 目录发布（--publish）：superseded 列的三条收敛路径（T-FM-02）
+# ---------------------------------------------------------------------------
+class _Rows:
+    """最小结果集替身：mappings()/scalars()/all()/first() 与 SQLAlchemy 同形。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+
+class _CatalogSession:
+    """目录发布用最小会话：只认版本查询与 enabled 列查询，其余 SQL 响亮拒绝。
+
+    「响亮拒绝」本身是断言：发布路径若悄悄发明了第三条 SQL，替身炸掉，
+    而不是把意外写库当成通过。``rollback`` 记录次数（评审 M4/M3 的
+    中止路径必须回滚，否则孤儿草稿/半截写会被会话上下文提交）。
+    """
+
+    def __init__(self, *, version=None, enabled=()):
+        self._version = version
+        self._enabled = list(enabled)
+        self.queries: list[str] = []
+        self.rollbacks = 0
+
+    async def execute(self, statement, params=None):
+        sql = str(statement)
+        if "qm_training_factor_catalog_version" in sql:
+            self.queries.append("version")
+            return _Rows([self._version] if self._version else [])
+        if "qm_training_factor_mapping" in sql:
+            self.queries.append("enabled")
+            return _Rows(list(self._enabled))
+        raise AssertionError(f"意外的 SQL：{sql}")
+
+    def remove_enabled(self, columns) -> int:
+        """模拟 disable 真正生效：从启用集移除并返回被移除的列数。"""
+        drop = set(columns)
+        before = len(self._enabled)
+        self._enabled = [c for c in self._enabled if c not in drop]
+        return before - len(self._enabled)
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+def _install_publish_env(
+    monkeypatch,
+    tmp_path,
+    *,
+    version,
+    enabled,
+    superseded,
+    clone_rows=5,
+    disable_works=True,
+):
+    """把 ``_publish_catalog`` 的 DB/清单依赖全换替身。
+
+    返回 ``(flow, session, seen_manifest_roots)``。``disable_works=False``
+    时 disable 替身「不生效」（rowcount=0、启用集不变），用于钉复核闸门
+    会中止发布。``seen_manifest_roots`` 记录被顶替清单实际读自哪个根。
+    """
+    import contextlib
+
+    from backend.scripts import rd_mined_materialize as mat
+    from backend.services.api.routers.admin import quantdb_factor_catalog as qfc
+    from backend.shared import database_manager_v2 as dbm
+
+    session = _CatalogSession(version=version, enabled=enabled)
+    flow: list[tuple] = []
+    seen_manifest_roots: list = []
+
+    @contextlib.asynccontextmanager
+    async def _fake_session():
+        yield session
+
+    async def fake_ensure(_session):
+        flow.append(("ensure",))
+
+    async def fake_create(_session, dataset, name, market, created_by=None):
+        flow.append(("create", dataset, market))
+        return "v-new"
+
+    async def fake_seed(_session, payload):
+        flow.append(("seed", payload.get("version_id")))
+        return {"seeded_fields": 7}
+
+    async def fake_clone(_session, *, draft_id, market, source_dataset):
+        flow.append(("clone", draft_id))
+        return clone_rows
+
+    async def fake_disable(_session, version_id, columns):
+        flow.append(("disable", version_id, list(columns)))
+        if not disable_works:
+            return 0  # 模拟 UPDATE 命中 0 行：禁用没生效
+        return session.remove_enabled(columns)
+
+    async def fake_publish(_session, version_id):
+        flow.append(("publish", version_id))
+
+    manifest = {
+        f"f-{col}": {"status": "superseded", "column": col} for col in superseded
+    }
+
+    def fake_load_manifest(root):
+        seen_manifest_roots.append(Path(root))
+        return manifest
+
+    monkeypatch.setattr(qfc, "_ensure_schema", fake_ensure)
+    monkeypatch.setattr(qfc, "create_catalog_draft", fake_create)
+    monkeypatch.setattr(qfc, "seed_catalog_mappings", fake_seed)
+    monkeypatch.setattr(qfc, "seed_draft_from_published", fake_clone)
+    monkeypatch.setattr(qfc, "disable_catalog_mappings", fake_disable)
+    monkeypatch.setattr(qfc, "publish_catalog_version", fake_publish)
+    monkeypatch.setattr(dbm, "get_session", _fake_session)
+    monkeypatch.setattr(mat, "_load_manifest", fake_load_manifest)
+    monkeypatch.setattr(prm, "resolve_roots", lambda: (tmp_path / "s", tmp_path / "t"))
+    return flow, session, seen_manifest_roots
+
+
+@pytest.mark.unit
+def test_publish_noop_when_published_has_no_superseded(monkeypatch, tmp_path):
+    """线上目录已不含被顶替列（启用面板干净）→ 真正的 no-op，不发新版本。"""
+    flow, _session, seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-pub", "status": "published"},
+        enabled=["c_a"],
+        superseded={"c_dead"},
+    )
+    assert prm._publish_catalog() == 0
+    assert flow == [("ensure",)]
+    src, _dst = prm.resolve_roots()
+    assert seen == [src], "缺省源根下清单读自 resolve_roots 的源库"
+
+
+@pytest.mark.unit
+def test_publish_republishes_when_published_still_enables_superseded(
+    monkeypatch, tmp_path
+):
+    """线上仍启用被顶替列 → 克隆线上（保手工勾选）→ 禁用 → 重发布。
+
+    已发布版本不可改写，也绝不静默放过：拒绝走「原地改旧版」或「不管它」。
+    """
+    flow, session, _seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-pub", "status": "published"},
+        enabled=["c_a", "c_dead"],
+        superseded={"c_dead"},
+    )
+    assert prm._publish_catalog() == 0
+
+    assert ("create", prm.DATASET, prm.TARGET_MARKET) in flow
+    assert ("clone", "v-new") in flow
+    assert ("disable", "v-new", ["c_dead"]) in flow
+    assert (
+        flow.index(("clone", "v-new"))
+        < flow.index(("disable", "v-new", ["c_dead"]))
+        < flow.index(("publish", "v-new"))
+    ), "顺序：先克隆（吃到现状）再禁用再发布"
+    assert ("publish", "v-pub") not in flow, "旧版本绝不被当成新草稿发布"
+    assert session.queries == ["version", "enabled", "enabled"], (
+        "第一次查线上启用面，第二次是禁用后的复核（评审 M3）"
+    )
+
+
+@pytest.mark.unit
+def test_publish_aborts_when_clone_from_published_is_empty(monkeypatch, tmp_path):
+    """线上启用着被顶替列却一行没克隆到 → 回滚 + 中止（rc=1），绝不发布空版本。
+
+    发布会把旧版转 archived 且不可逆：克隆得 0 行说明中间层坏了，
+    此时发布等于把线上训练口径清空。必须 rollback——不 rollback 的话
+    get_session 会把「正常 return」当成功提交，孤儿空草稿被后续 promote
+    选中、publish 又失败，目录永久卡死（评审 M4）。
+    """
+    flow, session, _seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-pub", "status": "published"},
+        enabled=["c_dead"],
+        superseded={"c_dead"},
+        clone_rows=0,
+    )
+    assert prm._publish_catalog() == 1
+    assert ("publish", "v-new") not in flow
+    assert not any(step[0] == "disable" for step in flow)
+    assert session.rollbacks == 1, "中止必须回滚，不给孤儿草稿留提交机会"
+
+
+@pytest.mark.unit
+def test_publish_aborts_when_disable_does_not_take_effect(monkeypatch, tmp_path):
+    """禁用没生效（rowcount=0、启用集没变）→ 复核逮住 → 回滚中止发布。
+
+    评审 M3：发布不可逆，带着仍启用的已下架列发布 = 下架决定当场作废。
+    禁用行数只进日志是不够的。
+    """
+    flow, session, _seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-draft", "status": "draft"},
+        enabled=["c_dead"],
+        superseded={"c_dead"},
+        disable_works=False,
+    )
+    assert prm._publish_catalog() == 1
+    assert not any(step[0] == "publish" for step in flow)
+    assert session.rollbacks == 1
+
+
+@pytest.mark.unit
+def test_publish_reads_superseded_from_explicit_source_root(monkeypatch, tmp_path):
+    """显式源根穿透到清单读取（评审 M5）：--source-root 指到别处时，
+    被顶替清单必须跟着走——否则读默认库下架、给指定库发版，口径劈叉。"""
+    explicit = tmp_path / "elsewhere" / "6_ml_datasets" / "rd_mined"
+    flow, _session, seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-pub", "status": "published"},
+        enabled=["c_a"],
+        superseded={"c_dead"},
+    )
+    assert prm._publish_catalog(explicit) == 0
+    assert seen == [explicit]
+    assert flow == [("ensure",)]
+
+
+@pytest.mark.unit
+def test_main_threads_resolved_source_root_into_publish(monkeypatch, tmp_path):
+    """main() 把 CLI 解析出的实际源根传给 _publish_catalog（评审 M5）。"""
+    src_root = tmp_path / "quantcustom"
+    dst_root = tmp_path / "quantdb"
+    _write_partition(src_root, prm.DATASET, "20200102", b"a")
+
+    seen: list = []
+
+    def fake_publish(root=None):
+        seen.append(root)
+        return 0
+
+    monkeypatch.setattr(prm, "_publish_catalog", fake_publish)
+
+    rc = prm.main(
+        [
+            "--source-root",
+            str(src_root),
+            "--target-root",
+            str(dst_root),
+            "--publish",
+        ]
+    )
+
+    assert rc == 0
+    src, _dst = prm.resolve_roots(src_root, dst_root)
+    assert seen == [src], "发布读清单的源根必须是 CLI 解析出的那个"
+
+
+@pytest.mark.unit
+def test_publish_disables_before_publishing_existing_draft(monkeypatch, tmp_path):
+    """既有草稿：发布前把被顶替列禁用（列序按 sorted，确定性）。"""
+    flow, session, _seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version={"version_id": "v-draft", "status": "draft"},
+        enabled=[],
+        superseded={"c_dead", "c_dead2"},
+    )
+    assert prm._publish_catalog() == 0
+    assert flow[-2] == ("disable", "v-draft", ["c_dead", "c_dead2"])
+    assert flow[-1] == ("publish", "v-draft")
+    assert not any(step[0] in ("create", "seed", "clone") for step in flow)
+    assert session.queries == ["version", "enabled"], (
+        "草稿分支只多一次禁用后复核（评审 M3）"
+    )
+
+
+@pytest.mark.unit
+def test_publish_new_draft_seeds_then_disables_then_publishes(monkeypatch, tmp_path):
+    """无任何版本：新建 → 全量播种 → 禁用被顶替列 → 发布。"""
+    flow, _session, _seen = _install_publish_env(
+        monkeypatch,
+        tmp_path,
+        version=None,
+        enabled=[],
+        superseded={"c_dead"},
+    )
+    assert prm._publish_catalog() == 0
+    assert [step[0] for step in flow] == [
+        "ensure",
+        "create",
+        "seed",
+        "disable",
+        "publish",
+    ]
+    assert flow[3] == ("disable", "v-new", ["c_dead"])
+
+
+# ---------------------------------------------------------------------------
+# 推荐集写目录：剔除已顶替下架列（评审 M8）
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_drop_superseded_filters_rd_mined_recommendation_only(monkeypatch, tmp_path):
+    """apply 脚本写目录前剔除已下架列（评审 M8）。
+
+    脚本会把推荐集列重置 ``enabled = TRUE``；对 rd_mined 而言，被顶替下架
+    的列只要仍留在推荐集里就会被这一步**复活**进训练口径。其它数据集没有
+    替换机制，原样放行（不误剔）。
+    """
+    from backend.scripts import apply_factor_selection_to_catalog as afs
+    from backend.scripts import rd_mined_materialize as mat
+
+    manifest = {
+        "f1": {"status": "superseded", "column": "c_dead"},
+        "f2": {
+            "status": "rejected_duplicate",
+            "column": "c_carried",
+            "superseded_by": "f1",
+        },
+    }
+    seen_roots: list = []
+
+    def fake_load(root):
+        seen_roots.append(root)
+        return manifest
+
+    monkeypatch.setattr(mat, "_load_manifest", fake_load)
+    monkeypatch.setattr(prm, "resolve_roots", lambda: (tmp_path / "s", tmp_path / "t"))
+
+    kept, dropped = afs._drop_superseded("rd_mined", {"c_dead", "c_ok", "c_carried"})
+
+    assert kept == {"c_ok"}
+    assert dropped == {"c_dead", "c_carried"}, (
+        "并集判据：带 superseded_by 标记的重跑条目同样算下架"
+    )
+    assert seen_roots == [tmp_path / "s"], "清单读自 resolve_roots 的源根"
+
+    same = {"c_dead", "c_ok"}
+    assert afs._drop_superseded("l1_factors", same) == (same, set())

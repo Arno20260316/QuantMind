@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,9 @@ _project_root = Path(__file__).resolve().parents[2]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from backend.services.engine.alpha_agent.statistical import (  # noqa: E402
+    incremental as incremental_gate,
+)
 from backend.shared.factor_identity import (  # noqa: E402
     code_fingerprint,
     feature_column_name,
@@ -87,6 +91,12 @@ _CORR_REJECT = 0.9
 _MIN_PAIRS_PER_DAY = 20
 _MIN_SAMPLE_DAYS = 5
 _EXEC_TIMEOUT_S = 900
+
+# T-FM-02 替换机制：值级查重命中**恰好 1 列**时，若新因子
+# |IC| ≥ 0.10 且 ≥ 1.3× 被顶替列 |IC|（同窗口同 fwd 口径），
+# 则受理顶替（旧因子转 superseded、列下架目录）；否则照旧拒入。
+_REPLACE_IC_FLOOR = 0.10
+_REPLACE_IC_RATIO = 1.3
 
 
 # ── 清单与筛选 ─────────────────────────────────────────────────────────
@@ -145,10 +155,13 @@ def _eligible_row(row: Mapping[str, Any]) -> tuple[bool, str]:
     return True, "ok"
 
 
-# 终态裁决：物化成功 / 值级重复拒入 / 硬门禁拒入。常规路径
+# 终态裁决：物化成功 / 值级重复拒入 / 硬门禁拒入 / 被顶替下架。常规路径
 # （_should_materialize）与门禁复评（_gates_refresh_needed）共用同一集合，
-# 新增/改名终态时两处不漂移。
-_TERMINAL_STATUSES = frozenset({"materialized", "rejected_duplicate", "rejected_gate"})
+# 新增/改名终态时两处不漂移。superseded 的列**保留在数据集里**（数据是
+# 既成事实，不删值），但不再是库的活跃信息面、目录注册时禁用。
+_TERMINAL_STATUSES = frozenset(
+    {"materialized", "rejected_duplicate", "rejected_gate", "superseded"}
+)
 
 
 def _should_materialize(
@@ -243,52 +256,135 @@ def _max_abs_corr(
     sample_days: set[str] | None = None,
     exclude: set[str] | None = None,
 ) -> tuple[float, str | None]:
-    """新因子与对照列的最大日均 |Spearman ρ|。
+    """新因子与对照列的最大日均 |Spearman ρ|（值级查重口径）。
 
-    实现 = 逐日截面 rank 后按日求皮尔逊相关，再对日取均值（抓「逐日排序
-    相同的换皮因子」，对显著但非单调的高相关列更稳健）；要求每天至少
-    ``_MIN_PAIRS_PER_DAY`` 对、至少 ``_MIN_SAMPLE_DAYS`` 个有效日。
-    索引须为 ``(trade_date, symbol)`` 两层（``_to_canonical`` 保证）。
-    ``exclude`` 列（该因子自己的旧列）不参与比对——否则 --force 重做时
-    拿旧值比新值，|ρ|=1 自我拒绝。
+    实现 = 逐日截面 rank 后按日皮尔逊相关、对日取均值（抓「逐日排序相同
+    的换皮因子」）；底层与增量正交闸共用
+    ``statistical.incremental.mean_rho_by_column``（口径单源，T-FM-02 起）。
+    ``exclude`` 列（该因子自己的旧列）不参与——--force 重做时拿旧值比
+    新值会 |ρ|=1 自我拒绝。
     无重叠/样本不足时返回 ``(0.0, None)``（宁可漏报不误报）。
     """
-    if values is None or controls is None or len(values) == 0 or controls.empty:
-        return 0.0, None
-    new_col = values.rename("__new__")
-    if isinstance(new_col, pd.DataFrame):
-        new_col = new_col.iloc[:, 0]
-    frame = pd.concat([new_col, controls], axis=1, join="inner")
-    frame = frame[frame["__new__"].notna()]
-    if exclude:
-        drop = [c for c in exclude if c in frame.columns]
-        if drop:
-            frame = frame.drop(columns=drop)
-    if sample_days is not None:
-        frame = frame[frame.index.get_level_values(0).isin(sample_days)]
-    if frame.empty:
-        return 0.0, None
-    ranks = frame.groupby(level=0).rank()
-    new_rank = ranks["__new__"]
-    other = ranks.drop(columns="__new__")
-    if other.shape[1] == 0:
-        return 0.0, None
-    new_rank_c = new_rank - new_rank.groupby(level=0).transform("mean")
-    other_c = other - other.groupby(level=0).transform("mean")
-    pair_ok = other.notna()
-    cov = other_c.mul(new_rank_c, axis=0).where(pair_ok).groupby(level=0).sum()
-    var_other = (other_c**2).where(pair_ok).groupby(level=0).sum()
-    var_new = (new_rank_c.where(pair_ok.any(axis=1)) ** 2).groupby(level=0).sum()
-    n_pairs = pair_ok.groupby(level=0).sum()
-    denom = var_other.mul(var_new, axis=0) ** 0.5
-    rho_day = cov / denom.where(denom > 0)
-    rho_day = rho_day.where(n_pairs >= _MIN_PAIRS_PER_DAY)
-    rho_mean = rho_day.mean()
-    rho_mean = rho_mean.where(rho_day.notna().sum() >= _MIN_SAMPLE_DAYS)
-    abs_rho = rho_mean.abs().dropna()
+    abs_rho = (
+        _rho_series(values, controls, sample_days=sample_days, exclude=exclude)
+        .abs()
+        .dropna()
+    )
     if abs_rho.empty:
         return 0.0, None
     return float(abs_rho.max()), str(abs_rho.idxmax())
+
+
+def _rho_series(
+    values: pd.Series,
+    controls: pd.DataFrame,
+    *,
+    sample_days: set[str] | None = None,
+    exclude: set[str] | None = None,
+) -> pd.Series:
+    """有符号日均 ρ 列（查重的取最大与增量闸的筛基共用同一计算结果）。"""
+    return incremental_gate.mean_rho_by_column(
+        values,
+        controls,
+        sample_days=sample_days,
+        exclude=tuple(exclude) if exclude else (),
+        min_pairs=_MIN_PAIRS_PER_DAY,
+        min_sample_days=_MIN_SAMPLE_DAYS,
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementVerdict:
+    """值级查重命中单列时的替换裁决（T-FM-02；不替换 = 照旧拒入）。"""
+
+    replace: bool
+    reason: str
+    incumbent_column: str | None = None
+    incumbent_factor_id: str | None = None
+
+
+def _replacement_decision(
+    *,
+    hit_columns: list[str],
+    owners: Mapping[str, str],
+    manifest: Mapping[str, Any],
+    new_ic: float | None,
+    incumbent_ic: float | None,
+    ic_floor: float = _REPLACE_IC_FLOOR,
+    ic_ratio: float = _REPLACE_IC_RATIO,
+) -> ReplacementVerdict:
+    """替换判据（台账 T-FM-02）：命中**恰好 1 列** ∧ 该列属活跃因子 ∧
+    |新 IC| ≥ max(0.10, 1.3×|旧 IC|)。全部条件不满足即拒入（fail-closed）。
+
+    被顶替者的「活跃」判据 = manifest 状态 materialized：已 superseded /
+    被拒 / 出错条目的列仍留在数据集里参与查重（写值不删是既成事实），
+    但不可再作顶替对象——替换链不接力，避免连锁下架。
+    """
+    if len(hit_columns) != 1:
+        return ReplacementVerdict(False, "not_single_hit")
+    column = str(hit_columns[0])
+    incumbent_id = str(owners.get(column) or "")
+    if not incumbent_id:
+        return ReplacementVerdict(False, "not_owned")
+    entry = manifest.get(incumbent_id) or {}
+    if str((entry or {}).get("status") or "") != "materialized":
+        return ReplacementVerdict(
+            False,
+            "incumbent_not_active",
+            incumbent_column=column,
+            incumbent_factor_id=incumbent_id,
+        )
+    if new_ic is None:
+        return ReplacementVerdict(False, "new_ic_missing", column, incumbent_id)
+    if incumbent_ic is None:
+        return ReplacementVerdict(False, "incumbent_ic_missing", column, incumbent_id)
+    if abs(new_ic) < ic_floor:
+        return ReplacementVerdict(False, "ic_below_floor", column, incumbent_id)
+    if abs(new_ic) < ic_ratio * abs(incumbent_ic):
+        return ReplacementVerdict(False, "ratio_below", column, incumbent_id)
+    return ReplacementVerdict(True, "ok", column, incumbent_id)
+
+
+def _superseded_columns(manifest: Mapping[str, Any]) -> set[str]:
+    """被顶替下架、但值仍在数据集里的列名（目录注册禁用与面板同口径）。
+
+    判据是**并集**（评审 H1）：``status == "superseded"``，或条目处在其它
+    终态但带着 ``superseded_by`` 标记（被顶替过的因子重跑后新代码被拒入/
+    再失败，见 ``_carry_supersede``）。只看 status 会让「已下架列」因一次
+    重跑复活进活跃口径——目录重新启用、训练静默吃回。
+    """
+    return {
+        str((entry or {}).get("column") or "")
+        for entry in manifest.values()
+        if str((entry or {}).get("column") or "")
+        and (
+            str((entry or {}).get("status") or "") == "superseded"
+            or bool((entry or {}).get("superseded_by"))
+        )
+    }
+
+
+def _carry_supersede(old: Any, entry: dict[str, Any]) -> dict[str, Any]:
+    """重写既有条目时保留「被顶替下架」标记（评审 H1）。
+
+    已 superseded 的因子会因代码改写（``code_changed``）或 ``--force``
+    重跑；重跑结果若不是 materialized（拒入/再失败），旧条目会被整体
+    覆写——若把 ``superseded_by``/``superseded_at`` 丢掉，该列就从
+    ``_superseded_columns`` 的视野里消失、静默回到训练活跃口径。
+
+    规则：新条目自己声明了 ``superseded_by``（它自己就是被顶替终态）或
+    已 materialized（重新过闸入账即重新激活，例如新代码替换了自己的
+    顶替者）→ 原样返回；其余情形把旧标记带入新条目。
+    """
+    if entry.get("status") == "materialized" or entry.get("superseded_by"):
+        return entry
+    if not (old or {}).get("superseded_by"):
+        return entry
+    return {
+        **entry,
+        "superseded_by": old["superseded_by"],
+        "superseded_at": old.get("superseded_at"),
+    }
 
 
 def _long_to_wide(long_df: pd.DataFrame) -> pd.DataFrame:
@@ -307,10 +403,12 @@ def _long_to_wide(long_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_controls(lib_root: Path, sample_days: list[str]) -> pd.DataFrame:
-    """值级查重对照帧：CUSTOM ``l1_factors`` + ``rd_mined`` 既有列。
+    """值级查重/增量闸对照帧：CUSTOM ``l1_factors`` + ``rd_mined`` 既有列。
 
     只读采样日所在区间（近端窗口），列含 OHLCV——价格/成交量的直接
-    衍生因子同样应被拒。
+    衍生因子同样应被拒。**不在这里按采样日截断**：前向收益要按交易日
+    shift(-1)，先截断再 shift 会静默跨到「下一个采样日」（≈2 个交易日
+    跳步），IC 口径整体位移；取日过滤已上移到各消费方的 sample_days 参数。
     """
     from backend.shared.feature_source import read_factor_source
 
@@ -336,9 +434,7 @@ def _load_controls(lib_root: Path, sample_days: list[str]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     controls = pd.concat(frames, axis=1)
-    controls = controls.loc[:, ~controls.columns.duplicated()]
-    keep = set(sample_days)
-    return controls[controls.index.get_level_values(0).isin(keep)]
+    return controls.loc[:, ~controls.columns.duplicated()]
 
 
 # ── 因子代码执行（子进程 + daily_pv.h5） ───────────────────────────────
@@ -729,20 +825,29 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-async def _evaluate_gates(row: Mapping[str, Any]) -> Any:
+async def _evaluate_gates(
+    row: Mapping[str, Any], *, extra_metrics: Mapping[str, Any] | None = None
+) -> Any:
     """装配 GateContext → run_gates。池分位查询失败降级为 None（判 skipped），
-    门禁本身异常由 registry 吞并记 skipped——物化不因门禁故障中断。"""
+    门禁本身异常由 registry 吞并记 skipped——物化不因门禁故障中断。
+
+    ``extra_metrics``：物化期新算的指标（增量闸的 ``incremental_*``）。
+    ``--gates-only`` 复评无法重算它们（依赖因子值），改从 manifest 存档
+    回放——**一条 key 缺失即 judged skipped，绝不按 0 判**。
+    """
     from backend.services.engine.mining_plugins import GateContext, run_gates
 
     factor_id = str(row.get("factor_id") or "")
     market = str(row.get("market") or DEFAULT_MARKET)
     universe = str(row.get("universe") or "")
-    metrics = {
+    metrics: dict[str, Any] = {
         "pfs": _as_float(row.get("pfs")),
         "rre": _as_float(row.get("rre")),
         "ann_turnover": _as_float(row.get("ann_turnover")),
         "ann_return_net": _as_float(row.get("ann_return_net")),
     }
+    if extra_metrics:
+        metrics.update(dict(extra_metrics))
     pool_ic_pct: float | None = None
     user_id = str(row.get("user_id") or "")
     if user_id:
@@ -802,6 +907,12 @@ async def _update_factor_meta(factor_id: str, entry: Mapping[str, Any]) -> bool:
 # ── 门禁复评（--gates-only）：不跑因子代码的裁决刷新 ──────────────────
 
 
+#: 复评**无法供给输入**的门禁：增量口径依赖因子值，只有常规物化能现算
+#: （复评从 manifest 存档的 metrics 回放）。其 skipped 不得触发「再复评」
+#: 判据——否则每次 gates-only 都得同样 skipped，存量条目永久空转重刷。
+_GATES_ONLY_UNAVAILABLE = frozenset({"incremental_ic_ir_floor"})
+
+
 def _gates_refresh_needed(entry: Mapping[str, Any], *, force: bool) -> tuple[bool, str]:
     """复评选择判据：已有**完整**终态裁决才跳过（--force 无条件重评）。
 
@@ -809,6 +920,8 @@ def _gates_refresh_needed(entry: Mapping[str, Any], *, force: bool) -> tuple[boo
     含 ``skipped`` 门禁的裁决**不是终态**：先跑复评后补指标的场景下，
     若把「缺输入」当既成事实，指标补齐后默认轮次将永远不再看它
     （复评的价值就在于指标到位后自动收敛，不该要求 --force）。
+    例外：``_GATES_ONLY_UNAVAILABLE`` 门禁的 skipped 是复评的结构性
+    盲区（见其定义），不算「缺输入」。
     """
     status = str((entry or {}).get("status") or "")
     if status not in _TERMINAL_STATUSES:
@@ -818,7 +931,9 @@ def _gates_refresh_needed(entry: Mapping[str, Any], *, force: bool) -> tuple[boo
         return True, "force" if force else "refresh"
     outcomes = gates.get("gates") if isinstance(gates, Mapping) else None
     if isinstance(outcomes, list) and any(
-        str((outcome or {}).get("status") or "") == "skipped" for outcome in outcomes
+        str((outcome or {}).get("status") or "") == "skipped"
+        and str((outcome or {}).get("key") or "") not in _GATES_ONLY_UNAVAILABLE
+        for outcome in outcomes
     ):
         return True, "gates_partial"
     return False, "has_gates"
@@ -907,7 +1022,13 @@ async def _run_gates_only(args: argparse.Namespace) -> int:
                 stats["code_changed"] += 1
                 continue
         try:
-            decision = await _evaluate_gates(row)
+            saved_metrics = entry.get("metrics")
+            decision = await _evaluate_gates(
+                row,
+                extra_metrics=saved_metrics
+                if isinstance(saved_metrics, Mapping)
+                else None,
+            )
         except Exception as exc:  # noqa: BLE001 - 单因子装配故障不中断其余复评
             logger.warning("  复评失败（保留原裁决） %s：%s", factor_id[:8], exc)
             stats["errors"] += 1
@@ -1000,12 +1121,15 @@ async def _published_enabled_columns(session: Any) -> tuple[str | None, set[str]
 async def _register_library(lib_root: Path, *, force: bool = False) -> str | None:
     """刷新字段注册并发布/更新 rd_mined 训练目录版本。
 
-    幂等判据 = 已发布版本的 enabled 映射列集 vs 当前扫描列集，相同则跳过
-    （避免注册失败后「永远不再发」或每次空发新版）。
+    幂等判据 = 已发布版本的 enabled 映射列集 vs 当前**活跃**列集（扫描列
+    减去被顶替的 superseded 列），相同则跳过（避免注册失败后「永远不再
+    发」或每次空发新版）。superseded 列的值仍在数据集里，播种会把它当
+    普通字段启用——对每个新草稿显式禁用，目录面即「库的活跃信息面」。
     """
     from backend.services.api.routers.admin.quantdb_factor_catalog import (
         _ensure_schema,
         create_catalog_draft,
+        disable_catalog_mappings,
         publish_catalog_version,
         record_source_fields,
         seed_catalog_mappings,
@@ -1030,13 +1154,15 @@ async def _register_library(lib_root: Path, *, force: bool = False) -> str | Non
     if not factor_cols:
         logger.warning("rd_mined 分区存在但无因子列，跳过目录注册")
         return None
+    superseded = _superseded_columns(_load_manifest(lib_root))
+    active_cols = [c for c in factor_cols if c not in superseded]
     status_dict = status.to_dict()
     async with get_session() as session:
         await _ensure_schema(session)
         if not force:
             _published_vid, enabled = await _published_enabled_columns(session)
-            if _published_vid is not None and enabled == set(factor_cols):
-                logger.info("rd_mined 目录已最新（%d 列），跳过", len(factor_cols))
+            if _published_vid is not None and enabled == set(active_cols):
+                logger.info("rd_mined 目录已最新（%d 列），跳过", len(active_cols))
                 return None
         await record_source_fields(session, RD_MINED_SOURCE, status_dict, LIB_MARKET)
         version_id = await create_catalog_draft(
@@ -1054,11 +1180,23 @@ async def _register_library(lib_root: Path, *, force: bool = False) -> str | Non
                 "source_dataset": RD_MINED_SOURCE,
             },
         )
+        disabled = await disable_catalog_mappings(session, version_id, superseded)
+        # 发布不可逆，禁用行数只进日志不够（评审 M3）：草稿是刚全量播种的
+        # 新版本，每个在盘的被顶替列必然被启用过，UPDATE 命中行数应精确
+        # 等于 superseded∩在盘列数；不等即异常，中止发布（不 publish 就
+        # 没有不可逆后果，孤儿草稿下次 force 重注册会重建）。
+        expect = len(superseded & set(factor_cols))
+        if disabled != expect:
+            raise RuntimeError(
+                f"被顶替列禁用不完整：{disabled}/{expect}（中止发布，"
+                f"避免目录带已下架列上线）"
+            )
         await publish_catalog_version(session, version_id)
     logger.info(
-        "rd_mined 目录已发布 %s（%d 因子列，播种 %s）",
+        "rd_mined 目录已发布 %s（%d 活跃因子列，禁用 %d 被顶替列，播种 %s）",
         version_id,
-        len(factor_cols),
+        len(active_cols),
+        disabled,
         seeded,
     )
     return version_id
@@ -1203,6 +1341,7 @@ async def materialize_overview(*, market: str = DEFAULT_MARKET) -> dict[str, Any
 
     lib_root = _lib_root()
     manifest = _load_manifest(lib_root)
+    superseded = _superseded_columns(manifest)
     candidates: dict[str, Any] = {
         "total": 0,
         "pending": 0,
@@ -1268,11 +1407,13 @@ async def materialize_overview(*, market: str = DEFAULT_MARKET) -> dict[str, Any
         async with get_session() as session:
             version_id, enabled = await _published_enabled_columns(session)
         # 与 _register_library 的跳过判据同源：目录是否最新 = 已发布 enabled
-        # 映射列集 == 当前盘上列集。
+        # 映射列集 == 当前盘上**活跃**列集（扣除被顶替列——值在盘上但目录
+        # 已禁用，若把它算进来面板会永报「未最新」）。
+        active_cols = factor_cols - superseded
         catalog = {
             "published_version": version_id,
             "published_columns": len(enabled),
-            "up_to_date": version_id is not None and enabled == factor_cols,
+            "up_to_date": version_id is not None and enabled == active_cols,
         }
     except Exception as exc:  # noqa: BLE001 - DB 抖动时面板降级展示，不整页失败
         catalog["error"] = str(exc)[:300]
@@ -1350,11 +1491,13 @@ async def _run(args: argparse.Namespace) -> int:
         "materialized": 0,
         "rejected_duplicate": 0,
         "rejected_gate": 0,
+        "superseded": 0,  # 被新因子顶替下架的旧因子数（T-FM-02）
         "errors": 0,
         "corr_unverified": 0,  # 值级查重没算出结果的因子数（门静默退化可见性）
     }
     dirty_library = False  # 有任一因子写过值 → 尾部必须跑 schema 对齐
     controls: pd.DataFrame | None = None
+    controls_fwd: pd.Series | None = None
     sample_days: list[str] | None = None
     h5_path: Path | None = None
     for idx, row in enumerate(todo, 1):
@@ -1380,6 +1523,9 @@ async def _run(args: argparse.Namespace) -> int:
                 raise RuntimeError("因子值为全空")
             rho: float | None = None
             matched: str | None = None
+            hit_columns: list[str] = []
+            rho_series: pd.Series | None = None
+            replacement = ReplacementVerdict(False, "no_hit")
             if not args.no_corr_gate:
                 if controls is None:
                     sample_days = _recent_sample_days(values)
@@ -1387,53 +1533,170 @@ async def _run(args: argparse.Namespace) -> int:
                     if controls.empty:
                         logger.warning("无对照库数据，本轮值级查重不可用")
                     else:
+                        # 前向收益在全交易日帧上一次算好（增量闸与替换 IC 共用）
+                        controls_fwd = incremental_gate.forward_return_series(controls)
                         logger.info(
                             "对照帧：%d 行 × %d 列，采样日 %d 天",
                             len(controls),
                             controls.shape[1],
                             len(sample_days),
                         )
-                rho, matched = _max_abs_corr(
+                rho_series = _rho_series(
                     values,
                     controls,
                     sample_days=set(sample_days or []) or None,
                     exclude=_owned_columns(owners, factor_id) | {column},
                 )
-                if not controls.empty and matched is None and rho == 0.0:
-                    # matched=None ⇒ 没算出任何可比对列（非「算出来是 0」）：
-                    # 该因子本轮未经值级查重，计入汇总，别让门静默退化
+                abs_rho = rho_series.abs().dropna()
+                if not controls.empty and abs_rho.empty:
+                    # 没算出任何可比对列（非「算出来是 0」）：该因子本轮未经
+                    # 值级查重，计入汇总，别让门静默退化
                     logger.warning("  值级查重未生效（与对照库无足够重叠样本）")
                     stats["corr_unverified"] += 1
-                if rho >= args.corr_threshold:
-                    entry = {
-                        "status": "rejected_duplicate",
-                        "column": column,
-                        "name": name,
-                        "corr": round(float(rho), 4),
-                        "corr_against": matched,
-                        "code_fp": code_fingerprint(str(row.get("factor_code") or "")),
-                        "at": _now_iso(),
-                    }
-                    manifest[factor_id] = entry
-                    _save_manifest(lib_root, manifest)
-                    await _update_factor_meta(factor_id, entry)
-                    owners[column] = factor_id
-                    stats["rejected_duplicate"] += 1
-                    logger.warning(
-                        "  值级重复（|ρ|=%.3f vs %s），拒绝入账", rho, matched
+                if abs_rho.empty:
+                    rho, matched = 0.0, None
+                else:
+                    rho, matched = float(abs_rho.max()), str(abs_rho.idxmax())
+                hit_columns = [
+                    str(c) for c in abs_rho[abs_rho >= args.corr_threshold].index
+                ]
+                if hit_columns:
+                    # T-FM-02 替换机制：命中恰好 1 列时按「新 |IC| ≥
+                    # max(0.10, 1.3×被顶替列 |IC|)」裁量顶替或拒入；两个 IC
+                    # 都取同一采样窗口、同一 fwd 口径的实测值（活跃口径，
+                    # 不是落库的历史排名）。
+                    new_ic: float | None = None
+                    incumbent_ic: float | None = None
+                    if len(hit_columns) == 1 and controls_fwd is not None:
+                        window = set(sample_days or []) or None
+                        new_ic, _ = incremental_gate.mean_abs_rank_ic(
+                            values, controls_fwd, sample_days=window
+                        )
+                        if hit_columns[0] in controls.columns:
+                            incumbent_ic, _ = incremental_gate.mean_abs_rank_ic(
+                                controls[hit_columns[0]],
+                                controls_fwd,
+                                sample_days=window,
+                            )
+                    replacement = _replacement_decision(
+                        hit_columns=hit_columns,
+                        owners=owners,
+                        manifest=manifest,
+                        new_ic=new_ic,
+                        incumbent_ic=incumbent_ic,
                     )
-                    continue
-                if rho >= _CORR_WARN:
+                    if not replacement.replace:
+                        entry = {
+                            "status": "rejected_duplicate",
+                            "column": column,
+                            "name": name,
+                            "corr": round(float(rho), 4),
+                            "corr_against": matched,
+                            "replacement": {
+                                "decision": replacement.reason,
+                                "hits": hit_columns,
+                                "new_ic": new_ic,
+                                "incumbent_ic": incumbent_ic,
+                            },
+                            "code_fp": code_fingerprint(
+                                str(row.get("factor_code") or "")
+                            ),
+                            "at": _now_iso(),
+                        }
+                        # 被顶替过的因子重跑被拒：下架标记必须随身（评审 H1）
+                        entry = _carry_supersede(manifest.get(factor_id), entry)
+                        # 写序统一（评审 M1）：metadata 先行、成功才落 manifest
+                        # —— manifest 是跳过判据读的那份，先落会把回写失败
+                        # 卡成永久跳过。
+                        if await _update_factor_meta(factor_id, entry):
+                            manifest[factor_id] = entry
+                            _save_manifest(lib_root, manifest)
+                        else:
+                            stats["errors"] += 1
+                            logger.warning(
+                                "  拒入裁决 metadata 回写失败：不落 manifest，下轮重跑"
+                            )
+                        owners[column] = factor_id
+                        stats["rejected_duplicate"] += 1
+                        logger.warning(
+                            "  值级重复（|ρ|=%.3f vs %s），拒绝入账（替换不受理：%s）",
+                            rho,
+                            matched,
+                            replacement.reason,
+                        )
+                        continue
+                    logger.info(
+                        "  值级重复（|ρ|=%.3f vs %s）命中替换条件：新 |IC|=%.4f"
+                        " ≥ %.1f×%.4f → 受理顶替 %s",
+                        rho,
+                        matched,
+                        new_ic,
+                        _REPLACE_IC_RATIO,
+                        incumbent_ic,
+                        str(replacement.incumbent_factor_id or "")[:8],
+                    )
+                elif rho >= _CORR_WARN:
                     logger.warning(
                         "  相关偏高：与 %s 的 |ρ|=%.3f（拒绝阈值 %.2f）",
                         matched,
                         rho,
                         args.corr_threshold,
                     )
+            # 增量正交闸指标（T-FE-01）：对照帧可用时现算；替换受理时把
+            # 被顶替列排除出基（正交口径 = 库沿替换后剩下的列）。无对照帧
+            # 时指标缺失 → 闸判 skipped，绝不按 0 判。
+            incremental_metrics: dict[str, Any] | None = None
+            incremental_audit: dict[str, Any] | None = None
+            if controls is not None and not controls.empty and sample_days:
+                own_excl = _owned_columns(owners, factor_id) | {column}
+                replaced_col = (
+                    replacement.incumbent_column if replacement.replace else None
+                )
+                # 基口径 = 库的**活跃**信息面：被顶替列值虽在盘，但已下架，
+                # 不该再作对照基稀释新因子的残差（与 active_cols =
+                # factor_cols − superseded 同口径；评审 MEDIUM-①）。替换
+                # 路径经 basis_exclude；非替换路径预筛 ρ 已在手，剔除退役
+                # 列后复用（同一帧同一算法，等价且不重算）。
+                retired = _superseded_columns(manifest)
+                if replaced_col:
+                    basis_exclude: tuple[str, ...] = tuple(
+                        own_excl | {replaced_col} | retired
+                    )
+                    pre_rho: pd.Series | None = None
+                elif rho_series is None:
+                    # 无预筛 ρ（--no-corr-gate）：直接让内部计算排除退役列
+                    basis_exclude = tuple(retired)
+                    pre_rho = None
+                else:
+                    basis_exclude = ()
+                    dropped = [c for c in retired if c in rho_series.index]
+                    pre_rho = rho_series.drop(index=dropped) if dropped else rho_series
+                inc_result = incremental_gate.incremental_ic_ir(
+                    values,
+                    controls,
+                    sample_days=set(sample_days),
+                    basis_exclude=basis_exclude,
+                    fwd_ret=controls_fwd,
+                    rho=pre_rho,
+                    # 阈值单源（评审 LOW-①）：显式沿用本模块常量，不依赖
+                    # incremental 模块默认值
+                    min_pairs=_MIN_PAIRS_PER_DAY,
+                    min_sample_days=_MIN_SAMPLE_DAYS,
+                )
+                incremental_audit = inc_result.to_dict()
+                incremental_metrics = {
+                    "incremental_ic_ir": inc_result.ic_ir,
+                    "incremental_basis_n": (
+                        None
+                        if inc_result.status == "unavailable"
+                        else int(inc_result.n_basis)
+                    ),
+                    "incremental_ic_days": int(inc_result.n_days),
+                }
             # 物化门禁（P1，软告警默认）：值级查重（既有硬拒）之后、发布之前。
             # 软失败只记录（manifest + metadata.materialization.gates）；
             # hard 失败拒入账（rejected_gate，--force 可重做）。
-            decision = await _evaluate_gates(row)
+            decision = await _evaluate_gates(row, extra_metrics=incremental_metrics)
             _log_gate_outcomes(decision)
             if decision.rejected:
                 entry = {
@@ -1441,12 +1704,21 @@ async def _run(args: argparse.Namespace) -> int:
                     "column": column,
                     "name": name,
                     "gates": decision.to_dict(),
+                    "metrics": incremental_metrics or {},
                     "code_fp": code_fingerprint(str(row.get("factor_code") or "")),
                     "at": _now_iso(),
                 }
-                manifest[factor_id] = entry
-                _save_manifest(lib_root, manifest)
-                await _update_factor_meta(factor_id, entry)
+                # 被顶替过的因子重跑被拒：下架标记必须随身（评审 H1）
+                entry = _carry_supersede(manifest.get(factor_id), entry)
+                # 写序统一（评审 M1）：metadata 先行、成功才落 manifest
+                if await _update_factor_meta(factor_id, entry):
+                    manifest[factor_id] = entry
+                    _save_manifest(lib_root, manifest)
+                else:
+                    stats["errors"] += 1
+                    logger.warning(
+                        "  拒入裁决 metadata 回写失败：不落 manifest，下轮重跑"
+                    )
                 owners[column] = factor_id
                 stats["rejected_gate"] += 1
                 logger.warning("  硬门禁未过，拒绝入账（--force 可重做）")
@@ -1467,12 +1739,59 @@ async def _run(args: argparse.Namespace) -> int:
                 if rho is not None and rho >= _CORR_WARN
                 else None,
                 "gates": gate_entry,
+                "metrics": incremental_metrics or {},
+                "incremental": incremental_audit,
                 "code_fp": code_fingerprint(str(row.get("factor_code") or "")),
                 "at": _now_iso(),
             }
+            if replacement.replace:
+                # 受理顶替的裁量数字与拒入路径同账（评审 M6）：凭什么顶替
+                # 要可审——拒入条目有 replacement 明细而受理没有，账面对称。
+                entry["replacement"] = {
+                    "decision": "ok",
+                    "hits": hit_columns,
+                    "new_ic": new_ic,
+                    "incumbent_ic": incumbent_ic,
+                }
+            # 写序（评审 M1）：metadata 先行、成功才把 manifest 落成终态。
+            # manifest 是「跳过判据」读的那份——先落终态会把 metadata 回写
+            # 失败的因子永久卡死（值在盘、账不认、永不再试）；顺序反过来，
+            # 任何中途崩溃只留一份非终态记录，下轮整体重做收敛。
+            if not await _update_factor_meta(factor_id, entry):
+                stats["errors"] += 1
+                owners[column] = factor_id
+                logger.warning(
+                    "  物化值已写但 metadata 回写失败：不落 manifest，"
+                    "下轮重跑收敛（列以孤立值暂存于数据集）"
+                )
+                continue
+            superseded_entry: dict[str, Any] | None = None
+            if replacement.replace and replacement.incumbent_factor_id:
+                # 顶替落账：新因子 metadata 已在上方写实才轮到这里，失败则
+                # 连 manifest 一起不落（两列暂并存；--force 对胜者重跑会
+                # 重走替换并自愈），目录不会禁一个面板还显示活跃的列。
+                incumbent_id = replacement.incumbent_factor_id
+                superseded_entry = {
+                    **dict(manifest.get(incumbent_id) or {}),
+                    "status": "superseded",
+                    "superseded_by": factor_id,
+                    "superseded_at": _now_iso(),
+                }
+                if not await _update_factor_meta(incumbent_id, superseded_entry):
+                    superseded_entry = None
+                    logger.warning(
+                        "  顶替的旧因子 %s metadata 回写失败：暂不落 superseded"
+                        "（两列暂并存；--force 对胜者重跑会重走替换并自愈）",
+                        incumbent_id[:8],
+                    )
+            # manifest 单一提交点（评审 M2）：新因子终态与被顶替者下架同一次
+            # 落盘——中途崩溃两者都不落，下轮新因子非终态→整体重做，不会
+            # 留下「PG 已下架 / manifest 未下架」的半截态。
             manifest[factor_id] = entry
+            if superseded_entry is not None:
+                manifest[replacement.incumbent_factor_id] = superseded_entry
+                stats["superseded"] += 1
             _save_manifest(lib_root, manifest)
-            await _update_factor_meta(factor_id, entry)
             owners[column] = factor_id
             if controls is not None and sample_days:
                 sub = values[values.index.get_level_values(0).isin(set(sample_days))]
@@ -1480,6 +1799,12 @@ async def _run(args: argparse.Namespace) -> int:
                     controls[column] = sub
             stats["materialized"] += 1
             logger.info("  完成：%d 个非空值", written)
+            if superseded_entry is not None:
+                logger.info(
+                    "  顶替生效：%s（列 %s）转 superseded，目录注册时禁用",
+                    str(replacement.incumbent_factor_id)[:8],
+                    replacement.incumbent_column,
+                )
         except Exception as exc:  # noqa: BLE001 - 单因子失败记录后继续
             logger.exception("  失败：%s", exc)
             entry = {
@@ -1489,9 +1814,15 @@ async def _run(args: argparse.Namespace) -> int:
                 "error": str(exc)[:500],
                 "at": _now_iso(),
             }
-            manifest[factor_id] = entry
-            _save_manifest(lib_root, manifest)
-            await _update_factor_meta(factor_id, entry)
+            # 被顶替过的因子重跑再失败：下架标记必须随身（评审 H1）
+            entry = _carry_supersede(manifest.get(factor_id), entry)
+            # 写序统一（评审 M1）：metadata 先行；error 本非终态，
+            # 回写失败也不落 manifest，下轮照样重试
+            if await _update_factor_meta(factor_id, entry):
+                manifest[factor_id] = entry
+                _save_manifest(lib_root, manifest)
+            else:
+                logger.warning("  错误记录 metadata 回写也失败：仅日志留痕，下轮重跑")
             owners[column] = factor_id  # 失败也占名：重试落回原列，不与后来者交错
             stats["errors"] += 1
 

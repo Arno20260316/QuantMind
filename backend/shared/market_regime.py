@@ -20,6 +20,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import Counter
+from collections.abc import Mapping
 from typing import Any
 
 DEFAULT_THRESHOLDS: dict[str, float] = {
@@ -150,6 +152,30 @@ def build_state_series(
         row["effective_date"]: row["state"]
         for row in build_state_rows(closes, volumes, dates, window, thresholds)
     }
+
+
+def monthly_states(
+    effective_states: Mapping[str, str], *, tie_break: str = "neutral"
+) -> dict[str, str]:
+    """生效日状态序列 → 月状态（``YYYY-MM`` → 当月生效日多数票；平票取 ``tie_break``）。
+
+    输入即 :func:`build_state_series` 的输出（effective_date → state）；月标签
+    取生效日前 7 位。平票默认 neutral——挑「最中间」的档，不虚报牛/熊。
+    未知状态值立即报错（自家产物，静默丢弃只会把口径错误藏起来）。
+    """
+    if tie_break not in STATES:
+        raise ValueError(f"tie_break 必须是 {STATES} 之一（收到 {tie_break!r}）")
+    buckets: dict[str, Counter] = {}
+    for effective, state in effective_states.items():
+        if state not in STATES:
+            raise ValueError(f"未知状态 {state!r}（生效日 {effective}）")
+        buckets.setdefault(str(effective)[:7], Counter())[state] += 1
+    out: dict[str, str] = {}
+    for month, counts in buckets.items():
+        top = max(counts.values())
+        winners = [state for state in STATES if counts.get(state, 0) == top]
+        out[month] = winners[0] if len(winners) == 1 else tie_break
+    return out
 
 
 def forming_inputs(

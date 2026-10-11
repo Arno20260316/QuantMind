@@ -43,14 +43,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
+from backend.shared.market_regime import STATES as _REGIME_STATES
+from backend.shared import regime_buckets as _rb
+
 from . import candidates as _candidates
 from . import composite as _composite
+from . import costs as _costs
 from . import dedup as _dedup
 from . import ic_stats as _ic
 from . import neutralize as _nz
@@ -96,7 +100,9 @@ class StatisticalConfig:
         if self.neutralize not in {"none", "industry", "industry_size"}:
             raise ValueError(f"neutralize 口径非法: {self.neutralize!r}")
         if self.stability_folds < 2:
-            raise ValueError(f"stability_folds 至少为 2（收到 {self.stability_folds!r}）")
+            raise ValueError(
+                f"stability_folds 至少为 2（收到 {self.stability_folds!r}）"
+            )
         if not 0 < self.min_fold_sign_consistency <= 1:
             raise ValueError(
                 "min_fold_sign_consistency 必须在 (0, 1]"
@@ -110,7 +116,9 @@ class StatisticalConfig:
                 f"（收到 warn={self.dedup_corr_warn!r} reject={self.dedup_corr_reject!r}）"
             )
         if self.composite_z_window < 2:
-            raise ValueError(f"composite_z_window 至少为 2（收到 {self.composite_z_window!r}）")
+            raise ValueError(
+                f"composite_z_window 至少为 2（收到 {self.composite_z_window!r}）"
+            )
 
 
 @dataclass(frozen=True)
@@ -127,6 +135,27 @@ class HorizonStats:
     #: 朴素 t 与 NW 带宽（审计对照；缺失期 = NaN/0）
     rank_ic_t_naive: float = float("nan")
     rank_ic_t_lags: int = 0
+
+
+@dataclass(frozen=True)
+class RegimeStat:
+    """单市场状态的样本内 IC 证据（T-FE-03「分市场状态 IC」列的一个桶）。
+
+    join 按**月**（``run_statistical_mining`` 的 ``regime_by_month``）：
+    缺失月份标签的 IC 日不进任何桶（n_days 可见覆盖，不补假值）。
+    弱区语义（``weak``）沿用 ``regime_buckets.is_weak_bucket`` 唯一谓词：
+    ``mean ≤ 0 且 n ≥ 15``。
+
+    **口径警示（样本内展示口径）**：月标签=整月多数票（``market_regime.
+    monthly_states``），月内换档的月份**含前视**（月末才知道的月度状态被
+    贴到月初的 IC 日上）。本列只作样本内「因子在什么行情里灵」的展示/
+    归因线索，**不得**当可分桶的交易信号或绩效承诺使用。
+    """
+
+    state: str
+    n_days: int
+    rank_ic_mean: float  # 桶内无样本 → NaN（不是 0）
+    weak: bool
 
 
 @dataclass(frozen=True)
@@ -167,6 +196,20 @@ class CandidateReport:
     ic_decay_slope: float = float("nan")  # 衰减系数 λ（≤0 = 不衰减）
     max_abs_corr: float = float("nan")  # 与其他保留入选者的最大 |ρ|
     corr_warn: str = ""  # ρ ∈ [warn, reject) 的警语（保留但提示）
+    # ── T-FE-03 交易性证据（样本内；只在入选者上算——因子值懒算纪律：
+    #    未入选 = 缺省值，语义=「没算」而不是「算出来是这些」）──
+    factor_autocorr: float = float("nan")  # 日截面 Rank 自相关 ρ₁（lag-1 观测）
+    #: ρ₁ 的有效滞后配对日数；< min_valid_days → 上两列降级（NaN/None）——
+    #: 天数可见，与 ic_net_days 同款纪律（评审 M2）
+    factor_autocorr_days: int = 0
+    #: ρ₁ → 调仓建议（**自相关**半衰期；None=无证据/不够算。区别于
+    #: ic_half_life=多周期 IC 衰减半衰期，评审 L2）
+    rebalance_days: int | None = None
+    turnover_daily: float = float("nan")  # 多头名单日换手均值（rank pct ≥ 0.7）
+    ann_turnover: float = float("nan")  # 年化 = 日换手均值 × ANNUALIZE（单源 252）
+    ic_net_mean: float = float("nan")  # 扣费净 RankIC 均值（成本率单源）
+    ic_net_days: int = 0
+    regime_ic: tuple[RegimeStat, ...] = ()  # 分状态 IC（月标签 join；()=无时间线）
 
 
 @dataclass(frozen=True)
@@ -202,6 +245,15 @@ class CompositeReport:
     spread_mean: float
     eligible: bool  # 样本内可评估 ∧ 样本外闸（若配）
     reject_reason: str = ""
+    # ── T-FE-03 交易性证据（与 CandidateReport 同义、同口径）──
+    factor_autocorr: float = float("nan")
+    factor_autocorr_days: int = 0
+    rebalance_days: int | None = None
+    turnover_daily: float = float("nan")
+    ann_turnover: float = float("nan")
+    ic_net_mean: float = float("nan")
+    ic_net_days: int = 0
+    regime_ic: tuple[RegimeStat, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -227,7 +279,9 @@ class MiningResult:
 # ── 内部工具 ─────────────────────────────────────────────────────────
 
 
-def _best_horizon(stats: tuple[HorizonStats, ...] | list[HorizonStats]) -> HorizonStats | None:
+def _best_horizon(
+    stats: tuple[HorizonStats, ...] | list[HorizonStats],
+) -> HorizonStats | None:
     valid = [s for s in stats if np.isfinite(s.rank_ic_mean)]
     if not valid:
         return None
@@ -237,8 +291,14 @@ def _best_horizon(stats: tuple[HorizonStats, ...] | list[HorizonStats]) -> Horiz
 def _horizon_stats(horizon: int, summary: _ic.IcSummary | None) -> HorizonStats:
     if summary is None:
         return HorizonStats(
-            horizon=horizon, n_days=0, ic_mean=np.nan, rank_ic_mean=np.nan,
-            icir=np.nan, rank_ic_t=np.nan, rank_ic_p=np.nan, rank_ic_win_rate=np.nan,
+            horizon=horizon,
+            n_days=0,
+            ic_mean=np.nan,
+            rank_ic_mean=np.nan,
+            icir=np.nan,
+            rank_ic_t=np.nan,
+            rank_ic_p=np.nan,
+            rank_ic_win_rate=np.nan,
         )
     return HorizonStats(
         horizon=horizon,
@@ -333,6 +393,7 @@ def run_statistical_mining(
     qlib_dir: str = _panel.DEFAULT_QLIB_DIR,
     universe: str = "all_a",
     progress: Callable[[str, str], None] | None = None,
+    regime_by_month: Mapping[str, str] | None = None,
 ) -> MiningResult:
     """跑一轮统计派挖掘（``price_panel``/``metadata`` 可注入：离线测试全链路）。
 
@@ -341,11 +402,19 @@ def run_statistical_mining(
     换池（换池的 IC 数字不是用户要的东西）。
 
     ``price_panel`` 注入时须已含暖机段（调用方负责），且覆盖到两个区间的并集。
+
+    ``regime_by_month``（T-FE-03）：``YYYY-MM`` → bull/neutral/bear 的月状态表
+    （runner 由 ``market_regime.monthly_states`` 生成，多数票、平票→neutral）。
+    只影响报告的「分市场状态 IC」列；不给（None）该列留空，其余证据照算——
+    拿不到 regime 数据不牵连其它列。月标签是**整月多数票**，月内换档的月份
+    含前视（样本内展示口径，见 ``RegimeStat`` 口径警示）。
     """
     cfg = cfg or StatisticalConfig()
     emit = progress or (lambda _stage, _detail: None)
     has_oos = valid_start is not None or valid_end is not None
-    anchor = min([pd.Timestamp(t) for t in (mining_start, valid_start) if t is not None])
+    anchor = min(
+        [pd.Timestamp(t) for t in (mining_start, valid_start) if t is not None]
+    )
     fetch_end = max([pd.Timestamp(t) for t in (mining_end, valid_end) if t is not None])
 
     universe = str(universe or "").strip() or "all_a"
@@ -384,8 +453,10 @@ def run_statistical_mining(
     position = panel.groupby(level=1).cumcount()
     in_is = _window_slice(panel.index, mining_start, mining_end)
     in_oos = _window_slice(panel.index, valid_start, valid_end)
-    if has_oos and (pd.Timestamp(valid_start or mining_start) <= pd.Timestamp(mining_end)
-                    and pd.Timestamp(valid_end or mining_end) >= pd.Timestamp(mining_start)):
+    if has_oos and (
+        pd.Timestamp(valid_start or mining_start) <= pd.Timestamp(mining_end)
+        and pd.Timestamp(valid_end or mining_end) >= pd.Timestamp(mining_start)
+    ):
         emit("filter", "⚠ 验证区间与挖掘区间重叠：样本外复算已被样本内污染")
 
     industry = size = None
@@ -418,14 +489,18 @@ def run_statistical_mining(
         factor, candidate_nz = _compute_factor(
             candidate, panel, trad_mask, position, neutralize, industry, size
         )
-        nz_report = candidate_nz if candidate_nz is not None else nz_report  # 形状报告取最后非空
+        nz_report = (
+            candidate_nz if candidate_nz is not None else nz_report
+        )  # 形状报告取最后非空
         stats = []
         for h in cfg.horizons:
             daily = _ic.daily_ic(
                 factor[in_is], fwd[h][in_is], min_names=cfg.min_names_per_day
             )
             daily_is[(candidate.key, h)] = daily
-            stats.append(_horizon_stats(h, _ic.summarize_ic(daily, min_days=cfg.min_valid_days)))
+            stats.append(
+                _horizon_stats(h, _ic.summarize_ic(daily, min_days=cfg.min_valid_days))
+            )
         horizon_stats[candidate.key] = stats
         best = _best_horizon(stats)
         oos_stats[candidate.key] = None
@@ -457,7 +532,9 @@ def run_statistical_mining(
         for candidate in _candidates.CANDIDATES:
             best = _best_horizon(horizon_stats[candidate.key])
             if best is not None:
-                rank_series[candidate.key] = daily_is[(candidate.key, best.horizon)]["rank_ic"]
+                rank_series[candidate.key] = daily_is[(candidate.key, best.horizon)][
+                    "rank_ic"
+                ]
         stab = _stab.reselect_statistics(
             rank_series,
             folds=cfg.stability_folds,
@@ -466,7 +543,10 @@ def run_statistical_mining(
         )
         thin = [key for key, s in stab.items() if not s.eligible and s.fold_ics]
         if thin:
-            emit("stability", f"{len(thin)} 个候选折内有效日不足：不判稳定性（如实记 note）")
+            emit(
+                "stability",
+                f"{len(thin)} 个候选折内有效日不足：不判稳定性（如实记 note）",
+            )
 
     emit("select", "样本外一致性 + 选择分排序（Top-K 席位）")
     drafts: list[CandidateReport] = []
@@ -548,7 +628,12 @@ def run_statistical_mining(
         if key not in factor_cache:
             factor, _ = _compute_factor(
                 _candidates.CANDIDATE_BY_KEY[key],
-                panel, trad_mask, position, neutralize, industry, size,
+                panel,
+                trad_mask,
+                position,
+                neutralize,
+                industry,
+                size,
             )
             factor_cache[key] = factor[in_is]
         return factor_cache[key]
@@ -583,13 +668,40 @@ def run_statistical_mining(
 
     selected_factors = {key: _factor_of(key) for key in selected_keys}
 
+    # T-FE-03 交易性证据（自相关→调仓建议 / 换手·扣费净 IC / 分状态 IC）：
+    # 与分组证据同域——只对入选集算（因子值懒算纪律，见 _trade_evidence）
+    trade_info = _trade_evidence_per_selected(
+        selected_keys,
+        drafts,
+        selected_factors,
+        daily_is,
+        fwd,
+        in_is,
+        cfg,
+        regime_by_month,
+    )
+
     composite_report = _composite_evidence(
-        selected_keys, drafts, panel, trad_mask, position, fwd, in_is, in_oos,
-        has_oos, cfg, emit,
+        selected_keys,
+        drafts,
+        panel,
+        trad_mask,
+        position,
+        fwd,
+        in_is,
+        in_oos,
+        has_oos,
+        cfg,
+        emit,
+        regime_by_month=regime_by_month,
     )
 
     quantile_info = _quantile_evidence(
-        selected_keys, drafts, selected_factors, fwd, cfg,
+        selected_keys,
+        drafts,
+        selected_factors,
+        fwd,
+        cfg,
     )
 
     dropped_because: dict[str, tuple[str, float]] = {}
@@ -602,33 +714,49 @@ def run_statistical_mining(
     for report in drafts:
         if report.key in selected_keys:
             tau, spread = quantile_info.get(report.key, (np.nan, np.nan))
-            final.append(CandidateReport(**{
-                **report.__dict__,
-                "selected": True,
-                "quantile_monotonicity": tau,
-                "spread_mean": spread,
-                "reject_reason": "",
-                "max_abs_corr": (
-                    dedup_report.max_abs_corr(report.key)
-                    if dedup_report is not None else np.nan
-                ),
-                "corr_warn": (
-                    dedup_report.warn_note(report.key) if dedup_report is not None else ""
-                ),
-            }))
+            final.append(
+                CandidateReport(
+                    **{
+                        **report.__dict__,
+                        "selected": True,
+                        "quantile_monotonicity": tau,
+                        "spread_mean": spread,
+                        "reject_reason": "",
+                        "max_abs_corr": (
+                            dedup_report.max_abs_corr(report.key)
+                            if dedup_report is not None
+                            else np.nan
+                        ),
+                        "corr_warn": (
+                            dedup_report.warn_note(report.key)
+                            if dedup_report is not None
+                            else ""
+                        ),
+                        **trade_info.get(report.key, {}),
+                    }
+                )
+            )
         elif report.key in dropped_because:
             # 已过全部闸门、进了 Top-K，被值级去重挤出——拒因要写清「被谁挤掉」
             matched, rho = dropped_because[report.key]
             threshold = cfg.dedup_corr_reject
-            final.append(CandidateReport(**{
-                **report.__dict__,
-                "reject_reason": f"与 {matched} 高度相关（ρ={rho:.2f}，阈值 {threshold:g}）",
-            }))
+            final.append(
+                CandidateReport(
+                    **{
+                        **report.__dict__,
+                        "reject_reason": f"与 {matched} 高度相关（ρ={rho:.2f}，阈值 {threshold:g}）",
+                    }
+                )
+            )
         elif not report.reject_reason:
-            final.append(CandidateReport(**{
-                **report.__dict__,
-                "reject_reason": "未入选 Top-K（按选择分排序）",
-            }))
+            final.append(
+                CandidateReport(
+                    **{
+                        **report.__dict__,
+                        "reject_reason": "未入选 Top-K（按选择分排序）",
+                    }
+                )
+            )
         else:
             final.append(report)
     return MiningResult(
@@ -648,7 +776,8 @@ def run_statistical_mining(
             "fetch_end": fetch_end.strftime("%Y-%m-%d"),
             "validation_overlaps_mining": bool(
                 has_oos
-                and pd.Timestamp(valid_start or mining_start) <= pd.Timestamp(mining_end)
+                and pd.Timestamp(valid_start or mining_start)
+                <= pd.Timestamp(mining_end)
                 and pd.Timestamp(valid_end or mining_end) >= pd.Timestamp(mining_start)
             ),
         },
@@ -686,13 +815,8 @@ def _rank_eligible(drafts: list[CandidateReport]) -> list[str]:
     K 截断不在这里做——选择期去重的贪心步行需要 K 外的递补者（去重被拒者
     不占席）；步行走完自然凑满 K。同分以 |RankIC| 兜底，再平按登记序（稳定排序）。
     """
-    eligible = [
-        r for r in drafts
-        if r.best_horizon is not None and not r.reject_reason
-    ]
-    eligible.sort(
-        key=lambda r: (r.selection_score, abs(r.rank_ic_mean)), reverse=True
-    )
+    eligible = [r for r in drafts if r.best_horizon is not None and not r.reject_reason]
+    eligible.sort(key=lambda r: (r.selection_score, abs(r.rank_ic_mean)), reverse=True)
     return [r.key for r in eligible]
 
 
@@ -729,6 +853,129 @@ def _quantile_evidence(
             else (np.nan, np.nan)
         )
     return out
+
+
+def _trade_evidence_per_selected(
+    selected_keys: list[str],
+    drafts: list[CandidateReport],
+    factors: dict[str, pd.Series],
+    daily_is: dict[tuple[str, int], pd.DataFrame],
+    fwd: dict[int, pd.Series],
+    in_is: np.ndarray,
+    cfg: StatisticalConfig,
+    regime_by_month: Mapping[str, str] | None,
+) -> dict[str, dict[str, object]]:
+    """入选集的 T-FE-03 证据 → {key: 字段字典}（未入选不在此列——没算）。
+
+    与 ``_quantile_evidence`` 同域：因子值只对入选集已算，逐消费方重算
+    是这层最贵的错误。逐日 IC 复用 ``daily_is`` 已算出的证据帧。
+    """
+    best_by_key = {r.key: r.best_horizon for r in drafts}
+    out: dict[str, dict[str, object]] = {}
+    for key in selected_keys:
+        horizon = best_by_key.get(key)
+        factor = factors.get(key)
+        if horizon is None or factor is None:
+            continue
+        out[key] = _trade_evidence(
+            factor,
+            best_horizon=horizon,
+            daily=daily_is[(key, horizon)],
+            fwd=fwd,
+            in_is=in_is,
+            cfg=cfg,
+            regime_by_month=regime_by_month,
+        )
+    return out
+
+
+def _trade_evidence(
+    factor: pd.Series,
+    *,
+    best_horizon: int,
+    daily: pd.DataFrame,
+    fwd: dict[int, pd.Series],
+    in_is: np.ndarray,
+    cfg: StatisticalConfig,
+    regime_by_month: Mapping[str, str] | None,
+) -> dict[str, object]:
+    """T-FE-03 交易性证据三件套（样本内 best horizon 上，字段名=报告字段名）：
+
+    - **自相关 → 调仓建议**：ρ₁ = ``daily_rank_corr(factor, factor 按标的
+      lag-1)``（lag-1 观测：停牌日不产生新观测）；建议天数 = 因子自相关
+      半衰期（``costs.suggest_rebalance_days``；**证据闸**：配对日数 <
+      ``min_valid_days`` → 上两列降级 NaN/None——2 天面板也能凑出一个 ρ₁，
+      天数可见才拦得住假精度）。
+    - **换手 · 扣费净 IC**：多头谓词/成本率/年化全走 ``costs`` 单源（与
+      回测路径同常量，跨实现对拍测试钉住）。
+    - **分状态 IC**：``_regime_evidence``（月标签 join）。
+
+    只在该候选/合成的因子值已算时被调用（懒算纪律）——本函数自己不做
+    「要不要算」的决策。
+    """
+    ac1, n_ac = _ic.daily_rank_corr(
+        factor, factor.groupby(level=1).shift(1), min_names=cfg.min_names_per_day
+    )
+    ac1_ok = bool(np.isfinite(ac1)) and n_ac >= cfg.min_valid_days
+    turnover = _costs.daily_turnover_long(factor, min_names=cfg.min_names_per_day)
+    turnover_mean = float(turnover.mean()) if not turnover.empty else float("nan")
+    net_mean, net_days = _costs.net_rank_ic(
+        factor,
+        fwd[best_horizon][in_is],
+        min_names=cfg.min_names_per_day,
+        min_days=cfg.min_valid_days,
+    )
+    return {
+        "factor_autocorr": float(ac1) if ac1_ok else float("nan"),
+        "factor_autocorr_days": int(n_ac),
+        "rebalance_days": (
+            _costs.suggest_rebalance_days(float(ac1)) if ac1_ok else None
+        ),
+        "turnover_daily": turnover_mean,
+        "ann_turnover": (
+            turnover_mean * _costs.ANNUALIZE
+            if np.isfinite(turnover_mean)
+            else float("nan")
+        ),
+        "ic_net_mean": net_mean,
+        "ic_net_days": net_days,
+        "regime_ic": _regime_evidence(daily, regime_by_month),
+    }
+
+
+def _regime_evidence(
+    daily: pd.DataFrame, regime_by_month: Mapping[str, str] | None
+) -> tuple[RegimeStat, ...]:
+    """分市场状态 IC：逐日 IC × 月状态标签（``regime_by_month``）。
+
+    join 按**月**（标签取 IC 日的 YYYY-MM；月粒度避免日状态噪声把同一段
+    行情切碎）；缺月份标签的 IC 日不进任何桶——缺失如实计，n_days 可见
+    覆盖（口径与 ``regime_buckets`` 的「缺失不进桶」纪律一致）。弱区谓词
+    复用 ``bucket_of``（唯一实现），不另立门槛。``None`` → 空元组
+    （未取数/降级——不是「三个空桶」）。
+
+    月标签=整月多数票，月内换档月份含前视（样本内展示口径）——本列供
+    归因，不作可分桶交易信号（详见 ``RegimeStat`` 口径警示）。
+    """
+    if regime_by_month is None:
+        return ()
+    points = [(str(day)[:10], float(val)) for day, val in daily["rank_ic"].items()]
+    states = {
+        day: regime_by_month[day[:7]] for day, _ in points if day[:7] in regime_by_month
+    }
+    out: list[RegimeStat] = []
+    for state in _REGIME_STATES:
+        bucket = _rb.bucket_of(points, states, state)
+        mean = bucket["mean_ic"]
+        out.append(
+            RegimeStat(
+                state=state,
+                n_days=int(bucket["n_days"]),
+                rank_ic_mean=float(mean) if mean is not None else float("nan"),
+                weak=bool(bucket["weak"]),
+            )
+        )
+    return tuple(out)
 
 
 def _pick_composite_horizon(
@@ -770,6 +1017,7 @@ def _composite_evidence(
     has_oos: bool,
     cfg: StatisticalConfig,
     emit: Callable[[str, str], None],
+    regime_by_month: Mapping[str, str] | None = None,
 ) -> CompositeReport | None:
     """去重后入选集 → IC 加权合成因子证据（Tier 3 / T-S3-04）；退化 → None。
 
@@ -806,16 +1054,18 @@ def _composite_evidence(
     series = _candidates.compute_panel(panel, plan.candidate()).where(
         trad_mask & (position >= plan.min_history)
     )
-    stats = tuple(
-        _horizon_stats(
-            h,
-            _ic.summarize_ic(
-                _ic.daily_ic(series[in_is], fwd[h][in_is], min_names=cfg.min_names_per_day),
-                min_days=cfg.min_valid_days,
-            ),
+    # 逐日帧留存：分状态 IC 直接用 best 周期的这份证据（不因 T-FE-03 重算 IC）
+    daily_by_h: dict[int, pd.DataFrame] = {}
+    stats_list = []
+    for h in cfg.horizons:
+        daily = _ic.daily_ic(
+            series[in_is], fwd[h][in_is], min_names=cfg.min_names_per_day
         )
-        for h in cfg.horizons
-    )
+        daily_by_h[h] = daily
+        stats_list.append(
+            _horizon_stats(h, _ic.summarize_ic(daily, min_days=cfg.min_valid_days))
+        )
+    stats = tuple(stats_list)
     best = _best_horizon(stats)
     oos = None
     if has_oos and best is not None:
@@ -834,6 +1084,7 @@ def _composite_evidence(
     if best is None:
         oos_reason = "样本内有效日不足"
     tau = spread = np.nan
+    trade_fields: dict[str, object] = {}
     if best is not None:
         summary = _ic.quantile_returns(
             series[in_is],
@@ -843,6 +1094,15 @@ def _composite_evidence(
         )
         if summary is not None:
             tau, spread = summary.monotonicity_tau, summary.spread_mean
+        trade_fields = _trade_evidence(
+            series[in_is],
+            best_horizon=best.horizon,
+            daily=daily_by_h[best.horizon],
+            fwd=fwd,
+            in_is=in_is,
+            cfg=cfg,
+            regime_by_month=regime_by_month,
+        )
     return CompositeReport(
         key=plan.candidate().key,
         name=plan.candidate().name,
@@ -867,4 +1127,5 @@ def _composite_evidence(
         spread_mean=spread,
         eligible=bool(oos_pass and best is not None),
         reject_reason=oos_reason,
+        **trade_fields,
     )

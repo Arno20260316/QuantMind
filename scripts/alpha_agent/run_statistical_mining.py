@@ -90,12 +90,88 @@ def _resolve_windows() -> tuple[object, object | None, str]:
     parsed = window_from_env()
     if parsed is not None:
         mining, validation = parsed
-        return mining, validation, "custom" if validation is not None else "custom_mining_only"
+        return (
+            mining,
+            validation,
+            "custom" if validation is not None else "custom_mining_only",
+        )
     mining, validation = default_windows(data_end=data_end)
     return mining, validation, "default_4y1y"
 
 
+# ── regime 月状态（T-FE-03「分市场状态 IC」的标签来源）────────────────
+
+
+def _load_regime_by_month() -> tuple[dict[str, str] | None, dict]:
+    """``YYYY-MM`` → bull/neutral/bear（CN=沪深300，``market_regime`` 单源）。
+
+    取数/口径全部走既有件：``regime_persist.load_index_history`` +
+    ``build_state_series`` + ``monthly_states``（月多数票、平票→neutral）。
+    **任何失败 → ``(None, source)``**：报告少一列，挖掘主链不因 regime
+    数据缺席失败（缺失如实留空，不硬凑）。第二个返回值是降级/就绪的
+    审计 source（成功=指数与月份数；失败=错误摘要）——报告里「为什么没有
+    这一列」可追溯，不再只有一个 warning 就沉默（评审 M4）。
+    """
+    try:
+        from backend.services.engine.regime_persist import (  # noqa: PLC0415
+            load_index_history,
+        )
+        from backend.shared.market_regime import (  # noqa: PLC0415
+            REGIME_INDEX_BY_MARKET,
+            STATES,
+            build_state_series,
+            monthly_states,
+        )
+
+        symbol = REGIME_INDEX_BY_MARKET["CN"]
+        history = load_index_history("CN", symbol)
+        if len(history["dates"]) < 2:
+            raise ValueError(f"regime 指数 {symbol} 无日线历史")
+        states = build_state_series(
+            history["closes"], history["volumes"], history["dates"]
+        )
+        by_month = monthly_states(states)
+        if not by_month:
+            raise ValueError("索引历史不足一个稳态窗口，月状态为空")
+        dist = {s: sum(1 for v in by_month.values() if v == s) for s in STATES}
+        logger.info("regime 月状态就绪：%d 个月（%s）%s", len(by_month), symbol, dist)
+        return by_month, {"market": "CN", "index": symbol, "months": len(by_month)}
+    except Exception as exc:  # noqa: BLE001 - 报告证据降级，不拖垮挖掘主链
+        logger.warning(
+            "regime 月状态不可用——「分市场状态 IC」列将留空：%s", exc, exc_info=True
+        )
+        return None, {"market": "CN", "error": str(exc)[:200]}
+
+
 # ── 落库 ─────────────────────────────────────────────────────────────
+
+
+def _trade_metadata_fields(report) -> dict:
+    """T-FE-03 交易性证据 → metadata 字段（单候选与合成共用同一形状）。
+
+    ``regime_ic`` 空元组 → None（缺时间线不是「三个空桶」）；桶内 NaN
+    经 ``ser.json_safe`` 落 null（缺失一律 null 的同一口径）。
+    """
+    return {
+        "factor_autocorr": report.factor_autocorr,
+        "factor_autocorr_days": report.factor_autocorr_days,
+        "rebalance_days": report.rebalance_days,
+        "turnover_daily": report.turnover_daily,
+        "ann_turnover": report.ann_turnover,
+        "ic_net_mean": report.ic_net_mean,
+        "ic_net_days": report.ic_net_days,
+        "regime_ic": (
+            {
+                r.state: {
+                    "n_days": r.n_days,
+                    "rank_ic_mean": r.rank_ic_mean,
+                    "weak": r.weak,
+                }
+                for r in report.regime_ic
+            }
+            or None
+        ),
+    }
 
 
 def _factor_metadata(
@@ -130,45 +206,49 @@ def _factor_metadata(
         }
         for h in report.horizons
     }
-    return ser.json_safe({
-        "source": "statistical",
-        "algorithm": "statistical",
-        "market": market,
-        "task_id": task_id,
-        "task_fingerprint": task_fingerprint or None,
-        "identity_scheme": identity_scheme or None,
-        "candidate_key": report.key,
-        "family": report.family,
-        "literature": report.source,
-        "min_history": report.min_history,
-        "best_horizon": report.best_horizon,
-        "horizons": horizons,
-        "rank_icir": report.icir,
-        "fdr_pass": report.fdr_pass,
-        "fdr_horizons": list(report.fdr_horizons),
-        "oos_verified": report.oos_verified,
-        "oos_horizon": report.oos_horizon,
-        "oos_rank_ic": report.oos_rank_ic,
-        "quantile_monotonicity": report.quantile_monotonicity,
-        "spread_mean": report.spread_mean,
-        # Tier 3 证据（不可判定 → null，与展示面「缺失一律 —」同口径）
-        "fold_ics": list(report.fold_ics),
-        "fold_sign_consistency": report.fold_sign_consistency,
-        "selection_score": report.selection_score,
-        "reselect_rate": report.reselect_rate,
-        "reselect_hits": report.reselect_hits,
-        "reselect_checkpoints": report.reselect_checkpoints,
-        "ic_half_life": report.ic_half_life,
-        "ic_decay_slope": report.ic_decay_slope,
-        "max_abs_corr": report.max_abs_corr,
-        "corr_warn": report.corr_warn or None,
-        "window": audit.get("window"),
-        "neutralize_mode": audit.get("neutralize_mode"),
-        "filter": audit.get("filter"),
-        # 审计自带口径：这份 IC 是在哪个池子上算的（请求与实跑同一值，
-        # 引擎层已保证）——落库行 universe 列与 metadata 不打架
-        "universe": audit.get("universe"),
-    })
+    return ser.json_safe(
+        {
+            "source": "statistical",
+            "algorithm": "statistical",
+            "market": market,
+            "task_id": task_id,
+            "task_fingerprint": task_fingerprint or None,
+            "identity_scheme": identity_scheme or None,
+            "candidate_key": report.key,
+            "family": report.family,
+            "literature": report.source,
+            "min_history": report.min_history,
+            "best_horizon": report.best_horizon,
+            "horizons": horizons,
+            "rank_icir": report.icir,
+            "fdr_pass": report.fdr_pass,
+            "fdr_horizons": list(report.fdr_horizons),
+            "oos_verified": report.oos_verified,
+            "oos_horizon": report.oos_horizon,
+            "oos_rank_ic": report.oos_rank_ic,
+            "quantile_monotonicity": report.quantile_monotonicity,
+            "spread_mean": report.spread_mean,
+            # Tier 3 证据（不可判定 → null，与展示面「缺失一律 —」同口径）
+            "fold_ics": list(report.fold_ics),
+            "fold_sign_consistency": report.fold_sign_consistency,
+            "selection_score": report.selection_score,
+            "reselect_rate": report.reselect_rate,
+            "reselect_hits": report.reselect_hits,
+            "reselect_checkpoints": report.reselect_checkpoints,
+            "ic_half_life": report.ic_half_life,
+            "ic_decay_slope": report.ic_decay_slope,
+            "max_abs_corr": report.max_abs_corr,
+            "corr_warn": report.corr_warn or None,
+            # T-FE-03 交易性证据（自相关→调仓建议 / 换手·扣费净 IC / 分状态 IC）
+            **_trade_metadata_fields(report),
+            "window": audit.get("window"),
+            "neutralize_mode": audit.get("neutralize_mode"),
+            "filter": audit.get("filter"),
+            # 审计自带口径：这份 IC 是在哪个池子上算的（请求与实跑同一值，
+            # 引擎层已保证）——落库行 universe 列与 metadata 不打架
+            "universe": audit.get("universe"),
+        }
+    )
 
 
 def _composite_metadata(
@@ -203,38 +283,42 @@ def _composite_metadata(
         }
         for h in report.horizons
     }
-    return ser.json_safe({
-        "source": "statistical",
-        "algorithm": "statistical",
-        "market": market,
-        "task_id": task_id,
-        "task_fingerprint": task_fingerprint or None,
-        "identity_scheme": identity_scheme or None,
-        "candidate_key": report.key,
-        "family": "composite",
-        "literature": "Tier 3：入选因子按目标周期 RankIC 加权合成",
-        "composite": True,
-        "components": list(report.components),
-        "weights": list(report.weights),
-        "component_rank_ics": list(report.component_rank_ics),
-        "weight_horizon": report.horizon,
-        "z_window": report.z_window,
-        "fdr_applied": False,
-        "neutralized": False,
-        "min_history": report.min_history,
-        "best_horizon": report.best_horizon,
-        "horizons": horizons,
-        "rank_icir": report.icir,
-        "oos_verified": report.oos_verified,
-        "oos_horizon": report.oos_horizon,
-        "oos_rank_ic": report.oos_rank_ic,
-        "quantile_monotonicity": report.quantile_monotonicity,
-        "spread_mean": report.spread_mean,
-        "window": audit.get("window"),
-        "neutralize_mode": audit.get("neutralize_mode"),
-        "filter": audit.get("filter"),
-        "universe": audit.get("universe"),
-    })
+    return ser.json_safe(
+        {
+            "source": "statistical",
+            "algorithm": "statistical",
+            "market": market,
+            "task_id": task_id,
+            "task_fingerprint": task_fingerprint or None,
+            "identity_scheme": identity_scheme or None,
+            "candidate_key": report.key,
+            "family": "composite",
+            "literature": "Tier 3：入选因子按目标周期 RankIC 加权合成",
+            "composite": True,
+            "components": list(report.components),
+            "weights": list(report.weights),
+            "component_rank_ics": list(report.component_rank_ics),
+            "weight_horizon": report.horizon,
+            "z_window": report.z_window,
+            "fdr_applied": False,
+            "neutralized": False,
+            "min_history": report.min_history,
+            "best_horizon": report.best_horizon,
+            "horizons": horizons,
+            "rank_icir": report.icir,
+            "oos_verified": report.oos_verified,
+            "oos_horizon": report.oos_horizon,
+            "oos_rank_ic": report.oos_rank_ic,
+            "quantile_monotonicity": report.quantile_monotonicity,
+            "spread_mean": report.spread_mean,
+            # T-FE-03 交易性证据（合成与单候选同一份形状）
+            **_trade_metadata_fields(report),
+            "window": audit.get("window"),
+            "neutralize_mode": audit.get("neutralize_mode"),
+            "filter": audit.get("filter"),
+            "universe": audit.get("universe"),
+        }
+    )
 
 
 async def _persist_selected(
@@ -305,8 +389,12 @@ async def _persist_selected(
     for report in [r for r in result.candidates if r.selected]:
         factor_id, scheme = _identity(report.key)
         metadata = _factor_metadata(
-            report, task_id=task_id, market=market, audit=audit,
-            task_fingerprint=task_fingerprint, identity_scheme=scheme,
+            report,
+            task_id=task_id,
+            market=market,
+            audit=audit,
+            task_fingerprint=task_fingerprint,
+            identity_scheme=scheme,
         )
         try:
             await _save_one(
@@ -315,8 +403,12 @@ async def _persist_selected(
             saved += 1
             logger.info(
                 "落库 %s（%s，身份=%s）：RankIC=%.4f 周期=%s τ=%.2f",
-                report.name, report.key, scheme, report.rank_ic_mean,
-                report.best_horizon, report.quantile_monotonicity,
+                report.name,
+                report.key,
+                scheme,
+                report.rank_ic_mean,
+                report.best_horizon,
+                report.quantile_monotonicity,
             )
         except Exception as exc:  # noqa: BLE001 - 单因子失败不拖垮整批
             logger.warning("落库失败 %s：%s", report.key, exc)
@@ -328,13 +420,18 @@ async def _persist_selected(
     if not composite.eligible:
         logger.info(
             "合成因子不落库（%s）：%s",
-            composite.key, composite.reject_reason or "不适格",
+            composite.key,
+            composite.reject_reason or "不适格",
         )
         return saved, saved_composite
     factor_id, scheme = _identity(composite.key)
     metadata = _composite_metadata(
-        composite, task_id=task_id, market=market, audit=audit,
-        task_fingerprint=task_fingerprint, identity_scheme=scheme,
+        composite,
+        task_id=task_id,
+        market=market,
+        audit=audit,
+        task_fingerprint=task_fingerprint,
+        identity_scheme=scheme,
     )
     try:
         await _save_one(
@@ -349,8 +446,11 @@ async def _persist_selected(
         saved_composite += 1
         logger.info(
             "落库合成因子（%s，身份=%s）：分量 %d 个，RankIC=%.4f（h*=%d）",
-            composite.key, scheme, len(composite.components),
-            composite.rank_ic_mean, composite.horizon,
+            composite.key,
+            scheme,
+            len(composite.components),
+            composite.rank_ic_mean,
+            composite.horizon,
         )
     except Exception as exc:  # noqa: BLE001 - 合成失败不拖垮整批
         logger.warning("落库失败 %s（合成）：%s", composite.key, exc)
@@ -412,7 +512,9 @@ def main() -> None:
     parser.add_argument("--log-dir", default="")
     args = parser.parse_args()
 
-    log_dir = Path(args.log_dir or os.getenv("LOG_TRACE_PATH", "/tmp/statistical_logs")).resolve()
+    log_dir = Path(
+        args.log_dir or os.getenv("LOG_TRACE_PATH", "/tmp/statistical_logs")
+    ).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 60)
@@ -438,15 +540,20 @@ def main() -> None:
     task_fingerprint = task_fingerprint_from_env()
     logger.info(
         "任务指纹：%s",
-        task_fingerprint or "(缺省——落库身份退回任务级，metadata 记 identity_scheme=task)",
+        task_fingerprint
+        or "(缺省——落库身份退回任务级，metadata 记 identity_scheme=task)",
     )
 
     mining, validation, window_kind = _resolve_windows()
     mining_start, mining_end = mining.iso()
-    valid_start, valid_end = validation.iso() if validation is not None else (None, None)
+    valid_start, valid_end = (
+        validation.iso() if validation is not None else (None, None)
+    )
     logger.info(
         "窗口（%s）：挖掘 %s~%s；检验 %s",
-        window_kind, mining_start, mining_end,
+        window_kind,
+        mining_start,
+        mining_end,
         f"{valid_start}~{valid_end}" if valid_start else "(无)",
     )
 
@@ -467,6 +574,10 @@ def main() -> None:
         except OSError as exc:  # noqa: BLE001 - 进度面不是主链
             logger.warning("进度写入失败：%s", exc)
 
+    # T-FE-03：regime 月状态（取不到 → None，报告少一列不拖垮主链；
+    # regime_source 是降级/就绪的可追溯痕迹，落进审计报告）
+    regime_by_month, regime_source = _load_regime_by_month()
+
     t0 = time.time()
     try:
         result = eng.run_statistical_mining(
@@ -477,6 +588,7 @@ def main() -> None:
             cfg=eng.StatisticalConfig(top_k=args.top_k),
             universe=args.universe,
             progress=emit,
+            regime_by_month=regime_by_month,
         )
     except Exception as exc:  # noqa: BLE001 - 子进程出口：日志 + 非零码
         logger.exception("统计量价挖掘失败：%s", exc)
@@ -485,6 +597,7 @@ def main() -> None:
 
     audit = ser.result_to_dict(result)
     audit["window_kind"] = window_kind
+    audit["regime_source"] = regime_source
     # 落盘也用 json_safe：裸 NaN 是 Python 方言，JSON.parse / Postgres 都不认
     (log_dir / "mining_report.json").write_text(
         json.dumps(ser.json_safe(audit), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -506,7 +619,10 @@ def main() -> None:
     rejected = [r for r in result.candidates if not r.selected]
     logger.info(
         "候选 %d：入选 %d，落库 %d，合成落库 %d",
-        len(result.candidates), len(result.selected), persisted, persisted_composite,
+        len(result.candidates),
+        len(result.selected),
+        persisted,
+        persisted_composite,
     )
     for report in rejected:
         logger.info("  未入选 %s：%s", report.key, report.reject_reason)

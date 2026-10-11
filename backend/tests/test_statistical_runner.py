@@ -44,10 +44,14 @@ class TestInvocationContract:
                 [
                     sys.executable,
                     str(RUNNER_PATH),
-                    "--task-id", "t_runner_guard",
-                    "--user-id", "u_test",
-                    "--market", "hong_kong",
-                    "--log-dir", tmp,
+                    "--task-id",
+                    "t_runner_guard",
+                    "--user-id",
+                    "u_test",
+                    "--market",
+                    "hong_kong",
+                    "--log-dir",
+                    tmp,
                 ],
                 capture_output=True,
                 text=True,
@@ -112,24 +116,67 @@ class TestFactorMetadata:
 
         horizons = (
             eng.HorizonStats(
-                horizon=1, n_days=80, ic_mean=0.031, rank_ic_mean=0.041,
-                icir=0.9, rank_ic_t=3.1, rank_ic_p=0.002, rank_ic_win_rate=0.6,
-                fdr_pass=True, rank_ic_t_naive=1.9, rank_ic_t_lags=5,
+                horizon=1,
+                n_days=80,
+                ic_mean=0.031,
+                rank_ic_mean=0.041,
+                icir=0.9,
+                rank_ic_t=3.1,
+                rank_ic_p=0.002,
+                rank_ic_win_rate=0.6,
+                fdr_pass=True,
+                rank_ic_t_naive=1.9,
+                rank_ic_t_lags=5,
             ),
             eng.HorizonStats(
-                horizon=5, n_days=75, ic_mean=0.012, rank_ic_mean=0.018,
-                icir=0.4, rank_ic_t=1.2, rank_ic_p=0.23, rank_ic_win_rate=0.52,
+                horizon=5,
+                n_days=75,
+                ic_mean=0.012,
+                rank_ic_mean=0.018,
+                icir=0.4,
+                rank_ic_t=1.2,
+                rank_ic_p=0.23,
+                rank_ic_win_rate=0.52,
                 fdr_pass=False,
             ),
         )
         return eng.CandidateReport(
-            key="reversal_5d", name="5 日反转", family="reversal",
-            formulation="close[t-5]/close[t] - 1", source="Jegadeesh(1990)",
-            expression="Ref($close,5)/$close-1", min_history=5,
-            horizons=horizons, best_horizon=1, rank_ic_mean=0.041, icir=0.9,
-            t_stat=3.1, p_value=0.002, fdr_pass=True, fdr_horizons=(1,),
-            oos_verified=True, oos_horizon=1, oos_rank_ic=0.033, oos_n_days=60,
-            quantile_monotonicity=0.9, spread_mean=0.004, selected=True,
+            key="reversal_5d",
+            name="5 日反转",
+            family="reversal",
+            formulation="close[t-5]/close[t] - 1",
+            source="Jegadeesh(1990)",
+            expression="Ref($close,5)/$close-1",
+            min_history=5,
+            horizons=horizons,
+            best_horizon=1,
+            rank_ic_mean=0.041,
+            icir=0.9,
+            t_stat=3.1,
+            p_value=0.002,
+            fdr_pass=True,
+            fdr_horizons=(1,),
+            oos_verified=True,
+            oos_horizon=1,
+            oos_rank_ic=0.033,
+            oos_n_days=60,
+            quantile_monotonicity=0.9,
+            spread_mean=0.004,
+            selected=True,
+            factor_autocorr=0.85,
+            factor_autocorr_days=90,
+            rebalance_days=5,
+            turnover_daily=0.12,
+            ann_turnover=30.24,
+            ic_net_mean=0.028,
+            ic_net_days=78,
+            regime_ic=(
+                eng.RegimeStat(state="bull", n_days=40, rank_ic_mean=0.05, weak=False),
+                eng.RegimeStat(
+                    state="neutral", n_days=30, rank_ic_mean=0.01, weak=False
+                ),
+                eng.RegimeStat(state="bear", n_days=8, rank_ic_mean=-0.02, weak=False),
+            ),
         )
 
     def test_metadata_carries_full_audit(self, runner):
@@ -143,7 +190,9 @@ class TestFactorMetadata:
             "neutralize_mode": "industry",
             "filter": {"n_kept": 4700},
         }
-        meta = runner._factor_metadata(self._report(runner), task_id="t1", market="a_share", audit=audit)
+        meta = runner._factor_metadata(
+            self._report(runner), task_id="t1", market="a_share", audit=audit
+        )
 
         assert meta["source"] == "statistical"
         assert meta["algorithm"] == "statistical"
@@ -165,6 +214,20 @@ class TestFactorMetadata:
         assert meta["horizons"]["1"]["rank_ic_t_naive"] == pytest.approx(1.9)
         # 未喂对照列（dataclass 默认 NaN）的周期 → 严格 JSON null，不是 0
         assert meta["horizons"]["5"]["rank_ic_t_naive"] is None
+        # T-FE-03：交易性证据随 metadata 落库（调仓建议/换手/扣费净 IC/分状态）
+        assert meta["factor_autocorr"] == pytest.approx(0.85)
+        assert meta["factor_autocorr_days"] == 90, "ρ₁ 的配对日数须落库（证据闸可复核）"
+        assert meta["rebalance_days"] == 5
+        assert meta["turnover_daily"] == pytest.approx(0.12)
+        assert meta["ann_turnover"] == pytest.approx(30.24)
+        assert meta["ic_net_mean"] == pytest.approx(0.028)
+        assert meta["ic_net_days"] == 78
+        assert meta["regime_ic"]["bull"] == {
+            "n_days": 40,
+            "rank_ic_mean": 0.05,
+            "weak": False,
+        }
+        assert set(meta["regime_ic"]) == {"bull", "neutral", "bear"}
 
     def test_metadata_is_strict_json_with_nan_as_null(self, runner):
         """被闸门拒掉的周期 IC 是 NaN——metadata 必须是严格 JSON。
@@ -179,19 +242,41 @@ class TestFactorMetadata:
 
         nan = float("nan")
         report = eng.CandidateReport(
-            key="k", name="k", family="f", formulation="x", source="s",
-            expression="$close", min_history=5,
+            key="k",
+            name="k",
+            family="f",
+            formulation="x",
+            source="s",
+            expression="$close",
+            min_history=5,
             horizons=(
                 eng.HorizonStats(
-                    horizon=20, n_days=0, ic_mean=nan, rank_ic_mean=nan,
-                    icir=nan, rank_ic_t=nan, rank_ic_p=nan, rank_ic_win_rate=nan,
+                    horizon=20,
+                    n_days=0,
+                    ic_mean=nan,
+                    rank_ic_mean=nan,
+                    icir=nan,
+                    rank_ic_t=nan,
+                    rank_ic_p=nan,
+                    rank_ic_win_rate=nan,
                     fdr_pass=False,
                 ),
             ),
-            best_horizon=None, rank_ic_mean=nan, icir=nan, t_stat=nan, p_value=nan,
-            fdr_pass=False, fdr_horizons=(), oos_verified=False, oos_horizon=None,
-            oos_rank_ic=None, oos_n_days=0, quantile_monotonicity=None,
-            spread_mean=None, reject_reason="样本内有效日不足", selected=False,
+            best_horizon=None,
+            rank_ic_mean=nan,
+            icir=nan,
+            t_stat=nan,
+            p_value=nan,
+            fdr_pass=False,
+            fdr_horizons=(),
+            oos_verified=False,
+            oos_horizon=None,
+            oos_rank_ic=None,
+            oos_n_days=0,
+            quantile_monotonicity=None,
+            spread_mean=None,
+            reject_reason="样本内有效日不足",
+            selected=False,
         )
         audit = {
             "window": {"mining_start": "2025-01-02", "mining_end": "2025-06-30"},
@@ -199,7 +284,9 @@ class TestFactorMetadata:
             "filter": {"n_kept": 1},
             "universe": "csi300",
         }
-        meta = runner._factor_metadata(report, task_id="t1", market="a_share", audit=audit)
+        meta = runner._factor_metadata(
+            report, task_id="t1", market="a_share", audit=audit
+        )
 
         # allow_nan=False：严格 JSON 才许出门（裸 NaN 会被 Postgres/JSON.parse 拒）
         text = json.dumps(meta, ensure_ascii=False, allow_nan=False)
@@ -229,8 +316,15 @@ def _horizon(runner):
     from backend.services.engine.alpha_agent.statistical import engine as eng
 
     return eng.HorizonStats(
-        horizon=1, n_days=80, ic_mean=0.031, rank_ic_mean=0.041, icir=0.9,
-        rank_ic_t=3.1, rank_ic_p=0.002, rank_ic_win_rate=0.6, fdr_pass=True,
+        horizon=1,
+        n_days=80,
+        ic_mean=0.031,
+        rank_ic_mean=0.041,
+        icir=0.9,
+        rank_ic_t=3.1,
+        rank_ic_p=0.002,
+        rank_ic_win_rate=0.6,
+        fdr_pass=True,
     )
 
 
@@ -239,17 +333,36 @@ def _tier3_report(runner):
     from backend.services.engine.alpha_agent.statistical import engine as eng
 
     return eng.CandidateReport(
-        key="reversal_5d", name="5 日反转", family="reversal",
-        formulation="close[t-5]/close[t] - 1", source="Jegadeesh(1990)",
-        expression="Ref($close,5)/$close-1", min_history=5,
-        horizons=(_horizon(runner),), best_horizon=1, rank_ic_mean=0.041,
-        icir=0.9, t_stat=3.1, p_value=0.002, fdr_pass=True, fdr_horizons=(1,),
-        oos_verified=True, oos_horizon=1, oos_rank_ic=0.033, oos_n_days=60,
-        quantile_monotonicity=0.9, spread_mean=0.004, selected=True,
-        fold_ics=(0.05, 0.04, 0.03, 0.05), fold_sign_consistency=1.0,
+        key="reversal_5d",
+        name="5 日反转",
+        family="reversal",
+        formulation="close[t-5]/close[t] - 1",
+        source="Jegadeesh(1990)",
+        expression="Ref($close,5)/$close-1",
+        min_history=5,
+        horizons=(_horizon(runner),),
+        best_horizon=1,
+        rank_ic_mean=0.041,
+        icir=0.9,
+        t_stat=3.1,
+        p_value=0.002,
+        fdr_pass=True,
+        fdr_horizons=(1,),
+        oos_verified=True,
+        oos_horizon=1,
+        oos_rank_ic=0.033,
+        oos_n_days=60,
+        quantile_monotonicity=0.9,
+        spread_mean=0.004,
+        selected=True,
+        fold_ics=(0.05, 0.04, 0.03, 0.05),
+        fold_sign_consistency=1.0,
         selection_score=0.031,
-        reselect_rate=2 / 3, reselect_hits=2, reselect_checkpoints=3,
-        ic_half_life=float("nan"), ic_decay_slope=-0.12,
+        reselect_rate=2 / 3,
+        reselect_hits=2,
+        reselect_checkpoints=3,
+        ic_half_life=float("nan"),
+        ic_decay_slope=-0.12,
         max_abs_corr=0.31,
     )
 
@@ -258,14 +371,28 @@ def _composite_report(runner, *, eligible: bool):
     from backend.services.engine.alpha_agent.statistical import engine as eng
 
     return eng.CompositeReport(
-        key="ic_weighted_composite", name="IC 加权合成因子", horizon=1,
-        components=("reversal_5d", "momentum_20d"), weights=(0.6, -0.4),
-        component_rank_ics=(0.06, -0.04), z_window=60,
-        expression="0.600000*(...)-0.400000*(...)", min_history=64,
-        horizons=(_horizon(runner),), best_horizon=1, rank_ic_mean=0.051,
-        icir=1.1, t_stat=3.9, p_value=0.0003, oos_verified=True, oos_horizon=1,
-        oos_rank_ic=0.044, oos_n_days=60, quantile_monotonicity=0.8,
-        spread_mean=0.005, eligible=eligible,
+        key="ic_weighted_composite",
+        name="IC 加权合成因子",
+        horizon=1,
+        components=("reversal_5d", "momentum_20d"),
+        weights=(0.6, -0.4),
+        component_rank_ics=(0.06, -0.04),
+        z_window=60,
+        expression="0.600000*(...)-0.400000*(...)",
+        min_history=64,
+        horizons=(_horizon(runner),),
+        best_horizon=1,
+        rank_ic_mean=0.051,
+        icir=1.1,
+        t_stat=3.9,
+        p_value=0.0003,
+        oos_verified=True,
+        oos_horizon=1,
+        oos_rank_ic=0.044,
+        oos_n_days=60,
+        quantile_monotonicity=0.8,
+        spread_mean=0.005,
+        eligible=eligible,
         reject_reason="" if eligible else "样本外衰减过大",
     )
 
@@ -276,12 +403,19 @@ class TestTier3Metadata:
         这条因子被去重挤掉/被稳定性闸拒」在库外无据可查。"""
         import json  # noqa: PLC0415
 
-        audit = {"window": {"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
-                 "neutralize_mode": "industry", "filter": {"n_kept": 1}}
+        audit = {
+            "window": {"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
+            "neutralize_mode": "industry",
+            "filter": {"n_kept": 1},
+        }
 
         meta = runner._factor_metadata(
-            _tier3_report(runner), task_id="t1", market="a_share", audit=audit,
-            task_fingerprint="fp-abc", identity_scheme="config",
+            _tier3_report(runner),
+            task_id="t1",
+            market="a_share",
+            audit=audit,
+            task_fingerprint="fp-abc",
+            identity_scheme="config",
         )
 
         assert meta["fold_ics"] == [0.05, 0.04, 0.03, 0.05]
@@ -304,14 +438,20 @@ class TestTier3Metadata:
         落库表达式等价的前提，藏起来就等于让回测方以为是同口径。"""
         import json  # noqa: PLC0415
 
-        audit = {"window": {"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
-                 "neutralize_mode": "industry", "filter": {"n_kept": 1},
-                 "universe": "csi300"}
+        audit = {
+            "window": {"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
+            "neutralize_mode": "industry",
+            "filter": {"n_kept": 1},
+            "universe": "csi300",
+        }
 
         meta = runner._composite_metadata(
             _composite_report(runner, eligible=True),
-            task_id="t1", market="a_share", audit=audit,
-            task_fingerprint="fp-abc", identity_scheme="config",
+            task_id="t1",
+            market="a_share",
+            audit=audit,
+            task_fingerprint="fp-abc",
+            identity_scheme="config",
         )
 
         assert meta["composite"] is True
@@ -323,6 +463,12 @@ class TestTier3Metadata:
         # NW 审计列在合成路径同样随行（默认 NaN/0 → null/0，不炸严格 JSON）
         assert meta["horizons"]["1"]["rank_ic_t_naive"] is None
         assert meta["horizons"]["1"]["rank_ic_t_lags"] == 0
+        # T-FE-03：合成报告未喂交易性证据 → 默认值（NaN→null / None），不出假数字
+        assert meta["rebalance_days"] is None
+        assert meta["regime_ic"] is None
+        assert meta["factor_autocorr"] is None
+        assert meta["factor_autocorr_days"] == 0
+        assert meta["ic_net_days"] == 0
         json.dumps(meta, ensure_ascii=False, allow_nan=False)
 
 
@@ -346,10 +492,16 @@ class TestPersistSelectedWiring:
         )
         counts = asyncio.run(
             runner._persist_selected(
-                result, task_id="t1", user_id="u1", market="a_share",
-                universe="csi300", audit={
-                    "window": {"mining_start": "2021-01-01",
-                               "mining_end": "2024-12-31"},
+                result,
+                task_id="t1",
+                user_id="u1",
+                market="a_share",
+                universe="csi300",
+                audit={
+                    "window": {
+                        "mining_start": "2021-01-01",
+                        "mining_end": "2024-12-31",
+                    },
                 },
                 task_fingerprint=fingerprint,
             )
@@ -362,7 +514,8 @@ class TestPersistSelectedWiring:
         )
 
         counts, recorder = self._run(
-            runner, monkeypatch,
+            runner,
+            monkeypatch,
             composite=_composite_report(runner, eligible=True),
             fingerprint="fp-abc",
         )
@@ -370,8 +523,12 @@ class TestPersistSelectedWiring:
         assert counts == (1, 1)
         expected = [
             dd.stable_factor_id(
-                user_id="u1", market="a_share", universe="csi300",
-                candidate_key=key, task_fingerprint="fp-abc", task_id="t1",
+                user_id="u1",
+                market="a_share",
+                universe="csi300",
+                candidate_key=key,
+                task_fingerprint="fp-abc",
+                task_id="t1",
             )[0]
             for key in ("reversal_5d", "ic_weighted_composite")
         ]
@@ -386,16 +543,15 @@ class TestPersistSelectedWiring:
     def test_ineligible_composite_is_accounted_not_persisted(self, runner, monkeypatch):
         """合成因子样本外闸不过 → 只记账不落库（闸的实际作用），返回值如实。"""
         counts, recorder = self._run(
-            runner, monkeypatch,
+            runner,
+            monkeypatch,
             composite=_composite_report(runner, eligible=False),
             fingerprint="fp-abc",
         )
 
         assert counts == (1, 0)
         assert len(recorder.saved) == 1
-        assert "ic_weighted_composite" not in [
-            c["factor_name"] for c in recorder.saved
-        ]
+        assert "ic_weighted_composite" not in [c["factor_name"] for c in recorder.saved]
 
     def test_missing_fingerprint_falls_back_to_task_identity(self, runner, monkeypatch):
         """缺指纹：身份退回任务级（scheme=task），metadata 可追溯——不装作
@@ -405,7 +561,8 @@ class TestPersistSelectedWiring:
         )
 
         counts, recorder = self._run(
-            runner, monkeypatch,
+            runner,
+            monkeypatch,
             composite=_composite_report(runner, eligible=True),
             fingerprint="",
         )
@@ -415,8 +572,12 @@ class TestPersistSelectedWiring:
         assert meta["identity_scheme"] == dd.SCHEME_TASK
         assert meta["task_fingerprint"] is None
         fallback_id, _ = dd.stable_factor_id(
-            user_id="u1", market="a_share", universe="csi300",
-            candidate_key="reversal_5d", task_fingerprint="", task_id="t1",
+            user_id="u1",
+            market="a_share",
+            universe="csi300",
+            candidate_key="reversal_5d",
+            task_fingerprint="",
+            task_id="t1",
         )
         assert recorder.saved[0]["factor_id"] == fallback_id
 
@@ -494,7 +655,9 @@ class TestSpawnValidationWiring:
         assert data["window"] == payload["window"]
         assert data["dedup"]["max_abs_corr"] is None, "NaN → null（「算不出」不是 0）"
 
-    def test_spawn_false_is_written_and_return_wins(self, runner, monkeypatch, tmp_path):
+    def test_spawn_false_is_written_and_return_wins(
+        self, runner, monkeypatch, tmp_path
+    ):
         """没拉起（关了开关/无对象可验）→ result.json 如实写 false；payload
         里即使带陈旧的 validation_spawned 也被真实返回值覆盖。"""
         import json  # noqa: PLC0415
@@ -514,3 +677,224 @@ class TestSpawnValidationWiring:
         assert spawned is False
         data = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
         assert data["validation_spawned"] is False
+
+
+class TestRegimeByMonth:
+    """``_load_regime_by_month``（T-FE-03）：口径复用 ``market_regime`` 单源，
+    任何失败降级 ``(None, source)``——报告少一列，挖掘主链不因 regime 数据
+    缺席失败；source 记录降级原因（评审 M4：可追溯，不只一条 warning）。"""
+
+    def test_index_history_failure_degrades_to_none(self, runner, monkeypatch):
+        from backend.services.engine import regime_persist  # noqa: PLC0415
+
+        def _boom(market: str, symbol: str):
+            raise FileNotFoundError("qdb_index_daily 不可达")
+
+        monkeypatch.setattr(regime_persist, "load_index_history", _boom)
+        by_month, source = runner._load_regime_by_month()
+        assert by_month is None
+        assert source["market"] == "CN"
+        assert "qdb_index_daily 不可达" in source["error"]
+
+    def test_short_history_degrades_to_none(self, runner, monkeypatch):
+        """单根 bar 也当「有历史」会让状态序列空转——显式拒绝，不硬凑月标签。"""
+        from backend.services.engine import regime_persist  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            regime_persist,
+            "load_index_history",
+            lambda market, symbol: {
+                "dates": ["2023-01-03"],
+                "closes": [4000.0],
+                "volumes": [1.0e8],
+            },
+        )
+        by_month, source = runner._load_regime_by_month()
+        assert by_month is None
+        assert "无日线历史" in source["error"]
+
+    def test_rising_history_yields_bull_months(self, runner, monkeypatch):
+        from datetime import date, timedelta  # noqa: PLC0415
+
+        from backend.services.engine import regime_persist  # noqa: PLC0415
+
+        dates: list[str] = []
+        closes: list[float] = []
+        volumes: list[float] = []
+        day = date(2023, 1, 3)
+        price = 4000.0
+        while len(dates) < 130:
+            if day.weekday() < 5:
+                dates.append(day.isoformat())
+                closes.append(price)
+                volumes.append(1.0e8)
+                price *= 1.002  # 每日 +0.2%：20 日滚动 ≈ +4.1%、波动≈0 → bull
+            day += timedelta(days=1)
+
+        monkeypatch.setattr(
+            regime_persist,
+            "load_index_history",
+            lambda market, symbol: {
+                "dates": dates,
+                "closes": closes,
+                "volumes": volumes,
+            },
+        )
+        by_month, source = runner._load_regime_by_month()
+        assert by_month is not None
+        assert len(by_month) >= 3
+        assert set(by_month.values()) == {"bull"}
+        assert all(len(m) == 7 and m[4] == "-" for m in by_month), "键是 YYYY-MM"
+        assert source == {"market": "CN", "index": "000300.SH", "months": len(by_month)}
+
+
+class TestMainWiring:
+    """``main()`` 全接线（评审 M5b）：单点各自绿不代表接线没断——regime 月
+    状态必须真进 ``run_statistical_mining``，降级痕迹必须真落
+    ``mining_report.json``。用替身记账，不取数、不写生产表。"""
+
+    def _stub_everything(self, runner, monkeypatch, tmp_path, *, regime_result, calls):
+        from backend.services.engine.alpha_agent.statistical import engine as eng
+        from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+            tradability as td,
+        )
+
+        class _Win:
+            def iso(self):
+                return ("2021-01-01", "2024-12-31")
+
+        monkeypatch.setattr(runner, "_resolve_windows", lambda: (_Win(), None, "stub"))
+        monkeypatch.setattr(runner, "_load_regime_by_month", lambda: regime_result)
+
+        def _fake_run(*args, **kwargs):
+            calls["engine"] = kwargs
+            cand = eng.CandidateReport(
+                key="reversal_5d",
+                name="5 日反转",
+                family="reversal",
+                formulation="x",
+                source="s",
+                expression="$close",
+                min_history=5,
+                horizons=(),
+                best_horizon=None,
+                rank_ic_mean=float("nan"),
+                icir=float("nan"),
+                t_stat=float("nan"),
+                p_value=float("nan"),
+                fdr_pass=False,
+                fdr_horizons=(),
+                oos_verified=False,
+                oos_horizon=None,
+                oos_rank_ic=float("nan"),
+                oos_n_days=0,
+                quantile_monotonicity=float("nan"),
+                spread_mean=float("nan"),
+                selected=False,
+                reject_reason="无有效 IC 日",
+            )
+            return eng.MiningResult(
+                candidates=(cand,),
+                selected=(),
+                filter_report=td.FilterReport(
+                    n_input=10,
+                    n_suspended=0,
+                    n_st=0,
+                    n_new_listing=0,
+                    n_limit_locked=0,
+                    n_low_liquidity=0,
+                ),
+                neutralize_report=None,
+                neutralize_mode="none",
+                horizons=(1, 5),
+                window={"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
+                panel_rows=100,
+                n_symbols=10,
+                universe="all_a",
+            )
+
+        monkeypatch.setattr(eng, "run_statistical_mining", _fake_run)
+
+        async def _fake_persist(result, **kwargs):
+            calls["persist"] = kwargs
+            return 0, 0
+
+        monkeypatch.setattr(runner, "_persist_selected", _fake_persist)
+
+        def _fake_spawn(**kwargs):
+            calls["spawn"] = kwargs
+            return False
+
+        monkeypatch.setattr(runner, "_spawn_validation_and_write_result", _fake_spawn)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_statistical_mining.py",
+                "--task-id",
+                "t1",
+                "--user-id",
+                "u1",
+                "--market",
+                "a_share",
+                "--universe",
+                "all_a",
+                "--top-k",
+                "3",
+                "--log-dir",
+                str(tmp_path),
+            ],
+        )
+
+    def test_month_states_reach_engine_and_source_lands_in_report(
+        self, runner, monkeypatch, tmp_path
+    ):
+        import json  # noqa: PLC0415
+
+        calls: dict = {}
+        source = {"market": "CN", "index": "000300.SH", "months": 2}
+        self._stub_everything(
+            runner,
+            monkeypatch,
+            tmp_path,
+            regime_result=({"2021-01": "bull", "2021-02": "neutral"}, source),
+            calls=calls,
+        )
+
+        runner.main()
+
+        assert calls["engine"]["regime_by_month"] == {
+            "2021-01": "bull",
+            "2021-02": "neutral",
+        }, "月状态必须真进引擎调用——接线断=「分市场状态 IC」列静默留空"
+        report = json.loads(
+            (tmp_path / "mining_report.json").read_text(encoding="utf-8")
+        )
+        assert report["regime_source"] == source, "就绪痕迹（指数/月数）须落审计报告"
+        assert report["window_kind"] == "stub"
+        assert calls["spawn"]["log_dir"] == tmp_path
+
+    def test_degraded_regime_leaves_trace_in_report(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """regime 取不到：引擎收到 None（少一列不失败），审计报告记下
+        **为什么**——降级原因可追溯（评审 M4），不是只剩一条易丢的 warning。"""
+        import json  # noqa: PLC0415
+
+        calls: dict = {}
+        source = {"market": "CN", "error": "qdb_index_daily 不可达"}
+        self._stub_everything(
+            runner,
+            monkeypatch,
+            tmp_path,
+            regime_result=(None, source),
+            calls=calls,
+        )
+
+        runner.main()
+
+        assert calls["engine"]["regime_by_month"] is None
+        report = json.loads(
+            (tmp_path / "mining_report.json").read_text(encoding="utf-8")
+        )
+        assert report["regime_source"] == source

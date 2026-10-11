@@ -43,18 +43,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.services.engine.alpha_agent.statistical import candidates as cand  # noqa: E402
+from backend.services.engine.alpha_agent.statistical import costs as sc  # noqa: E402
 from backend.services.engine.alpha_agent.statistical import engine as eng  # noqa: E402
 from backend.services.engine.alpha_agent.statistical import serialize as ser  # noqa: E402
 
 N_SYMBOLS = 40
 N_DAYS = 120
 MINING_START_IDX = 8
-MINING_END_IDX = 79   # OOS: 80..119
+MINING_END_IDX = 79  # OOS: 80..119
 VALID_START_IDX = 80
 
-BETA = 0.05         # 昨日收益通道系数（全程激活，弱而稳：RankIC ≈ β）
+BETA = 0.05  # 昨日收益通道系数（全程激活，弱而稳：RankIC ≈ β）
 EARLY_GAMMA = -0.006  # 日内位置通道在前段的弱负系数（折 1..3 稳定反向）
-LATE_GAMMA = 0.3      # 日内位置通道在尾折的强正系数（一折独大，反超整窗）
+LATE_GAMMA = 0.3  # 日内位置通道在尾折的强正系数（一折独大，反超整窗）
 #: 翻转日 = 63 → 第 63..79 日的前向收益带上尾折信号（t 日的 late 预测
 #: ret[t+1]），恰好落在挖掘窗（8..79）第 4 折内：折 1..3 的 late 信号是
 #: EARLY_GAMMA 的稳定弱负——尾折 |IC| 必须 > 3× 前段 |IC|，整窗才翻正，
@@ -84,7 +85,9 @@ def _make_panel(*, seed: int = 7) -> pd.DataFrame:
     noise = rng.normal(size=(N_DAYS, N_SYMBOLS))
     low = close - pos * 2 * half
     high = low + 2 * half
-    index = pd.MultiIndex.from_product([dates, _symbols()], names=["trade_date", "symbol"])
+    index = pd.MultiIndex.from_product(
+        [dates, _symbols()], names=["trade_date", "symbol"]
+    )
     flat = lambda m: np.asarray(m, dtype=float).reshape(-1)  # noqa: E731
     return pd.DataFrame(
         {
@@ -125,10 +128,18 @@ def _intraday_position(frame: pd.DataFrame) -> pd.Series:
     return (frame["close"] - frame["low"]) / (frame["high"] - frame["low"])
 
 
-def _fake(key: str, compute, expression: str, *, min_history: int = 2) -> cand.Candidate:
+def _fake(
+    key: str, compute, expression: str, *, min_history: int = 2
+) -> cand.Candidate:
     return cand.Candidate(
-        key=key, name=key, family="test", formulation=f"{key} (测试用)",
-        source="test", expression=expression, min_history=min_history, compute=compute,
+        key=key,
+        name=key,
+        family="test",
+        formulation=f"{key} (测试用)",
+        source="test",
+        expression=expression,
+        min_history=min_history,
+        compute=compute,
     )
 
 
@@ -138,9 +149,12 @@ def _registry(monkeypatch, *candidates: cand.Candidate) -> None:
 
 
 EARLY = _fake("early", _yesterday_return, YESTERDAY_EXPR)
-CLONE = _fake("clone", lambda frame: _yesterday_return(frame) * 2 + 1e-4, YESTERDAY_EXPR)
+CLONE = _fake(
+    "clone", lambda frame: _yesterday_return(frame) * 2 + 1e-4, YESTERDAY_EXPR
+)
 LATE = _fake(
-    "late", _intraday_position,
+    "late",
+    _intraday_position,
     "($close-$low)/($high-$low)",
 )
 WEAK = _fake("weak", lambda frame: frame["noise"], "$noise")
@@ -160,19 +174,30 @@ def _window_names():
 def _cfg(**overrides) -> eng.StatisticalConfig:
     """小面板：门槛按比例收，折门槛收到 5 天（4 折 × ~18 天，判定照常可判）。"""
     base = {
-        "top_k": 1, "horizons": (1,), "min_valid_days": 5, "oos_min_days": 5,
-        "min_names_per_day": 5, "min_fold_days": 5,
+        "top_k": 1,
+        "horizons": (1,),
+        "min_valid_days": 5,
+        "oos_min_days": 5,
+        "min_names_per_day": 5,
+        "min_fold_days": 5,
     }
     base.update(overrides)
     return eng.StatisticalConfig(**base)
 
 
-def _run(panel, metadata, cfg, *, with_oos: bool = False, registry=()):
+def _run(
+    panel, metadata, cfg, *, with_oos: bool = False, registry=(), regime_by_month=None
+):
     mining_start, mining_end, valid_start, valid_end = _window_names()
     windows = {"valid_start": valid_start, "valid_end": valid_end} if with_oos else {}
     return eng.run_statistical_mining(
-        mining_start, mining_end, cfg=cfg,
-        price_panel=panel, metadata=metadata, **windows,
+        mining_start,
+        mining_end,
+        cfg=cfg,
+        price_panel=panel,
+        metadata=metadata,
+        regime_by_month=regime_by_month,
+        **windows,
     )
 
 
@@ -181,9 +206,7 @@ def _report(result, key) -> eng.CandidateReport:
 
 
 class TestFoldConsistencyGate:
-    def test_late_burst_candidate_gated_and_switch_flips_outcome(
-        self, monkeypatch
-    ):
+    def test_late_burst_candidate_gated_and_switch_flips_outcome(self, monkeypatch):
         """late 整窗最强但折间符号翻脸（尾折单骑救主）→ 闸拦下；关闸后它当选。
 
         完整行为闭环：闸开 = early（折间全同号）当选、late 带「折间符号不稳」
@@ -233,7 +256,9 @@ class TestFoldConsistencyGate:
         # 当选，证明它输掉 gated 局不是别的原因。
         _registry(monkeypatch, EARLY, LATE)
         ungated = _run(panel, meta, _cfg(require_stability=False, require_fdr=False))
-        assert ungated.selected == ("late",), "只剩稳定性闸：关了它整窗最强当选——闸不是装饰"
+        assert ungated.selected == ("late",), (
+            "只剩稳定性闸：关了它整窗最强当选——闸不是装饰"
+        )
 
         # 单闸隔离（FDR 关、稳定性开）：late 被稳定性闸**独立**拦下——FDR
         # 不是唯一拦它的闸（两道闸各自可拦，各有一个不依赖对方的实证）。
@@ -272,7 +297,8 @@ class TestDedupGate:
         _registry(monkeypatch, EARLY, CLONE)
 
         result = _run(
-            panel, _metadata(panel),
+            panel,
+            _metadata(panel),
             _cfg(top_k=2, require_fdr=False),
         )
 
@@ -281,7 +307,7 @@ class TestDedupGate:
         assert "高度相关" in clone.reject_reason and "early" in clone.reject_reason
         assert result.dedup is not None
         assert result.dedup.kept == ("early",)
-        (dropped_key, matched_key, rho), = result.dedup.dropped
+        ((dropped_key, matched_key, rho),) = result.dedup.dropped
         assert (dropped_key, matched_key) == ("clone", "early")
         assert abs(rho) >= 0.9
         assert abs(_report(result, "early").max_abs_corr - abs(rho)) < 1e-12, (
@@ -299,7 +325,8 @@ class TestDedupGate:
         _registry(monkeypatch, EARLY, CLONE, WEAK)
 
         result = _run(
-            panel, _metadata(panel),
+            panel,
+            _metadata(panel),
             _cfg(top_k=2, require_fdr=False, require_stability=False),
         )
 
@@ -314,7 +341,7 @@ class TestDedupGate:
         assert "高度相关" in clone.reject_reason and "early" in clone.reject_reason
         assert result.dedup is not None
         assert result.dedup.kept == ("early", "weak")
-        (dropped_key, matched_key, rho), = result.dedup.dropped
+        ((dropped_key, matched_key, rho),) = result.dedup.dropped
         assert (dropped_key, matched_key) == ("clone", "early")
         assert abs(rho) == pytest.approx(1.0)
 
@@ -323,7 +350,8 @@ class TestDedupGate:
         _registry(monkeypatch, EARLY, CLONE)
 
         result = _run(
-            panel, _metadata(panel),
+            panel,
+            _metadata(panel),
             _cfg(top_k=2, require_fdr=False, require_dedup=False),
         )
 
@@ -342,7 +370,8 @@ class TestComposite:
         _registry(monkeypatch, EARLY, CLONE)
 
         result = _run(
-            panel, _metadata(panel),
+            panel,
+            _metadata(panel),
             _cfg(top_k=2, require_fdr=False, require_dedup=False, composite_z_window=4),
         )
 
@@ -357,7 +386,9 @@ class TestComposite:
         assert "\n" not in plan.expression and "Std(" in plan.expression
         assert not plan.expression.startswith("+")
         assert plan.rank_ic_mean > 0, "同向信号合成后不该翻号"
-        assert plan.eligible is True, "未配验证区间：样本外闸不拦（报告标 oos_verified=False）"
+        assert plan.eligible is True, (
+            "未配验证区间：样本外闸不拦（报告标 oos_verified=False）"
+        )
 
         audit = ser.result_to_dict(result)
         assert audit["composite"]["components"] == ["early", "clone"]
@@ -381,12 +412,192 @@ class TestComposite:
         _registry(monkeypatch, EARLY, CLONE)
 
         result = _run(
-            panel, _metadata(panel),
+            panel,
+            _metadata(panel),
             _cfg(
-                top_k=2, require_fdr=False, require_dedup=False,
+                top_k=2,
+                require_fdr=False,
+                require_dedup=False,
                 composite_enabled=False,
             ),
         )
 
         assert set(result.selected) == {"early", "clone"}, "前置：两个分量都入选"
         assert result.composite is None
+
+
+class TestTradeEvidence:
+    """T-FE-03：报告补三列——分状态 IC（月标签）/ 自相关→调仓建议 / 换手·扣费净 IC。"""
+
+    #: 月状态表覆盖整个挖掘窗（2023-01..04）；05/06 多出的月份从不被查到——
+    #: join 只有 IC 日出现的月份才参与，多给键无害
+    MONTHS = {
+        "2023-01": "bull",
+        "2023-02": "bear",
+        "2023-03": "neutral",
+        "2023-04": "bull",
+        "2023-05": "neutral",
+        "2023-06": "bear",
+    }
+
+    def test_regime_evidence_splits_by_month_label(self):
+        """白盒：月标签 join 精确——缺标签的 IC 日不进任何桶（缺失如实计）。
+
+        弱区谓词沿用 ``regime_buckets.bucket_of``（mean≤0 ∧ n≥15 唯一实现），
+        不按「因子是新的」另立门槛。
+        """
+        daily = pd.DataFrame(
+            {
+                "ic": [0.1, 0.2, -0.3, 0.05, 0.4],
+                "rank_ic": [0.1, 0.2, -0.3, 0.05, 0.4],
+                "n": [40, 40, 40, 40, 40],
+            },
+            index=pd.DatetimeIndex(
+                ["2023-01-03", "2023-01-04", "2023-02-01", "2023-02-02", "2023-03-01"]
+            ).rename("trade_date"),
+        )
+        stats = eng._regime_evidence(daily, {"2023-01": "bull", "2023-02": "bear"})
+        by_state = {s.state: s for s in stats}
+        assert [s.state for s in stats] == ["bull", "neutral", "bear"], "档序 = STATES"
+        assert by_state["bull"].n_days == 2
+        assert by_state["bull"].rank_ic_mean == pytest.approx(0.15)
+        assert by_state["bear"].n_days == 2
+        assert by_state["bear"].rank_ic_mean == pytest.approx(-0.125)
+        assert by_state["neutral"].n_days == 0
+        assert np.isnan(by_state["neutral"].rank_ic_mean), "空桶是 NaN，不是 0"
+        assert by_state["bear"].weak is False, (
+            "mean<0 但 n=2<15：弱区谓词与 regime_buckets 同门槛，不下结论"
+        )
+        assert eng._regime_evidence(daily, None) == (), "无时间线 → 空，不编造"
+
+    def test_selected_gets_trade_evidence_rejected_gets_defaults(self, monkeypatch):
+        """入选者拿全三列；未入选 = 缺省值（因子值懒算纪律——没算就没有数字）。"""
+        panel = _make_panel()
+        _registry(monkeypatch, EARLY, WEAK)
+
+        result = _run(panel, _metadata(panel), _cfg(), regime_by_month=self.MONTHS)
+
+        early = _report(result, "early")
+        assert early.selected
+        assert np.isfinite(early.factor_autocorr)
+        assert early.factor_autocorr_days > 0, "配对日数是 ρ₁ 的证据面，随行可见"
+        assert early.rebalance_days == sc.suggest_rebalance_days(early.factor_autocorr)
+        assert 0.0 <= early.turnover_daily <= 1.0
+        assert early.ann_turnover == pytest.approx(early.turnover_daily * sc.ANNUALIZE)
+        assert early.ic_net_days > 0 and np.isfinite(early.ic_net_mean)
+        assert [s.state for s in early.regime_ic] == ["bull", "neutral", "bear"]
+        best_stat = next(h for h in early.horizons if h.horizon == early.best_horizon)
+        assert sum(s.n_days for s in early.regime_ic) == best_stat.n_days, (
+            "月表覆盖整个挖掘窗 → 每个 IC 日都落到某一桶，n_days 合计对得上"
+        )
+
+        weak = _report(result, "weak")
+        assert not weak.selected
+        assert np.isnan(weak.factor_autocorr)
+        assert weak.factor_autocorr_days == 0
+        assert weak.rebalance_days is None
+        assert np.isnan(weak.turnover_daily) and np.isnan(weak.ann_turnover)
+        assert weak.ic_net_days == 0 and np.isnan(weak.ic_net_mean)
+        assert weak.regime_ic == (), "未入选：因子值没算，三列一律缺省"
+
+    def test_regime_absent_other_columns_still_filled(self, monkeypatch):
+        """拿不到 regime 时间线（runner 降级）：只有 regime_ic 留空——另外两列
+        照算，降级不牵连。"""
+        panel = _make_panel()
+        _registry(monkeypatch, EARLY, WEAK)
+
+        result = _run(panel, _metadata(panel), _cfg())
+
+        early = _report(result, "early")
+        assert early.regime_ic == ()
+        assert np.isfinite(early.factor_autocorr)
+        assert np.isfinite(early.turnover_daily)
+        assert early.ic_net_days > 0
+
+    def test_composite_carries_trade_evidence(self, monkeypatch):
+        """合成因子（真正的可交易产出）同带三列——不是只有单候选有。"""
+        panel = _make_panel()
+        _registry(monkeypatch, EARLY, CLONE)
+
+        result = _run(
+            panel,
+            _metadata(panel),
+            _cfg(top_k=2, require_fdr=False, require_dedup=False, composite_z_window=4),
+            regime_by_month=self.MONTHS,
+        )
+
+        plan = result.composite
+        assert plan is not None
+        assert np.isfinite(plan.factor_autocorr)
+        assert 0.0 <= plan.turnover_daily <= 1.0
+        assert [s.state for s in plan.regime_ic] == ["bull", "neutral", "bear"]
+        best_stat = next(h for h in plan.horizons if h.horizon == plan.best_horizon)
+        assert sum(s.n_days for s in plan.regime_ic) == best_stat.n_days
+
+
+class TestTradeEvidenceNumericPins:
+    """评审 M5a：ρ₁ 的方向与证据闸钉**数值**（不只是 isfinite）——
+
+    - 截面恒序（每天排序完全相同）→ ρ₁ ≈ +1 → 建议封顶 ``MAX_REBALANCE_DAYS``；
+    - 逐日完全反转 → ρ₁ ≈ −1 → 建议 1（别囤隔夜名单）；
+    - 配对日数 < ``min_valid_days`` → NaN/None 降级，天数如实可见（M2 闸的
+      行为锚点：2 天面板也能凑出一个 |ρ₁|=1，没有天数闸就是假精度）。
+    """
+
+    @staticmethod
+    def _pin_factor(day_values: list[list[float]]) -> pd.Series:
+        n = len(day_values[0])
+        days = pd.bdate_range("2023-01-02", periods=len(day_values))
+        idx = pd.MultiIndex.from_product(
+            [days, [f"sh600{i:03d}" for i in range(n)]],
+            names=["trade_date", "symbol"],
+        )
+        return pd.Series([v for row in day_values for v in row], index=idx)
+
+    @staticmethod
+    def _evidence(factor: pd.Series, cfg: eng.StatisticalConfig) -> dict:
+        fwd = pd.Series(0.01, index=factor.index)
+        daily = pd.DataFrame(
+            {"ic": [0.1], "rank_ic": [0.1], "n": [40]},
+            index=pd.DatetimeIndex(["2023-01-03"], name="trade_date"),
+        )
+        return eng._trade_evidence(
+            factor,
+            best_horizon=1,
+            daily=daily,
+            fwd={1: fwd},
+            in_is=np.ones(len(fwd), dtype=bool),
+            cfg=cfg,
+            regime_by_month=None,
+        )
+
+    def test_constant_cross_sectional_order_pins_autocorr_one(self):
+        v = [float(i) for i in range(6)]
+        factor = self._pin_factor([v] * 6)
+        info = self._evidence(factor, _cfg())
+
+        assert info["factor_autocorr"] == pytest.approx(1.0, abs=1e-12)
+        assert info["factor_autocorr_days"] == 5, "6 天 → 5 个 lag-1 配对日"
+        assert info["rebalance_days"] == sc.MAX_REBALANCE_DAYS, (
+            "ρ₁=1（恒序）→ 半衰期发散，建议封顶——发散量不出建议"
+        )
+
+    def test_daily_full_reversal_pins_autocorr_minus_one(self):
+        v = [float(i) for i in range(6)]
+        factor = self._pin_factor([v, v[::-1]] * 3)
+        info = self._evidence(factor, _cfg())
+
+        assert info["factor_autocorr"] == pytest.approx(-1.0, abs=1e-12)
+        assert info["factor_autocorr_days"] == 5
+        assert info["rebalance_days"] == 1, "ρ₁≤0（无持续性）→ 每日重排"
+
+    def test_below_min_days_degrades_and_reports_pair_count(self):
+        """2 天面板：恰 1 个配对日 < min_valid_days=5 → NaN/None；天数=1
+        如实落字段——「算不出」与「算出来恰好如此」分得开。"""
+        v = [float(i) for i in range(6)]
+        factor = self._pin_factor([v] * 2)
+        info = self._evidence(factor, _cfg())
+
+        assert info["factor_autocorr_days"] == 1
+        assert np.isnan(info["factor_autocorr"]), "证据不足不许出 ±1 的假精度"
+        assert info["rebalance_days"] is None

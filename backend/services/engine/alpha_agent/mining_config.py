@@ -236,8 +236,17 @@ def default_windows(
 ) -> tuple[Window, Window]:
     """默认窗口：锚定数据覆盖末端（无覆盖锚今天）前推 5 年 = 4 年挖掘 + 1 年检验。
 
-    覆盖期不足 5 年时整体前移到覆盖起点，并按可用跨度重算 4:1 切分
-    （跨度不足 1 年时检验窗收敛为 0 长度，前端会提示用户显式调整）。
+    覆盖期不足 5 年时整体前移到覆盖起点；4:1 切分只在有空间时成立——跨度
+    ≤ 4 年时 ``split`` 被顶到覆盖末端，检验窗退化为与挖掘窗**共享末日**的
+    单日窗，前端会提示用户显式调整。
+
+    正常分支（跨度 > 4 年）挖掘窗与检验窗**不共享边界日**：检验从挖掘终点的
+    **次日**起算。旧实现两窗共用 split 日，那一天的前向收益在样本内、样本外
+    各被算了一次——「样本外」名不副实。退化分支（跨度 ≤ 4 年）没有非重叠
+    检验窗可放，如实保留共享末日的行为（**是共享，不是「相接」**——相接指
+    ``[.., d]`` 与 ``[d+1, ..]``，那是正常分支）；:func:`validate_windows`
+    两分支都按 ``valid.start >= mining.end`` 放行，统计派报告以
+    ``validation_overlaps_mining`` 如实标 True。
 
     ``data_end``（回测可用末端）给定且早于覆盖末端时锚它——默认值本身就落在
     可回测范围内，前端预填的默认窗口不因末端保护被改（否则"预填范围 vs 实跑
@@ -262,7 +271,9 @@ def default_windows(
         split = start
     if split > anchor_end:
         split = anchor_end
-    return Window(start, split), Window(split, anchor_end)
+    return Window(start, split), Window(
+        min(split + timedelta(days=1), anchor_end), anchor_end
+    )
 
 
 def qlib_segments(

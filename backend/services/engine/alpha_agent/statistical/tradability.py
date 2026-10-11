@@ -118,7 +118,8 @@ def limit_locked(
     dates = panel.index.get_level_values(0)
 
     board = map_unique(symbols, board_of)
-    width = pd.Series(BOARD_LIMIT).reindex(board).to_numpy(dtype=float)
+    # copy=True：pandas 3 CoW 下 to_numpy() 可能给只读视图，下面要就地改宽（ST/注册制前）
+    width = pd.Series(BOARD_LIMIT).reindex(board).to_numpy(dtype=float, copy=True)
     if (board == "gem").any():
         early = (board == "gem") & (dates < GEM_20PCT_START)
         width[early] = BOARD_LIMIT["main"]

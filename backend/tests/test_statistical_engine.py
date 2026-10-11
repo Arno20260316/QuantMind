@@ -194,6 +194,8 @@ class TestConfigValidation:
             ({"top_k": 0}, "top_k"),
             ({"quantiles": 1}, "quantiles"),
             ({"neutralize": "size"}, "neutralize"),
+            ({"min_fold_sign_consistency": 0.0}, "min_fold_sign_consistency"),
+            ({"min_fold_sign_consistency": 1.5}, "min_fold_sign_consistency"),
         ],
     )
     def test_bad_config_rejected(self, kwargs, match):
@@ -229,15 +231,19 @@ class TestSelectionGates:
         """同一份数据只拨 FDR 开关：无预测力候选的去留必须跟着变。
 
         关掉样本外闸（不配验证区间）是因为噪声因子的样本外符号本就一半概率翻——
-        那是闸门**该**拦的，会盖住这里要单独验的 FDR 变量。
+        那是闸门**该**拦的，会盖住这里要单独验的 FDR 变量。稳定性闸同理关掉：
+        噪声因子的折间符号本就近抛硬币（本种子 2/4 折同号），新闸取折间一致性，
+        会先把 weak 拒掉，同样盖住 FDR 变量（Tier 3 闸门行为由 tier3 专项钉住）。
         """
         panel = _make_panel()
-        off = _run(panel, _metadata(panel), cfg=_cfg(top_k=3, horizons=(1,), require_fdr=False),
+        off = _run(panel, _metadata(panel),
+                   cfg=_cfg(top_k=3, horizons=(1,), require_fdr=False, require_stability=False),
                    with_oos=False)
         assert "weak" in off.selected, "FDR 关掉后无预测力候选也过闸（Top-K 内）"
         assert "BH-FDR" not in _report(off, "weak").reject_reason
 
-        on = _run(panel, _metadata(panel), cfg=_cfg(top_k=3, horizons=(1,)),
+        on = _run(panel, _metadata(panel),
+                  cfg=_cfg(top_k=3, horizons=(1,), require_stability=False),
                   with_oos=False)
         assert "weak" not in on.selected
         assert "BH-FDR" in _report(on, "weak").reject_reason

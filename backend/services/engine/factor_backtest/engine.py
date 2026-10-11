@@ -54,6 +54,7 @@ from backend.services.engine.routers.alpha_agent import (
     _format_backtest_error,
     _resolve_instruments_for_universe,
     _resolve_mining_source_h5,
+    _run_expression_factor_subprocess,
     _run_factor_class_subprocess,
     _run_functional_factor_subprocess,
     _run_mining_evaluators,
@@ -118,18 +119,27 @@ def _mask_split_like_returns(r: pd.Series) -> tuple[pd.Series, int, int]:
     return out, n_masked, n_extreme_kept
 
 
+def _qlib_region(qlib_market: str) -> str:
+    """qlib region 口径唯一实现（CN 系 cn，其余 us）——与旧实现一致。"""
+    return "cn" if qlib_market in ("CN", "HK", "FUTURES", "CRYPTO") else "us"
+
+
+def _qlib_provider_and_region(qlib_market: str) -> tuple[str, str]:
+    """(provider_uri, region)——expression 子进程要给这两值，口径与
+    :func:`_ensure_qlib` 同一处（expression 子进程是新解释器，不吃本进程
+    已 init 的全局态，必须显式传）。"""
+    from backend.shared.qlib_paths import resolve_qlib_provider_uri
+
+    return resolve_qlib_provider_uri(qlib_market), _qlib_region(qlib_market)
+
+
 def _ensure_qlib(qlib_market: str) -> None:
     """幂等 qlib.init（region 口径与旧实现一致）；失败只告警。"""
     import qlib
 
-    from backend.shared.qlib_paths import resolve_qlib_provider_uri
-
-    provider_uri = resolve_qlib_provider_uri(qlib_market)
+    provider_uri, region = _qlib_provider_and_region(qlib_market)
     try:
-        qlib.init(
-            provider_uri=provider_uri,
-            region="cn" if qlib_market in ("CN", "HK", "FUTURES", "CRYPTO") else "us",
-        )
+        qlib.init(provider_uri=provider_uri, region=region)
     except Exception as e:  # noqa: BLE001 — 重复 init 快速返回；真失败由后续取数暴露
         logger.warning("qlib.init(%s) raised: %s", provider_uri, e)
 
@@ -331,7 +341,15 @@ async def evaluate_factor_market(
 
     # ⑦ 因子值计算（subprocess 隔离；CN 优先挖掘同源富化 39 列）
     try:
-        if kind == "functional":
+        if kind == "expression":
+            # 统计派 qlib 表达式：qlib 原生求值（实现是 eval）必须子进程，与
+            # 「严禁主进程 exec 因子文本」同一条纪律；子进程是新解释器，
+            # provider/region 必须显式传（口径与 _ensure_qlib 同一处）
+            provider_uri, region = _qlib_provider_and_region(profile.qlib_market)
+            factor_series = await _run_expression_factor_subprocess(
+                factor_id, code, provider_uri, region, instruments, start, end
+            )
+        elif kind == "functional":
             mining_source = (
                 _resolve_mining_source_h5(market) if market == "a_share" else None
             )

@@ -1,8 +1,8 @@
 """统计派挖掘引擎（移植 P2/P3，机构级 Tier 1+2+3）——全流水线编排。
 
     取数(含暖机) → 可交易性过滤 → 逐候选计算 → 可选中性化 → 多周期 IC
-    → BH-FDR(跨 候选×周期) → 子窗稳定性/滚动再选择 → 样本外一致性
-    → Top-K → 相关性去重 → IC 加权合成 → 全量审计
+    → BH-FDR(跨 候选×周期) → 子窗稳定性（折间符号一致性）→ 样本外一致性
+    → 选择分排序 → 选择期值级去重（遭拒递补）→ IC 加权合成 → 全量审计
 
 **选择规则**（顺序固定；每个候选都带拒因落审计，不许静默落榜）：
 
@@ -12,15 +12,19 @@
    Top-K 本身就是选择偏差，逐周期修正；任一周期过线即算过（报告记明哪几个）。
    FDR 未过者**照样复算样本外**：拒因已定，但「弱但方向一致」与「弱且反转」
    对复核是两条信息，报告要给全；
-3. 子窗稳定性（Tier 3，``require_stability``）：展开窗检查点重排 Top-K 的
-   命中率 < ``reselect_min_rate`` → 拒（``滚动再选择不稳定``）。折结构不足
-   （任一折有效日 < ``min_fold_days``）**不拒**：如实记 note，不拿假精确说话；
+3. 子窗稳定性（Tier 3，``require_stability``）：逐折 RankIC 与全窗同号的折
+   占比 < ``min_fold_sign_consistency`` → 拒（``折间符号不稳``）。折结构不足
+   （任一折有效日 < ``min_fold_days``）**不拒**：如实记 note，不拿假精确说话。
+   滚动再选择命中率是**审计量**（跨候选抢 K 席的相对量，不当闸——2026-10-11
+   csi300 实跑：19/28 候选命中 0/3 而折间全同号，旧闸刀锋误伤，见 stability.py）；
 4. 样本外一致性（配了验证区间才启用）：同号且 ``|OOS RankIC| ≥ oos_min_ratio
    × |IS RankIC|``，否则拒（``样本外符号反转`` / ``样本外衰减过大``）；
-5. 通过者在 ``|RankIC|`` 上降序取 Top-K；不足 K 就是不足 K，不凑数；过闸但
-   排名在 K 外的记 ``未入选 Top-K``；
-6. **相关性去重**（Tier 3，``require_dedup``）：入选集内按 |RankIC| 降序贪心，
-   与已保留者 |ρ| ≥ ``dedup_corr_reject`` 者拒（``与 X 高度相关``），不补位；
+5. 通过者按**选择分**（``|RankIC| × 折间符号一致性``；无稳定性证据时权重取
+   中性 1）降序排序——幅度与稳定同权，防「整窗 |RankIC| 大、一半折反向」的
+   候选纯靠幅度霸榜；过闸但排在 K 外的记 ``未入选 Top-K``；
+6. **选择期相关性去重**（Tier 3，``require_dedup``）：沿选择分序贪心，与已
+   保留者 |ρ| ≥ ``dedup_corr_reject`` 者跳过（``与 X 高度相关``）并**递补**
+   ——Top-K 是席位，信息量相同的因子只留代表，凑满即停；不足 K 就是不足 K；
 7. **IC 加权合成**（Tier 3，``composite_enabled``）：去重后入选 ≥ 2 个时合成
    ``Σ ŵ·z(f)``（口径见 ``composite.py``），走同一套 IC/样本外/分组证据；
    不进 BH-FDR（不属于原始候选池）；合成因子的样本外闸不过 → 只记账不落库。
@@ -73,7 +77,7 @@ class StatisticalConfig:
     tradability: _td.TradabilityConfig = field(default_factory=_td.TradabilityConfig)
     # ── Tier 3（体系化）：子窗稳定性 / 相关性去重 / IC 加权合成 ──────────
     stability_folds: int = _stab.DEFAULT_FOLDS
-    reselect_min_rate: float = _stab.DEFAULT_RESELECT_MIN_RATE
+    min_fold_sign_consistency: float = _stab.DEFAULT_MIN_FOLD_SIGN_CONSISTENCY
     min_fold_days: int = _stab.DEFAULT_MIN_FOLD_DAYS
     require_stability: bool = True
     dedup_corr_reject: float = _dedup.DEFAULT_CORR_REJECT
@@ -93,8 +97,11 @@ class StatisticalConfig:
             raise ValueError(f"neutralize 口径非法: {self.neutralize!r}")
         if self.stability_folds < 2:
             raise ValueError(f"stability_folds 至少为 2（收到 {self.stability_folds!r}）")
-        if not 0 < self.reselect_min_rate <= 1:
-            raise ValueError(f"reselect_min_rate 必须在 (0, 1]（收到 {self.reselect_min_rate!r}）")
+        if not 0 < self.min_fold_sign_consistency <= 1:
+            raise ValueError(
+                "min_fold_sign_consistency 必须在 (0, 1]"
+                f"（收到 {self.min_fold_sign_consistency!r}）"
+            )
         if self.min_fold_days < 1:
             raise ValueError(f"min_fold_days 至少为 1（收到 {self.min_fold_days!r}）")
         if not 0.0 <= self.dedup_corr_warn < self.dedup_corr_reject <= 1.0:
@@ -148,8 +155,9 @@ class CandidateReport:
     reject_reason: str = ""
     # ── Tier 3 证据（不可判定一律 NaN/空，语义见 stability/dedup 模块）──
     fold_ics: tuple[float, ...] = ()  # 逐折 RankIC 均值（stability_folds 个）
-    fold_sign_consistency: float = float("nan")  # 与全窗同号的折占比
-    reselect_rate: float = float("nan")  # 展开窗检查点 Top-K 命中率
+    fold_sign_consistency: float = float("nan")  # 与全窗同号的折占比（闸取它）
+    selection_score: float = float("nan")  # |RankIC| × 折间符号一致性（选择排序键）
+    reselect_rate: float = float("nan")  # 展开窗检查点 Top-K 命中率（审计量）
     reselect_hits: int = 0
     reselect_checkpoints: int = 0
     ic_half_life: float = float("nan")  # |RankIC| 对数线性衰减半衰期（bar）
@@ -437,7 +445,8 @@ def run_statistical_mining(
     if cfg.require_stability:
         emit(
             "stability",
-            f"滚动再选择（{cfg.stability_folds} 折展开窗，逐检查点重排 Top-{cfg.top_k}）",
+            f"子窗稳定性（{cfg.stability_folds} 折：折间符号一致性闸 + "
+            f"滚动再选择审计，逐检查点重排 Top-{cfg.top_k}）",
         )
         rank_series: dict[str, pd.Series] = {}
         for candidate in _candidates.CANDIDATES:
@@ -454,7 +463,7 @@ def run_statistical_mining(
         if thin:
             emit("stability", f"{len(thin)} 个候选折内有效日不足：不判稳定性（如实记 note）")
 
-    emit("select", "样本外一致性 + Top-K 选择")
+    emit("select", "样本外一致性 + 选择分排序（Top-K 席位）")
     drafts: list[CandidateReport] = []
     for candidate in _candidates.CANDIDATES:
         stats = horizon_stats[candidate.key]
@@ -473,18 +482,18 @@ def run_statistical_mining(
             reasons.append("多重检验未过（BH-FDR）")
         if oos_reason:
             reasons.append(oos_reason)
-        # 子窗稳定性闸：只拦「可判定且低命中」；不可判定（折薄/无数据）不拒——
-        # 拒要有证据，没证据的场景如实记 note 进报告，不拿 NaN 冒充结论
+        # 子窗稳定性闸：折间符号翻脸才算不稳；不可判定（折薄/无数据/全窗零）
+        # 不拒——拒要有证据，没证据的场景如实记 note 进报告，不拿 NaN 冒充结论
         if (
             best is not None
             and stability is not None
             and stability.eligible
-            and stability.reselect_rate < cfg.reselect_min_rate
+            and np.isfinite(stability.sign_consistency)
+            and stability.sign_consistency < cfg.min_fold_sign_consistency
         ):
-            reasons.append(
-                "滚动再选择不稳定"
-                f"（{stability.reselect_hits}/{stability.reselect_checkpoints} 检查点入选）"
-            )
+            n_active = sum(1 for ic in stability.fold_ics if np.isfinite(ic))
+            matches = int(round(stability.sign_consistency * n_active))
+            reasons.append(f"折间符号不稳（{matches}/{n_active} 折与全窗同号）")
         drafts.append(
             CandidateReport(
                 key=candidate.key,
@@ -514,6 +523,7 @@ def run_statistical_mining(
                 fold_sign_consistency=(
                     stability.sign_consistency if stability else np.nan
                 ),
+                selection_score=_selection_score(best, stability),
                 reselect_rate=stability.reselect_rate if stability else np.nan,
                 reselect_hits=stability.reselect_hits if stability else 0,
                 reselect_checkpoints=stability.reselect_checkpoints if stability else 0,
@@ -521,38 +531,52 @@ def run_statistical_mining(
                 ic_decay_slope=decay,
             )
         )
-    selected_keys = _rank_top_k(drafts, cfg)
+    ranked_keys = _rank_eligible(drafts)
 
-    # 入选因子值只算一次：分组证据与相关性去重共用（面板几百万行，逐消费方
-    # 重算是这层最大的重复开销）
-    selected_factors: dict[str, pd.Series] = {}
-    for key in selected_keys:
-        factor, _ = _compute_factor(
-            _candidates.CANDIDATE_BY_KEY[key],
-            panel, trad_mask, position, neutralize, industry, size,
-        )
-        selected_factors[key] = factor[in_is]
+    # 入选因子值懒算 + 缓存：选择期去重的贪心步行走哪算哪（K 席之外或递补后
+    # 才轮到的候选不白算），算过的留给分组证据复用——面板几百万行，逐消费方
+    # 重算是这层最大的重复开销。被**拒**的候选在判决当下即释放（on_drop）：
+    # 只压尾巴不压峰值，缓存峰值恒为 O(K+1) 而不是 O(走过的候选数)
+    factor_cache: dict[str, pd.Series] = {}
+
+    def _factor_of(key: str) -> pd.Series:
+        if key not in factor_cache:
+            factor, _ = _compute_factor(
+                _candidates.CANDIDATE_BY_KEY[key],
+                panel, trad_mask, position, neutralize, industry, size,
+            )
+            factor_cache[key] = factor[in_is]
+        return factor_cache[key]
 
     dedup_report: _dedup.DedupReport | None = None
-    if cfg.require_dedup and len(selected_keys) >= 2:
+    if cfg.require_dedup:
         emit(
             "dedup",
-            f"入选集值级去重（逐日 Rank 相关，拒 |ρ| ≥ {cfg.dedup_corr_reject:g}）",
+            f"选择期值级去重（逐日 Rank 相关，拒 |ρ| ≥ {cfg.dedup_corr_reject:g}，"
+            f"遭拒递补至 Top-{cfg.top_k} 满）",
         )
-        dedup_report = _dedup.dedup_selected(
-            selected_factors,
-            order=selected_keys,
+        report = _dedup.greedy_select(
+            ranked_keys,
+            provider=_factor_of,
+            top_k=cfg.top_k,
             reject=cfg.dedup_corr_reject,
             warn=cfg.dedup_corr_warn,
             min_names=cfg.min_names_per_day,
+            on_drop=lambda key: factor_cache.pop(key, None),
         )
-        if dedup_report.dropped:
+        if report.dropped:
             emit(
                 "dedup",
-                f"去重挤掉 {len(dedup_report.dropped)} 个入选"
-                "（与已保留因子高相关，不补位）",
+                f"去重跳过 {len(report.dropped)} 个（与已保留因子高相关，"
+                "后续候选递补）",
             )
-        selected_keys = list(dedup_report.kept)
+        selected_keys = list(report.kept)
+        # 一对都没比过（入选 < 2 / K=1）→ 无报告（没去重过就没有报告，不是空报告）
+        dedup_report = report if report.n_pairs > 0 else None
+    else:
+        selected_keys = ranked_keys[: cfg.top_k]
+
+    selected_factors = {key: _factor_of(key) for key in selected_keys}
 
     composite_report = _composite_evidence(
         selected_keys, drafts, panel, trad_mask, position, fwd, in_is, in_oos,
@@ -598,7 +622,7 @@ def run_statistical_mining(
         elif not report.reject_reason:
             final.append(CandidateReport(**{
                 **report.__dict__,
-                "reject_reason": "未入选 Top-K（按 |RankIC| 排序）",
+                "reject_reason": "未入选 Top-K（按选择分排序）",
             }))
         else:
             final.append(report)
@@ -630,14 +654,41 @@ def run_statistical_mining(
     )
 
 
-def _rank_top_k(drafts: list[CandidateReport], cfg: StatisticalConfig) -> list[str]:
-    """过闸候选按 |RankIC| 降序取 Top-K（拒因已在草稿上记好，这里不改状态）。"""
+def _selection_score(
+    best: HorizonStats | None, stability: _stab.ReselectStats | None
+) -> float:
+    """选择分 = |RankIC| × 折间符号一致性（无稳定性证据 → 权重取中性 1）。
+
+    幅度与稳定同权（FactorEngine 的 FS 适应度同思路）：防「整窗 |RankIC| 大、
+    但一半折反向」的候选在纯幅度排序下霸榜。折结构不足 / 未算稳定性
+    （``require_stability=False``）时不加权——没有证据不罚，也不假装稳定。
+    """
+    if best is None:
+        return float("nan")
+    weight = 1.0
+    if (
+        stability is not None
+        and stability.eligible
+        and np.isfinite(stability.sign_consistency)
+    ):
+        weight = float(stability.sign_consistency)
+    return abs(float(best.rank_ic_mean)) * weight
+
+
+def _rank_eligible(drafts: list[CandidateReport]) -> list[str]:
+    """过闸候选按选择分降序排**全序**（拒因已在草稿上记好，这里不改状态）。
+
+    K 截断不在这里做——选择期去重的贪心步行需要 K 外的递补者（去重被拒者
+    不占席）；步行走完自然凑满 K。同分以 |RankIC| 兜底，再平按登记序（稳定排序）。
+    """
     eligible = [
         r for r in drafts
         if r.best_horizon is not None and not r.reject_reason
     ]
-    eligible.sort(key=lambda r: abs(r.rank_ic_mean), reverse=True)
-    return [r.key for r in eligible[: cfg.top_k]]
+    eligible.sort(
+        key=lambda r: (r.selection_score, abs(r.rank_ic_mean)), reverse=True
+    )
+    return [r.key for r in eligible]
 
 
 def _quantile_evidence(

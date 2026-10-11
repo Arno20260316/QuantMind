@@ -1,12 +1,19 @@
 """统计派 · 子窗稳定性与滚动再选择（移植 Tier 3 / T-S3-01/02）。
 
-两个问题、两条纯函数：
+一次折划分，两条证据，一条闸：
 
-1. **滚动再选择**（:func:`reselect_statistics`）——「如果当初在更早的检查点上
-   重排 Top-K，这个因子会被选中吗？」把挖掘窗按**全体候选中证日期的并集**
-   切成 ``folds`` 个等份，检查点 = 第 2..K 折末（展开窗）；每个检查点上用
-   「折 1..j 的合并日均 RankIC」按 |RankIC| 重排 Top-K，记命中率
-   （``reselect_rate``）。率低 = 当前入选靠的是窗尾的偶发强段，不是一路都强。
+1. **子窗稳定性**（:func:`reselect_statistics`）——把挖掘窗按**全体候选中证
+   日期的并集**切成 ``folds`` 个等份，一次算齐两件证据：
+
+   - **折间符号一致性**（``sign_consistency``）：逐折 RankIC 与全窗同号的
+     折占比——**闸取它**（引擎层 ``min_fold_sign_consistency``）：符号翻脸
+     （先正后负 / 先负后正）是窗段过拟合的典型形态，拒之有名；
+   - **滚动再选择命中率**（``reselect_rate``）：检查点 = 第 2..K 折末（展开
+     窗），逐点按「折 1..j 合并日均 RankIC」重排 Top-K 的命中比例。**降为
+     审计量**（2026-10-11 csi300 实跑实证：它是「跨候选抢 K 席」的相对量，
+     19/28 候选命中 0/3 但折间全同号——席位被同簇因子霸榜时一致因子集体
+     误伤，刀锋判决，不当闸）。率低 = 靠的是窗尾偶发强段，证据照记、随
+     报告上屏，人审用。
 
    **诚实边界（写死在明面上）**：重放只重演**排名阶段**——不逐检查点重跑
    BH-FDR 与样本外闸（两者要各自的周期估计，逐点重算是另一个量级的机制）。
@@ -33,21 +40,25 @@ import pandas as pd
 
 #: 默认折数（4 折 ≈ 三个检查点；再多折在 4 年窗上单折样本就开始薄了）
 DEFAULT_FOLDS = 4
-#: 单折最少有效 IC 日（低于此不出率——折太薄上的率是噪声）
+#: 单折最少有效 IC 日（低于此不判稳定性——折太薄上的证据是噪声）
 DEFAULT_MIN_FOLD_DAYS = 10
-#: 默认最低再选择命中率（低于即「滚动再选择不稳定」）
-DEFAULT_RESELECT_MIN_RATE = 0.5
+#: 默认折间符号一致性闸（低于即「折间符号不稳」）
+DEFAULT_MIN_FOLD_SIGN_CONSISTENCY = 0.75
 #: 半衰期对数线性拟合的最少点数（少于 3 点没有拟合自由度）
 MIN_HALF_LIFE_POINTS = 3
 
 
 @dataclass(frozen=True)
 class ReselectStats:
-    """单候选的滚动再选择证据（不可判定时 rate = NaN，note 说明原因）。"""
+    """单候选的子窗证据（不可判定时 rate/consistency = NaN，note 说明原因）。
+
+    ``reselect_rate`` 是审计量（证据照记，不当闸）；闸在引擎层用
+    ``sign_consistency``。
+    """
 
     fold_ics: tuple[float, ...]  # 每折 RankIC 均值（该折无有效日为 NaN）
-    sign_consistency: float  # 与全窗同号的折占比（无有效折 → NaN）
-    reselect_rate: float  # 检查点入选比例（不可判定 → NaN）
+    sign_consistency: float  # 与全窗同号的折占比（无有效折 → NaN）——闸取它
+    reselect_rate: float  # 检查点入选比例（不可判定 → NaN）——审计量，不进闸
     reselect_hits: int
     reselect_checkpoints: int
     eligible: bool  # 折结构足够（每折有效日 ≥ min_fold_days），率可判定

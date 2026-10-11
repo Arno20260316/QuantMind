@@ -29,7 +29,7 @@ TDD：先红后绿。本文件只测纯函数——不碰 DB / 不碰子进程 /
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -127,15 +127,18 @@ def test_default_windows_anchor_to_coverage_end():
     # 5 年跨度：2021-10-09 ~ 2026-10-09；前 4 年挖掘、后 1 年检验
     assert mining.start == date(2021, 10, 9)
     assert mining.end == date(2025, 10, 9)
-    assert valid.start == date(2025, 10, 9)
+    # 检验自挖掘终点**次日**起算：两窗不共享边界日（旧实现 split 日双算，
+    # 那天前向收益在样本内外各被用一次）
+    assert valid.start == date(2025, 10, 10)
     assert valid.end == date(2026, 10, 9)
-    assert valid.start >= mining.end
+    assert valid.start > mining.end
 
 
 def test_default_windows_fall_back_to_today_without_coverage():
     mining, valid = MC.default_windows(None, today=date(2026, 10, 10))
     assert valid.end == date(2026, 10, 10)
     assert mining.start == date(2021, 10, 10)
+    assert valid.start == date(2025, 10, 11), "检验起点 = 挖掘终点次日，不共享边界日"
 
 
 def test_default_windows_clamp_to_coverage_start():
@@ -145,6 +148,12 @@ def test_default_windows_clamp_to_coverage_start():
     assert mining.start == date(2016, 1, 4)
     assert valid.end == date(2018, 6, 30)
     assert mining.end <= valid.end  # 可用跨度不足 4 年时挖掘终点收敛到覆盖末端
+    # split 顶到覆盖末端 → 检验窗退化为单日窗，且这**恰是挖掘窗的最后一天**
+    # （共享末日：没有非重叠检验窗可放，如实保留旧行为；validate_windows 只按
+    # valid.start >= mining.end 放行，documented 于 default_windows docstring）
+    assert mining.end == date(2018, 6, 30)
+    assert valid.start == valid.end == date(2018, 6, 30)
+    MC.validate_windows(mining, valid)
 
 
 # ── 4b. 回测末端保护（qlib 需要 t+1 次日行情） ───────────────────────
@@ -219,7 +228,9 @@ def test_default_windows_anchor_backtest_guard():
         _cov("2016-01-04", "2026-10-09"), data_end=date(2026, 10, 8)
     )
     assert valid.end == date(2026, 10, 8)
-    assert mining.end == valid.start  # 4+1 年切分不受锚点前移影响
+    # 4+1 年切分不受锚点前移影响；检验起点仍是挖掘终点次日
+    assert mining.end == date(2025, 10, 8)
+    assert valid.start == mining.end + timedelta(days=1)
 
 
 # ── 5. qlib 分段 ────────────────────────────────────────────────────

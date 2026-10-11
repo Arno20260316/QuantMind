@@ -25,8 +25,13 @@
   ``identity_scheme`` 可追溯。跨配置的值级查重仍归物化器（离线全库操作）。
 - **不跑硬件锁**：``assert_factor_mining_hardware`` 是 LLM 派的 GPU 约束，
   统计派纯 CPU（pandas + qlib 取数），不占用显卡。
-- **不自动物化/验证**：物化器按 ``--task-id`` 读因子，语义上链路通用；但统计派
-  因子表达式是 qlib 原生式，直接走回测链路即可，先不挂 RD-Agent 的 h5 物化。
+- **不挂 h5 物化，但自动验证已挂**：统计派因子表达式是 qlib 原生式，回测/
+  验证直接走 T-FB 阶段引擎执行，不需要 RD-Agent 的 h5 物化（那是 functional
+  类因子的入口）。落库后自动拉起 T-MV-09 六节验证（``validate_spawn``，
+  与 LLM 派同一份实现；``RD_AGENT_AUTO_VALIDATE=false`` 可关）：未附
+  ``--h5-path``（无 h5），验证器对 expression 类因子在 h5 阶段（衰减/PIT）
+  如实降级标注，T-FB 阶段照常全市场执行。是否拉起写进 ``result.json`` 的
+  ``validation_spawned``——自动链失败不阻断挖掘收尾，需手工补跑时看得见。
 """
 
 from __future__ import annotations
@@ -147,6 +152,7 @@ def _factor_metadata(
         # Tier 3 证据（不可判定 → null，与展示面「缺失一律 —」同口径）
         "fold_ics": list(report.fold_ics),
         "fold_sign_consistency": report.fold_sign_consistency,
+        "selection_score": report.selection_score,
         "reselect_rate": report.reselect_rate,
         "reselect_hits": report.reselect_hits,
         "reselect_checkpoints": report.reselect_checkpoints,
@@ -347,6 +353,48 @@ async def _persist_selected(
     return saved, saved_composite
 
 
+def _spawn_validation_and_write_result(
+    *,
+    task_id: str,
+    market: str,
+    log_dir: Path,
+    persisted_total: int,
+    payload: dict,
+    logger: logging.Logger,
+) -> bool:
+    """落库后自动验证（T-MV-09）+ ``result.json`` 落盘（main 尾部的薄切片）。
+
+    ``payload`` 是 result.json 的其余字段；本函数补 ``validation_spawned`` 并
+    写盘（json_safe 兜底 NaN），返回是否真的拉起验证子进程——单独成函数是为了
+    接线可测（误传 ``persisted``/漏写字段要被测试拦住，而不是靠人看）。
+    """
+    from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+        serialize as ser,
+    )
+    from backend.services.engine.alpha_agent.validate_spawn import (  # noqa: PLC0415
+        spawn_validation,
+    )
+
+    validation_spawned = spawn_validation(
+        task_id=task_id,
+        market=market,
+        log_dir=log_dir,
+        persisted=persisted_total,
+        log=logger,
+    )
+    (log_dir / "result.json").write_text(
+        json.dumps(
+            # json_safe 兜底：dedup/composite 段带 NaN 语义（缺失 = null），
+            # 裸 NaN 会让下游严格 JSON 解析器整份读不出来
+            ser.json_safe({**payload, "validation_spawned": validation_spawned}),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return validation_spawned
+
+
 # ── 主流程 ───────────────────────────────────────────────────────────
 
 
@@ -459,30 +507,30 @@ def main() -> None:
     for report in rejected:
         logger.info("  未入选 %s：%s", report.key, report.reject_reason)
 
-    (log_dir / "result.json").write_text(
-        json.dumps(
-            # json_safe 兜底：dedup/composite 段带 NaN 语义（缺失 = null），
-            # 裸 NaN 会让下游严格 JSON 解析器整份读不出来
-            ser.json_safe({
-                "task_id": args.task_id,
-                "algorithm": "statistical",
-                "market": args.market,
-                # 与审计报告同一口径：引擎真跑的池子（= 任务请求的 universe）
-                "universe": audit.get("universe") or args.universe,
-                "window": audit["window"],
-                "window_kind": window_kind,
-                "total_candidates": len(result.candidates),
-                "selected_factors": len(result.selected),
-                "persisted_factors": persisted,
-                "persisted_composite": persisted_composite,
-                "composite": audit.get("composite"),
-                "dedup": audit.get("dedup"),
-                "elapsed_seconds": elapsed,
-            }),
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    # 落库后自动验证（T-MV-09 六节报告）——后台子进程，不阻塞收尾；无 h5，
+    # 验证器对 expression 类因子在 h5 阶段如实降级（口径唯一实现见 validate_spawn）
+    _spawn_validation_and_write_result(
+        task_id=args.task_id,
+        market=args.market,
+        log_dir=log_dir,
+        persisted_total=persisted + persisted_composite,
+        payload={
+            "task_id": args.task_id,
+            "algorithm": "statistical",
+            "market": args.market,
+            # 与审计报告同一口径：引擎真跑的池子（= 任务请求的 universe）
+            "universe": audit.get("universe") or args.universe,
+            "window": audit["window"],
+            "window_kind": window_kind,
+            "total_candidates": len(result.candidates),
+            "selected_factors": len(result.selected),
+            "persisted_factors": persisted,
+            "persisted_composite": persisted_composite,
+            "composite": audit.get("composite"),
+            "dedup": audit.get("dedup"),
+            "elapsed_seconds": elapsed,
+        },
+        logger=logger,
     )
     logger.info("=" * 60)
     logger.info("统计量价挖掘完成！task_id=%s，用时 %.1fs", args.task_id, elapsed)

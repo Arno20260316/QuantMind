@@ -2,8 +2,10 @@
 
 1. **相关性口径**（``ic_stats.daily_rank_corr``）：逐日截面 Spearman 的时间均值——
    完美同序 → 1、逆序 → −1、无重叠日 → NaN（``(NaN, 0)`` 是「没证据」不是「不相关」）；
-2. **去重判决**：按 order（|RankIC| 降序）贪心，与任何**已保留者**超阈值即拒、
-   warn 带保留、算不出 ρ 的对保留并记 NaN；不补位；max_abs_corr 对称；
+2. **去重判决**（``greedy_select``）：按 order（|RankIC| 降序）贪心，与任何
+   **已保留者**超阈值即拒、warn 带保留、算不出 ρ 的对保留并记 NaN；选择期
+   凑满 ``top_k`` 即停（被拒者不占席，后续候选**递补**；provider 按需取值），
+   ``dedup_selected`` 是其 k=∞ 特例（走完全集、不补位）；max_abs_corr 对称；
 3. **稳定身份**（``stable_factor_id``）：同配置恒同 id（md5，跨进程稳定），
    配置间的任何差异（user/market/universe/key/指纹）都换 id；无指纹退回
    任务级身份并如实标 scheme——空指纹不许当作「配置身份」互相幂等覆盖。
@@ -110,6 +112,120 @@ class TestDailyRankCorr:
         rho, _n = ic.daily_rank_corr(a, _base_with_swaps(3))
 
         assert 0 < rho < 1
+
+
+class TestGreedySelect:
+    def test_backfills_after_drop_until_top_k(self):
+        """Top-K 是席位：b 被 a 挤掉后 c 递补进来，凑满 2 席即停。
+
+        已被拒者不占席；凑满后 d 根本不该被取值（provider 按需 + 调用方
+        懒计算/缓存），也不该在报告里出现。
+        """
+        values = {
+            "a": _factored(np.arange(N_SYMBOLS)),
+            "b": _factored(np.arange(N_SYMBOLS) * 3.0),  # 与 a 秩同序 → ρ=1
+            "c": _noise(23),
+            "d": _noise(77),
+        }
+        calls: list[str] = []
+
+        def _provider(key):
+            calls.append(key)
+            return values[key]
+
+        report = dd.greedy_select(["a", "b", "c", "d"], provider=_provider, top_k=2)
+
+        assert report.kept == ("a", "c")
+        assert report.dropped == (("b", "a", pytest.approx(1.0)),)
+        assert "d" not in calls, "凑满 K 席后不该再取值（d 没轮到）"
+        assert set(calls) <= {"a", "b", "c"}
+
+    def test_on_drop_releases_only_rejected(self):
+        """被拒判决的**当下**回调 on_drop（调用方借此释放缓存值）——保留者不回调。
+
+        缓存峰值由此恒为 O(K+1)：b 被拒即释放，c 递补占席保留。
+        """
+        values = {
+            "a": _factored(np.arange(N_SYMBOLS)),
+            "b": _factored(np.arange(N_SYMBOLS) * 3.0),  # 与 a 秩同序 → ρ=1
+            "c": _noise(23),
+            "d": _noise(77),
+        }
+        released: list[str] = []
+
+        report = dd.greedy_select(
+            ["a", "b", "c", "d"],
+            provider=values.__getitem__,
+            top_k=2,
+            on_drop=released.append,
+        )
+
+        assert report.kept == ("a", "c")
+        assert released == ["b"], "只释放被拒者；保留者与未取值者都不回调"
+
+    def test_on_drop_omitted_is_noop(self):
+        """缺省不传 on_drop：行为与带回调完全一致（回调是可选副作用）。"""
+        values = {
+            "a": _factored(np.arange(N_SYMBOLS)),
+            "b": _factored(np.arange(N_SYMBOLS) * 3.0),
+        }
+        report = dd.greedy_select(["a", "b"], provider=values.__getitem__, top_k=2)
+        assert report.kept == ("a",)
+        assert report.dropped == (("b", "a", pytest.approx(1.0)),)
+
+    def test_uncomputable_rho_kept_as_seat_filler(self):
+        """算不出 ρ 的对按「无证据」保留——不能因换不到证据就空着席位。"""
+        a = _factored(np.arange(N_SYMBOLS))
+        b = a.copy()
+        b.index = b.index.set_levels(
+            b.index.levels[0] + pd.Timedelta(days=365), level=0
+        )
+
+        report = dd.greedy_select(
+            ["a", "b"], provider={"a": a, "b": b}.__getitem__, top_k=2
+        )
+
+        assert report.kept == ("a", "b")
+        assert report.dropped == () and report.warnings == ()
+        assert report.n_pairs == 1
+
+    def test_warn_band_occupies_seat(self):
+        """ρ ∈ [warn, reject) → 保留 + 警语，同样占席（与事后全判一致）。"""
+        a = _factored(np.arange(N_SYMBOLS))
+        values = {"a": a, "b": _noise(5), "c": _noise(6)}
+
+        report = dd.greedy_select(
+            ["a", "b", "c"],
+            provider=values.__getitem__,
+            top_k=2,
+            warn=0.0,
+            reject=1.0,
+        )
+
+        assert report.kept == ("a", "b")
+        assert len(report.warnings) == 1
+        assert "相关偏高" in report.warn_note("a")
+
+    def test_provider_missing_key_raises(self):
+        """provider 缺 key 是调用方 bug，不许静默跳过一对。"""
+        with pytest.raises(KeyError):
+            dd.greedy_select(["a"], provider={}.__getitem__, top_k=1)
+
+    @pytest.mark.parametrize("top_k", [0, -1])
+    def test_top_k_must_be_positive(self, top_k):
+        def _never(_key):  # pragma: no cover — 校验失败应在取值前抛
+            raise AssertionError("provider 不该被调用")
+
+        with pytest.raises(ValueError, match="top_k"):
+            dd.greedy_select([], provider=_never, top_k=top_k)
+
+    def test_bad_thresholds_rejected(self):
+        with pytest.raises(ValueError, match="阈值非法"):
+            dd.greedy_select([], provider={}.__getitem__, top_k=1, warn=0.9, reject=0.8)
+        with pytest.raises(ValueError, match="阈值非法"):
+            dd.greedy_select(
+                [], provider={}.__getitem__, top_k=1, warn=-0.1, reject=0.9
+            )
 
 
 class TestDedupSelected:

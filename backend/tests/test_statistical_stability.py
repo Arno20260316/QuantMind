@@ -107,11 +107,13 @@ class TestFoldBoundaries:
 
 class TestReselectStatistics:
     def test_late_burst_candidate_gets_low_rate(self):
-        """全程稳定者命中 2/3、窗尾爆发者只有 1/3——闸门存在的理由。
+        """全程稳定者命中 2/3、窗尾爆发者只有 1/3——审计量的典型形态。
 
         steady 在前两个检查点稳赢；**末检查点的累计窗口就是整窗**，tail 的
         整窗 |均值|（0.3×20/80 = 0.075）反超 steady（0.05）——「整窗最强」
-        正是这条闸门要拦的形态：它可能是最近一段猛，不是一路都行。
+        但只有末段发力。命中率是审计量（2026-10-11 起不当闸：它是跨候选抢
+        K 席的相对量，实跑会刀锋误伤；闸取折间符号一致性，见 stability.py），
+        命中低照记、随报告上屏供人审。
         """
         steady = _series([0.05] * 80)
         tail = _series([0.0] * 60 + [0.3] * 20)
@@ -123,13 +125,11 @@ class TestReselectStatistics:
         assert stats["steady"].reselect_hits == 2
         assert stats["steady"].reselect_rate == pytest.approx(2 / 3)
         assert stats["steady"].eligible is True
-        assert stats["steady"].reselect_rate >= st.DEFAULT_RESELECT_MIN_RATE
 
         # 检查点 2/3 上 tail 的累计均值为 0（窗尾才发力）→ 只可能在检查点 4 命中
         assert stats["tail"].reselect_hits == 1
         assert stats["tail"].reselect_rate == pytest.approx(1 / 3)
         assert stats["tail"].eligible is True
-        assert stats["tail"].reselect_rate < st.DEFAULT_RESELECT_MIN_RATE
 
     def test_fold_ics_and_sign_consistency(self):
         steady = _series([0.05] * 80)

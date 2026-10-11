@@ -100,6 +100,10 @@ class TestWindowResolution:
         assert validation is not None, "默认路径挖掘+检验双窗齐备"
         start, end = mining.iso()
         assert start < end
+        assert validation.iso()[0] > mining.iso()[1], (
+            "默认双窗不共享边界日：检验窗必须从挖掘窗结束的次日开始（预留 label 缓冲，"
+            "边界日收益不喂进两侧）"
+        )
 
 
 class TestFactorMetadata:
@@ -237,6 +241,7 @@ def _tier3_report(runner):
         oos_verified=True, oos_horizon=1, oos_rank_ic=0.033, oos_n_days=60,
         quantile_monotonicity=0.9, spread_mean=0.004, selected=True,
         fold_ics=(0.05, 0.04, 0.03, 0.05), fold_sign_consistency=1.0,
+        selection_score=0.031,
         reselect_rate=2 / 3, reselect_hits=2, reselect_checkpoints=3,
         ic_half_life=float("nan"), ic_decay_slope=-0.12,
         max_abs_corr=0.31,
@@ -274,6 +279,10 @@ class TestTier3Metadata:
         )
 
         assert meta["fold_ics"] == [0.05, 0.04, 0.03, 0.05]
+        assert meta["selection_score"] == pytest.approx(0.031), (
+            "选择分（|RankIC|×折间符号一致性）是 Top-K 排序与去重步行序的依据，"
+            "必须落库可审计"
+        )
         assert meta["reselect_rate"] == pytest.approx(2 / 3)
         assert meta["reselect_checkpoints"] == 3
         assert meta["ic_decay_slope"] == pytest.approx(-0.12)
@@ -401,3 +410,98 @@ class TestPersistSelectedWiring:
             candidate_key="reversal_5d", task_fingerprint="", task_id="t1",
         )
         assert recorder.saved[0]["factor_id"] == fallback_id
+
+
+class TestSpawnValidationWiring:
+    """收尾薄切片 ``_spawn_validation_and_write_result`` 的接线契约。
+
+    这是 main() 与 T-MV-09 启动链之间唯一可测的缝：spawn 参数（尤其
+    ``persisted`` = 入选+合成总数，误传会导致「明明落了因子却不验证」）与
+    ``result.json`` 里的 ``validation_spawned`` 必须对得上——自动验证没挂上
+    而 result.json 不写，上层看不出需要手工补跑。
+    """
+
+    def _spawn_recorder(self, monkeypatch, *, returns: bool) -> list[dict]:
+        """打桩 ``validate_spawn.spawn_validation``（函数体内是调用时导入，
+        打在源模块上即生效），记账并返回固定值。"""
+        from backend.services.engine.alpha_agent import validate_spawn  # noqa: PLC0415
+
+        calls: list[dict] = []
+
+        def fake_spawn(**kwargs) -> bool:
+            calls.append(kwargs)
+            return returns
+
+        monkeypatch.setattr(validate_spawn, "spawn_validation", fake_spawn)
+        return calls
+
+    def test_arguments_and_result_json(self, runner, monkeypatch, tmp_path):
+        """spawn 拿到原样参数；result.json 补 validation_spawned 且严格 JSON。
+
+        payload 里的 NaN（dedup/composite 段的「算不出」语义）必须落成
+        null——裸 NaN 会让 launcher 侧的严格 JSON 解析整份读不出来。
+        """
+        import json  # noqa: PLC0415
+        import logging  # noqa: PLC0415
+
+        calls = self._spawn_recorder(monkeypatch, returns=True)
+        log = logging.getLogger("test-spawn-wiring")
+        payload = {
+            "task_id": "t1",
+            "algorithm": "statistical",
+            "persisted_factors": 2,
+            "persisted_composite": 1,
+            "window": {"mining_start": "2021-01-01", "mining_end": "2024-12-31"},
+            "dedup": {"kept": ["a", "b"], "max_abs_corr": float("nan")},
+        }
+
+        spawned = runner._spawn_validation_and_write_result(
+            task_id="t1",
+            market="a_share",
+            log_dir=tmp_path,
+            persisted_total=3,
+            payload=payload,
+            logger=log,
+        )
+
+        assert spawned is True
+        (call,) = calls
+        assert call["task_id"] == "t1"
+        assert call["market"] == "a_share"
+        assert call["log_dir"] == tmp_path
+        assert call["persisted"] == 3, "传的是入选+合成总数——少传会让合成因子没人验"
+        assert call["log"] is log
+
+        def _reject_const(const: str):  # pragma: no cover - 有 NaN 即失败
+            raise AssertionError(f"result.json 含非标准 JSON 常量：{const}")
+
+        data = json.loads(
+            (tmp_path / "result.json").read_text(encoding="utf-8"),
+            parse_constant=_reject_const,
+        )
+        assert data["validation_spawned"] is True
+        assert data["persisted_factors"] == 2
+        assert data["persisted_composite"] == 1
+        assert data["window"] == payload["window"]
+        assert data["dedup"]["max_abs_corr"] is None, "NaN → null（「算不出」不是 0）"
+
+    def test_spawn_false_is_written_and_return_wins(self, runner, monkeypatch, tmp_path):
+        """没拉起（关了开关/无对象可验）→ result.json 如实写 false；payload
+        里即使带陈旧的 validation_spawned 也被真实返回值覆盖。"""
+        import json  # noqa: PLC0415
+        import logging  # noqa: PLC0415
+
+        self._spawn_recorder(monkeypatch, returns=False)
+
+        spawned = runner._spawn_validation_and_write_result(
+            task_id="t1",
+            market="a_share",
+            log_dir=tmp_path,
+            persisted_total=0,
+            payload={"task_id": "t1", "validation_spawned": "stale"},
+            logger=logging.getLogger("test-spawn-wiring"),
+        )
+
+        assert spawned is False
+        data = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+        assert data["validation_spawned"] is False

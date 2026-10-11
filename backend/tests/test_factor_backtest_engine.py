@@ -75,6 +75,8 @@ def _install_ok_seams(monkeypatch, df, f_series, *, captured=None):
         if captured is not None:
             captured["instruments"] = instruments
             captured["fields"] = fields
+            captured["load_start"] = start
+            captured["load_end"] = end
         return df
 
     monkeypatch.setattr(E, "_load_features", fake_features)
@@ -150,6 +152,70 @@ async def test_unknown_kind_fails_before_execution(monkeypatch):
     # Assert
     assert res["status"] == "failed"
     assert res["reason"] == "unknown_factor_kind"
+
+
+@pytest.mark.asyncio
+async def test_expression_factor_dispatches_to_expression_subprocess(
+    monkeypatch, tmp_path
+):
+    """统计派 qlib 表达式（SyntaxError + ``$`` 白名单）→ expression 子进程求值。
+
+    绝不落进 Factor 类执行器；provider/region 显式传给子进程（expression 是
+    新解释器，不吃本进程已 init 的全局态），region 按市场档案（美股 → us）；
+    instruments 与主进程解析的池**同一份**原样透传（在子进程重解析会出现
+    「回测的池子与价格面不同」）。
+    """
+    # Arrange
+    prov = _make_fake_provider(tmp_path)
+    monkeypatch.setattr(P, "resolve_qlib_provider_uri", lambda m: prov)
+    # _qlib_provider_and_region 在调用时从 backend.shared.qlib_paths 取函数，
+    # 打桩要落在源模块上（与上面 profiles 缝不同层）
+    monkeypatch.setattr(
+        "backend.shared.qlib_paths.resolve_qlib_provider_uri", lambda m: prov
+    )
+    df, f_series, _ = _fake_panel()
+    captured = {}
+    _install_ok_seams(monkeypatch, df, f_series, captured=captured)
+    monkeypatch.setattr(E, "_resolve_instruments_for_universe", lambda mu, u: "ALL_SEL")
+
+    async def fake_expr(
+        factor_id, expression, provider_uri, region, instruments, start, end
+    ):
+        captured.update(
+            factor_id=factor_id,
+            expression=expression,
+            provider_uri=provider_uri,
+            region=region,
+            instruments=instruments,
+            start=start,
+            end=end,
+        )
+        return f_series
+
+    monkeypatch.setattr(E, "_run_expression_factor_subprocess", fake_expr)
+
+    async def boom_class(*a, **kw):
+        raise AssertionError("表达式不得走 Factor 类执行器")
+
+    monkeypatch.setattr(E, "_run_factor_class_subprocess", boom_class)
+    factor = {"factor_id": "f-expr-1", "factor_code": "Ref($close,5)/$close-1"}
+    # Act
+    res = await E.evaluate_factor_market(factor, market="us_stock")
+    # Assert
+    assert res["status"] == "ok"
+    assert res["kind"] == "expression"
+    assert captured["expression"] == "Ref($close,5)/$close-1"
+    assert captured["provider_uri"] == prov
+    assert captured["region"] == "us"
+    assert captured["instruments"] == "ALL_SEL"
+    # 子进程窗口必须与主进程行情装载的**同一份**——expr 是新解释器，拿的是
+    # 显式透传的窗；两窗劈叉 = 因子面与评分数据面错位（IC 还算得出来，但算的
+    # 不是同一个区间）。只断言非空挡不住这类错位，必须逐字对齐。
+    assert (captured["start"], captured["end"]) == (
+        captured["load_start"],
+        captured["load_end"],
+    )
+    assert captured["start"] and captured["end"]
 
 
 @pytest.mark.asyncio

@@ -5,8 +5,10 @@
 1. **值级相关性去重**（:func:`greedy_select` / :func:`dedup_selected`）——
    候选两两「逐日截面 Spearman 的时间均值」（``ic_stats.daily_rank_corr``，
    与 IC 同族口径）。沿选择分序贪心：与任何**已保留**者 |ρ| ≥ ``reject``
-   （0.9，与 ``rd_mined_materialize`` 的值级去重同阈值）→ 拒；``[warn,
-   reject)`` → 保留但记警。两条语义（2026-10-11 起）：
+   （0.9）→ 拒；``[warn, reject)`` → 保留但记警。此 0.9/0.8 是**批内**阈值
+   （候选池是固定目录，去重防同批席位重复），与库级值级闸
+   （``rd_mined_materialize`` 0.5 拒 / 0.4 警，T-FM-03 2026-10-11 起）
+   **刻意分开**——批内和库级不是一回事。两条语义（2026-10-11 起）：
 
    - **选择期**（:func:`greedy_select`，引擎主路径）：Top-K 是**席位**——
      被拒者不占席，后续候选继续**递补**，凑满 K 即停。``provider`` 按需
@@ -43,7 +45,8 @@ import pandas as pd
 
 from . import ic_stats as _ic
 
-#: 值级去重阈值（与 ``rd_mined_materialize`` 的 0.9 拒 / 0.8 警同口径）
+#: 值级去重阈值——**批内**口径（0.9 拒 / 0.8 警）；与库级闸
+#: （``rd_mined_materialize`` 0.5 拒 / 0.4 警，T-FM-03）刻意分开，不要对齐
 DEFAULT_CORR_REJECT = 0.9
 DEFAULT_CORR_WARN = 0.8
 

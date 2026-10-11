@@ -7,6 +7,11 @@
 - 落库行形状（``fm:`` 前缀 factor_code、formulation=FM 原式、metadata
   **不得有 formulation 键**、可翻译因子带 ``qlib_expression``）；
 - dry-run 不触库、``--apply`` 才写，且 save/update 的参数与统计派同款；
+- 结构原创闸接线（T-FM-06 落点 #7）：批内 AST 克隆拒（``rejected`` 出参
+  记录）且不落行；对已注册 ``fm:`` 语料（代码内 LIBRARY，排除自身 key）
+  的判决进 ``metadata["structure_screen"]``（只标注不裁决——对库克隆的
+  历史导入走值级闸豁免，拒只发生在同一批内）；FM 原式解析失败带 fid
+  上下文响亮抛错；
 - 真报告文件在本机时补一组整报告计数钉子（110/102/20、31/79）。
 """
 
@@ -23,6 +28,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from backend.services.engine.alpha_agent.factorminer import (  # noqa: E402
+    structure as structure_mod,
+)
+from backend.services.engine.alpha_agent.factorminer.dsl import (  # noqa: E402
+    parse as fm_parse,
+)
+from backend.services.engine.alpha_agent.factorminer.library import (  # noqa: E402
+    LIBRARY,
+)
 
 IMPORTER_PATH = ROOT / "scripts" / "alpha_agent" / "import_paper_factors.py"
 
@@ -256,6 +271,90 @@ class TestApply:
         assert persistence is sentinel
 
 
+class TestStructureScreen:
+    """T-FM-06 落点 #7：FM 原式过结构原创闸——批内 clone 拒 + 对已注册
+    ``fm:`` 语料（代码内 LIBRARY，排除自身）判决标注进 metadata。"""
+
+    def test_batch_clone_rejected_and_recorded(self, imp):
+        report = _mini_report()
+        report["paper"]["factors"].append(
+            _factor("004", "Mean($close, 5)", fdr=True, selected=False)
+        )
+        rejected: list[dict] = []
+
+        rows = imp.build_rows(
+            report, tier="all", report_path=REPORT_PATH, rejected=rejected
+        )
+
+        assert [r["key"] for r in rows] == ["fm001", "fm002", "fm003"]
+        assert rejected == [
+            {"key": "fm004", "fid": "004", "reason": "clone", "clone_of": "fm001"}
+        ]
+
+    def test_clone_of_library_factor_annotated_but_not_rejected(self, imp):
+        """对库克隆只标注不拒——一次性历史导入走值级闸豁免（细案 §3.3）。"""
+        first = LIBRARY[0]
+        report = _mini_report()
+        report["paper"]["factors"].append(
+            _factor("900", first.expression, fdr=True, selected=False)
+        )
+
+        rows = {
+            r["key"]: r
+            for r in imp.build_rows(report, tier="all", report_path=REPORT_PATH)
+        }
+        screen = rows["fm900"]["metadata"]["structure_screen"]
+
+        assert screen["verdict"] == "clone"
+        assert screen["best_match"] == f"fm{first.fid}"
+        assert screen["trigram_cosine"] == pytest.approx(1.0)
+        assert screen["near_threshold"] == structure_mod.DEFAULT_NEAR_THRESHOLD
+
+    def test_self_entry_excluded_from_corpus(self, imp):
+        """自身 key 在语料里必须排除：若未排除，「自己与自己」必判 clone。"""
+        lib_factor = LIBRARY[41]
+        report = _mini_report()
+        report["paper"]["factors"].append(
+            _factor(lib_factor.fid, lib_factor.expression, fdr=True, selected=False)
+        )
+
+        rows = {
+            r["key"]: r
+            for r in imp.build_rows(report, tier="all", report_path=REPORT_PATH)
+        }
+        screen = rows[f"fm{lib_factor.fid}"]["metadata"]["structure_screen"]
+
+        # T-FM-06 结构审计：110 内部 clone=0 对——排除自身后绝不可能是 clone
+        assert screen["verdict"] != "clone"
+        assert screen["best_match"] != f"fm{lib_factor.fid}"
+
+    def test_annotation_matches_screen_api(self, imp):
+        factor = _mini_report()["paper"]["factors"][0]
+        assert factor["key"] == "fm001"
+        row = next(r for r in _rows(imp, "all") if r["key"] == "fm001")
+
+        ast = fm_parse(factor["expression"])
+        corpus = {f"fm{f.fid}": f.ast for f in LIBRARY if f"fm{f.fid}" != "fm001"}
+        expected = structure_mod.screen(ast, corpus)
+        best = expected.best
+
+        assert row["metadata"]["structure_screen"] == {
+            "verdict": expected.verdict,
+            "best_match": best.key if best else None,
+            "trigram_cosine": best.similarity.trigram_cosine if best else None,
+            "n_matches": len(expected.matches),
+            "near_threshold": structure_mod.DEFAULT_NEAR_THRESHOLD,
+        }
+
+    def test_malformed_expression_raises_with_factor_context(self, imp):
+        report = _mini_report()
+        report["paper"]["factors"].append(
+            _factor("004", "Bogus($close", fdr=True, selected=False)
+        )
+        with pytest.raises(ValueError, match="fm004"):
+            imp.build_rows(report, tier="all", report_path=REPORT_PATH)
+
+
 class TestDefaultReportResolution:
     """默认报告路径解析：宿主候选 → 容器候选（/data）存在性择一。
 
@@ -309,3 +408,9 @@ class TestRealReport:
             r["metadata"]["fdr_pass"] == bool(r["metadata"]["fdr_horizons"])
             for r in rows
         )
+
+        # 结构原创闸：全库 110 条全部标注；T-FM-06 审计（5995 对内 clone=0）
+        # ⇒ 排除自身后任何一条都不可能判 clone
+        verdicts = {r["metadata"]["structure_screen"]["verdict"] for r in rows}
+        assert verdicts <= {"clone", "literal_variant", "near", "novel"}
+        assert "clone" not in verdicts

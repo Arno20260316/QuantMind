@@ -5,7 +5,8 @@
 （``backend/scripts/rd_mined_materialize.py``）在入库闸上调用；闸门本体见
 ``mining_plugins/gates/builtin.py`` 的 ``incremental_ic_ir_floor``。
 
-与既有值级查重（|ρ|≥0.9 硬拒）是**两个机制**：查重管「近乎重复」，增量闸
+与既有值级查重（逐日 rank |ρ| 超过硬拒阈值即拒；阈值见物化器
+``rd_mined_materialize`` 常量）是**两个机制**：查重管「近乎重复」，增量闸
 管「有冗余基时，残差还剩多少独立信息」。口径要点：
 
 - **对照集 = basis**：与库列的 |日均 Spearman ρ| ≥ ``DEFAULT_BASIS_ABS_CORR``
@@ -108,7 +109,9 @@ def mean_rho_by_column(
     """新因子与每个对照列的**有符号**日均 Spearman ρ。
 
     实现 = 逐日截面 rank 后按日求皮尔逊相关、再对日取均值（抓「逐日排序
-    相同的换皮因子」）；要求每天至少 ``min_pairs`` 对、至少
+    相同的换皮因子」）；**成对相关按逐列对交集域（pairwise-complete）
+    计算**——对照列的缺失行不参与该列的协方差与两侧方差，覆盖域窄的列
+    绝不被系统性缩水。要求每天至少 ``min_pairs`` 对、至少
     ``min_sample_days`` 个有效日，否则该列为 NaN。索引须为
     ``(trade_date, symbol)`` 两层。``exclude`` 列（该因子自己的旧列，
     或替换受理时被顶替的列）不参与。
@@ -138,14 +141,27 @@ def mean_rho_by_column(
     other = ranks.drop(columns="__new__")
     if other.shape[1] == 0:
         return empty
-    new_rank_c = new_rank - new_rank.groupby(level=0).transform("mean")
-    other_c = other - other.groupby(level=0).transform("mean")
+    # 逐列按「与 __new__ 的对交集」域算原始和（pairwise-complete）：协方差
+    # 与两侧方差必须同域。曾有实现让 new 方差取「任一对照列非空」的宽域
+    # （pair_ok.any(axis=1)）——对照列覆盖域窄于 values 时（如 l1 只覆盖
+    # 部分标的、帧是全票并集）分母被抬高，ρ 系统性缩水
+    # sqrt(k_pair/k_wide)（实测 0.773），真重复列会静默漏过硬拒闸。
     pair_ok = other.notna()
-    cov = other_c.mul(new_rank_c, axis=0).where(pair_ok).groupby(level=0).sum()
-    var_other = (other_c**2).where(pair_ok).groupby(level=0).sum()
-    var_new = (new_rank_c.where(pair_ok.any(axis=1)) ** 2).groupby(level=0).sum()
+    # values 已全帧非 NaN（上方过滤），other 的 NaN 即 pair 缺失；masked 为 0
+    # 处恰是 pair 缺失（rank≥1，非零），平方后 0² 仍 0，可复用算 Σn²。
+    masked_new = pair_ok.mul(new_rank, axis=0)
+    sum_n = masked_new.groupby(level=0).sum()
+    masked_new **= 2
+    sum_nn = masked_new.groupby(level=0).sum()
+    del masked_new
+    sum_o = other.groupby(level=0).sum()
+    sum_oo = (other * other).groupby(level=0).sum()
+    sum_no = other.mul(new_rank, axis=0).groupby(level=0).sum()
     n_pairs = pair_ok.groupby(level=0).sum()
-    denom = var_other.mul(var_new, axis=0) ** 0.5
+    cov = n_pairs * sum_no - sum_n * sum_o
+    var_new = n_pairs * sum_nn - sum_n * sum_n
+    var_other = n_pairs * sum_oo - sum_o * sum_o
+    denom = (var_new * var_other) ** 0.5
     rho_day = cov / denom.where(denom > 0)
     rho_day = rho_day.where(n_pairs >= min_pairs)
     rho_mean = rho_day.mean()

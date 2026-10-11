@@ -118,6 +118,12 @@ class TestRenderStageBlock:
         assert "最后一轮" in render_stage_block(total_loops=3, current_loop=3)
         assert "最后一轮" not in render_stage_block(total_loops=8, current_loop=5)
 
+    def test_s4_自查线与库级硬拒线同源(self):
+        """S4 的自查目标必须指向真闸（0.5 拒 / 0.4 告警），不得停留在 0.9 时代。"""
+        text = render_stage_block(total_loops=16, current_loop=13)
+        assert "S4" in text
+        assert "|ρ|<0.4" in text and "|ρ|≥0.5" in text
+
     def test_total_below_current_is_clamped_up(self):
         text = render_stage_block(total_loops=2, current_loop=7)
         assert "第 7/7 轮" in text
@@ -139,8 +145,8 @@ class TestEvalCriteriaBlock:
             assert token in text
         # 成本口径：0.2% 双边（factor_research.analysis.COST_RATE 单一出处）
         assert "0.2%" in text and "双边" in text
-        # 硬规则：|ρ|≥0.9 值级查重硬拒
-        assert "0.9" in text
+        # 硬规则：|ρ|≥0.5 值级查重硬拒 / 0.4 告警（T-FM-03 阈值；不再是 0.9）
+        assert "|ρ|≥0.5" in text and "0.4" in text
         # 多头口径与评估器一致：截面 rank 前 30%
         assert "30%" in text
 

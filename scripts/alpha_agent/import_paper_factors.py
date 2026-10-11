@@ -13,6 +13,17 @@
   可携带翻译，审计/移植用；CsRank 类为 null 并附 ``qlib_export_gap``）；
   **刻意不写 ``formulation`` 键**——admin 管线 ``_extract_qlib_expression``
   会把它当 qlib 表达式直喂求值器，FM 原式不是 qlib 语法；
+- **结构原创闸接线**（T-FM-06 落点 #7）：每条 FM 原式先过 ``dsl.parse``
+  （报告损坏即响亮抛错，带 fid 上下文）——**批内 AST 逐位相同的克隆**
+  拒（后到者跳过，记录到 ``build_rows(rejected=...)``），对已注册
+  ``fm:`` 语料（代码内 LIBRARY，排除候选自身 key）的结构判决标注进
+  ``metadata["structure_screen"]``（只标注不裁决——对库内既有因子的克隆
+  属一次性历史导入，走值级闸豁免，见 T-FM-03 细案 §3.3）；
+- **整单拒契约（刻意的 all-or-nothing）**：任一表达式解析失败
+  （``_parse_expression`` 抛错）⇒ ``build_rows`` 整体中止、一行不落。
+  报告是冻结的验证产物（110 条命名集合），解析错误只可能是报告损坏——
+  静默跳过坏行会把「半份导入」伪装成成功；坏整单、响亮报错、重跑幂等，
+  才是这份一次性历史导入的正确语义（T-FM-03 评审 MEDIUM-2 的取舍记录）；
 - 默认 **dry-run**（打印逐条身份/翻译状态），``--apply`` 才真写。
 
 用法（宿主或容器；容器里 qlib 数据路径固定 /data）：
@@ -36,9 +47,17 @@ if str(ROOT) not in sys.path:
 
 from backend.services.engine.alpha_agent.factorminer import (  # noqa: E402
     qlib_export,
+    structure,
 )
 from backend.services.engine.alpha_agent.factorminer.dsl import (  # noqa: E402
     FM_CODE_PREFIX,
+    Node,
+)
+from backend.services.engine.alpha_agent.factorminer.dsl import (  # noqa: E402
+    parse as fm_parse,
+)
+from backend.services.engine.alpha_agent.factorminer.library import (  # noqa: E402
+    LIBRARY,
 )
 from backend.services.engine.alpha_agent.statistical import dedup as dedup_mod  # noqa: E402
 from backend.services.engine.alpha_agent.statistical.serialize import (  # noqa: E402
@@ -85,6 +104,32 @@ def select_factors(report: dict, tier: str) -> list[dict]:
     raise ValueError(f"未知 tier：{tier}（可选 {TIERS}）")
 
 
+def _parse_expression(key: str, expression: str) -> Node:
+    """FM 原式 → AST；非法形态带 fid 上下文响亮抛（报告损坏不静默）。"""
+    try:
+        return fm_parse(expression)
+    except ValueError as exc:
+        raise ValueError(f"因子 {key} 表达式非法：{exc}") from exc
+
+
+def _structure_screen(ast: Node, *, key: str) -> dict:
+    """候选对已注册 ``fm:`` 语料（代码内 LIBRARY）的结构判决（只读标注）。
+
+    排除候选自身 key——否则任何因子对自己必判 clone。语料 key 用
+    ``fm{fid}``，与报告/因子池的 key 形态一致，``best_match`` 可直接回查。
+    """
+    corpus = {f"fm{f.fid}": f.ast for f in LIBRARY if f"fm{f.fid}" != key}
+    result = structure.screen(ast, corpus)
+    best = result.best
+    return {
+        "verdict": result.verdict,
+        "best_match": best.key if best else None,
+        "trigram_cosine": best.similarity.trigram_cosine if best else None,
+        "n_matches": len(result.matches),
+        "near_threshold": structure.DEFAULT_NEAR_THRESHOLD,
+    }
+
+
 def _build_metadata(
     factor: dict,
     report: dict,
@@ -94,6 +139,7 @@ def _build_metadata(
     report_path: Path,
     market: str,
     universe: str,
+    structure_screen: dict,
 ) -> dict:
     horizons = {
         str(h["horizon"]): {k: v for k, v in h.items() if k != "horizon"}
@@ -142,6 +188,7 @@ def _build_metadata(
         "max_abs_corr_vs_house": factor.get("max_abs_corr_vs_house"),
         "closest_house": factor.get("closest_house"),
         "reject_reason": factor.get("reject_reason"),
+        "structure_screen": structure_screen,
         "window": report.get("window"),
         "returns_convention": report.get("returns_convention"),
         "neutralize_mode": report.get("neutralize"),
@@ -160,12 +207,33 @@ def build_rows(
     user_id: str = DEFAULT_USER_ID,
     market: str = "a_share",
     universe: str = "csi300",
+    rejected: list[dict] | None = None,
 ) -> list[dict]:
-    """报告 + tier → 待落库行（纯函数：不触库，dry-run 与 --apply 共用）。"""
+    """报告 + tier → 待落库行（纯函数：不触库，dry-run 与 --apply 共用）。
+
+    结构原创闸（T-FM-06 落点 #7）：**批内** AST 逐位相同的克隆拒——同一
+    报告出现同式因子必是资产事故，后到者跳过（传入 ``rejected`` 列表时
+    追加记录）。对已注册语料的判决只进 metadata 不裁决。
+    """
     rows: list[dict] = []
+    accepted: list[tuple[str, Node]] = []
     for factor in select_factors(report, tier):
         key = factor["key"]
         fm_expr = factor["expression"]
+        ast = _parse_expression(key, fm_expr)
+        clone_of = next((k for k, a in accepted if structure.ast_equal(ast, a)), None)
+        if clone_of is not None:
+            if rejected is not None:
+                rejected.append(
+                    {
+                        "key": key,
+                        "fid": factor["fid"],
+                        "reason": structure.VERDICT_CLONE,
+                        "clone_of": clone_of,
+                    }
+                )
+            continue
+        accepted.append((key, ast))
         factor_id, scheme = dedup_mod.stable_factor_id(
             user_id=user_id,
             market=market,
@@ -182,6 +250,7 @@ def build_rows(
             report_path=report_path,
             market=market,
             universe=universe,
+            structure_screen=_structure_screen(ast, key=key),
         )
         horizons = meta["horizons"]
         h1 = horizons.get("1") or next(iter(horizons.values()), {})
@@ -271,6 +340,7 @@ def main(argv=None) -> int:
 
     report_path = Path(args.report)
     report = load_report(report_path)
+    rejected: list[dict] = []
     rows = build_rows(
         report,
         tier=args.tier,
@@ -278,6 +348,7 @@ def main(argv=None) -> int:
         user_id=args.user_id,
         market=args.market,
         universe=args.universe,
+        rejected=rejected,
     )
     n_qlib = sum(1 for r in rows if r["qlib_expression"])
     for row in rows:
@@ -286,9 +357,12 @@ def main(argv=None) -> int:
             f"{row['key']:>6}  id={row['factor_id'][:12]}  {state:>7}  "
             f"rank_ic={_fmt_ic(row['rank_ic'])}  {row['factor_name']}"
         )
+    for rec in rejected:
+        print(f"{rec['key']:>6}  拒：与 {rec['clone_of']} AST 逐位相同（批内克隆）")
+    clone_note = f"批内克隆拒 {len(rejected)} 条；" if rejected else ""
     print(
-        f"共 {len(rows)} 条（tier={args.tier}；可翻译 qlib {n_qlib} / FM-only "
-        f"{len(rows) - n_qlib}）；"
+        f"共 {len(rows)} 条（tier={args.tier}；{clone_note}可翻译 qlib {n_qlib} / "
+        f"FM-only {len(rows) - n_qlib}）；"
         + ("--apply 已给，开始写库" if args.apply else "dry-run（--apply 才写库）")
     )
     if not args.apply:

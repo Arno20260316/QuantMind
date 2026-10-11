@@ -227,6 +227,22 @@ def test_rho_series_is_signed_and_shares_max_abs_corr_backend():
     assert _rho_series(base, controls, sample_days={"1999-01-01"}).dropna().empty
 
 
+@pytest.mark.unit
+def test_corr_thresholds_pinned_to_tfm03_calibration():
+    """T-FM-03 值级审计（2026-10-11）校准：拒 0.5 / 警 0.4。
+
+    审计依据：0.9 闸时代 0.5–0.9 灰区全放行（within-rd ≥0.5 计 436 对；
+    rd↔l1 ≥0.9 计 37 对——主要是闸 var 域错配缩水的逃逸物，见
+    ``incremental.py`` 注释）；0.5 回溯模拟 119 个已物化 rd 列 91 个
+    多命中（76.5%）。阈值只管**未来准入**，历史列冻结不追删；单命中走
+    T-FM-02 替换裁决（唯一泄压阀），多命中即拒。
+    """
+    from backend.scripts.rd_mined_materialize import _CORR_REJECT, _CORR_WARN
+
+    assert _CORR_REJECT == 0.5
+    assert _CORR_WARN == 0.4
+
+
 # ── 替换判据（T-FM-02）──────────────────────────────────────────────
 
 
@@ -1392,7 +1408,7 @@ class TestMainLoopReplacementAndIncremental:
             }
         )
         if retired and rho_map is None:
-            rho_values["c_dead"] = 0.5
+            rho_values["c_dead"] = 0.35  # < 警戒线 0.4：退役列非命中（不搅动命中数）
 
         def fake_rho(values_, controls_, *, sample_days=None, exclude=None):
             calls["rho_exclude"] = exclude
@@ -1493,6 +1509,38 @@ class TestMainLoopReplacementAndIncremental:
         assert extra["incremental_ic_days"] == 30
 
     @pytest.mark.asyncio
+    async def test_gray_zone_single_hit_engages_replacement(
+        self, monkeypatch, tmp_path
+    ):
+        """0.5–0.9 灰区（旧 0.9 闸的全放行带）单命中：新阈值下必须进替换裁决。"""
+        mod, args, _calls = self._env(
+            monkeypatch, tmp_path, rho_map={"c_old": 0.55, "c_other": 0.05}
+        )
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        assert manifest["fid_new"]["status"] == "materialized"
+        assert manifest["fid_new"]["replacement"]["hits"] == ["c_old"]
+        assert manifest["fid_old"]["status"] == "superseded"
+
+    @pytest.mark.asyncio
+    async def test_gray_zone_multi_hit_rejects(self, monkeypatch, tmp_path):
+        """灰区多命中（替换不受理 not_single_hit）→ 拒入。
+
+        旧 0.9 闸下这两对（0.55/0.52）都被静默放行——0.5 闸的首日行为差异。"""
+        mod, args, _calls = self._env(
+            monkeypatch, tmp_path, rho_map={"c_old": 0.55, "c_other": 0.52}
+        )
+        rc = await mod._run(args)
+        assert rc == 0
+
+        manifest = _load_manifest(tmp_path)
+        assert manifest["fid_new"]["status"] == "rejected_duplicate"
+        assert manifest["fid_new"]["replacement"]["decision"] == "not_single_hit"
+        assert manifest["fid_old"]["status"] == "materialized", "多命中不顶替任何列"
+
+    @pytest.mark.asyncio
     async def test_replacement_rejected_records_audit_and_keeps_incumbent(
         self, monkeypatch, tmp_path
     ):
@@ -1562,7 +1610,7 @@ class TestMainLoopReplacementAndIncremental:
             monkeypatch,
             tmp_path,
             retired=True,
-            rho_map={"c_old": 0.2, "c_dead": 0.5},
+            rho_map={"c_old": 0.2, "c_dead": 0.45},  # 均 < 0.5 拒入线：非替换路径
         )
         rc = await mod._run(args)
         assert rc == 0

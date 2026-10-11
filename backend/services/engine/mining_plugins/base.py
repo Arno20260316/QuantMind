@@ -73,8 +73,8 @@ class GateDescriptor:
     """单个门禁的展示与策略契约。
 
     default_mode：soft 失败只记录（用户裁决的默认）；hard 失败即拒
-    （materializer 走 ``rejected_gate``）。既有 |ρ|≥0.9 值级查重**不**在本
-    插件集里，它保持原实现原语义（硬拒）。
+    （materializer 走 ``rejected_gate``）。既有 |ρ|≥0.5 值级查重**不**在本
+    插件集里，它保持原实现原语义（硬拒；T-FM-03 2026-10-11 起拒线 0.9→0.5）。
     """
 
     key: str

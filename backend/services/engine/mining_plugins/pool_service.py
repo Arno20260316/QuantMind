@@ -65,8 +65,9 @@ _ENV_INJECT_K = "QM_FACTOR_POOL_INJECT_K"
 _ENV_INJECT_DISABLED = "QM_FACTOR_POOL_INJECT_DISABLED"
 DEFAULT_INJECT_K = 5
 
-#: |ρ|≥0.8 连 correlated_with 边（与物化器 _CORR_WARN 同值口径）
-CORR_EDGE_THRESHOLD = 0.8
+#: |ρ|≥0.5 连 correlated_with 边——对齐值级查重硬拒线（``rd_mined_materialize._CORR_REJECT``，
+#: T-FM-03 2026-10-11）；0.4–0.5 告警带不入图，避免边密度在灰区暴涨
+CORR_EDGE_THRESHOLD = 0.5
 
 _INJECT_FILENAME = "pool_context.md"
 

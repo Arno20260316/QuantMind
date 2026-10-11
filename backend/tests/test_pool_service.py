@@ -162,6 +162,12 @@ async def _cleanup(factor_ids: list[str], users: list[str]) -> None:
 
 
 class TestEnvKnobs:
+    def test_corr_edge_threshold_aligns_with_library_reject_line(self):
+        # T-FM-03（2026-10-11）：库级值级查重拒线 0.9→0.5，池图 correlated_with
+        # 边阈值必须同源对齐——否则 0.5–0.8 的近重复因子在关系图/注入摘要里
+        # 「看不见」（评审 MEDIUM-1）。此钉防回漂。
+        assert pool_service.CORR_EDGE_THRESHOLD == 0.5
+
     def test_injection_enabled_default_on(self, monkeypatch):
         monkeypatch.delenv("QM_FACTOR_POOL_INJECT_DISABLED", raising=False)
         assert pool_service.injection_enabled() is True

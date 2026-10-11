@@ -7,7 +7,8 @@
 2. 在子进程里执行因子代码（输入 = RD-Agent 同款 ``daily_pv.h5``：
    QuantDB parquet 生成、qfq + ``$factor`` + 富化列），产出全历史因子值；
 3. 值级查重：逐日截面秩相关（日均 |ρ|）对照 CUSTOM ``l1_factors`` +
-   ``rd_mined`` 既有列，≥ 阈值（默认 0.9）判为重复因子拒入；
+   ``rd_mined`` 既有列，≥ 阈值（默认 0.5 拒 / 0.4 警，T-FM-03 2026-10-11 收紧）
+   判为重复因子拒入；
 4. 物化门禁（P1）：PFS／RRE／池内 IC 分位／年化换手／扣费年化五项，默认
    全软（只告警并落 manifest + ``metadata.materialization.gates``）；
    yaml/env 升级为 hard 后失败即拒（status=``rejected_gate``，--force 重做）；
@@ -86,8 +87,12 @@ DEFAULT_MARKET = "a_share"
 
 _SAMPLE_DAYS = 60
 _RECENT_WINDOW_DAYS = 120
-_CORR_WARN = 0.8
-_CORR_REJECT = 0.9
+# T-FM-03 值级审计（2026-10-11）校准：拒 0.5 / 警 0.4。0.9 闸时代
+# 0.5–0.9 灰区全放行（within-rd ≥0.5 计 436 对）；增量闸修复为
+# pairwise-complete 口径后，阈值测的是真 ρ。阈值只管**未来准入**，
+# 历史列冻结不追删；单命中走 T-FM-02 替换裁决（唯一泄压阀），多命中即拒。
+_CORR_WARN = 0.4
+_CORR_REJECT = 0.5
 _MIN_PAIRS_PER_DAY = 20
 _MIN_SAMPLE_DAYS = 5
 _EXEC_TIMEOUT_S = 900

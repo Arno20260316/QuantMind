@@ -105,6 +105,72 @@ def test_mean_rho_by_column_signs_and_exclude():
     assert inc.mean_rho_by_column(values, controls, sample_days={"1999-01-01"}).empty
 
 
+@pytest.mark.unit
+def test_sparse_control_rho_not_deflated_by_coverage():
+    """对照列覆盖域窄于 values 时，ρ 必须按「逐列对交集」域算——不得缩水。
+
+    实测史（T-FM-03，2026-10-11）：``rd_cci_20 vs TDXGS_CCI_20`` 真 ρ=0.9985，
+    旧实现报 0.7632（缩水比 = sqrt(k_pair/k_wide) = sqrt(3255/5511)≈0.773）。
+    根因 = 协方差取逐列 pair 域、new 方差却取「任一对照列非空」的宽域——
+    l1 对照列只覆盖部分标的（帧是全票并集）时全体 l1 列被系统性缩水，
+    真重复列在 0.9 闸下静默漏过。克隆列（真 ρ=1）是该缺陷的钢性判据。
+    """
+    days = [f"2026-01-{i:02d}" for i in range(1, 7)]
+    syms = [f"SH60{i:04d}" for i in range(60)]
+    idx = pd.MultiIndex.from_product([days, syms], names=["trade_date", "symbol"])
+    rng = np.random.default_rng(7)
+    values = pd.Series(rng.normal(size=len(idx)), index=idx)
+    # 稀疏列 = values 在「每日下半区 30 只」上的克隆：values 在这 30 行上的
+    # 全局秩恰为 1..30，与稀疏列自身的局部秩逐位相同 → 真 ρ=1。若改取任意
+    # 30 只，全局秩带缺口，Pearson-on-rank 本身 <1，克隆判据就不钢性了。
+    keep = values.groupby(level=0).rank() <= 30
+    sparse = values.where(keep)
+    controls = pd.DataFrame({"dense": values * 3.0 + 1.0, "sparse": sparse}, index=idx)
+
+    rho = inc.mean_rho_by_column(values, controls)
+
+    assert rho["dense"] == pytest.approx(1.0, abs=1e-9)
+    assert rho["sparse"] == pytest.approx(1.0, abs=1e-9)  # 旧实现≈sqrt(30/60)=0.707
+
+
+@pytest.mark.unit
+def test_matches_pandas_pairwise_corr_on_ragged_panel():
+    """金样：逐日 rank → pandas 逐日成对 corr（pairwise-complete）→ 对日均值。
+
+    覆盖「全票列 / 半票列 / 带洞相关列」参差面板——该口径与物化器值级查重
+    及审计脚本（T-FM-03 audit_library_corr）必须同源。
+    """
+    days = [f"2026-01-{i:02d}" for i in range(1, 9)]
+    syms = [f"SH60{i:04d}" for i in range(50)]
+    idx = pd.MultiIndex.from_product([days, syms], names=["trade_date", "symbol"])
+    rng = np.random.default_rng(11)
+    values = pd.Series(rng.normal(size=len(idx)), index=idx)
+    full = pd.Series(rng.normal(size=len(idx)), index=idx)
+    half = rng.normal(size=len(idx))
+    half_vals = pd.Series(half, index=idx)
+    half_vals[~idx.get_level_values(1).isin(syms[::2])] = np.nan  # 隔一留一
+    ragged = values + pd.Series(rng.normal(0, 0.5, len(idx)), index=idx)
+    ragged[rng.random(len(idx)) < 0.3] = np.nan  # 30% 随机空洞
+    controls = pd.DataFrame(
+        {"full": full, "half": half_vals, "ragged": ragged}, index=idx
+    )
+
+    rho = inc.mean_rho_by_column(values, controls)
+
+    frame = pd.concat([values.rename("__new__"), controls], axis=1)
+    for col in controls.columns:
+        per_day = []
+        for _day, day_df in frame.groupby(level=0):
+            day_ranks = day_df.rank()
+            per_day.append(day_ranks["__new__"].corr(day_ranks[col], min_periods=20))
+        valid = pd.Series(per_day).dropna()
+        expected = valid.mean() if len(valid) >= 5 else float("nan")
+        if np.isnan(expected):
+            assert np.isnan(rho[col])
+        else:
+            assert rho[col] == pytest.approx(expected, abs=1e-9)
+
+
 # ── 残差 IC_IR 主口径 ──────────────────────────────────────────────────
 
 

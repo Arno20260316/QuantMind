@@ -64,6 +64,9 @@ from backend.services.engine.alpha_agent.factorminer import (  # noqa: E402
 from backend.services.engine.alpha_agent.factorminer import (  # noqa: E402
     dsl as fm_dsl,
 )
+from backend.services.engine.alpha_agent.factorminer import (  # noqa: E402
+    runtime as fm_runtime,
+)
 from backend.services.engine.alpha_agent.statistical import (  # noqa: E402
     candidates as house,
 )
@@ -96,8 +99,6 @@ HOUSE_DEDUP_WARN = dedup_mod.DEFAULT_CORR_WARN
 MIN_FOLD_SIGN_CONSISTENCY = stability.DEFAULT_MIN_FOLD_SIGN_CONSISTENCY
 #: 仓库侧滚动再选择 Top-K（引擎 StatisticalConfig.top_k 默认 5）
 HOUSE_RESELECT_TOP_K = 5
-#: vwap 合理性覆盖率下限（低于即单位口径有问题，直接退出）
-VWAP_COVERAGE_FLOOR = 0.99
 
 _FM_PREFIX = "fm"
 
@@ -122,18 +123,9 @@ def _data_end() -> date | None:
 # ── 数据装载 ─────────────────────────────────────────────────────────
 
 
-def _normalize_single(raw: pd.DataFrame, field: str) -> pd.Series:
-    """单列 qlib 取数 → 标准长序列（index=(trade_date, symbol)）。
-
-    与 ``panel.normalize_panel`` 同一套 index 约定（raw 的 index 是
-    ``(instrument, datetime)``，reset 后前两列即 symbol/trade_date）。
-    """
-    frame = raw[[field]].rename(columns={field: "value"}).reset_index()
-    keys = list(frame.columns[:2])
-    frame = frame.rename(columns={keys[0]: "symbol", keys[1]: "trade_date"})
-    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
-    frame["symbol"] = frame["symbol"].astype(str)
-    return frame.set_index(["trade_date", "symbol"])["value"].astype(float).sort_index()
+# 取数/组帧原语已收敛到 factorminer.runtime（生产链路同一实现）；保留私有
+# 别名，既有调用无感。
+_normalize_single = fm_runtime.normalize_single
 
 
 def load_bundle(
@@ -172,57 +164,15 @@ def load_bundle(
 def build_features(
     price_full: pd.DataFrame, factor_long: pd.Series
 ) -> tuple[dict[str, pd.DataFrame], dict]:
-    """长面板 → FM-DSL 的 8 个字段宽面 + vwap 口径判定记录。"""
+    """长面板 → FM-DSL 的 8 个字段宽面 + vwap 口径判定记录。
 
-    def wide(long_series: pd.Series) -> pd.DataFrame:
-        return long_series.unstack(level="symbol").sort_index(axis=0).sort_index(axis=1)
-
-    close = wide(price_full["close"])
-    volume = wide(price_full["volume"])
-    amount = wide(price_full["amount"])
-    factor = wide(factor_long).reindex(columns=close.columns)
-    vm = (amount * 1e4 / volume.where(volume > 0)).replace([np.inf, -np.inf], np.nan)
-    high, low = wide(price_full["high"]), wide(price_full["low"])
-
-    def coverage(vwap: pd.DataFrame) -> float:
-        valid = vwap.notna() & low.notna() & high.notna()
-        inside = valid & (vwap >= low - 1e-6) & (vwap <= high + 1e-6)
-        return float(inside.to_numpy().sum() / max(1, valid.to_numpy().sum()))
-
-    cov_factor = coverage(vm * factor)
-    cov_raw = coverage(vm)
-    use_factor = cov_factor >= cov_raw
-    vwap = vm * factor if use_factor else vm
-    info = {
-        "vwap_convention": "amount/volume×$factor" if use_factor else "amount/volume",
-        "vwap_coverage": cov_factor if use_factor else cov_raw,
-        "vwap_coverage_with_factor": cov_factor,
-        "vwap_coverage_without_factor": cov_raw,
-    }
-    if info["vwap_coverage"] < VWAP_COVERAGE_FLOOR:
-        raise SystemExit(
-            f"$vwap 合理性覆盖率过低（×factor={cov_factor:.4f}，"
-            f"不带 factor={cov_raw:.4f}，下限 {VWAP_COVERAGE_FLOOR}）——"
-            "单位口径有问题（volume 股 / amount 万元），vwap 类因子会整体"
-            "失真，先修数据口径再跑。"
-        )
-    # $returns 与仓库候选同式（candidates.py `_ret = close/close.shift(1) - 1`）：
-    # 在长面板上逐标的算再展开成宽面——停牌缺口复牌首日=整段收益，且不产生
-    # 合成 0 收益（早前先在宽面上 ffill().pct_change() 会把停牌格填 0，注入
-    # 波动/偏度窗口）。价差法同时绕开 pandas 2/3 的 pct_change fill_method 漂移。
-    close_long = price_full["close"]
-    returns_long = close_long / close_long.groupby(level="symbol").shift(1) - 1.0
-    frames = {
-        "$open": wide(price_full["open"]),
-        "$high": high,
-        "$low": low,
-        "$close": close,
-        "$volume": volume,
-        "$amt": amount,
-        "$vwap": vwap,
-        "$returns": wide(returns_long),
-    }
-    return frames, info
+    实现已收敛到 ``factorminer.runtime.build_field_frames``（实验与生产
+    同一实现）；CLI 语义保持：口径不合格 → SystemExit，不带病出数。
+    """
+    try:
+        return fm_runtime.build_field_frames(price_full, factor_long)
+    except fm_runtime.VwapConventionError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 # ── 因子求值（全部对齐到 base_index 的共享索引） ──────────────────────

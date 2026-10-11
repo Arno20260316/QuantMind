@@ -297,9 +297,9 @@ def test_detect_factor_kind_routes_statistical_catalog_expressions():
     from backend.services.engine.alpha_agent.statistical import candidates as cand
 
     for candidate in cand.CANDIDATES:
-        assert (
-            aa._detect_factor_kind(candidate.expression) == "expression"
-        ), f"{candidate.key} 的表达式未被识别为 expression：{candidate.expression}"
+        assert aa._detect_factor_kind(candidate.expression) == "expression", (
+            f"{candidate.key} 的表达式未被识别为 expression：{candidate.expression}"
+        )
 
 
 @pytest.mark.unit
@@ -327,12 +327,70 @@ def test_looks_like_qlib_expression_accepts(text):
         "drop tables",  # 无 $ 字段引用：是坏 Python，不是表达式
         "Ref($close,5)\n/$close-1",  # 多行 = 代码不是表达式
         "Ref($close,5); import os",  # 分号：语句分隔符不进白名单
-        "__import__(\"os\").system(\"id\")",  # 引号/括号外字符一律不认
+        '__import__("os").system("id")',  # 引号/括号外字符一律不认
         "Ref($close,5) # $comment",  # 注释
     ],
 )
 def test_looks_like_qlib_expression_rejects(text):
     assert not aa._looks_like_qlib_expression(text)
+
+
+# ── expression kind（FM-DSL dialect：FactorMiner 论文落库形态） ────────
+
+
+@pytest.mark.unit
+def test_detect_factor_kind_routes_factorminer_catalog_expressions():
+    """论文库 **110 条**每条 ``fm:`` 前缀形态都必须识别成 expression。
+
+    与统计派目录同一纪律：检测器不靠举例，直接拿真实库钉契约——`fm:` 的
+    ``:`` 使文本必然不是 Python（SyntaxError 分支），前缀 + 白名单解析
+    双判据通过才路由到 FM 求值器；识别不了 = 论文因子落库后点「回测」
+    先撞「语法错误」。
+    """
+    from backend.services.engine.alpha_agent.factorminer import LIBRARY
+    from backend.services.engine.alpha_agent.factorminer.dsl import FM_CODE_PREFIX
+
+    for factor in LIBRARY:
+        code = FM_CODE_PREFIX + factor.expression
+        assert aa._detect_factor_kind(code) == "expression", (
+            f"fm{factor.fid} 的落库形态未被识别为 expression：{code}"
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fm:Neg($close)",
+        "fm:Neg(Div(CsRank($returns), Add(Std($amt, 12), 0.000001)))",
+    ],
+)
+def test_looks_like_fm_expression_accepts(text):
+    assert aa._looks_like_fm_expression(text)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fm:",  # 空表达式
+        "fm:Neg($close",  # 括号不闭合
+        "fm:Bad($close)",  # 白名单外算子：解析器拒 → 不路由
+        "fm:Neg($close) extra",  # 尾随记号
+        "fm:__import__('os')",  # 注入形态：解析器直接拒
+        "fm:Mean(($high-$low)/$close, 20)",  # infix：FM-DSL 是纯函数式，解析器拒
+        "Neg($close)",  # 无前缀：FM 判据不管裸表达式
+    ],
+)
+def test_looks_like_fm_expression_rejects(text):
+    assert not aa._looks_like_fm_expression(text)
+
+
+@pytest.mark.unit
+def test_detect_factor_kind_fm_garbage_still_raises():
+    """前缀对但解析不过：不许路由，维持「报语法错误」的原行为。"""
+    with pytest.raises(RuntimeError, match="语法错误"):
+        aa._detect_factor_kind("fm:Bad($close)")
 
 
 # ── worker ───────────────────────────────────────────────────────────

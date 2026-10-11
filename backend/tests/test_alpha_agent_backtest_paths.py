@@ -567,7 +567,9 @@ def test_expression_subprocess_evaluates_like_pandas_on_qlib_data() -> None:
     wide = D.features(
         instruments, ["$close"], start_time="2023-11-01", end_time=end, freq="day"
     )
-    expected = (wide["$close"].groupby(level=0).shift(5) / wide["$close"] - 1).rename("e")
+    expected = (wide["$close"].groupby(level=0).shift(5) / wide["$close"] - 1).rename(
+        "e"
+    )
     expected = aa._canonicalize_multiindex(expected).dropna()  # noqa: SLF001
 
     joined = pd.DataFrame({"got": s, "exp": expected}).dropna()
@@ -579,3 +581,98 @@ def test_expression_subprocess_evaluates_like_pandas_on_qlib_data() -> None:
         atol=1e-7,
         err_msg="表达式求值与宽窗 pandas 口径不等价——回测与挖掘会两说",
     )
+
+
+def test_expression_subprocess_fm_dialect_matches_pandas() -> None:
+    """``fm:`` 方言走 FM 求值器子进程：合成字段 + 滚动暖机在真数据上与宽窗
+    pandas 口径逐点一致（论文 110 因子的生产求值入口）。
+
+    ``Mean($returns, 5)`` 同时压三件事：``fm:`` 前缀路由（_detect_factor_kind
+    → 子进程 FM 脚本）、``$returns`` 长面板价差法合成、以及运行时「窗口前
+    预取暖机 + position 掩码」后与 qlib 自动扩史等价的满窗语义。
+    """
+    if not Path(_QLIB_DIR).is_dir():
+        pytest.skip(f"qlib 数据目录不存在: {_QLIB_DIR}（QM_TEST_QLIB_DIR 可覆盖）")
+
+    import qlib
+    from qlib.data import D
+
+    qlib.init(provider_uri=_QLIB_DIR, region="cn")
+
+    expression = "fm:Mean($returns, 5)"
+    instruments = ["sh600000", "sz000001"]
+    start, end = "2024-01-02", "2024-03-29"
+
+    s = asyncio.run(
+        aa._run_expression_factor_subprocess(  # noqa: SLF001
+            "t_fm_expr_eval_00", expression, _QLIB_DIR, "cn", instruments, start, end
+        )
+    )
+
+    assert s is not None and len(s) > 0
+    assert s.index.names == ["datetime", "instrument"]
+    assert set(s.index.get_level_values("instrument")) <= set(instruments)
+
+    # 宽窗（起点提前 40 个交易日）现算 pandas 口径
+    wide = D.features(
+        instruments,
+        ["$close"],
+        start_time="2023-11-01",
+        end_time=end,
+        freq="day",
+    )
+    close = wide["$close"].unstack(level=0)  # datetime × instrument
+    returns = close / close.shift(1) - 1.0
+    expected = returns.rolling(5, min_periods=1).mean().stack()
+    expected.index = expected.index.set_names(["datetime", "instrument"])
+    expected = aa._canonicalize_multiindex(expected).dropna()  # noqa: SLF001
+
+    joined = pd.DataFrame({"got": s, "exp": expected}).dropna()
+    assert len(joined) > 100, f"对比点太少：{len(joined)}"
+    np.testing.assert_allclose(
+        joined["got"].to_numpy(dtype="float64"),
+        joined["exp"].to_numpy(dtype="float64"),
+        rtol=1e-4,
+        atol=1e-7,
+        err_msg="FM 方言求值与宽窗 pandas 口径不等价——论文因子回测与挖掘会两说",
+    )
+
+
+def test_fm_runtime_resolves_qlib_instruments_config_dict() -> None:
+    """CN 原生池给的股票池是 qlib **配置字典**（``D.instruments(market=…)``
+    形态）时，FM 运行时必须自己解析成真列表。
+
+    ``_resolve_instruments_for_universe`` 对 ``_QLIB_NATIVE_UNIVERSES`` 返回
+    配置字典，FM 分支原样透传进子进程；老实现 ``[str(i) for i in instruments]``
+    拿到的是 ``"market"``/``"filter_pipe"`` 两个键名——整池静默取空，再被
+    vwap 覆盖率拦下（2026-10-11 代码评审实锤的 HIGH）。
+    """
+    if not Path(_QLIB_DIR).is_dir():
+        pytest.skip(f"qlib 数据目录不存在: {_QLIB_DIR}（QM_TEST_QLIB_DIR 可覆盖）")
+
+    import qlib
+    from qlib.data import D
+
+    from backend.services.engine.alpha_agent.factorminer import (
+        runtime as fm_runtime,
+    )
+
+    qlib.init(provider_uri=_QLIB_DIR, region="cn")
+
+    cfg = D.instruments(market="csi300")
+    assert isinstance(cfg, dict), (
+        "本仓 D.instruments 返回配置字典是测试前置事实；若上游改了形态需重估"
+    )
+
+    s = fm_runtime.evaluate_window(
+        "fm:Neg($close)",
+        instruments=cfg,
+        start="2024-06-03",
+        end="2024-06-14",
+        qlib_dir=_QLIB_DIR,
+    )
+
+    real = set(D.list_instruments(cfg, as_list=True))
+    assert len(s) > 0, "配置字典股票池整池取空——runtime 没有解析 D.instruments 配置"
+    assert s.notna().any()
+    assert set(s.index.get_level_values("symbol")) <= real

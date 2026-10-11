@@ -48,6 +48,12 @@ class Call:
 
 Node = Num | Feature | Call
 
+#: 落库前缀：因子池 factor_code 里 FM-DSL 表达式的形态（如 ``fm:Neg($close)``）。
+#: 与统计派的裸 qlib 表达式区分路由（``routers/alpha_agent._detect_factor_kind``
+#: 双判据之一）；两类都进 "expression" kind，但求值器不同——FM 走
+#: ``factorminer.runtime`` 的自有白名单求值器，qlib 走 qlib 原生。
+FM_CODE_PREFIX = "fm:"
+
 FEATURES: frozenset[str] = frozenset(
     {"$open", "$high", "$low", "$close", "$volume", "$amt", "$vwap", "$returns"}
 )

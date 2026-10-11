@@ -2675,7 +2675,9 @@ async def mining_config_options(
     if is_minute:
         coverage = scope.coverage if scope else None
         guard = scope.data_end if scope else None
-        default_mining, default_validation = (scope.usable, None) if scope else (None, None)
+        default_mining, default_validation = (
+            (scope.usable, None) if scope else (None, None)
+        )
     else:
         coverage = _quantdb_coverage()
         guard = _backtest_guard(coverage)
@@ -3460,6 +3462,28 @@ def _looks_like_qlib_expression(factor_code: str) -> bool:
     return bool(_QLIB_EXPRESSION_CHARS.fullmatch(factor_code))
 
 
+def _looks_like_fm_expression(factor_code: str) -> bool:
+    """FM-DSL 因子（论文 110 因子落库形态 ``fm:…``）的保守路由判据。
+
+    双判据：``fm:`` 前缀 + 白名单解析器（``factorminer.dsl.parse``，禁 eval）
+    能完整解析——解析器本身就是安全边界，解析不过的文本不路由，维持
+    「坏代码报语法错误」的原行为。判真也只管路由，求不动的因子按回测失败
+    落库，与 qlib 表达式路径同一纪律。
+    """
+    from backend.services.engine.alpha_agent.factorminer.dsl import (  # noqa: PLC0415
+        FM_CODE_PREFIX,
+        parse as fm_parse,
+    )
+
+    if not factor_code.startswith(FM_CODE_PREFIX):
+        return False
+    try:
+        fm_parse(factor_code[len(FM_CODE_PREFIX) :])
+    except ValueError:
+        return False
+    return True
+
+
 def _detect_factor_kind(factor_code: str) -> str:
     """AST 预检：判断 Qlib Factor 类 / RD-Agent 函数式 / qlib 表达式。
 
@@ -3482,6 +3506,12 @@ def _detect_factor_kind(factor_code: str) -> str:
     try:
         tree = ast.parse(factor_code)
     except SyntaxError as e:
+        # FM-DSL 因子（`fm:` 前缀，论文 110 因子落库形态）：FM 原文必含
+        # `$字段`，按 Python 解析必 SyntaxError（`:` 本身不保证非法——
+        # `fm:Mean` 是合法注解语法；真防线是前缀 + 白名单解析双判据）；
+        # 求值走 factorminer 自有求值器（见 _run_expression_factor_subprocess）。
+        if _looks_like_fm_expression(factor_code):
+            return "expression"
         # 统计派因子是 qlib 表达式：只有通过文件头的字符白名单才路由到
         # expression，其余 SyntaxError 文本维持原行为（报错，不送进求值路径）。
         if _looks_like_qlib_expression(factor_code):
@@ -4688,8 +4718,19 @@ async def _run_expression_factor_subprocess(
 
     ``instruments`` 原样透传主进程解析出的股票池（list 或 qlib config dict），
     两边取数口径必须一致——在子进程里重解析会出现「回测的池子与价格面不同」。
+
+    **两类 dialect**（按 ``fm:`` 前缀分派，求值器不同、隔离纪律相同）：
+
+    - 裸 qlib 表达式（统计派）：qlib 原生求值（上面一段）；
+    - ``fm:`` FM-DSL 表达式（FactorMiner 论文落库形态）：qlib 表达式引擎
+      没有截面算子（CsRank 类占 74/110），走 ``factorminer.runtime`` 的
+      白名单求值器；取数/暖机/全网格语义与挖掘链路同一实现。
     """
     import uuid
+
+    from backend.services.engine.alpha_agent.factorminer.dsl import (  # noqa: PLC0415
+        FM_CODE_PREFIX,
+    )
 
     run_id = uuid.uuid4().hex[:8]
     out_path = f"/tmp/_expr_result_{run_id}.h5"
@@ -4697,7 +4738,35 @@ async def _run_expression_factor_subprocess(
     Path(tb_path).unlink(missing_ok=True)
     Path(out_path).unlink(missing_ok=True)
 
-    script = f"""
+    if expression.startswith(FM_CODE_PREFIX):
+        # FM-DSL：子进程里把仓库根塞进 sys.path（容器 /app == 宿主仓库根，
+        # parents[4] 两边同解）；因子文本只进白名单解析器，不进 eval。
+        repo_root = str(Path(__file__).resolve().parents[4])
+        script = f"""
+import sys, traceback
+sys.path.insert(0, {repo_root!r})
+try:
+    from backend.services.engine.alpha_agent.factorminer.runtime import evaluate_window
+
+    _series = evaluate_window(
+        {expression!r},
+        instruments={instruments!r},
+        start={start!r},
+        end={end!r},
+        qlib_dir={provider_uri!r},
+    )
+    if _series is None or _series.empty:
+        print("EMPTY_EXPRESSION_RESULT"); sys.exit(1)
+    _series.to_frame("value").to_hdf({out_path!r}, key="data", mode="w")
+    print("FACTOR_DONE")
+except Exception as _e:
+    with open({tb_path!r}, "w") as _f:
+        traceback.print_exc(file=_f)
+    print(f"ERROR: {{_e}}")
+    sys.exit(1)
+"""
+    else:
+        script = f"""
 import sys, traceback
 try:
     import qlib

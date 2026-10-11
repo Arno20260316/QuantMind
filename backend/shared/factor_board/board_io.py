@@ -106,7 +106,7 @@ def factor_payload(sel: pd.DataFrame, horizon: pd.DataFrame) -> list[dict]:
 
 
 def horizon_payload(horizon: pd.DataFrame, sel: pd.DataFrame) -> dict:
-    """全局 + 分族持有期 |IC|。"""
+    """全局 + 分族持有期方向对齐 IC（见 composite.horizon_table 口径）。"""
     if horizon is None or horizon.empty:
         return {"global": {}, "by_group": {}}
     glob = {str(h): _clean(horizon[h].mean(skipna=True)) for h in C.HORIZON_DAYS}

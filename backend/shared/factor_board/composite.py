@@ -145,11 +145,17 @@ def horizon_table(
     start_idx: int,
     fwd_by_h: dict[int, dict[str, pd.Series]],
 ) -> pd.DataFrame:
-    """入选因子 × 持有期（1/2/5/10/20 日）的近窗 |IC| 均值。"""
+    """入选因子 × 持有期（1/2/5/10/20 日）的近窗**方向对齐** IC 均值。
+
+    对齐口径与合成一致：``sgn × RankIC``。原始符号由入选表「方向」列显式
+    携带，画像回答「按入选方向使用，该持有期的 IC 有多强」；对齐后单值仍可为
+    负（该持有期跨日翻转占优），是有效信息不是缺陷。
+    """
     acc: dict[tuple[str, str], dict[int, list[float]]] = {
         (r["lib"], r["name"]): {h: [] for h in C.HORIZON_DAYS}
         for _, r in selected.iterrows()
     }
+    sgn_map = {(r["lib"], r["name"]): int(r["sgn"]) for _, r in selected.iterrows()}
     by_lib = selected.groupby("lib")["name"].apply(list).to_dict()
     for i in range(start_idx, len(dates)):
         dt = dates[i]
@@ -170,7 +176,8 @@ def horizon_table(
                         continue
                     m = v.notna() & fr.notna()
                     if int(m.sum()) >= C.MIN_STOCK_SAMPLE:
-                        acc[(lib, n)][h].append(float(v[m].rank().corr(fr[m])))
+                        ic = float(v[m].rank().corr(fr[m]))
+                        acc[(lib, n)][h].append(sgn_map[(lib, n)] * ic)
     rows = {}
     for key, hz in acc.items():
         rows[key] = {

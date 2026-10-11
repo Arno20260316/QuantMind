@@ -1,6 +1,8 @@
 """Unit and integration tests for QuantDB Market Analysis feed."""
 
+import pandas as pd
 import pytest
+
 from backend.services.api.market_analysis import quantdb_feed
 
 
@@ -75,15 +77,6 @@ def test_quantdb_stock_money_flow():
     assert "large" in first
 
 
-def test_quantdb_money_flow_sankey():
-    """验证资金流动桑基图节点与连接关系"""
-    sankey = quantdb_feed.get_money_flow_sankey()
-    assert isinstance(sankey, dict)
-    assert "nodes" in sankey
-    assert "links" in sankey
-    assert len(sankey["nodes"]) > 0
-    assert len(sankey["links"]) > 0
-
 
 def test_quantdb_tag_lookup():
     """验证标签查成分股以及个股查归属标签"""
@@ -96,6 +89,56 @@ def test_quantdb_tag_lookup():
     stock_tags = quantdb_feed.get_tags_by_stock(symbol="SH600036")
     assert isinstance(stock_tags, dict)
     assert len(stock_tags) > 0
+
+
+def test_match_sectors_pure_ranking_and_literal_match():
+    """板块名候选（纯函数）：子串匹配、精确>前缀>子串、组内成分数降序；正则元字符按字面量。"""
+    members = pd.DataFrame(
+        [
+            {"sector_name": "航空机场", "sector_type": "行业板块(二级)", "symbol": f"SH6000{i:02d}"}
+            for i in range(13)
+        ]
+        + [
+            {"sector_name": "低空经济", "sector_type": "概念板块", "symbol": f"SZ0000{i:02d}"}
+            for i in range(32)
+        ]
+        + [
+            {"sector_name": "航空", "sector_type": "概念板块", "symbol": f"SZ1000{i:02d}"}
+            for i in range(5)
+        ]
+        + [
+            {"sector_name": "低空经济(试点)", "sector_type": "地区板块", "symbol": "SH999999"},
+        ]
+    )
+    # 精确 > 前缀（「航空」自身排第一，「航空机场」紧随）
+    rows = quantdb_feed.match_sectors(members, "航空")
+    assert [r["name"] for r in rows] == ["航空", "航空机场"]
+    assert rows[1]["count"] == 13 and rows[1]["sector_type"] == "行业板块(二级)"
+
+    # 同 rank 内按成分数降序；count 为行数
+    rows = quantdb_feed.match_sectors(members, "低空")
+    assert [r["name"] for r in rows] == ["低空经济", "低空经济(试点)"]
+    assert rows[0]["count"] == 32 and rows[0]["sector_type"] == "概念板块"
+
+    # 正则元字符按字面量（"(试点)" 不会被当分组）
+    rows = quantdb_feed.match_sectors(members, "经济(")
+    assert [r["name"] for r in rows] == ["低空经济(试点)"]
+
+    # 空白 / 无匹配 / limit 截断
+    assert quantdb_feed.match_sectors(members, "  ") == []
+    assert quantdb_feed.match_sectors(members, "不存在") == []
+    assert len(quantdb_feed.match_sectors(members, "低", limit=1)) == 1
+    assert quantdb_feed.match_sectors(pd.DataFrame(), "航空") == []
+
+
+def test_get_tag_matches_real_members():
+    """真实成分表：输入「航空」应命中「航空机场」（行业二级）——搜索框候选金样。"""
+    rows = quantdb_feed.get_tag_matches(q="航空", limit=20)
+    assert isinstance(rows, list) and rows
+    assert "航空机场" in [r["name"] for r in rows]
+    for r in rows:
+        assert set(r) == {"name", "sector_type", "count"}
+        assert isinstance(r["count"], int) and r["count"] > 0
 
 
 def test_quantdb_money_flow_period():

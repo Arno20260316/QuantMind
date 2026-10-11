@@ -467,26 +467,6 @@ async def get_stock_money_flow_full(
     return await asyncio.to_thread(quantdb_feed.get_stock_money_flow_full)
 
 
-@router.get("/money-flow/sankey")
-async def get_money_flow_sankey(
-    date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
-    current_user: dict = Depends(get_current_user),
-) -> dict:
-    """获取主力资金流向桑基图数据 (Nodes & Links)（优先快照）"""
-    _ = current_user
-    if not realtime:
-        data = _snap.sankey(date)
-        if data:
-            return data
-    if date:
-        return {"nodes": [], "links": []}
-    data = quantdb_feed.get_money_flow_sankey()
-    if data:
-        return data
-    return {"nodes": [], "links": []}
-
-
 @router.get("/money-flow/panorama")
 async def get_money_flow_panorama(
     period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
@@ -625,6 +605,25 @@ async def get_tags_by_stock(
     return {"symbol": symbol, "tags": {}}
 
 
+@router.get("/tags/matches")
+async def match_sectors_by_name(
+    q: str = Query(
+        ..., min_length=1, max_length=32, description="板块名关键词，如：航空 / 华为"
+    ),
+    limit: int = Query(default=30, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """板块名候选解析（统一搜索框用）。
+
+    只扫成分表、不算任何行情/资金流——逐击键调用也毫秒级返回。匹配为子串、
+    大小写不敏感；排序精确 > 前缀 > 子串、组内按成分数降序。**不筛板块类型**：
+    地区/风格等非资金流体系板块也如实返回（消费方按类型决定是否可联动）。
+    """
+    _ = current_user
+    matches = quantdb_feed.get_tag_matches(q=q, limit=limit)
+    return {"q": q, "matches": matches}
+
+
 def _snap_normalize_symbol(symbol: str) -> str:
     """把用户输入归一为快照标签库使用的 Prefix（SH600036）。"""
     s = symbol.strip().upper()
@@ -736,7 +735,6 @@ def _persist_stream_snapshot(
     breadth: Any,
     heatmap_shenwan: Any,
     heatmap_concept: Any,
-    sankey: Any,
     stock_flow: Any,
     stock_flow_full: Any,
     money_flow_periods: dict[str, Any],
@@ -770,13 +768,14 @@ def _persist_stream_snapshot(
             heatmap["concept"] = heatmap_concept
 
         doc: dict[str, Any] = dict(base)
+        # 旧版快照携带 sankey 块（已退役，消费方为零）：重写时顺带剔除，防止存量字段长留
+        doc.pop("sankey", None)
         doc.update({
             "trade_date": trade_date,
             "generated_at": generated_at,
             "indices": indices or [],
             "breadth": breadth or {},
             "heatmap": heatmap,
-            "sankey": sankey or {},
             "stock_flow": stock_flow or [],
             "stock_flow_full": stock_flow_full or base.get("stock_flow_full") or [],
             "money_flow_periods": money_flow_periods or base.get("money_flow_periods") or {},
@@ -881,7 +880,7 @@ async def trigger_market_analysis_stream(
     """手动触发市场分析（SSE 流式）。
 
     清空缓存后按步骤顺序执行，每算完一部分立即推送该部分数据：
-    indices -> breadth -> heatmap -> sankey -> stock_flow -> done。
+    indices -> breadth -> heatmap -> stock_flow -> done。
     前端边收边渲染，无需等全部分析完成。
     客户端断连时立即停止后续步骤（当前线程跑完后自然结束，不浪费资源）。
 
@@ -912,11 +911,6 @@ async def trigger_market_analysis_stream(
 
             heatmap = await _run_step("heatmap", quantdb_feed.get_sector_heatmap, "shenwan")
             yield _sse("heatmap", {"heatmap": heatmap})
-            if await request.is_disconnected():
-                return
-
-            sankey = await _run_step("sankey", quantdb_feed.get_money_flow_sankey)
-            yield _sse("sankey", {"sankey": sankey})
             if await request.is_disconnected():
                 return
 
@@ -960,7 +954,6 @@ async def trigger_market_analysis_stream(
                     breadth=breadth,
                     heatmap_shenwan=heatmap,
                     heatmap_concept=heatmap_concept,
-                    sankey=sankey,
                     stock_flow=stock_flow,
                     stock_flow_full=stock_flow_full,
                     money_flow_periods=money_flow_periods,

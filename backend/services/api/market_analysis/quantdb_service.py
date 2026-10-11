@@ -558,60 +558,6 @@ def stock_money_flow(limit: int = 20) -> list[dict[str, Any]]:
     return out
 
 
-def money_flow_sankey() -> dict[str, Any]:
-    """主力/散户资金流向桑基图（l2 真实行业资金流，单位：元）。"""
-    latest = _l2_latest_dt()
-    if not latest:
-        return {"nodes": [], "links": [], "trade_date": ""}
-    day = _load_l2_flow(latest)
-    if day.empty:
-        return {"nodes": [], "links": [], "trade_date": ""}
-    members = _sector_industry_members()
-    if members.empty:
-        return {"nodes": [], "links": [], "trade_date": latest}
-    merged = day.merge(members, left_on="symbol", right_on="Symbol", how="inner")
-    agg = merged.groupby("SectorName").agg(
-        super=("flow_super_net", "sum"),
-        large=("flow_large_net", "sum"),
-        medium=("flow_medium_net", "sum"),
-        small=("flow_small_net", "sum"),
-    ).fillna(0)
-
-    # 主力（超大+大单）净流入行业；散户（中+小单）净流入行业
-    main_sectors = agg[agg["super"] + agg["large"] > 0].sort_values("super", ascending=False).head(6)
-    retail_sectors = agg[agg["medium"] + agg["small"] > 0].sort_values("medium", ascending=False).head(4)
-
-    nodes = [
-        {"name": "主力资金 (Net Buy)"},
-        {"name": "散户资金 (Retail)"},
-        {"name": "超大单 (Super Large)"},
-        {"name": "大单 (Large)"},
-        {"name": "中单 (Medium)"},
-        {"name": "小单 (Small)"},
-    ]
-    links = [
-        {"source": "主力资金 (Net Buy)", "target": "超大单 (Super Large)",
-         "value": int(float(agg["super"].sum()))},
-        {"source": "主力资金 (Net Buy)", "target": "大单 (Large)",
-         "value": int(float(agg["large"].sum()))},
-        {"source": "散户资金 (Retail)", "target": "中单 (Medium)",
-         "value": int(float(agg["medium"].sum()))},
-        {"source": "散户资金 (Retail)", "target": "小单 (Small)",
-         "value": int(float(agg["small"].sum()))},
-    ]
-
-    for name, row in main_sectors.iterrows():
-        target = "超大单 (Super Large)" if row["super"] >= row["large"] else "大单 (Large)"
-        nodes.append({"name": name})
-        links.append({"source": target, "target": name, "value": int(abs(float(max(row["super"], row["large"]))))})
-    for name, row in retail_sectors.iterrows():
-        target = "中单 (Medium)" if abs(row["medium"]) >= abs(row["small"]) else "小单 (Small)"
-        nodes.append({"name": name})
-        links.append({"source": target, "target": name, "value": int(abs(float(max(row["medium"], row["small"]))))})
-
-    return {"nodes": nodes, "links": links, "trade_date": latest}
-
-
 # ---------------------------------------------------------------------------
 # 标签双向查询
 # ---------------------------------------------------------------------------

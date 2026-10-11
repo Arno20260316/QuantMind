@@ -25,7 +25,7 @@ import {
 import { DateBadge, EmptyHint, NumText, PeriodChips, RankRow, SectionCard, fmtInt } from '../../market-analysis-shared/ui';
 import { signalPositionLabel } from '../../shared/signalVocabulary';
 import type { VerdictMeta } from '../factorBoardVocabulary';
-import { decayMeta, regimeNoteMeta, verdictMeta } from '../factorBoardVocabulary';
+import { decayMeta, quadChipCls, regimeNoteMeta, verdictMeta } from '../factorBoardVocabulary';
 import {
   FactorBoardError,
   FactorBoardMaskInfo,
@@ -213,16 +213,6 @@ type StockRowItem = {
   quadrant: string | null;
   sector_l2?: string | null;
 };
-
-/** 象限 chip 着色（与四象限矩阵同口径）：HH 红 / LL 绿 / 背离琥珀 / 其余中性。 */
-function quadChipCls(q: string | null): string {
-  if (q === 'HH') return 'bg-red-50 text-red-600 border-red-200/70';
-  if (q === 'LL') return 'bg-green-50 text-green-700 border-green-200/70';
-  if (q && ((q[0] === 'H' && q[1] !== 'H') || (q[0] === 'L' && q[1] !== 'L'))) {
-    return 'bg-amber-50 text-amber-700 border-amber-200/70';
-  }
-  return 'bg-slate-50 text-slate-500 border-slate-200/60';
-}
 
 function StockRow({ rank, item }: { rank: number; item: StockRowItem }) {
   return (

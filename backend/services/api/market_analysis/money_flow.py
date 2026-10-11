@@ -1,7 +1,6 @@
 """资金流向数据模块
 
-提供板块/个股维度的主力资金流入/流出/净流向数据记录与查询，
-支持桑基图 (Sankey) 可视化所需的数据结构。
+提供板块/个股维度的主力资金流入/流出/净流向数据记录与查询。
 
 数据存储在 ``qm_sector_daily_metrics.details`` JSON 字段中，
 以 ``money_flow`` 键保存，避免新增数据库表。
@@ -57,7 +56,7 @@ class MoneyFlowRecord:
     medium_outflow: float = 0.0
     small_inflow: float = 0.0
     small_outflow: float = 0.0
-    # 扩展字段，用于桑基图节点/连线自定义属性
+    # 扩展字段：附加自定义属性（随记录存储，不参与查询）
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,29 +65,6 @@ class MoneyFlowRecord:
         d.pop("extra", None)
         d["trade_date"] = str(self.trade_date)
         return d
-
-    def to_sankey_node(self) -> dict[str, Any]:
-        """转为桑基图节点数据
-
-        返回流入/流出各档位的金额，前端可直接用于构建 Sankey 连线。
-        """
-        return {
-            "sector_id": self.sector_id,
-            "trade_date": str(self.trade_date),
-            "inflows": {
-                "super_large": self.super_large_inflow,
-                "large": self.large_inflow,
-                "medium": self.medium_inflow,
-                "small": self.small_inflow,
-            },
-            "outflows": {
-                "super_large": self.super_large_outflow,
-                "large": self.large_outflow,
-                "medium": self.medium_outflow,
-                "small": self.small_outflow,
-            },
-            "net_flow": self.net_flow,
-        }
 
 
 class MoneyFlowService:

@@ -144,3 +144,44 @@ export function regimeNoteMeta(state: string | null | undefined): VerdictMeta {
     }
   );
 }
+
+/** 个股象限 chip 着色（唯一实现：因子概率板名单行与资金流个股卡共用）。
+ *
+ * 与四象限矩阵同口径：HH 红 / LL 绿 / 背离琥珀（因子轴在极端而模型轴未同向）
+ * / 其余中性。输入为两字母组合（fq+mq ∈ {H,M,L}²），null/未知 → 中性。
+ */
+export function quadChipCls(q: string | null | undefined): string {
+  if (q === 'HH') return 'bg-red-50 text-red-600 border-red-200/70';
+  if (q === 'LL') return 'bg-green-50 text-green-700 border-green-200/70';
+  if (q && ((q[0] === 'H' && q[1] !== 'H') || (q[0] === 'L' && q[1] !== 'L'))) {
+    return 'bg-amber-50 text-amber-700 border-amber-200/70';
+  }
+  return 'bg-slate-50 text-slate-500 border-slate-200/60';
+}
+
+const QUAD_AXIS_WORD: Record<string, string> = { H: '高', M: '中', L: '低' };
+
+/** 个股象限 chip 的文案与释义（两字母 = 因子分位档 + 模型分位档）。
+ *
+ * 释义只用位置词（高/中/低为截面分位档，靠前/靠后描述方向），不写买卖。
+ * 缺失一律「—」并说明原因，绝不按 0 处理。
+ */
+export function quadrantMeta(q: string | null | undefined): VerdictMeta {
+  const cls = quadChipCls(q);
+  if (!q || q.length !== 2 || !(q[0] in QUAD_AXIS_WORD) || !(q[1] in QUAD_AXIS_WORD)) {
+    return {
+      label: '—',
+      cls,
+      hint: '无象限数据（因子分位或模型分位缺失，绝不按 0 处理）',
+    };
+  }
+  const fw = QUAD_AXIS_WORD[q[0]];
+  const mw = QUAD_AXIS_WORD[q[1]];
+  let meaning: string;
+  if (q === 'HH') meaning = '两者同向靠前（因子分位与模型分位都在截面高位）';
+  else if (q === 'LL') meaning = '两者同向靠后（因子分位与模型分位都在截面低位）';
+  else if (q[0] === 'H') meaning = '背离：因子层靠前、模型层未同向';
+  else if (q[0] === 'L') meaning = '背离：因子层靠后、模型层未同向';
+  else meaning = '因子层居中，无共振/背离判定';
+  return { label: q, cls, hint: `因子分位${fw} × 模型分位${mw}；${meaning}` };
+}

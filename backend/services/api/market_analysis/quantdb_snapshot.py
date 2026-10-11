@@ -213,14 +213,6 @@ def stock_flow_full(date: str | None = None) -> list | None:
     return (snap or {}).get("stock_flow_full") or None
 
 
-def sankey(date: str | None = None) -> dict | None:
-    snap = _load(date)
-    s = (snap or {}).get("sankey")
-    if s and (s.get("nodes") or s.get("links")):
-        return s
-    return None
-
-
 def money_flow_period(period: str, dimension: str, category: str, limit: int,
                       date: str | None = None) -> list | None:
     snap = _load(date)

@@ -630,82 +630,6 @@ def _money_flow_period_impl(
     return items[:limit]
 
 
-def get_money_flow_sankey() -> dict[str, Any] | None:
-    """当日主力资金流向桑基图（行业维度，金额为亿元）。"""
-    if not _available():
-        return None
-
-    latest = _latest_l2_date()
-    if not latest:
-        return None
-    days = _trading_days(latest, 1)
-    if not days:
-        return None
-    flow = _load_l2_flow([days[0]])
-    if flow.empty:
-        return None
-
-    groups = _sector_groups("shenwan")
-    agg: list[tuple[str, float, float, float, float]] = []
-    for name, syms in groups.items():
-        grp = flow[flow["symbol"].isin(syms)]
-        if grp.empty:
-            continue
-        agg.append((
-            name,
-            _f(grp["flow_super_net"].sum()),
-            _f(grp["flow_large_net"].sum()),
-            _f(grp["flow_medium_net"].sum()),
-            _f(grp["flow_small_net"].sum()),
-        ))
-    if not agg:
-        return None
-    agg.sort(key=lambda x: abs(x[1] + x[2] + x[3] + x[4]), reverse=True)
-    top = agg[:8]
-
-    nodes = [
-        {"name": "主力资金 (Net Buy)"},
-        {"name": "散户资金 (Retail)"},
-        {"name": "超大单 (Super Large)"},
-        {"name": "大单 (Large)"},
-        {"name": "中单 (Medium)"},
-        {"name": "小单 (Small)"},
-    ]
-    # 固定三层有向无环结构：订单类型 -> 主力/散户资金 -> 行业。
-    # 方向恒为自上而下且取绝对值，避免不同行业方向相反时在
-    # 主力/散户节点形成环（ECharts sankey 要求 DAG，否则抛异常）。
-    # 同一 (source, target) 只保留一条边（跨行业累加），避免金额重复展示。
-    links: dict[tuple[str, str], float] = {}
-
-    def yi(v: float) -> float:
-        return abs(v) / 1e8
-
-    for name, super_net, large_net, medium_net, small_net in top:
-        nodes.append({"name": name})
-        links[("超大单 (Super Large)", "主力资金 (Net Buy)")] = (
-            links.get(("超大单 (Super Large)", "主力资金 (Net Buy)"), 0.0) + yi(super_net)
-        )
-        links[("大单 (Large)", "主力资金 (Net Buy)")] = (
-            links.get(("大单 (Large)", "主力资金 (Net Buy)"), 0.0) + yi(large_net)
-        )
-        links[("中单 (Medium)", "散户资金 (Retail)")] = (
-            links.get(("中单 (Medium)", "散户资金 (Retail)"), 0.0) + yi(medium_net)
-        )
-        links[("小单 (Small)", "散户资金 (Retail)")] = (
-            links.get(("小单 (Small)", "散户资金 (Retail)"), 0.0) + yi(small_net)
-        )
-        links[("主力资金 (Net Buy)", name)] = yi(super_net + large_net)
-        links[("散户资金 (Retail)", name)] = yi(medium_net + small_net)
-
-    return {
-        "nodes": nodes,
-        "links": [
-            {"source": src, "target": dst, "value": round(v, 2)}
-            for (src, dst), v in links.items()
-        ],
-    }
-
-
 def _limit_counts(pct: pd.Series, symbols: pd.Series, trade_date: str) -> tuple[int, int]:
     """涨停/跌停家数 —— 口径唯一事实源见 ``shared.market_breadth``。
 
@@ -910,6 +834,62 @@ def get_indices_overview() -> list[dict[str, Any]]:
         return result
 
     return _cached("indices_overview", _QUERY_TTL, _load)
+
+
+MATCH_LIMIT_DEFAULT = 30
+
+
+def match_sectors(
+    members: pd.DataFrame, q: str, limit: int = MATCH_LIMIT_DEFAULT
+) -> list[dict[str, Any]]:
+    """把用户输入解析为板块名候选（纯函数；只扫成分表，不算行情/资金流）。
+
+    匹配语义与 ``/tags/by-tag`` 同为**子串、大小写不敏感**（``regex=False``，
+    用户输入的 ``(``/``[`` 等正则元字符原样当字面量，不会误伤）。排序：精确
+    > 前缀 > 子串，组内按成分数降序、名称升序——「航空」应先把「航空机场」
+    抬出来，而不是随机顺序。返回 ``[{name, sector_type, count}]``。
+    """
+    query = (q or "").strip().lower()
+    if not query or members.empty or "sector_name" not in members.columns:
+        return []
+    m = members.copy()
+    m["sector_name"] = m["sector_name"].astype(str).str.strip()
+    m = m[m["sector_name"] != ""]
+    if m.empty:
+        return []
+    sub = m[m["sector_name"].str.lower().str.contains(query, regex=False, na=False)]
+    if sub.empty:
+        return []
+    grp = (
+        sub.groupby(["sector_name", "sector_type"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+    rows: list[tuple[int, int, str, dict[str, Any]]] = []
+    for r in grp.itertuples(index=False):
+        name = str(r.sector_name)
+        nl = name.lower()
+        rank = 0 if nl == query else (1 if nl.startswith(query) else 2)
+        rows.append(
+            (
+                rank,
+                -int(r.count),
+                name,
+                {
+                    "name": name,
+                    "sector_type": str(r.sector_type or "通用标签"),
+                    "count": int(r.count),
+                },
+            )
+        )
+    rows.sort(key=lambda x: x[:3])
+    return [item for *_, item in rows[:limit]]
+
+
+def get_tag_matches(q: str, limit: int = MATCH_LIMIT_DEFAULT) -> list[dict[str, Any]]:
+    """板块名模糊解析（成员表进程内 lru 缓存，逐击键扫描即毫秒级；不进 _cached
+    ——用户输入是开集，无界缓存键会随击键膨胀）。"""
+    return match_sectors(_sector_members(), q, limit)
 
 
 def get_stocks_by_tag(tag: str, limit: int = 30) -> list[dict[str, Any]] | None:

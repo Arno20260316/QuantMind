@@ -2,7 +2,8 @@
  * 资金流全景面板（细案 v2 §5 状态中枢）。
  *
  * 布局：工具栏（周期/体系/方向/个股 TopK/数据日期）→ 证据 meta 披露条 →
- * 4 层桑基 v2（全宽）→ 板块⇄个股 双向工作台（选中个股时右侧加挂个股详情卡）。
+ * 板块标签融合条（统一搜索 + 热门板块）→ 4 层桑基 v2（全宽）→
+ * 板块⇄个股 双向工作台（选中个股时右侧加挂个股详情卡）。
  *
  * 状态纪律：
  * - 切体系 → 清板块选中（不同体系下名称不可混用）；切周期/方向/日期只重取；
@@ -18,6 +19,7 @@ import { FlowSankeyV2 } from './FlowSankeyV2';
 import { SectorFlowWorkbench } from './SectorFlowWorkbench';
 import { StockFlowDetailCard } from './StockFlowDetailCard';
 import { FlowEvidencePanel } from './FlowEvidencePanel';
+import { TagBrowserStrip } from './TagBrowserStrip';
 import {
   getFlowPanorama,
   getFlowSector,
@@ -309,6 +311,13 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
           </div>
         )}
       </div>
+
+      {/* ── 板块标签融合条（统一搜索 + 热门板块；数据面 /tags/*，不依赖全景取数） ── */}
+      <TagBrowserStrip
+        currentSectors={data?.sectors?.map((s) => s.name) ?? []}
+        onNavigateSector={handleNavigateSector}
+        onSelectStock={handleSelectStock}
+      />
 
       {/* ── 取数失败 ── */}
       {!loading && error && (

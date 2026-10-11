@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date as _date
 from datetime import datetime
 from typing import Any
 
@@ -967,7 +968,7 @@ def _stock_detail_impl(
         "series": series,
         "windows": windows,
         "attribution": attribution,
-        "factor": None,  # P3：对接因子概率板 members 伴生件（composite/model_rank/quadrant）
+        "factor": _factor_board_snapshot(suffix, days_list[0]),
         "meta": {
             "unit": "yuan",
             "series_unit": "yi",
@@ -975,6 +976,67 @@ def _stock_detail_impl(
             "disclosure": STOCK_DISCLOSURE,
         },
     }
+
+
+def _factor_board_snapshot(suffix: str, flow_date_raw: str) -> dict[str, Any] | None:
+    """个股「因子板共振态」：读因子概率板 members 伴生件（P3-③）。
+
+    定位用行业二级体系——一只票恰属一个二级行业，概念多对多不适合做「所属行业」。
+    数据源是产板伴生件 ``members/latest.json``（``backend/shared/factor_board``），
+    缺失/损坏一律返回 None：个股资金流主路径**绝不因因子板缺席而失败**。
+
+    ``stale_days`` = 资金流交易日 − 板决策日（正 = 板落后于行情；口径与
+    ``factor_board.consume._staleness`` 一致，阈值同为 ``OVERLAY_STALE_DAYS``）。
+    超阈或日期不可解析 → ``stale=True``，展示层转陈旧态；绝不用陈旧板冒充当日。
+    """
+    try:
+        from backend.shared.factor_board import board_io as fb_io
+        from backend.shared.factor_board import config as fb_config
+        from backend.shared.factor_board.consume import OVERLAY_STALE_DAYS
+
+        index = fb_io.load_members_index(fb_config.resolve_board_dir())
+        if not isinstance(index, dict):
+            return None
+        sectors = index.get("sectors")
+        l2 = sectors.get("industry_l2") if isinstance(sectors, dict) else None
+        hit_sector: str | None = None
+        hit_row: dict[str, Any] | None = None
+        if isinstance(l2, dict):
+            for sector_name, rows in l2.items():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if isinstance(row, dict) and str(row.get("symbol")) == suffix:
+                        hit_sector, hit_row = str(sector_name), row
+                        break
+                if hit_row is not None:
+                    break
+
+        decision = str(index.get("decision_date") or "").strip() or None
+        stale_days: int | None = None
+        if decision and flow_date_raw:
+            try:
+                d_flow = _date.fromisoformat(_dash(str(flow_date_raw)))
+                d_decision = _date.fromisoformat(decision)
+                stale_days = (d_flow - d_decision).days
+            except ValueError:
+                stale_days = None
+        stale = stale_days is None or stale_days > OVERLAY_STALE_DAYS
+
+        return {
+            "available": hit_row is not None,
+            "decision_date": decision,
+            "trade_date": index.get("trade_date"),
+            "stale_days": stale_days,
+            "stale": stale,
+            "sector_l2": hit_sector,
+            "quadrant": None if hit_row is None else hit_row.get("quadrant"),
+            "composite": None if hit_row is None else hit_row.get("composite"),
+            "model_rank": None if hit_row is None else hit_row.get("model_rank"),
+        }
+    except Exception:  # pragma: no cover - 兜底：因子板是增强面，绝不拦主路径
+        logger.exception("[flow-panorama] 因子板快照读取失败（按缺失处理）")
+        return None
 
 
 def _stock_attribution(

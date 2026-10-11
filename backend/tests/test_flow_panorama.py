@@ -322,6 +322,82 @@ def test_stock_detail_invalid_symbol_returns_none():
     assert flow_panorama.get_stock_detail(symbol="") is None
 
 
+def test_stock_detail_factor_block_missing_present_stale_uncovered(
+    tmp_path, monkeypatch
+):
+    """因子板共振态四态：板缺失→None / 在板→行业二级+象限 / 陈旧→stale / 未收录。
+
+    板目录用 QM_FACTOR_BOARD_DIR 切到 tmp（members 伴生件由 board_io 原子写），
+    个股侧走真实 L2 分区（与本节其余契约测同款依赖）。
+    """
+    from backend.shared.factor_board import board_io as fb_io
+
+    # 0) 板目录缺失 → factor=None（个股资金流主路径不因因子板缺席而失败）
+    monkeypatch.setenv("QM_FACTOR_BOARD_DIR", str(tmp_path / "empty"))
+    pan = flow_panorama.get_panorama(period="1d", stocks_per_sector=5)
+    stock_node = next(n for n in pan["nodes"] if n["kind"] == "stock")
+    detail = flow_panorama.get_stock_detail(symbol=stock_node["key"], days=5)
+    assert detail is not None and detail["available"] is True
+    assert detail["factor"] is None
+
+    suffix = detail["suffix"]
+    board_dir = tmp_path / "board"
+
+    def _write_members(decision_date: str, include: bool) -> None:
+        rows = (
+            [
+                {
+                    "symbol": suffix,
+                    "name": detail["name"],
+                    "composite": 0.66,
+                    "model_rank": 0.83,
+                    "quadrant": "HH",
+                }
+            ]
+            if include
+            else [
+                {"symbol": "SH000000", "name": "占位", "composite": 0.1,
+                 "model_rank": 0.1, "quadrant": "LL"}
+            ]
+        )
+        fb_io.write_members_index(
+            {
+                "decision_date": decision_date,
+                "trade_date": decision_date,
+                "sectors": {"industry_l2": {"测试行业": rows}},
+            },
+            board_dir,
+        )
+
+    # 1) 板与资金流数据日同日 → available + 行业二级定位 + 象限原样 + 不陈旧
+    _write_members(detail["trade_date"], include=True)
+    monkeypatch.setenv("QM_FACTOR_BOARD_DIR", str(board_dir))
+    quantdb_feed.clear_cache()  # 步骤 0 已缓存同一 key，换板后须重算
+    f = flow_panorama.get_stock_detail(symbol=stock_node["key"], days=5)["factor"]
+    assert f is not None
+    assert f["available"] is True
+    assert f["sector_l2"] == "测试行业"
+    assert f["quadrant"] == "HH"
+    assert f["composite"] == pytest.approx(0.66)
+    assert f["model_rank"] == pytest.approx(0.83)
+    assert f["decision_date"] == detail["trade_date"]
+    assert f["stale_days"] == 0 and f["stale"] is False
+
+    # 2) 板决策日远落后于资金流数据日 → 只显形不冒充当日（stale=True）
+    _write_members("2020-01-01", include=True)
+    quantdb_feed.clear_cache()
+    f_old = flow_panorama.get_stock_detail(symbol=stock_node["key"], days=5)["factor"]
+    assert f_old["available"] is True and f_old["stale"] is True
+    assert f_old["stale_days"] is not None and f_old["stale_days"] > 3
+
+    # 3) 板在但该股未收录 → available=False（不许翻成 None 或编造象限）
+    _write_members(detail["trade_date"], include=False)
+    quantdb_feed.clear_cache()
+    f_miss = flow_panorama.get_stock_detail(symbol=stock_node["key"], days=5)["factor"]
+    assert f_miss["available"] is False
+    assert f_miss["quadrant"] is None and f_miss["sector_l2"] is None
+
+
 def test_panorama_evidence_gating_fresh_stale_missing(tmp_path, monkeypatch):
     """证据四态：缺失(not_built) / 陈旧(stale) / 新鲜(available) / 体系不适配(not_applicable)。"""
     monkeypatch.setenv("QM_FLOW_EVIDENCE_DIR", str(tmp_path))

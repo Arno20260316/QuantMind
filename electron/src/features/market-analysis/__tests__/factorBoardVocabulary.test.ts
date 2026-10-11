@@ -18,6 +18,8 @@ import {
     REGIME_NOTE_META,
     VERDICT_META,
     decayMeta,
+    quadChipCls,
+    quadrantMeta,
     regimeNoteMeta,
     verdictMeta,
 } from '../factorBoardVocabulary';
@@ -108,5 +110,72 @@ describe('因子概率板词汇与契约', () => {
         const unknownNote = regimeNoteMeta('brand_new_note');
         expect(unknownNote.label).toBe('未知');
         expect(unknownNote.hint).toContain('brand_new_note');
+    });
+});
+
+describe('个股象限词汇（factor list 与个股卡共用唯一实现）', () => {
+    /** 九象限 → 期望着色档（HH 红 / LL 绿 / 背离琥珀 / 其余中性）。 */
+    const CLS_CASES: Array<{ q: string; tone: 'red' | 'green' | 'amber' | 'slate' }> = [
+        { q: 'HH', tone: 'red' },
+        { q: 'LL', tone: 'green' },
+        { q: 'HM', tone: 'amber' },
+        { q: 'HL', tone: 'amber' },
+        { q: 'LH', tone: 'amber' },
+        { q: 'LM', tone: 'amber' },
+        { q: 'MH', tone: 'slate' },
+        { q: 'MM', tone: 'slate' },
+        { q: 'ML', tone: 'slate' },
+    ];
+
+    it('九象限着色：HH 红 / LL 绿 / 背离琥珀 / 其余中性，坏输入一律中性', () => {
+        for (const { q, tone } of CLS_CASES) {
+            expect(quadChipCls(q), `象限 ${q} 着色`).toContain(`bg-${tone}-50`);
+        }
+        // 缺失/未知不得套任何方向色（绝不按 0 处理）
+        for (const bad of [null, undefined, '', 'X', 'HHH', 'AA', '1H']) {
+            expect(quadChipCls(bad as string | null | undefined), `坏输入 ${String(bad)}`).toContain(
+                'bg-slate-50',
+            );
+        }
+    });
+
+    it('quadrantMeta 与 quadChipCls 同档着色（单实现不漂移）', () => {
+        for (const { q } of CLS_CASES) {
+            expect(quadrantMeta(q).cls).toBe(quadChipCls(q));
+        }
+        expect(quadrantMeta(null).cls).toBe(quadChipCls(null));
+    });
+
+    it('象限释义只描述位置方向：同向/背离/居中三口径', () => {
+        expect(quadrantMeta('HH').label).toBe('HH');
+        expect(quadrantMeta('HH').hint).toContain('同向靠前');
+        expect(quadrantMeta('LL').hint).toContain('同向靠后');
+        // 因子轴极端而模型轴未同向 → 背离（H* 与 L* 各自表述）
+        expect(quadrantMeta('HM').hint).toContain('背离');
+        expect(quadrantMeta('HL').hint).toContain('背离');
+        expect(quadrantMeta('LH').hint).toContain('背离');
+        expect(quadrantMeta('LM').hint).toContain('背离');
+        // 因子轴居中 → 无共振/背离判定
+        for (const q of ['MH', 'MM', 'ML']) {
+            expect(quadrantMeta(q).label).toBe(q);
+            expect(quadrantMeta(q).hint).toContain('居中');
+        }
+    });
+
+    it('象限缺失显形为 — 并说明原因（缺失 ≠ 0）', () => {
+        const meta = quadrantMeta(null);
+        expect(meta.label).toBe('—');
+        expect(meta.hint).toContain('绝不按 0');
+        expect(quadrantMeta('XZ').label).toBe('—');
+        expect(quadrantMeta('HHH').label).toBe('—');
+    });
+
+    it('九象限文案不含买卖指令词（展示面纪律）', () => {
+        for (const { q } of CLS_CASES) {
+            const meta = quadrantMeta(q);
+            for (const word of BANNED_ADVICE_WORDS) {
+                expect(`${meta.label}|${meta.hint}`, `象限 ${q} 含禁用词 ${word}`).not.toContain(word);
+            }
+        }
     });
 });

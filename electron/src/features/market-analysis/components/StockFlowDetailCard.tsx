@@ -4,8 +4,9 @@
  * - 20 日逐日五档序列（C 级：红=净流入、绿=净流出）；
  * - 所属板块归因：板块 chips + 该股在各板块的贡献排名，点 chip 回板块视角
  *   （=「个股资金流返回板块」）；
- * - 个股层不出现资金流预测徽章——实测否决（IC≤0.01），页内明示原因（meta.disclosure）；
- * - factor（因子板共振态）为 P3 对接位；为 null 时不渲染（不编造）。
+ * - 因子板共振态：合成分 × 模型分位象限（个体预测锚；板缺失不渲染、陈旧显形
+ *   不冒充当日）；行业 chip 一键回板块工作台；
+ * - 个股层不出现资金流预测徽章——实测否决（IC≤0.01），页内明示原因（meta.disclosure）。
  */
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -20,7 +21,10 @@ import {
   flowTextClass,
   MoneyFlowError,
   type FlowStockDetailResponse,
+  type FlowStockFactor,
 } from '../services/moneyFlowService';
+import { quadChipCls, quadrantMeta } from '../factorBoardVocabulary';
+import { NumText } from '../../market-analysis-shared/ui';
 import { EvidenceBadge } from './EvidenceBadge';
 
 const INFLOW_COLOR = '#e11d48';
@@ -148,6 +152,80 @@ const WindowCard: React.FC<{ label: string; w: FlowStockDetailResponse['windows'
   </div>
 );
 
+/** 因子板共振态（个体预测锚）：行业 chip 一键回板块工作台 + 合成分/模型分位/象限。
+ *
+ * 后端约定见 moneyFlowService.FlowStockFactor：available=false = 板在但未收录；
+ * stale = 板决策日落后资金流数据日超 3 天（只显形不冒充当日）。缺失一律「—」。
+ */
+const FactorResonanceSection: React.FC<{
+  factor: FlowStockFactor;
+  onNavigateSector: (name: string, sectorSet: string | null) => void;
+}> = ({ factor, onNavigateSector }) => {
+  const q = quadrantMeta(factor.quadrant);
+  const sectorL2 = factor.sector_l2;
+  const staleTitle =
+    factor.stale_days === null
+      ? '板决策日无法与资金流数据日比较（按陈旧显形，不冒充当日）'
+      : `板决策日距资金流数据日 ${factor.stale_days} 天（超过 3 天视为陈旧）：只显形，不冒充当日`;
+  return (
+    <div className="flex flex-col gap-1.5 pt-1.5 border-t border-slate-100">
+      <div className="flex items-center gap-1.5">
+        <span
+          className="text-[10px] font-bold text-slate-400 cursor-help"
+          title="个股层资金流实测不具预测力；个体方向锚 = 因子板合成分 × 模型分位象限（个股层不设资金流预测徽章）"
+        >
+          因子板共振态
+        </span>
+        {factor.decision_date && (
+          <span className="text-[10px] font-mono text-slate-400">决策日 {factor.decision_date}</span>
+        )}
+        {factor.stale && (
+          <Tooltip title={staleTitle}>
+            <span className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200/70 rounded px-1 py-px cursor-help">
+              陈旧
+            </span>
+          </Tooltip>
+        )}
+      </div>
+      {factor.available ? (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {sectorL2 && (
+            <button
+              onClick={() => sectorL2 && onNavigateSector(sectorL2, 'industry2')}
+              className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-50 text-purple-700 border border-purple-200/80 hover:bg-purple-100 transition-colors cursor-pointer"
+              title="所属行业（二级，因子板口径）：点击回板块工作台"
+            >
+              {sectorL2}
+              <ChevronRight className="w-2.5 h-2.5 opacity-60" />
+            </button>
+          )}
+          <span
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] bg-slate-50 text-slate-600 border border-slate-200/80"
+            title="合成分（因子概率板口径，缺失显示 —）"
+          >
+            合成分 <NumText value={factor.composite} digits={3} />
+          </span>
+          <span
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] bg-slate-50 text-slate-600 border border-slate-200/80"
+            title="模型分位 = 同批推理截面 rank_pct（分母为该批标的，非全市场，跨模型不可比）"
+          >
+            模型分位 <span className="font-mono">{factor.model_rank === null ? '—' : factor.model_rank.toFixed(2)}</span>
+          </span>
+          <Tooltip title={q.hint}>
+            <span className={`min-w-7 text-center text-[10px] font-extrabold font-mono rounded border px-0.5 py-px cursor-help ${q.cls}`}>
+              {q.label}
+            </span>
+          </Tooltip>
+        </div>
+      ) : (
+        <span className="text-[11px] text-slate-400">
+          该股未收录于最新因子板截面{factor.decision_date ? `（决策日 ${factor.decision_date}）` : ''}
+        </span>
+      )}
+    </div>
+  );
+};
+
 export const StockFlowDetailCard: React.FC<StockFlowDetailCardProps> = ({
   symbol,
   date,
@@ -158,6 +236,7 @@ export const StockFlowDetailCard: React.FC<StockFlowDetailCardProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const reqSeq = useRef(0);
+  const factor = detail?.factor ?? null;
 
   useEffect(() => {
     const seq = ++reqSeq.current;
@@ -229,6 +308,8 @@ export const StockFlowDetailCard: React.FC<StockFlowDetailCardProps> = ({
             <WindowCard label="5 日" w={detail.windows['5d']} />
             <WindowCard label="20 日" w={detail.windows['20d']} />
           </div>
+
+          {factor && <FactorResonanceSection factor={factor} onNavigateSector={onNavigateSector} />}
 
           <div className="flex flex-col gap-1.5 pt-1.5 border-t border-slate-100">
             <span className="text-[10px] font-bold text-slate-400">所属板块归因（点击回板块视角）</span>

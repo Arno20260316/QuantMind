@@ -3,7 +3,9 @@
  * 契约（细案 v2 §4/§5/§8）：
  * - panorama：4 层桑基（entity/size/sector/stock）+ 板块 master 榜；金额单位「元」；
  * - sector：板块明细（20 日趋势 + 成分随窗口净额/贡献占比/板块内 rank）；
- * - stock：个股 20 日五档序列（亿元 4 位小数）+ 1/5/20 日窗口（元）+ 板块归因。
+ * - stock：个股 20 日五档序列（亿元 4 位小数）+ 1/5/20 日窗口（元）+ 板块归因
+ *   + factor（因子板共振态；板缺失为 null）；
+ * - tags（融合面）：统一搜索框的板块名候选（/tags/matches）与统计+热门（/tags/stats）。
  * 展示纪律：展示面只说位置与流量（净流入/净流出、靠前/靠后），个股层不出现预测
  * 徽章（实测否决，见 disclosures）；streak/证据一律来自离线产物，缺失为 null，
  * 绝不回落成 0。
@@ -194,6 +196,25 @@ export interface FlowStockAttribution {
   stock_net_main: number;
 }
 
+/** 因子板共振态（/money-flow/stock 的 factor 块，P3 对接）。
+ *
+ * 后端读因子概率板 members 伴生件的**行业二级**成员表：一只票恰属一个二级行业，
+ * 概念多对多不适合做「所属行业」。`available=false` = 板在但该股未收录；
+ * 整块 null = 板产物缺失（不渲染，不编造）。`stale` 由后端按 OVERLAY_STALE_DAYS
+ * 判定（`stale_days` = 资金流交易日 − 板决策日）；陈旧时展示层只许显形不许冒充当日。
+ */
+export interface FlowStockFactor {
+  available: boolean;
+  decision_date: string | null;
+  trade_date: string | null;
+  stale_days: number | null;
+  stale: boolean;
+  sector_l2: string | null;
+  quadrant: string | null;
+  composite: number | null;
+  model_rank: number | null;
+}
+
 export interface FlowStockDetailResponse {
   available: boolean;
   symbol: string;
@@ -209,8 +230,7 @@ export interface FlowStockDetailResponse {
     { net_main: number; net_total: number; net_ratio: number | null; days: number } | null
   >;
   attribution: FlowStockAttribution[];
-  /** P3：因子概率板共振态（composite/model_rank/quadrant）；P1 恒 null。 */
-  factor: unknown | null;
+  factor: FlowStockFactor | null;
   meta: { unit: string; series_unit: string; window_days: [string, string]; disclosure: string[] };
 }
 
@@ -385,6 +405,37 @@ export async function getFlowEvidence(
   if (params.date) qs.set('date', params.date);
   const suffix = qs.toString();
   return flowGet<FlowEvidenceResponse>(`/money-flow/evidence${suffix ? `?${suffix}` : ''}`);
+}
+
+// ── 板块标签融合（统一搜索框 / 热门 chips；数据面 /tags/*） ───────────────
+
+/** 标签体系统计（/tags/stats；hot_tags 的 type 为板块体系字符串）。 */
+export interface FlowTagStats {
+  trade_date: string | null;
+  total_sectors: number;
+  total_stocks: number;
+  avg_tags_per_stock: number;
+  max_tags_per_stock: number;
+  total_relations: number;
+  hot_tags: { name: string; type: string; count: number }[];
+}
+
+/** 板块名候选（/tags/matches；子串匹配、精确 > 前缀 > 子串排序）。 */
+export interface FlowTagMatch {
+  name: string;
+  sector_type: string;
+  count: number;
+}
+
+export async function getTagStats(): Promise<FlowTagStats> {
+  return flowGet<FlowTagStats>('/tags/stats?limit=100');
+}
+
+export async function getTagMatches(q: string): Promise<FlowTagMatch[]> {
+  const data = await flowGet<{ q: string; matches: FlowTagMatch[] }>(
+    `/tags/matches?q=${encodeURIComponent(q)}`,
+  );
+  return data.matches;
 }
 
 // ── 展示格式化（元/亿元口径统一出口；缺失一律 —，绝不显 0） ─────────────

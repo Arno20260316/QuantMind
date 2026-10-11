@@ -559,46 +559,6 @@ def get_stock_money_flow(con, data_dir: Path, limit: int = 20) -> list[dict]:
     return items
 
 
-def get_money_flow_sankey(con, data_dir: Path) -> dict | None:
-    latest = _latest_l2_date(data_dir)
-    if not latest:
-        return None
-    days = _trading_days(data_dir, latest, 1)
-    flow = _load_l2_flow(con, days)
-    if flow.empty:
-        return None
-    groups = _sector_groups(data_dir, "shenwan")
-    agg = []
-    for name, syms in groups.items():
-        grp = flow[flow["symbol"].isin(syms)]
-        if grp.empty:
-            continue
-        agg.append((name,
-                    _f(grp["flow_super_net"].sum()), _f(grp["flow_large_net"].sum()),
-                    _f(grp["flow_medium_net"].sum()), _f(grp["flow_small_net"].sum())))
-    if not agg:
-        return None
-    agg.sort(key=lambda x: abs(x[1] + x[2] + x[3] + x[4]), reverse=True)
-    top = agg[:8]
-    nodes = [
-        {"name": "主力资金 (Net Buy)"}, {"name": "散户资金 (Retail)"},
-        {"name": "超大单 (Super Large)"}, {"name": "大单 (Large)"},
-        {"name": "中单 (Medium)"}, {"name": "小单 (Small)"},
-    ]
-    links: dict[tuple[str, str], float] = {}
-    def yi(v: float) -> float:
-        return abs(v) / 1e8
-    for name, s, l, m, sm in top:
-        nodes.append({"name": name})
-        links[("超大单 (Super Large)", "主力资金 (Net Buy)")] = links.get(("超大单 (Super Large)", "主力资金 (Net Buy)"), 0.0) + yi(s)
-        links[("大单 (Large)", "主力资金 (Net Buy)")] = links.get(("大单 (Large)", "主力资金 (Net Buy)"), 0.0) + yi(l)
-        links[("中单 (Medium)", "散户资金 (Retail)")] = links.get(("中单 (Medium)", "散户资金 (Retail)"), 0.0) + yi(m)
-        links[("小单 (Small)", "散户资金 (Retail)")] = links.get(("小单 (Small)", "散户资金 (Retail)"), 0.0) + yi(sm)
-        links[("主力资金 (Net Buy)", name)] = yi(s + l)
-        links[("散户资金 (Retail)", name)] = yi(m + sm)
-    return {"nodes": nodes, "links": [{"source": src, "target": dst, "value": round(v, 2)} for (src, dst), v in links.items()]}
-
-
 def get_money_flow_period(con, data_dir: Path, period: str = "1d", dimension: str = "sector",
                           category: str = "shenwan", limit: int = 31) -> list[dict]:
     n_days = PERIOD_DAYS.get(period.lower(), 1)
@@ -782,8 +742,6 @@ def main():
     print(f"[step] heatmap shenwan {len(heatmap_shenwan)}")
     heatmap_concept = get_sector_heatmap(con, data_dir, "concept")
     print(f"[step] heatmap concept {len(heatmap_concept)}")
-    sankey = get_money_flow_sankey(con, data_dir)
-    print(f"[step] sankey nodes={len(sankey['nodes']) if sankey else 0}")
     stock_flow = get_stock_money_flow(con, data_dir, limit=20)
     print(f"[step] stock_flow {len(stock_flow)}")
     stock_flow_full = get_stock_flow_full(con, data_dir)
@@ -809,7 +767,6 @@ def main():
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "indices": indices, "breadth": breadth,
         "heatmap": {"shenwan": heatmap_shenwan, "concept": heatmap_concept},
-        "sankey": sankey or {"nodes": [], "links": []},
         "stock_flow": stock_flow, "stock_flow_full": stock_flow_full,
         "tag_stats": tag_stats, "money_flow_periods": money_flow_periods,
     }

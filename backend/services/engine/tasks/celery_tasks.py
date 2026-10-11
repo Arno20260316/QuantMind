@@ -1586,6 +1586,85 @@ def run_factor_board_build() -> dict[str, Any]:
         return {"status": "failed", "error": str(e)}
 
 
+@celery_app.task(name="engine.tasks.flow_evidence_build")
+def run_flow_evidence_build() -> dict[str, Any]:
+    """资金流延续证据产物（市场分析 · 资金流全景 v2 §3/§8，2026-10-11）。
+
+    子进程跑 ``backend/scripts/market_analysis/build_flow_evidence.py``：全史 L2
+    资金流（6_ml_datasets/l2_factors × daily_forward qfq）→ 板块「连N」条件统计
+    （探针对照 + 可执行 T+1 收盘建仓双口径、闸门五项、动量分层）+ 当日命中榜 →
+    ``latest.json`` / ``evidence.json`` / ``panel_sector.parquet``
+    （``QM_FLOW_EVIDENCE_DIR``，原子写，同日重跑覆盖）。
+
+    新鲜度门控：产物交易日已跟进库内最新 L2 分区时直接跳过——beat 在数据同步
+    窗口内轮询（同步时刻以用户「同步调度」配置为准，不假设固定时刻），无事可做
+    时静默跳过属正常行为。CLI 退码 0 成功 / 1 构建失败（校验不过**不落盘**）/
+    2 参数错误；退码≠0 如实转 failed，绝不静默产出坏产物。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from backend.shared import flow_evidence
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("flow_evidence")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = (
+            root / "backend" / "scripts" / "market_analysis" / "build_flow_evidence.py"
+        )
+        data_dir = os.getenv("QM_QUANTDB_DATA_DIR", "/data/quantdb")
+        out_dir = _Path(flow_evidence.resolve_evidence_dir())
+
+        # 新鲜度门控：库内最新 L2 分区未超前产物交易日 → 无事可做
+        l2_dir = _Path(data_dir) / "6_ml_datasets" / "l2_factors"
+        partitions = sorted(p.name[3:] for p in l2_dir.glob("dt=*") if p.is_dir())
+        latest_partition = partitions[-1] if partitions else ""
+        latest = flow_evidence.load_latest(out_dir)
+        built = flow_evidence.norm_trade_date((latest or {}).get("trade_date"))
+        if latest_partition and built and built >= latest_partition:
+            logger.info("[FlowEvidence] 跳过：产物已跟进最新分区 %s", latest_partition)
+            return {"status": "skipped", "reason": "up_to_date", "trade_date": built}
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--data-dir",
+            data_dir,
+            "--out-dir",
+            str(out_dir),
+        ]
+        started = datetime.now()
+        logger.info("[FlowEvidence] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0:
+            logger.error(
+                "[FlowEvidence] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info("[FlowEvidence] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:])
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "out_dir": str(out_dir),
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[FlowEvidence] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}
+
+
 @celery_app.task(name="engine.tasks.trade_mask_refresh")
 def run_trade_mask_refresh() -> dict[str, Any]:
     """可交易性掩码增量刷新（P2-d，2026-10-11）。

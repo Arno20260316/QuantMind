@@ -24,7 +24,10 @@ export interface FlowEvidenceStats {
   excess_daily_bp: number | null;
   hit: number | null;
   base_hit: number | null;
-  yearly?: Record<string, { n: number; excess_bp: number | null }>;
+  yearly?: Record<
+    string,
+    { n: number; excess_bp: number | null; hit?: number | null; base_hit?: number | null }
+  >;
 }
 
 /** P 级证据徽章（仅板块层；由后端 pick_badge 统一出口）。 */
@@ -211,6 +214,100 @@ export interface FlowStockDetailResponse {
   meta: { unit: string; series_unit: string; window_days: [string, string]; disclosure: string[] };
 }
 
+// ── 证据台（/money-flow/evidence；信号档案 + 命中榜） ──────────────────────
+
+/** 闸门五项判定（gate.checks 键为英文判据名，criteria 为整段判据文本）。 */
+export interface FlowEvidenceGate {
+  pass: boolean;
+  evaluated_horizon: number;
+  checks: Record<string, boolean>;
+  criteria: string;
+}
+
+/** 环境分层（市场 20 日环境 up/down 两档的条件超额）。 */
+export interface FlowEvidenceEnvSplit {
+  n: number;
+  excess_bp: number | null;
+  hit: number | null;
+}
+
+/** 信号档案的一档条件（streak_2 / streak_3 / streak_5）。 */
+export interface FlowEvidenceCondition {
+  level: number;
+  label: string;
+  years: number;
+  gate: FlowEvidenceGate;
+  fwd: Record<string, FlowEvidenceStats>;
+  exec: Record<string, FlowEvidenceStats>;
+  env: Record<string, FlowEvidenceEnvSplit>;
+  sub_splits?: {
+    low_mom: FlowEvidenceStats;
+    high_mom: FlowEvidenceStats;
+    note: string;
+  } | null;
+}
+
+export type FlowRejectedVerdict = 'reject' | 'background' | 'control';
+
+/** 否决清单条目（「已实测、不具预测力、不参与展示」节）。 */
+export interface FlowEvidenceRejected {
+  key: string;
+  scope: 'stock' | 'sector' | string;
+  label: string;
+  verdict: FlowRejectedVerdict | string;
+  note: string;
+  metrics: {
+    n?: number;
+    n_days?: number;
+    excess_bp?: number | null;
+    excess_daily_bp?: number | null;
+    hit?: number | null;
+    base_hit?: number | null;
+    ic_mean?: number;
+    icir?: number | null;
+    t_stat?: number | null;
+    pct_pos?: number;
+    yearly?: Record<string, unknown>;
+  };
+}
+
+/** 命中榜行（板块级；evidence 同徽章契约）。 */
+export interface FlowEvidenceHit {
+  name: string;
+  streak: number;
+  net_main: number | null;
+  net_ratio: number | null;
+  breadth: number | null;
+  members: number;
+  evidence: FlowEvidenceBadge | null;
+}
+
+export interface FlowEvidenceResponse {
+  available: boolean;
+  reason: 'not_built' | null;
+  requested_date: string | null;
+  trade_date: string | null;
+  trade_date_raw: string | null;
+  built_at: string | null;
+  window: string[] | null;
+  min_cond_n: number;
+  badge_levels: number[] | null;
+  badge_horizon: number | null;
+  conventions: Record<string, string>;
+  gate_criteria: string | null;
+  coverage: { days: number; sectors: number; panel_rows: number } | null;
+  conditions: Record<string, FlowEvidenceCondition>;
+  rejected: FlowEvidenceRejected[];
+  hits: FlowEvidenceHit[];
+  hits_trade_date: string | null;
+  hits_state: 'ok' | 'stale' | 'no_rows' | 'unbuilt';
+  meta: {
+    evidence_trade_date: string | null;
+    evidence_window: string[] | null;
+    disclosure: string[];
+  };
+}
+
 export class MoneyFlowError extends Error {
   readonly status: number;
 
@@ -278,6 +375,16 @@ export async function getFlowStock(
   if (params.days) qs.set('days', String(params.days));
   if (params.date) qs.set('date', params.date);
   return flowGet<FlowStockDetailResponse>(`/money-flow/stock?${qs.toString()}`);
+}
+
+/** 证据台：信号档案（过闸条件统计 + 否决清单）+ 命中榜（默认最新，可回溯快照日）。 */
+export async function getFlowEvidence(
+  params: { date?: string } = {},
+): Promise<FlowEvidenceResponse> {
+  const qs = new URLSearchParams();
+  if (params.date) qs.set('date', params.date);
+  const suffix = qs.toString();
+  return flowGet<FlowEvidenceResponse>(`/money-flow/evidence${suffix ? `?${suffix}` : ''}`);
 }
 
 // ── 展示格式化（元/亿元口径统一出口；缺失一律 —，绝不显 0） ─────────────

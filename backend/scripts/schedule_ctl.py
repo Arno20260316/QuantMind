@@ -625,6 +625,34 @@ def _run_duty_deadman(date_str: str | None, force: bool) -> int:
     return 1 if result.get("missing") else 0
 
 
+def _run_flow_evidence(date_str: str | None, force: bool) -> int:
+    """资金流延续证据「重跑」= 立刻按日更形态全史再构建一份（同日覆盖，原子写）。
+
+    ``--date`` 不适用（构建追随库内最新 L2 分区，不是某一天——给了会被静默
+    忽略，这里明说）；``--force`` 无特殊语义（重建本无条件，新鲜度门控只住在
+    beat 任务侧）。退码透传 CLI：0 成功 / 1 构建失败（校验不过**不落盘**）/
+    2 参数错误。
+    """
+    from backend.shared import flow_evidence as _fe
+
+    script = os.path.join(
+        PROJECT_ROOT, "backend", "scripts", "market_analysis", "build_flow_evidence.py"
+    )
+    cmd = [
+        sys.executable,
+        script,
+        "--data-dir",
+        os.getenv("QM_QUANTDB_DATA_DIR", "/data/quantdb"),
+        "--out-dir",
+        str(_fe.resolve_evidence_dir()),
+    ]
+    print(f"执行 {' '.join(cmd)}（输出直通）...")
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode in (0, 2):
+        return completed.returncode
+    return 1
+
+
 _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # 键 = 注册表任务键（唯一标识，禁止别名——测试防止漂移）
     "sim_eod": _run_sim_eod,
@@ -655,6 +683,8 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     "trade_mask_refresh": _run_trade_mask_refresh,
     # P2-f 因子概率板滚动重选（重跑 = 立刻跑一次；--date=历史回填 as_of）
     "factor_board_reselect": _run_factor_board_reselect,
+    # 资金流延续证据（重跑 = 立刻按日更形态全史再构建一份；同日覆盖，原子写）
+    "flow_evidence": _run_flow_evidence,
     # P1 滚动重训派发：重跑 = 按配置试一轮（--force 不看 enabled/到点/本期标记；
     # 真正提交在 API 进程，同窗口重复派发被 campaign 幂等键挡住）。
     "retrain_dispatch": _run_retrain_dispatch,

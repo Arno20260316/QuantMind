@@ -14,8 +14,8 @@
   行情最新分区时，调用方必须落 null 并在 meta 中披露原因——陈旧 streak 比没有更坏。
 - 证据只在「行业板块(二级)」上测量（预研口径）；其他板块体系不适用，
   统计不可跨体系迁移。
-- 构建由 ``backend/scripts/build_flow_evidence.py`` 夜间完成；本模块只读消费，
-  另提供原子写工具供 builder 使用。
+- 构建由 ``backend/scripts/market_analysis/build_flow_evidence.py`` 夜间完成；
+  本模块只读消费，另提供原子写工具供 builder 使用。
 """
 
 from __future__ import annotations

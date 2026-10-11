@@ -336,6 +336,20 @@ JOBS: tuple[JobSpec, ...] = (
         "段外历史原样保留（区间替换）；区间无交易日 no-op 退码 0；"
         "重跑 = 立刻再扫一遍（--date 指定重扫段尾，缺省=最近两周；确定性幂等）",
     ),
+    # 资金流延续证据产物（市场分析 · 资金流全景 v2 §3/§8）：倍频轮询 + 任务体
+    # 新鲜度门控（同 market_snapshot 的理由——同步时刻由用户「同步调度」配置，
+    # 不假设固定时刻；产物已跟进库内最新 L2 分区即跳过）。心跳 TTL 4 天
+    # （同 factor_board）：cron 是 mon-sat，周末最长间隔 72h。
+    JobSpec(
+        "flow_evidence", "资金流延续证据（市场分析）", "celery_beat", "celery",
+        "mon-sat 19:00–23:40 + 次日 04:00–05:40 每 20 分钟轮询（新鲜度门控：产物已跟进最新分区即跳过）",
+        "FLOW_EVIDENCE_ENABLED", True, 345600,
+        "python backend/scripts/schedule_ctl.py run flow_evidence",
+        "板块主力净额「连N」全史条件统计（探针对照 + 可执行 T+1 收盘建仓双口径、"
+        "闸门五项、动量分层）+ 当日命中榜 → latest.json / evidence.json / "
+        "panel_sector.parquet（/data/market-analysis/flow_evidence）；校验不过"
+        "退码 1 不落盘；重跑 = 立刻按日更形态全史再构建一份（同日覆盖）",
+    ),
     # P2-f 因子概率板滚动重选：月频（beat 排每月 1–12 日工作日 08:50，任务体判
     # 月首交易日）。心跳 TTL 32 天：beat 每触发日都刷，但窗口外日子不跑任务体
     # ——留足「上月 12 日 → 本月首个工作日」的最大间隔（约 3 周）。

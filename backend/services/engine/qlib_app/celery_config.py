@@ -266,6 +266,20 @@ if os.getenv("TRADE_MASK_REFRESH_ENABLED", "true").lower() == "true":
         "schedule": crontab(minute="40", hour="18", day_of_week="1-5"),
     }
 
+# 资金流延续证据（市场分析 · 资金流全景 v2 §3/§8，2026-10-11）：板块主力净额
+# 「连N」全史条件统计（探针对照 + 可执行 T+1 收盘建仓双口径、闸门五项、动量分层）
+# + 当日命中榜 → QM_FLOW_EVIDENCE_DIR=/data/market-analysis/flow_evidence，API/
+# 前端读取。数据同步时刻以用户在前端「同步调度」的配置为准，不假设固定时刻：
+# beat 在晚间（19:00–23:40）与次日清晨（04:00–05:40）各每 20 分钟轮询，任务自带
+# 新鲜度门控——库内 L2 分区未超前产物交易日时直接跳过，等同步落盘后的某一次
+# 轮询自然产出；节假日无新分区时全天跳过属正常。含周六：周五的数据常周六晨落盘。
+# 独立开关 FLOW_EVIDENCE_ENABLED（借别的开关会让体检把「本就没开」报成「停摆」）。
+if os.getenv("FLOW_EVIDENCE_ENABLED", "true").lower() == "true":
+    beat_schedule["flow-evidence-daily"] = {
+        "task": "engine.tasks.flow_evidence_build",
+        "schedule": crontab(minute="*/20", hour="4-5,19-23", day_of_week="mon-sat"),
+    }
+
 # 因子概率板滚动重选（P2-f，细案 §七）：每月首个交易日 08:50（晚于 08:40 产板）
 # 以最近分区为 as_of 重跑选择管线 → 应用月台本 + 回填上月 OOS。
 # beat 排每月 1–12 日工作日（月首交易日可能晚到，如国庆后 10-08），任务体再判

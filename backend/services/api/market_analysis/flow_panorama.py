@@ -83,6 +83,15 @@ SIZE_PARENT = {
     "small": RETAIL_NODE,
 }
 
+EVIDENCE_DISCLOSURE = [
+    "统计口径：板块（行业二级）连续净流入状态下，板块等权组合的前向收益相对全样本基准的超额；"
+    "主口径为可执行版（信号盘后可得 → 次一交易日收盘建仓、持有 1/3/5 个交易日），对照列为信号日起算口径；均为前复权价。",
+    "板块按当前成分回溯聚合，存在幸存者偏差；全部数字携带样本数与逐年分档，个别年份超额为负如实展示。",
+    "历史超额≠未来收益：条件超额是状态的历史分布，不构成对未来的承诺或投资建议；强度为 bp 级。",
+    "个股层资金流裸信号已实测不具预测力（RankIC≤0.01），列入「已实测不具预测力」一节，"
+    "不参与任何排序、徽章与展示；个体判断以因子概率板与模型为准。",
+]
+
 DISCLOSURE = [
     "板块按当前成分回溯聚合，存在幸存者偏差；行业二级覆盖约八成个股，未覆盖个股不计入板块层。",
     "净额为已发生资金流量的描述（背景级），红=净流入、绿=净流出；不构成预测。",
@@ -1029,3 +1038,149 @@ def _stock_attribution(
         )
     out.sort(key=lambda x: (_TYPE_PRIORITY.get(x["type"], 9), -abs(x["net_main"])))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 证据台（细案 v2 §6：命中榜 + 信号档案 + 否决清单）
+# ---------------------------------------------------------------------------
+
+
+def _dash_any(raw: Any) -> str | None:
+    """裸日期/ISO 日期 → ISO；空值 → None。"""
+    s = flow_evidence.norm_trade_date(raw)
+    if not s:
+        return None
+    return _dash(s) if len(s) == 8 and s.isdigit() else s
+
+
+def _streak_of(v: Any) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(f) else int(f)
+
+
+def get_evidence(date: str | None = None) -> dict[str, Any]:
+    """证据台：命中榜 + 信号档案（过闸 / 否决两节），只读离线产物。
+
+    ``date`` 为空 → 命中榜取 ``latest.json``（经新鲜度门：落后于最新 L2 分区
+    即 ``hits_state=stale``，不用陈旧 streak 冒充当日）；``date`` 为快照日 →
+    命中榜从 ``panel_sector.parquet`` 该日回溯（跨日状态可取历史值）。
+    条件统计（conditions）为全窗信号档案，与其新鲜度无关，恒定随档案返回。
+    """
+    target = _norm_date(date)
+    key = f"flow_evidence_{target or 'latest'}"
+    return _cached(key, PANORAMA_TTL, lambda: _evidence_impl(target))
+
+
+def _evidence_hits(
+    target: str | None, doc: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str | None, str]:
+    """(命中榜行, 命中榜交易日 ISO, 状态)。状态：ok / stale / no_rows / unbuilt。"""
+    if target:
+        panel = flow_evidence.load_sector_panel()
+        if panel is None or panel.empty or "dt" not in panel.columns:
+            return [], _dash_any(target), "no_rows"
+        rows = panel[panel["dt"].astype(str) == target]
+        if rows.empty:
+            return [], _dash_any(target), "no_rows"
+        hits: list[dict[str, Any]] = []
+        for r in rows.itertuples(index=False):
+            st = _streak_of(getattr(r, "streak", None))
+            if st is None or st < flow_evidence.BADGE_LEVELS[-1]:
+                continue
+            nm = _f_or_none(getattr(r, "net_main", None))
+            nr = _f_or_none(getattr(r, "net_ratio", None))
+            bd = _f_or_none(getattr(r, "breadth", None))
+            hits.append(
+                {
+                    "name": str(r.sector),
+                    "streak": st,
+                    "net_main": round(nm, 2) if nm is not None else None,
+                    "net_ratio": round(nr, 4) if nr is not None else None,
+                    "breadth": round(bd, 4) if bd is not None else None,
+                    "members": int(getattr(r, "members", 0) or 0),
+                    "evidence": flow_evidence.pick_badge(st, doc),
+                }
+            )
+        hits.sort(key=lambda x: (-x["streak"], -(x["net_main"] or 0.0)))
+        return hits, _dash_any(target), "ok"
+
+    latest = flow_evidence.load_latest()
+    if latest is None:
+        return [], None, "unbuilt"
+    l2_dates = _get_partition_dates("6_ml_datasets/l2_factors")
+    fresh = bool(l2_dates) and (
+        flow_evidence.norm_trade_date(latest.get("trade_date")) == l2_dates[0]
+    )
+    if not fresh:
+        return [], _dash_any(latest.get("trade_date")), "stale"
+    hits = []
+    for name, row in flow_evidence.streak_map(latest).items():
+        st = _streak_of(row.get("streak"))
+        if st is None or st < flow_evidence.BADGE_LEVELS[-1]:
+            continue
+        hits.append(
+            {
+                "name": name,
+                "streak": st,
+                "net_main": _f_or_none(row.get("net_main")),
+                "net_ratio": _f_or_none(row.get("net_ratio")),
+                "breadth": _f_or_none(row.get("breadth")),
+                "members": int(row.get("members") or 0),
+                "evidence": flow_evidence.pick_badge(st, doc),
+            }
+        )
+    hits.sort(key=lambda x: (-x["streak"], -(x["net_main"] or 0.0)))
+    return hits, _dash_any(latest.get("trade_date")), "ok"
+
+
+def _evidence_impl(target: str | None) -> dict[str, Any]:
+    doc = flow_evidence.load_evidence()
+    if doc is None:
+        return {
+            "available": False,
+            "reason": "not_built",
+            "requested_date": _dash_any(target),
+            "trade_date": None,
+            "built_at": None,
+            "window": None,
+            "min_cond_n": flow_evidence.MIN_COND_N,
+            "conventions": {},
+            "gate_criteria": None,
+            "conditions": {},
+            "rejected": [],
+            "hits": [],
+            "hits_trade_date": None,
+            "hits_state": "unbuilt",
+            "meta": {"disclosure": EVIDENCE_DISCLOSURE},
+        }
+    hits, hits_trade_date, hits_state = _evidence_hits(target, doc)
+    return {
+        "available": True,
+        "reason": None,
+        "requested_date": _dash_any(target),
+        "trade_date": _dash_any(doc.get("trade_date")),
+        "trade_date_raw": flow_evidence.norm_trade_date(doc.get("trade_date")),
+        "built_at": doc.get("built_at"),
+        "window": doc.get("window"),
+        "min_cond_n": doc.get("min_cond_n", flow_evidence.MIN_COND_N),
+        "badge_levels": doc.get("badge_levels"),
+        "badge_horizon": doc.get("badge_horizon"),
+        "conventions": doc.get("conventions") or {},
+        "gate_criteria": doc.get("gate_criteria"),
+        "coverage": doc.get("coverage"),
+        "conditions": doc.get("conditions") or {},
+        "rejected": doc.get("rejected") or [],
+        "hits": hits,
+        "hits_trade_date": hits_trade_date,
+        "hits_state": hits_state,
+        "meta": {
+            "evidence_trade_date": _dash_any(doc.get("trade_date")),
+            "evidence_window": doc.get("window"),
+            "disclosure": EVIDENCE_DISCLOSURE,
+        },
+    }

@@ -4,7 +4,9 @@
 - 纯逻辑单测（合成数据，随处可跑）：占位剔除、方向筛选、链接符号、徽章选取、
   原子写与 schema 校验；
 - 契约集成测（容器内真实 QuantDB）：4 层结构、topK、value≥0、窗口求和与独立重算
-  一致、证据产物 新鲜/陈旧/缺失/体系不适配 四态。
+  一致、证据产物 新鲜/陈旧/缺失/体系不适配 四态；
+- 证据端点契约（monkeypatch 证据目录与分区表，不依赖真实数据）：unbuilt / 仅档案 /
+  stale / 新鲜命中榜 / 快照回溯 / no_rows。
 """
 
 from __future__ import annotations
@@ -379,3 +381,174 @@ def test_panorama_evidence_gating_fresh_stale_missing(tmp_path, monkeypatch):
     # 其他板块无 streak 数据 → 保持 null（不编造）
     others = [r for r in pan2["sectors"] if r["name"] != target_name]
     assert all(r["streak"] is None for r in others)
+
+
+# ---------------------------------------------------------------------------
+# 证据端点契约（get_evidence；目录与分区表 monkeypatch，不依赖真实数据）
+# ---------------------------------------------------------------------------
+
+
+def _archive_doc() -> dict:
+    """带全字段的信号档案（_evidence_doc 的富化副本，供端点直传断言）。"""
+    return dict(
+        _evidence_doc(),
+        trade_date="2099-10-10",
+        built_at="2099-10-10T01:02:03Z",
+        badge_levels=list(flow_evidence.BADGE_LEVELS),
+        badge_horizon=flow_evidence.BADGE_HORIZON,
+        gate_criteria="n(h=3)≥min_cond_n ∧ exec>0 ∧ fwd>0 ∧ 环境双正",
+        coverage={"days": 520, "sectors": 80, "panel_rows": 41600},
+        conventions={"price_source": "daily_forward(qfq)"},
+    )
+
+
+def test_evidence_endpoint_unbuilt_stale_fresh_and_archive(tmp_path, monkeypatch):
+    """端点五路径：产物全缺 / 仅档案 / 陈旧 / 新鲜命中榜；档案与新鲜度解耦。"""
+    monkeypatch.setenv("QM_FLOW_EVIDENCE_DIR", str(tmp_path))
+    monkeypatch.setattr(flow_panorama, "_get_partition_dates", lambda rel: ["20991010"])
+
+    # ① 产物全缺 → not_built（不编造命中榜与档案）
+    doc = flow_panorama.get_evidence()
+    assert doc["available"] is False and doc["reason"] == "not_built"
+    assert doc["hits_state"] == "unbuilt" and doc["hits"] == []
+    assert doc["conditions"] == {} and doc["rejected"] == []
+    assert doc["min_cond_n"] == flow_evidence.MIN_COND_N
+    assert doc["meta"]["disclosure"] == flow_panorama.EVIDENCE_DISCLOSURE
+    assert doc["meta"]["disclosure"], "披露清单不得为空"
+
+    # ② 档案在、latest 缺 → available 但命中榜 unbuilt；档案字段原样直传
+    flow_evidence.write_json_atomic(tmp_path / "evidence.json", _archive_doc())
+    quantdb_feed.clear_cache()
+    doc = flow_panorama.get_evidence()
+    assert doc["available"] is True and doc["reason"] is None
+    assert doc["hits_state"] == "unbuilt" and doc["hits"] == []
+    assert doc["trade_date"] == "2099-10-10"
+    assert doc["trade_date_raw"] == "20991010"
+    assert doc["built_at"] == "2099-10-10T01:02:03Z"
+    assert doc["gate_criteria"].startswith("n(h=3)")
+    assert doc["coverage"] == {"days": 520, "sectors": 80, "panel_rows": 41600}
+    assert doc["conventions"] == {"price_source": "daily_forward(qfq)"}
+    assert doc["conditions"]["streak_3"]["gate"]["pass"] is True
+    assert doc["badge_horizon"] == flow_evidence.BADGE_HORIZON
+    assert doc["meta"]["evidence_trade_date"] == "2099-10-10"
+
+    # ③ 陈旧：latest 落后最新 L2 分区 → stale，不用陈旧 streak 冒充当日；
+    #    档案为全窗统计，与其新鲜度无关，仍随行返回
+    flow_evidence.write_json_atomic(
+        tmp_path / "latest.json",
+        {
+            "schema": flow_evidence.LATEST_SCHEMA,
+            "trade_date": "2099-01-01",
+            "sectors": {"半导体": {"streak": 4}},
+        },
+    )
+    quantdb_feed.clear_cache()
+    doc = flow_panorama.get_evidence()
+    assert doc["hits_state"] == "stale" and doc["hits"] == []
+    assert doc["hits_trade_date"] == "2099-01-01"
+    assert doc["conditions"], "档案不得随命中榜新鲜度一起消失"
+
+    # ④ 新鲜：命中榜装配（streak≥2 过滤、streak→净额双键排序、逐行徽章）
+    flow_evidence.write_json_atomic(
+        tmp_path / "latest.json",
+        {
+            "schema": flow_evidence.LATEST_SCHEMA,
+            "trade_date": "2099-10-10",
+            "sectors": {
+                "医药": {
+                    "streak": 4,
+                    "net_main": 1.1e9,
+                    "net_ratio": 0.021,
+                    "breadth": 0.7,
+                    "members": 300,
+                },
+                "银行": {
+                    "streak": 3,
+                    "net_main": 2.0e9,
+                    "net_ratio": 0.05,
+                    "breadth": 0.9,
+                    "members": 40,
+                },
+                "半导体": {
+                    "streak": 3,
+                    "net_main": 1.25e9,
+                    "net_ratio": 0.0333,
+                    "breadth": 0.75,
+                    "members": 120,
+                },
+                "煤炭": {"streak": 1, "net_main": 9e9},
+            },
+        },
+    )
+    quantdb_feed.clear_cache()
+    doc = flow_panorama.get_evidence()
+    assert doc["available"] is True and doc["hits_state"] == "ok"
+    assert doc["hits_trade_date"] == "2099-10-10"
+    # 煤炭 streak=1 剔除；先按 streak 降序，同 streak 再按净额降序
+    assert [h["name"] for h in doc["hits"]] == ["医药", "银行", "半导体"]
+    top = doc["hits"][0]
+    assert top["net_main"] == 1.1e9 and top["members"] == 300
+    assert top["evidence"]["level"] == 3  # streak 4 → 最高过闸档 3
+    assert top["evidence"]["fwd"]["n"] == 6235
+
+
+def test_evidence_endpoint_snapshot_backtrack_and_no_rows(tmp_path, monkeypatch):
+    """date=快照日：命中榜从 panel 回溯（2/4 位圆整）；无该日行或无面板 → no_rows。"""
+    monkeypatch.setenv("QM_FLOW_EVIDENCE_DIR", str(tmp_path))
+    flow_evidence.write_json_atomic(tmp_path / "evidence.json", _archive_doc())
+    pd.DataFrame(
+        [
+            {
+                "sector": "半导体",
+                "dt": "20990930",
+                "streak": 3,
+                "net_main": 66263022.51999999,
+                "net_ratio": 0.03333333,
+                "breadth": 0.83333333,
+                "members": 120,
+            },
+            {
+                "sector": "煤炭",
+                "dt": "20990930",
+                "streak": 1,
+                "net_main": -1.0,
+                "net_ratio": -0.001,
+                "breadth": 0.1,
+                "members": 30,
+            },
+            {
+                "sector": "半导体",
+                "dt": "20990929",
+                "streak": 2,
+                "net_main": 1.0,
+                "net_ratio": 0.0,
+                "breadth": 0.5,
+                "members": 120,
+            },
+        ]
+    ).to_parquet(tmp_path / "panel_sector.parquet", index=False)
+
+    doc = flow_panorama.get_evidence(date="2099-09-30")
+    assert doc["available"] is True and doc["hits_state"] == "ok"
+    assert doc["requested_date"] == "2099-09-30"
+    assert doc["hits_trade_date"] == "2099-09-30"
+    assert len(doc["hits"]) == 1
+    hit = doc["hits"][0]
+    assert hit["name"] == "半导体" and hit["streak"] == 3
+    # 面板路径 2/4 位圆整：无浮点尾巴
+    assert hit["net_main"] == 66263022.52
+    assert hit["net_ratio"] == 0.0333
+    assert hit["breadth"] == 0.8333
+    assert hit["members"] == 120
+    assert hit["evidence"]["level"] == 3
+
+    # 该日无行 → no_rows
+    doc = flow_panorama.get_evidence(date="2099-09-28")
+    assert doc["hits_state"] == "no_rows" and doc["hits"] == []
+    assert doc["requested_date"] == "2099-09-28"
+
+    # 面板缺失 → 仍 no_rows（不抛不编造）
+    (tmp_path / "panel_sector.parquet").unlink()
+    quantdb_feed.clear_cache()
+    doc = flow_panorama.get_evidence(date="2099-09-30")
+    assert doc["hits_state"] == "no_rows" and doc["hits"] == []

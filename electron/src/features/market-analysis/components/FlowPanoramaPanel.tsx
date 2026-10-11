@@ -17,6 +17,7 @@ import { Clock, Info, AlertCircle, Network, RefreshCw, Waves } from 'lucide-reac
 import { FlowSankeyV2 } from './FlowSankeyV2';
 import { SectorFlowWorkbench } from './SectorFlowWorkbench';
 import { StockFlowDetailCard } from './StockFlowDetailCard';
+import { FlowEvidencePanel } from './FlowEvidencePanel';
 import {
   getFlowPanorama,
   getFlowSector,
@@ -385,6 +386,9 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
           )}
         </div>
       )}
+
+      {/* ── 延续证据台（命中榜 + 信号档案；点击命中榜联动桑基/工作台） ── */}
+      <FlowEvidencePanel date={date} onSelectSector={(name) => handleNavigateSector(name, 'industry2')} />
 
       {/* ── 常驻披露 ── */}
       {!error && data?.meta.disclosure && data.meta.disclosure.length > 0 && (

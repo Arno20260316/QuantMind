@@ -23,12 +23,12 @@ export interface EvidenceBadgeProps {
   size?: 'sm' | 'md';
 }
 
-function fmtBp(v: number | null | undefined): string {
+export function fmtBp(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v)) return '—';
   return `${v >= 0 ? '+' : ''}${v.toFixed(1)}bp`;
 }
 
-function bpClass(v: number | null | undefined): string {
+export function bpClass(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v) || v === 0) return 'text-slate-500';
   return v > 0 ? 'text-rose-600' : 'text-emerald-600';
 }

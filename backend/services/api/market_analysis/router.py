@@ -553,6 +553,16 @@ async def get_money_flow_stock(
     return data
 
 
+@router.get("/money-flow/evidence")
+async def get_money_flow_evidence(
+    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新；快照日命中榜走日面板回溯）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """证据台：命中榜（延续状态 × 历史条件超额）+ 信号档案（过闸/否决两节）。"""
+    _ = current_user
+    return await asyncio.to_thread(flow_panorama.get_evidence, date=date)
+
+
 # ---- Tag Dual Lookup Endpoints (标签双向查询) ----
 
 @router.get("/tags/stats")

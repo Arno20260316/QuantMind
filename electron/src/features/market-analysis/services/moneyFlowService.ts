@@ -87,13 +87,17 @@ export interface FlowSectorRow {
   evidence: FlowEvidenceBadge | null;
 }
 
-/** 证据产物状态（meta.evidence）：缺失/陈旧一律为 null streak + 原因披露。 */
+/**
+ * 证据产物状态（meta.evidence，契约见后端 flow_panorama._evidence_context）：
+ * 正常态 reason=null 且 available=true；降级态 reason ∈ not_applicable | not_built |
+ * stale 且 available=false。后端从不下发 'ok'——判可用性一律用 available。
+ */
 export interface FlowEvidenceMeta {
   applicable: boolean;
   available: boolean;
   trade_date: string | null;
   window: string[] | null;
-  reason: 'ok' | 'not_applicable' | 'not_built' | 'stale' | null;
+  reason: 'not_applicable' | 'not_built' | 'stale' | null;
   built_at?: string | null;
 }
 
@@ -138,6 +142,8 @@ export interface FlowSectorMember {
   share: number | null;
   inner_rank: number;
   inner_total: number;
+  /** 近 ≤5 个 L2 分区日逐日涨跌幅（升序统一日期组；缺价 pct=null 显 —）。 */
+  recent?: { date: string; pct: number | null }[];
 }
 
 export interface FlowSectorDetailResponse {
@@ -447,6 +453,14 @@ export function fmtYi(yuan: number | null | undefined, digits = 2): string {
   if (yuan === null || yuan === undefined || Number.isNaN(yuan)) return '—';
   const v = yuan / YI;
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)} 亿`;
+}
+
+/** 「已是亿元」的序列值 → 带符号文本。与 fmtYi（入参「元」）严格区分：
+ *  flow 逐日序列（个股五档 / 板块 trend）后端已按 1e8 折算，再走 fmtYi 会双重
+ *  缩放，任何真实值都会显示成 +0.00 亿（个股卡 tooltip 曾因此全为 0）。 */
+export function fmtSeriesYi(yi: number | null | undefined, digits = 2): string {
+  if (yi === null || yi === undefined || Number.isNaN(yi)) return '—';
+  return `${yi >= 0 ? '+' : ''}${yi.toFixed(digits)} 亿`;
 }
 
 export function fmtPct(v: number | null | undefined, digits = 2): string {

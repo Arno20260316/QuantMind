@@ -493,7 +493,7 @@ def get_stock_flow_full(con, data_dir: Path, limit: int = 6500) -> list[dict]:
     return items
 
 
-def get_stock_money_flow(con, data_dir: Path, limit: int = 20) -> list[dict]:
+def get_stock_money_flow(con, data_dir: Path, limit: int = 50) -> list[dict]:
     ref = _latest_l2_date(data_dir)
     if not ref:
         return []
@@ -742,7 +742,7 @@ def main():
     print(f"[step] heatmap shenwan {len(heatmap_shenwan)}")
     heatmap_concept = get_sector_heatmap(con, data_dir, "concept")
     print(f"[step] heatmap concept {len(heatmap_concept)}")
-    stock_flow = get_stock_money_flow(con, data_dir, limit=20)
+    stock_flow = get_stock_money_flow(con, data_dir, limit=50)
     print(f"[step] stock_flow {len(stock_flow)}")
     stock_flow_full = get_stock_flow_full(con, data_dir)
     print(f"[step] stock_flow_full {len(stock_flow_full)}")

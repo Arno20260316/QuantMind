@@ -61,6 +61,108 @@ def test_select_sectors_split_6_4_and_filters():
     assert outflow == ["跌2", "跌1"]  # 最负优先
 
 
+def _synthetic_sankey_frames(mains: dict[str, float], groups: dict[str, list[str]]):
+    """合成 _sankey_graph 入参：sym_sums / member_df / agg / names（口径同 _symbol_sums）。"""
+    idx = list(mains)
+    sym_sums = pd.DataFrame(
+        {
+            "super": [mains[s] / 2 for s in idx],
+            "large": [mains[s] / 2 for s in idx],
+            "medium": [-mains[s] for s in idx],
+            "small": [0.0 for _ in idx],
+            "buy": [abs(mains[s]) for s in idx],
+            "sell": [abs(mains[s]) / 2 for s in idx],
+            "main": [mains[s] for s in idx],
+            "retail": [-mains[s] for s in idx],
+            "amount_y": [abs(mains[s]) * 100 for s in idx],
+        },
+        index=idx,
+    )
+    member_df = pd.DataFrame(
+        {
+            "symbol": [s for syms in groups.values() for s in syms],
+            "sector_name": [g for g, syms in groups.items() for _ in syms],
+            "sector_type": ["行业板块(二级)"] * sum(len(v) for v in groups.values()),
+        }
+    )
+    agg = pd.DataFrame(
+        {
+            "main": [sum(mains[s] for s in syms) for syms in groups.values()],
+            "retail": [-sum(mains[s] for s in syms) for syms in groups.values()],
+            "members": [len(syms) for syms in groups.values()],
+            "amount_y": [10000.0 for _ in groups],
+            "super": [sum(mains[s] for s in syms) / 2 for syms in groups.values()],
+            "large": [sum(mains[s] for s in syms) / 2 for syms in groups.values()],
+            "medium": [-sum(mains[s] for s in syms) for syms in groups.values()],
+            "small": [0.0 for _ in groups],
+        },
+        index=list(groups),
+    )
+    names = {s: f"票{s[:6]}" for s in idx}  # 注意：桑基按 name 去重，测试名必须逐码唯一
+    return sym_sums, member_df, agg, names
+
+
+def _stock_ranks(graph: dict, sector: str) -> list[int]:
+    return sorted(
+        n["inner_rank"] for n in graph["nodes"] if n["kind"] == "stock" and n["sector"] == sector
+    )
+
+
+def test_sankey_stock_layer_bilateral_6_4_and_direction_single_side():
+    """个股层选取（v4）：all=每板块流入前 3 + 流出最深 2（K=5）；单向=TopK/末位 K。
+
+    回归背景：旧实现按「板块主方向」单侧取 head/tail——强流入板块看不到流出排名、
+    强流出板块看不到流入排名；v4 起两翼并取（短板块自动收敛）。
+    """
+    syms_a = [f"{i:06d}.SZ" for i in range(1, 7)]
+    syms_b = [f"{i:06d}.SZ" for i in range(7, 13)]
+    mains = dict(zip(syms_a, [10, 9, 8, 7, 6, -5], strict=True)) | dict(
+        zip(syms_b, [-10, -9, -8, -7, -6, 5], strict=True)
+    )
+    sym_sums, member_df, agg, names = _synthetic_sankey_frames(
+        mains, {"A": syms_a, "B": syms_b}
+    )
+
+    g_all = flow_panorama._sankey_graph(
+        agg, member_df, sym_sums, names, {}, {}, {"A": 1.0, "B": -1.0},
+        {}, None, False, "all", 2, 5,
+    )
+    # 每板块 rank = {1,2,3（流入头翼）, 5,6（流出尾翼，末位起）}；inner_total=6
+    assert _stock_ranks(g_all, "A") == [1, 2, 3, 5, 6]
+    assert _stock_ranks(g_all, "B") == [1, 2, 3, 5, 6]
+    totals = {n["inner_total"] for n in g_all["nodes"] if n["kind"] == "stock"}
+    assert totals == {6}
+
+    g_in = flow_panorama._sankey_graph(
+        agg, member_df, sym_sums, names, {}, {}, {}, {}, None, False, "inflow", 2, 5,
+    )
+    # 单向流入：只展示 A，取头 5（rank 1..5）
+    assert _stock_ranks(g_in, "A") == [1, 2, 3, 4, 5]
+
+    g_out = flow_panorama._sankey_graph(
+        agg, member_df, sym_sums, names, {}, {}, {}, {}, None, False, "outflow", 2, 5,
+    )
+    # 单向流出：只展示 B，取末位 5（rank 2..6）
+    assert _stock_ranks(g_out, "B") == [2, 3, 4, 5, 6]
+
+
+def test_sankey_stock_layer_short_sector_converges_with_dedupe():
+    """短板块（成员 4 < K=5）双侧收敛为全量且头/尾翼重叠去重（不重复出行）。"""
+    syms = [f"{i:06d}.SZ" for i in range(20, 24)]
+    mains = dict(zip(syms, [4, 3, 2, -1.5], strict=True))
+    sym_sums, member_df, agg, names = _synthetic_sankey_frames(mains, {"C": syms})
+
+    g = flow_panorama._sankey_graph(
+        agg, member_df, sym_sums, names, {}, {}, {}, {}, None, False, "all", 2, 5,
+    )
+    # head(3) = {1,2,3}，tail(2) = {4,3} → 3 已在头翼 → 去重后全量 4 行且不重复
+    assert _stock_ranks(g, "C") == [1, 2, 3, 4]
+    rank_dupes = [
+        n["inner_rank"] for n in g["nodes"] if n["kind"] == "stock"
+    ]
+    assert len(rank_dupes) == len(set(rank_dupes))
+
+
 def test_mk_link_non_negative_value_and_sign():
     up = flow_panorama._mk_link("a", "b", 123.45)
     assert (
@@ -284,6 +386,101 @@ def test_sector_detail_members_contract():
             )
     assert len(detail["trend"]) >= 1 and len(detail["trend"]) <= 20
     assert detail["trend"] == sorted(detail["trend"], key=lambda x: x["date"])
+
+
+def test_sector_detail_members_recent_pct_window():
+    """成分行 recent：统一升序日期组（近 ≤5 个 L2 分区日），值为官方涨跌幅或 null。"""
+    from backend.shared.stock_utils import StockCodeUtil
+
+    pan = flow_panorama.get_panorama(period="1d")
+    name = pan["sectors"][0]["name"]
+    detail = flow_panorama.get_sector_detail(name=name, top=5)
+    assert detail is not None and detail["available"] is True
+    days = sorted(flow_panorama._l2_dates_upto(None, flow_panorama.SECTOR_RECENT_DAYS))
+    expect_dates = [flow_panorama._dash(d) for d in days]
+    rows = detail["members"]
+    assert rows
+    for r in rows:
+        recent = r["recent"]
+        assert isinstance(recent, list) and len(recent) == len(expect_dates)
+        # 统一日期组：所有成分行逐日对齐，缺价显 null 而非漏行
+        assert [p["date"] for p in recent] == expect_dates
+        for p in recent:
+            assert isinstance(p["date"], str) and len(p["date"]) == 10
+            assert p["pct"] is None or isinstance(p["pct"], (int, float))
+    # 与同源价格独立对齐：最新日 pct 应等于官方涨跌幅（同值源 _load_prices）
+    raw = StockCodeUtil.to_suffix(rows[0]["symbol"])
+    today_px = quantdb_feed._load_prices([days[-1]])
+    hit = today_px[today_px["symbol"] == raw]
+    if not hit.empty:
+        val = hit.iloc[0]["pct_change"]
+        got = rows[0]["recent"][-1]["pct"]
+        if pd.isna(val):
+            assert got is None
+        else:
+            assert got == pytest.approx(float(val), abs=1e-6)
+
+
+def test_sector_detail_day_stats_only_latest_day(monkeypatch):
+    """多日价格必须只取当日切片：成分均涨幅不得跨日放大（回归防线）。
+
+    合成 2 日价格（前日 +10/−5，当日 0/+1）：当日均涨幅应 = 0.5；
+    若调用方把多日价格整体 merge，均值会被放大到 1.5。
+    """
+    members = pd.DataFrame(
+        {
+            "symbol": ["600036.SH", "000001.SZ"],
+            "sector_name": ["板块A", "板块A"],
+            "sector_type": [flow_panorama.SECTOR_SET_TYPE["industry2"]] * 2,
+        }
+    )
+    monkeypatch.setattr(flow_panorama, "_available", lambda: True)
+    monkeypatch.setattr(
+        flow_panorama, "_l2_dates_upto", lambda target, n: ["20260102", "20251231"][:n]
+    )
+    monkeypatch.setattr(flow_panorama, "_sector_members", lambda: members)
+    monkeypatch.setattr(
+        flow_panorama,
+        "_load_l2_flow",
+        lambda days: pd.DataFrame(
+            {
+                "dt": ["20260102", "20251231"],
+                "symbol": ["600036.SH", "000001.SZ"],
+                "flow_super_net": [3.0e8, 1.0e8],
+                "flow_large_net": [1.0e8, 1.0e8],
+                "flow_medium_net": [0.0, 0.0],
+                "flow_small_net": [0.0, 0.0],
+                "flow_buy_amount": [5.0e8, 2.0e8],
+                "flow_sell_amount": [1.0e8, 0.0],
+                "amount": [100000.0, 80000.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        flow_panorama,
+        "_load_prices",
+        lambda days: pd.DataFrame(
+            {
+                "symbol": ["600036.SH", "000001.SZ", "600036.SH", "000001.SZ"],
+                "dt": ["20251231", "20251231", "20260102", "20260102"],
+                "close": [10.0, 20.0, 11.0, 19.0],
+                "pct_change": [10.0, -5.0, 0.0, 1.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        flow_panorama,
+        "_evidence_context",
+        lambda sector_set, day: ({}, None, {"available": False}),
+    )
+    monkeypatch.setattr(flow_panorama, "_instrument_names", lambda: {})
+
+    detail = flow_panorama._sector_detail_impl("板块A", "industry2", "1d", 30, None)
+    assert detail is not None and detail["available"] is True
+    assert detail["summary"]["pct_change"] == pytest.approx(0.5, abs=1e-6)
+    row = detail["members"][0]
+    assert [p["date"] for p in row["recent"]] == ["2025-12-31", "2026-01-02"]
+    assert [p["pct"] for p in row["recent"]] == [10.0, 0.0]
 
 
 def test_stock_detail_series_and_attribution_roundtrip():

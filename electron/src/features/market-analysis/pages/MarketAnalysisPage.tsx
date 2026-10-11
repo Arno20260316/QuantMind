@@ -91,7 +91,7 @@ export const MarketAnalysisPage: React.FC = () => {
     try {
       const [resIdx, resStock, resBreadth, resHeatmap] = await Promise.all([
         fetch(`${MARKET_ANALYSIS_API}/indices/overview${qs}`, { headers }),
-        fetch(`${MARKET_ANALYSIS_API}/money-flow/stocks?limit=20${qsWithAmp}`, { headers }),
+        fetch(`${MARKET_ANALYSIS_API}/money-flow/stocks?limit=50${qsWithAmp}`, { headers }),
         fetch(`${MARKET_ANALYSIS_API}/breadth${qs}`, { headers }),
         fetch(`${MARKET_ANALYSIS_API}/heatmap?category=shenwan${qsWithAmp}`, { headers }),
       ]);
@@ -372,11 +372,12 @@ export const MarketAnalysisPage: React.FC = () => {
                   profitEffect={breadth?.profit_effect}
                   limitUpBrokenRatio={breadth?.limit_up_broken_ratio}
                 />
-                <div className="flex flex-col gap-2 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 min-h-0 flex-1 justify-between">
-                  <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-2 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 min-h-0 flex-1">
+                  <div className="flex items-center justify-between shrink-0">
                     <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
                       <TrendingUp className="w-3.5 h-3.5 text-purple-600" />
-                      <span>主力资金净流入 Top 5 股票</span>
+                      <span>主力资金净流入 Top {Math.min(50, stockFlows.length) || 50} 股票</span>
+                      <span className="text-[10px] font-mono font-normal text-slate-400">列表内滚动查看</span>
                     </h3>
                     <span
                       onClick={() => setActiveTab('flow-panorama')}
@@ -385,7 +386,10 @@ export const MarketAnalysisPage: React.FC = () => {
                       资金流全景 ➔
                     </span>
                   </div>
-                  <StockMoneyFlowTable items={stockFlows.slice(0, 5)} isMini={true} onStockClick={openStockDetail} />
+                  {/* 滚动容器 + 表头吸顶（antd 表头默认 relative，!sticky 覆盖） */}
+                  <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar rounded-xl [&_.ant-table-thead>tr>th]:!sticky [&_.ant-table-thead>tr>th]:top-0 [&_.ant-table-thead>tr>th]:z-10">
+                    <StockMoneyFlowTable items={stockFlows.slice(0, 50)} isMini={true} onStockClick={openStockDetail} />
+                  </div>
                 </div>
               </div>
 

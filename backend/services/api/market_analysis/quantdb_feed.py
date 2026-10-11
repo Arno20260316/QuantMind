@@ -355,8 +355,8 @@ def placeholder_symbols_by_dt(hist: pd.DataFrame, share_thresh: int = 25) -> dic
     return bad
 
 
-def get_stock_money_flow(limit: int = 20) -> list[dict[str, Any]]:
-    """个股资金流向排行榜（当日主力净流入排序）。"""
+def get_stock_money_flow(limit: int = 50) -> list[dict[str, Any]]:
+    """个股资金流向排行榜（当日主力净流入排序；默认与看板 Top 50 口径一致）。"""
     if not _available():
         return []
 

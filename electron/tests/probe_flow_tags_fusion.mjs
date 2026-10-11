@@ -38,6 +38,29 @@ const page = await ctx.newPage();
 const pageErrors = [];
 page.on('pageerror', (e) => pageErrors.push(String(e).slice(0, 160)));
 
+// /money-flow/sector 响应累计：全景载入后前端会「默认选中排名第一板块」先行取数一次；
+// 若随后点击的板块恰与已选中同名，React 状态不变 → 不重发请求。这类场景应命中
+// 「已有响应/已就位」而非干等新响应（否则 60s 超时假红）。
+let sectorRespCount = 0;
+let lastSectorJson = null;
+page.on('response', (r) => {
+  if (!r.url().includes('/money-flow/sector')) return;
+  sectorRespCount += 1;
+  r.json().then((j) => { lastSectorJson = j; }).catch(() => {});
+});
+
+const clickAndExpectSector = async (locator, name, timeoutMs = 15000) => {
+  const before = sectorRespCount;
+  await locator.click();
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (sectorRespCount > before && lastSectorJson?.name === name) break;
+    if (lastSectorJson?.name === name) break; // 自动选中已就位（点击同名不触发重取）
+    await page.waitForTimeout(200);
+  }
+  return lastSectorJson;
+};
+
 console.log(`\n===== 资金流全景 v2 · P3 标签融合 + 因子板共振态探针 @ ${BASE} =====`);
 
 // ── 登录（样板同 probe_flow_evidence.mjs）────────────────────────────
@@ -96,11 +119,7 @@ const hotBtn = page.locator(`button[title^="${hot.type} · 成分 ${hot.count} �
 ok((await hotBtn.count()) > 0, `热门 chip「${hot.name}」可定位`, `${hot.type} · ${hot.count} 只`);
 let hotSector = null;
 if (await hotBtn.count()) {
-  const [resp] = await Promise.all([
-    page.waitForResponse((r) => r.url().includes('/money-flow/sector'), { timeout: 60000 }),
-    hotBtn.click(),
-  ]);
-  hotSector = await resp.json();
+  hotSector = await clickAndExpectSector(hotBtn, hot.name);
 }
 ok(hotSector?.name === hot.name, '点热门 chip → 工作台载入该板块', `detail=${hotSector?.name}`);
 
@@ -119,11 +138,7 @@ if (plane) {
   const chip = page.locator('button[title*="点击切换体系并联动"]').filter({ hasText: '航空机场' }).first();
   ok((await chip.count()) > 0, '候选 chip「航空机场」渲染（受支持类型=可点）');
   if (await chip.count()) {
-    const [resp] = await Promise.all([
-      page.waitForResponse((r) => r.url().includes('/money-flow/sector'), { timeout: 60000 }),
-      chip.click(),
-    ]);
-    planeSector = await resp.json();
+    planeSector = await clickAndExpectSector(chip, '航空机场');
   }
 }
 ok(planeSector?.name === '航空机场', '点候选 chip → 联动切板块（航空机场）', `detail=${planeSector?.name}`);
@@ -169,11 +184,7 @@ if (factor) {
       const fchip = page.locator('button[title^="所属行业（二级，因子板口径）"]').first();
       ok((await fchip.count()) > 0, `因子板行业 chip「${factor.sector_l2}」在屏`);
       if (await fchip.count()) {
-        const [resp] = await Promise.all([
-          page.waitForResponse((r) => r.url().includes('/money-flow/sector'), { timeout: 60000 }),
-          fchip.click(),
-        ]);
-        const sj = await resp.json();
+        const sj = await clickAndExpectSector(fchip, factor.sector_l2);
         ok(sj?.name === factor.sector_l2, '因子板行业 chip → 回板块工作台', `detail=${sj?.name}`);
       }
     }

@@ -15,6 +15,7 @@ import { Spin, Tooltip } from 'antd';
 import { X, TrendingUp, ChevronRight } from 'lucide-react';
 import {
   getFlowStock,
+  fmtSeriesYi,
   fmtYi,
   fmtPct,
   fmtRatio,
@@ -61,9 +62,9 @@ const SeriesChart: React.FC<{ detail: FlowStockDetailResponse; height?: number }
             if (!p) return '';
             return (
               `<div style="font-size:11px;line-height:1.6">${p.date}<br/>` +
-              `主力净额：<b style="color:${(p.main ?? 0) >= 0 ? INFLOW_COLOR : OUTFLOW_COLOR}">${fmtYi(p.main)}</b><br/>` +
-              `超大 ${fmtYi(p.super)} · 大 ${fmtYi(p.large)}<br/>` +
-              `中 ${fmtYi(p.medium)} · 小 ${fmtYi(p.small)}<br/>` +
+              `主力净额：<b style="color:${(p.main ?? 0) >= 0 ? INFLOW_COLOR : OUTFLOW_COLOR}">${fmtSeriesYi(p.main)}</b><br/>` +
+              `超大 ${fmtSeriesYi(p.super)} · 大 ${fmtSeriesYi(p.large)}<br/>` +
+              `中 ${fmtSeriesYi(p.medium)} · 小 ${fmtSeriesYi(p.small)}<br/>` +
               `净额比：${fmtRatio(p.net_ratio)} · 收盘 ${p.close ?? '—'}（${fmtPct(p.pct_change)}）</div>`
             );
           },

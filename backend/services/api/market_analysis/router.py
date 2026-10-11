@@ -472,7 +472,7 @@ async def get_money_flow_panorama(
     period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
     sectors: str = Query("industry2", description="板块体系: industry1 / industry2 / concept"),
     top_sectors: int = Query(10, ge=2, le=30, description="桑基展示板块数（all 时按 6:4 拆流入/流出）"),
-    stocks_per_sector: int = Query(5, ge=1, le=20, description="每板块展示的个股数（主力净额 TopK）"),
+    stocks_per_sector: int = Query(5, ge=1, le=20, description="每板块展示的个股数（all=流入前 6/流出最深 4 双侧；inflow/outflow=单向 TopK）"),
     direction: str = Query("all", description="方向: all / inflow / outflow"),
     date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
     current_user: dict = Depends(get_current_user),
@@ -914,7 +914,7 @@ async def trigger_market_analysis_stream(
             if await request.is_disconnected():
                 return
 
-            stock_flow = await _run_step("stock_flow", quantdb_feed.get_stock_money_flow, 20)
+            stock_flow = await _run_step("stock_flow", quantdb_feed.get_stock_money_flow, 50)
             yield _sse("stock_flow", {"stock_flow": stock_flow})
             if await request.is_disconnected():
                 return

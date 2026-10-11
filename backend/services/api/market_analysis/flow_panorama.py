@@ -63,6 +63,7 @@ INFLOW_SHARE = 0.6  # direction=all 时流入/流出名额拆分（10 → 6 流�
 STOCKS_PER_SECTOR_DEFAULT = 5
 STOCKS_PER_SECTOR_MAX = 20
 SECTOR_TREND_DAYS = 20  # 板块明细趋势窗口（交易日）
+SECTOR_RECENT_DAYS = 5  # 成分行近 N 日逐日涨跌幅窗口（升序日期组）
 MIN_BREADTH_MEMBERS = 5  # 广度计算的最小成分样本
 MIN_SHARE_DENOM = 1e6  # |板块净额| 低于此值（100 万元）时占比落 null（分母过小不稳定）
 MAX_STOCK_DAYS = 60  # 个股详情的最大序列长度
@@ -435,11 +436,24 @@ def _sankey_graph(
         if ranked.empty:
             continue
         total = len(ranked)
-        picked = (
-            ranked.head(stocks_per_sector)
-            if main >= 0
-            else ranked.tail(stocks_per_sector).iloc[::-1]
-        )
+        # 个股层选取：direction=inflow/outflow → 单向 TopK；all → 双侧 6:4——
+        # 每板块同时给出「流入排名前 n_in」与「流出排名最深 n_out」两翼
+        # （用户口径：到个股的流入/流出排名都要）。短板块自动收敛，
+        # 尾翼与头翼重叠时去重保序（头翼在前）。
+        if direction == "inflow":
+            picked = ranked.head(stocks_per_sector)
+        elif direction == "outflow":
+            picked = ranked.tail(stocks_per_sector).iloc[::-1]
+        else:
+            n_in = max(1, int(round(stocks_per_sector * INFLOW_SHARE)))
+            n_out = stocks_per_sector - n_in
+            picked_in = ranked.head(n_in)
+            if n_out <= 0:
+                picked = picked_in
+            else:
+                picked_out = ranked.tail(n_out).iloc[::-1]
+                picked_out = picked_out[~picked_out.index.isin(picked_in.index)]
+                picked = pd.concat([picked_in, picked_out])
         for sym, srow in picked.iterrows():
             link = _mk_link(
                 s, names.get(sym) or _normalize_prefix(sym), float(srow["main"])
@@ -755,8 +769,12 @@ def _sector_detail_impl(
                 }
             )
 
-    prices = _load_prices([days[0]])
-    day_stats = _day_sector_stats(flow, member_df, days[0], prices).get(name) or {}
+    recent_days = sorted(days[:SECTOR_RECENT_DAYS])
+    prices = _load_prices(recent_days)
+    # _day_sector_stats 按 symbol 直接 merge 价格：多日价格会把均值跨日放大，
+    # 广度/成分均涨幅只准用当日切片；近 N 日序列另行逐日对齐（见下）。
+    price_today = prices[prices["dt"] == days[0]] if not prices.empty else prices
+    day_stats = _day_sector_stats(flow, member_df, days[0], price_today).get(name) or {}
     names = _instrument_names()
     streak_rows, evidence_doc, ev_meta = _evidence_context(sector_set, days[0])
     info = streak_rows.get(name) or {}
@@ -768,6 +786,14 @@ def _sector_detail_impl(
     )
 
     ranked = sym_sums.sort_values("main", ascending=False)
+    # 近 N 日逐日涨跌幅：symbol → {raw_dt: pct|null}；无价不漏行（对齐统一日期组）
+    recent_pct: dict[str, dict[str, float | None]] = {}
+    if not prices.empty and "pct_change" in prices.columns:
+        pv = prices[prices["symbol"].isin(sec_set)]
+        for pr in pv.itertuples(index=False):
+            recent_pct.setdefault(str(pr.symbol), {})[str(pr.dt)] = _f_or_none(
+                pr.pct_change
+            )
     member_rows: list[dict[str, Any]] = []
     for sym, r in ranked.iterrows():
         m = float(r["main"])
@@ -786,6 +812,10 @@ def _sector_detail_impl(
                 else None,
                 "inner_rank": int(ranked.index.get_loc(sym)) + 1,
                 "inner_total": int(len(ranked)),
+                "recent": [
+                    {"date": _dash(d), "pct": recent_pct.get(sym, {}).get(d)}
+                    for d in recent_days
+                ],
             }
         )
     member_rows.sort(key=lambda x: abs(x["net_main"]), reverse=True)

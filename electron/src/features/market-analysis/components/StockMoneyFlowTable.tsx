@@ -452,7 +452,9 @@ export const StockMoneyFlowTable: React.FC<StockMoneyFlowTableProps> = ({
       )}
 
 
-      <div className="w-full overflow-hidden rounded-xl border border-slate-200/80 bg-white">
+      {/* overflow-clip（非 hidden）：保留圆角裁切，但 clip 不建立滚动容器——
+          否则表头 sticky 会绑定到这层"假滚动容器"，外层滚动时表头随之滚走（Top 50 卡吸顶失效）。 */}
+      <div className="w-full overflow-clip rounded-xl border border-slate-200/80 bg-white">
         <Table
           columns={isMini ? miniColumns : columns}
           dataSource={items.map((item, idx) => ({ ...item, key: idx }))}

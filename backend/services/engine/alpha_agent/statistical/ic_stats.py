@@ -6,8 +6,11 @@
   与 ``scipy.spearmanr`` 同值）；单日有效样本 < ``DEFAULT_MIN_NAMES_PER_DAY``
   （10，参考实现口径）不计；零方差截面（停牌/一字板）corr=NaN 自然剔除；
 - **ICIR = mean(RankIC) / std(RankIC)**（日频、非年化——与参考实现一致）；
-  t 值 = ICIR·√n（同口径代数等价），p 值 Student-t(df=n−1)；有效日
-  < ``DEFAULT_MIN_VALID_DAYS``（40）不出统计（样本不足 → ``None``，不硬凑）；
+  t 值走 **Newey–West 修正**（Bartlett HAC 标准误；逐日 IC 序列自相关会让
+  朴素 ``ICIR·√n`` 高估显著性，见 :func:`newey_west_t_stat`），朴素 t 保留
+  为 ``rank_ic_t_naive`` 审计对照；p 值 Student-t(df=n−1)（NW 只修正标准误，
+  参考分布口径不变——金样钉住）；有效日 < ``DEFAULT_MIN_VALID_DAYS``（40）
+  不出统计（样本不足 → ``None``，不硬凑）；
 - **分组收益**：逐日按因子值等份分 Q 组（rank 法，避免并列），报组均收益、
   Q_top−Q_bottom 价差均值/t 值与单调性 τ（分位序 × 组均收益的 Spearman）——
   IC 低但分组单调的因子与 IC 高但乱序的因子不是一回事，入库证据要分开看；
@@ -46,9 +49,14 @@ class IcSummary:
     rank_ic_mean: float
     rank_ic_std: float
     icir: float
+    #: Newey–West 修正 t（规范统计量：喂 p 值 / FDR / 落库 t_stat）
     rank_ic_t: float
     rank_ic_p: float
     rank_ic_win_rate: float
+    #: 朴素 t = ICIR·√n（审计对照列；自相关强时 NW 与它分离才是正常）
+    rank_ic_t_naive: float = float("nan")
+    #: 实际使用的 Bartlett 带宽（自动式结果；审计用）
+    rank_ic_t_lags: int = 0
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,60 @@ def two_sided_p(t_stat: float, dof: int) -> float:
     return float(2 * _scipy_stats.t.sf(abs(t_stat), dof))
 
 
+def newey_west_lag(n: int) -> int:
+    """Newey–West(1994) 自动带宽 ``L = ⌊4·(n/100)^{2/9}⌋``，钳到 [1, n//4]。"""
+    if n < 2:
+        return 0
+    lag = int(np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0)))
+    return max(1, min(lag, max(1, n // 4)))
+
+
+def newey_west_t_stat(series: pd.Series, *, lags: int | None = None) -> tuple[float, int]:
+    """序列均值的 Newey–West（Bartlett 核）t 值 → ``(t, 实际带宽)``。
+
+    逐日 IC 序列自带自相关（重叠周期标签、信号持续），朴素 ``均值/(s/√n)``
+    按独立样本算标准误 → 系统性高估显著性。NW 用 HAC 标准误修正：
+    ``SE² = (γ0 + 2Σ_{l=1..L} (1−l/(L+1))·γ_l) / n``。
+
+    口径实锤（2026-10-11 与 statsmodels
+    ``OLS(...).fit(cov_type="HAC", cov_kwds={"maxlags": L, "use_correction": False})``
+    六组 AR(1) 用例逐位一致，<1.1e-15；金样 ``fixtures/neweyWestGolden.json``）：
+
+    - 带宽默认走 :func:`newey_west_lag` 自动式（可显式覆盖做敏感度）；
+    - γ_l 除数 = n、核权 ``1−l/(L+1)``、**不做** statsmodels 的
+      ``use_correction`` 小样本放大（n/(n−k)）；
+    - HAC 方差估值非正时退回朴素方差 γ0——Bartlett 核数学上正定（真值
+      ≥0），触发只可能来自浮点舍入或 NaN 病态；退的是「不拿负方差开根、
+      不吐假 t」的守卫。
+
+    **带宽非周期感知（已知口径边界）**：自动带宽只看 n（A 股 ~4 年窗
+    n≈1000 → L≈6），而重叠前向标签（周期 h）的结构性自相关到 h−1；h≥10
+    时自动带宽只**部分**修掉重叠自相关。要更保守的口径须显式传
+    ``lags=h−1`` 起（本函数已支持，调用方自决——不默认放大，避免把
+    带宽选择变成隐性假设）。
+    """
+    x = np.asarray(series, dtype=float)
+    n = x.size
+    if n < 2:
+        return float("nan"), 0
+    if lags is None:
+        lags = newey_west_lag(n)
+    lags = max(0, min(int(lags), n - 1))
+    mean = float(x.mean())
+    xc = x - mean
+    gamma0 = float(xc @ xc) / n
+    hac = gamma0
+    for ell in range(1, lags + 1):
+        weight = 1.0 - ell / (lags + 1.0)
+        gamma_l = float(xc[ell:] @ xc[:-ell]) / n
+        hac += 2.0 * weight * gamma_l
+    if not hac > 0:  # 含 NaN 与负值：退回朴素方差
+        hac = gamma0
+    if not hac > 0:
+        return float("nan"), lags
+    return mean / float(np.sqrt(hac / n)), lags
+
+
 def summarize_ic(
     daily: pd.DataFrame, *, min_days: int = DEFAULT_MIN_VALID_DAYS
 ) -> IcSummary | None:
@@ -166,16 +228,20 @@ def summarize_ic(
     mean = float(rank_ic.mean())
     std = float(rank_ic.std(ddof=1))
     icir = mean / std if std > 0 else float("nan")
-    t_stat = icir * np.sqrt(n) if std > 0 else float("nan")
+    t_naive = icir * np.sqrt(n) if std > 0 else float("nan")
+    # 规范 t = Newey–West（自相关修正）；朴素 t 仅作审计对照
+    t_nw, nw_lags = newey_west_t_stat(rank_ic)
     return IcSummary(
         n_days=n,
         ic_mean=float(daily["ic"].mean()),
         rank_ic_mean=mean,
         rank_ic_std=std,
         icir=float(icir),
-        rank_ic_t=float(t_stat),
-        rank_ic_p=two_sided_p(t_stat, n - 1),
+        rank_ic_t=float(t_nw),
+        rank_ic_p=two_sided_p(t_nw, n - 1),
         rank_ic_win_rate=float((rank_ic > 0).mean()),
+        rank_ic_t_naive=float(t_naive),
+        rank_ic_t_lags=int(nw_lags),
     )
 
 
@@ -222,6 +288,9 @@ def quantile_returns(
     spread_arr = np.asarray(spreads, dtype=float)
     spread_mean = float(spread_arr.mean())
     spread_std = float(spread_arr.std(ddof=1)) if n > 1 else float("nan")
+    # 刻意朴素（与 rank_ic_t 的 NW 口径不同）：spread_t 不落库、不进任何
+    # 闸，消费方只用 monotonicity_tau/spread_mean——保持「独立样本」直读，
+    # 不做 NW 修正以免读者误以为它是判决量
     spread_t = spread_mean / (spread_std / np.sqrt(n)) if spread_std > 0 else float("nan")
     return QuantileSummary(
         n_days=n,

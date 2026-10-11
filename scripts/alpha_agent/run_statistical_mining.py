@@ -124,6 +124,8 @@ def _factor_metadata(
             "icir": h.icir,
             "rank_ic_t": h.rank_ic_t,
             "rank_ic_p": h.rank_ic_p,
+            "rank_ic_t_naive": h.rank_ic_t_naive,
+            "rank_ic_t_lags": h.rank_ic_t_lags,
             "fdr_pass": h.fdr_pass,
         }
         for h in report.horizons
@@ -196,6 +198,8 @@ def _composite_metadata(
             "icir": h.icir,
             "rank_ic_t": h.rank_ic_t,
             "rank_ic_p": h.rank_ic_p,
+            "rank_ic_t_naive": h.rank_ic_t_naive,
+            "rank_ic_t_lags": h.rank_ic_t_lags,
         }
         for h in report.horizons
     }

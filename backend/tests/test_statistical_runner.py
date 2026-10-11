@@ -114,7 +114,7 @@ class TestFactorMetadata:
             eng.HorizonStats(
                 horizon=1, n_days=80, ic_mean=0.031, rank_ic_mean=0.041,
                 icir=0.9, rank_ic_t=3.1, rank_ic_p=0.002, rank_ic_win_rate=0.6,
-                fdr_pass=True,
+                fdr_pass=True, rank_ic_t_naive=1.9, rank_ic_t_lags=5,
             ),
             eng.HorizonStats(
                 horizon=5, n_days=75, ic_mean=0.012, rank_ic_mean=0.018,
@@ -159,6 +159,12 @@ class TestFactorMetadata:
         assert meta["horizons"]["1"]["fdr_pass"] is True
         assert meta["horizons"]["5"]["fdr_pass"] is False
         assert meta["horizons"]["1"]["n_days"] == 80
+        # T-FE-04：NW 带宽与朴素对照列随 metadata 落库——复核自相关修正
+        # 是否生效（rank_ic_t 与 rank_ic_t_naive 分离才是正常）
+        assert meta["horizons"]["1"]["rank_ic_t_lags"] == 5
+        assert meta["horizons"]["1"]["rank_ic_t_naive"] == pytest.approx(1.9)
+        # 未喂对照列（dataclass 默认 NaN）的周期 → 严格 JSON null，不是 0
+        assert meta["horizons"]["5"]["rank_ic_t_naive"] is None
 
     def test_metadata_is_strict_json_with_nan_as_null(self, runner):
         """被闸门拒掉的周期 IC 是 NaN——metadata 必须是严格 JSON。
@@ -314,6 +320,9 @@ class TestTier3Metadata:
         assert meta["weight_horizon"] == 1 and meta["z_window"] == 60
         assert meta["fdr_applied"] is False and meta["neutralized"] is False
         assert meta["universe"] == "csi300"
+        # NW 审计列在合成路径同样随行（默认 NaN/0 → null/0，不炸严格 JSON）
+        assert meta["horizons"]["1"]["rank_ic_t_naive"] is None
+        assert meta["horizons"]["1"]["rank_ic_t_lags"] == 0
         json.dumps(meta, ensure_ascii=False, allow_nan=False)
 
 

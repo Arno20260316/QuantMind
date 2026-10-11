@@ -5,14 +5,17 @@
 1. **前向收益**按 symbol 内 bar 序 shift（停牌缺 bar 自动跨过），close-to-close；
 2. **逐日截面 IC** = Pearson；**RankIC** = 双向秩后 Pearson（与 scipy.spearmanr
    同值）；单日样本 <10 剔除；零方差/全 NaN 日自然剔除；
-3. **汇总**：ICIR=mean/std（日频）；t=ICIR·√n；p 用 Student-t(df=n−1)；
-   有效日 <40 → ``None``（不硬凑）；
+3. **汇总**：ICIR=mean/std（日频）；t 走 **Newey–West（Bartlett HAC，带宽自动式
+   ``newey_west_lag``）**，金样钉 6 组 AR(1) 对 statsmodels（``use_correction=
+   False`` 口径）；朴素 t=ICIR·√n 保留为审计对照列；p 用 Student-t(df=n−1)
+   （NW 只修标准误）；有效日 <40 → ``None``（不硬凑）；
 4. **分组收益**：等份 rank 分组，报组均、顶底价差 t 与单调性 τ；
 5. **BH-FDR**：标准步进，NaN 项不计入 m 也不判显著。
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -171,12 +174,87 @@ class TestSummarize:
         arr = np.asarray(values)
         mean, std = arr.mean(), arr.std(ddof=1)
         icir = mean / std
-        t_stat = icir * np.sqrt(40)
+        t_naive = icir * np.sqrt(40)
+        t_nw, lags = ics.newey_west_t_stat(pd.Series(values, dtype=float))
         assert summary.rank_ic_mean == pytest.approx(mean)
         assert summary.icir == pytest.approx(icir)
-        assert summary.rank_ic_t == pytest.approx(t_stat)
-        assert summary.rank_ic_p == pytest.approx(2 * sps.t.sf(abs(t_stat), 39))
+        # 规范 t = NW（接线钉住）；朴素 t 只作对照列
+        assert summary.rank_ic_t == pytest.approx(t_nw)
+        assert summary.rank_ic_t_lags == lags
+        assert lags == ics.newey_west_lag(40)
+        assert summary.rank_ic_t_naive == pytest.approx(t_naive)
+        assert summary.rank_ic_p == pytest.approx(2 * sps.t.sf(abs(t_nw), 39))
+        # 周期序列带负自相关 → NW 标准误收缩、|t| 放大（方向钉住；
+        # 若接线回朴素 t 这条也会红）
+        assert abs(t_nw) > abs(t_naive)
         assert summary.rank_ic_win_rate == 1.0
+
+
+# ── Newey–West t（T-FE-04） ──────────────────────────────────────────
+
+GOLDEN_PATH = Path(__file__).resolve().parent / "fixtures" / "neweyWestGolden.json"
+
+
+class TestNeweyWest:
+    """金样 = 容器 statsmodels HAC(``use_correction=False``) 独立实现输出。
+
+    口径：γ_l 除数 n、Bartlett 核权 ``1−l/(L+1)``、带宽自动式；朴素 t
+    （ICIR·√n，ddof=1）仅作审计对照。正自相关 → NW 收缩显著性；负自相关
+    → NW 放大（两条方向在 6 组用例上全钉）。
+    """
+
+    def test_golden_matches_statsmodels(self):
+        cases = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))["cases"]
+        assert len(cases) >= 6
+        for case in cases:
+            n, phi = case["n"], case["phi"]
+            rng = np.random.default_rng(case["seed"])
+            x = np.zeros(n)
+            for i in range(1, n):
+                x[i] = phi * x[i - 1] + rng.normal()
+            t_nw, lags = ics.newey_west_t_stat(pd.Series(x))
+            assert lags == case["lags"], case
+            assert t_nw == pytest.approx(case["t_nw"], rel=1e-9), case
+            # 朴素对照列同金样 —— 同时自查生成序列与钻探逐位一致
+            naive = float(x.mean() / (x.std(ddof=1) / np.sqrt(n)))
+            assert naive == pytest.approx(case["t_naive"], rel=1e-9), case
+            if phi > 0:
+                assert abs(t_nw) < abs(naive), case
+            else:
+                assert abs(t_nw) > abs(naive), case
+
+    def test_automatic_bandwidth_formula(self):
+        # L = ⌊4·(n/100)^{2/9}⌋，钳到 [1, n//4]
+        assert ics.newey_west_lag(100) == 4
+        assert ics.newey_west_lag(40) == 3
+        assert ics.newey_west_lag(60) == 3
+        assert ics.newey_west_lag(500) == 5
+        assert ics.newey_west_lag(1000) == 6
+        assert ics.newey_west_lag(5) == 1  # n//4=1 下限钳制
+        assert ics.newey_west_lag(1) == 0
+        assert ics.newey_west_lag(0) == 0
+
+    def test_lags_zero_equals_population_variance_t(self):
+        # 显式 lags=0 ⇒ hac=γ0（ddof=0 口径）——与解析式逐位一致
+        x = np.linspace(-1, 1, 50) ** 3
+        t, lags = ics.newey_west_t_stat(pd.Series(x), lags=0)
+        xc = x - x.mean()
+        expected = float(x.mean() / np.sqrt((xc @ xc) / x.size / x.size))
+        assert lags == 0
+        assert t == pytest.approx(expected, rel=1e-12)
+
+    def test_nonpositive_or_nan_hac_is_guard_not_fake_t(self):
+        # 常数序列：γ0=HAC=0 → 不出统计（NaN），不开根负数、不吐假 t
+        t_const, _ = ics.newey_west_t_stat(pd.Series([3.0] * 40))
+        assert np.isnan(t_const)
+        # 含 NaN：HAC 传染为 NaN → 同样退为 NaN
+        t_nan, lags = ics.newey_west_t_stat(pd.Series([0.1, 0.2, np.nan, 0.4, 0.5]))
+        assert np.isnan(t_nan)
+        assert lags == ics.newey_west_lag(5)
+        # 过短序列：n<2 无统计可言
+        t_short, lags_short = ics.newey_west_t_stat(pd.Series([1.0]))
+        assert np.isnan(t_short)
+        assert lags_short == 0
 
 
 # ── 分组收益 ─────────────────────────────────────────────────────────

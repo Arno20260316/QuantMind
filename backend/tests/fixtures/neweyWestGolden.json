@@ -1,0 +1,11 @@
+{
+  "note": "T-FE-04 金样：AR(1) 序列均值的 Newey–West (Bartlett HAC) t 值。生成方式 x[i]=phi*x[i-1]+rng.normal()，rng=np.random.default_rng(seed)（PCG64 流跨版本稳定）。参照实现 = 容器 statsmodels OLS(y~1).fit(cov_type='HAC', cov_kwds={'maxlags': lags, 'use_correction': False})（2026-10-11 实测与 ic_stats.newey_west_t_stat 逐位一致，diff<1.1e-15）。t_naive = mean/(std(ddof=1)/sqrt(n))，即 ICIR·√n，作审计对照列。",
+  "cases": [
+    {"n": 120, "phi": 0.5, "seed": 42, "lags": 4, "t_nw": -1.077327189773, "t_naive": -1.564399169138},
+    {"n": 60, "phi": 0.7, "seed": 7, "lags": 3, "t_nw": -2.437604448784, "t_naive": -4.176583769262},
+    {"n": 240, "phi": 0.3, "seed": 1234, "lags": 4, "t_nw": 1.015568872869, "t_naive": 1.321632011150},
+    {"n": 40, "phi": 0.6, "seed": 99, "lags": 3, "t_nw": 2.202174201010, "t_naive": 2.785193089068},
+    {"n": 90, "phi": -0.4, "seed": 5, "lags": 3, "t_nw": -1.961731317930, "t_naive": -1.412512137717},
+    {"n": 500, "phi": 0.2, "seed": 2026, "lags": 5, "t_nw": 0.588474441198, "t_naive": 0.728756312765}
+  ]
+}

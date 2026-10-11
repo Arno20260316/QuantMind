@@ -208,6 +208,10 @@ def evaluate_house_factors(
 
 
 def _horizon_entry(h: int, summary: ic_stats.IcSummary | None) -> dict:
+    # t 值口径 = Newey–West（T-FE-04 起 ic_stats.summarize_ic 的统一口径）：
+    # rank_ic_t 是规范量（喂 p/FDR），naive t 与带宽随行落审计列——与
+    # statistical runner 的 metadata 同构，报告间可对照复核（缺审计列就
+    # 说不清「这个 t 是哪个口径」）。
     if summary is None:
         return {
             "horizon": h,
@@ -217,6 +221,8 @@ def _horizon_entry(h: int, summary: ic_stats.IcSummary | None) -> dict:
             "icir": float("nan"),
             "rank_ic_t": float("nan"),
             "rank_ic_p": float("nan"),
+            "rank_ic_t_naive": float("nan"),
+            "rank_ic_t_lags": 0,
             "rank_ic_win_rate": float("nan"),
             "fdr_pass": False,
         }
@@ -228,6 +234,8 @@ def _horizon_entry(h: int, summary: ic_stats.IcSummary | None) -> dict:
         "icir": summary.icir,
         "rank_ic_t": summary.rank_ic_t,
         "rank_ic_p": summary.rank_ic_p,
+        "rank_ic_t_naive": summary.rank_ic_t_naive,
+        "rank_ic_t_lags": summary.rank_ic_t_lags,
         "rank_ic_win_rate": summary.rank_ic_win_rate,
         "fdr_pass": False,
     }

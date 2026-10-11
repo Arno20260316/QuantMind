@@ -14,7 +14,10 @@
    把闸关掉 late 立刻当选（整窗最强）——行为随开关翻转，闸不是装饰。early
    折间全同号 → 当选；它的滚动再选择命中率恰为 0/3 也照样当选——审计量不进闸
    的实证（旧闸按率判决时正是把 early 误杀、放行 late，与 csi300 实跑
-   19/28 候选 0/3 同形态）；
+   19/28 候选 0/3 同形态）。**T-FE-04（NW t）后 FDR 也独立拦下 late**：
+   尾折爆发的 IC 序列自相关强，朴素 t 的假显著被修正（p≈0.2 不过 BH-FDR）
+   ——同一形态被两道闸独立识别；因此「闸关后当选」的隔离实验改为**同时关
+   FDR**，单独考察稳定性闸；
 2. **证据诚实**：late 的逐折 IC 首折反向、末折强正（证据与判决对得上）；
    闸关闭时稳定性字段如实留 NaN/空（不伪造 0）；
 3. **相关性去重 + 递补**：秩完全同序的两个候选（|ρ|≈1）后者被去重挤掉、拒因
@@ -184,10 +187,12 @@ class TestFoldConsistencyGate:
         """late 整窗最强但折间符号翻脸（尾折单骑救主）→ 闸拦下；关闸后它当选。
 
         完整行为闭环：闸开 = early（折间全同号）当选、late 带「折间符号不稳」
-        拒因；闸关 = late（整窗 |RankIC| 更大）当选——闸不是装饰。early 的
-        滚动再选择命中率恰为 0/3（三个检查点全被 late 的累计 |IC| 压过）也
-        照样当选：审计量不进闸的实证——旧闸按率判决时正是误杀 early、放行
-        late（与 2026-10-11 csi300 实跑 19/28 候选 0/3 同形态）。
+        拒因（T-FE-04 后连 FDR 都过不了：NW 修正把自相关序列的假显著打回，
+        双闸独立拦同一形态）；闸关 = late（整窗 |RankIC| 更大）当选——闸
+        不是装饰。early 的滚动再选择命中率恰为 0/3（三个检查点全被 late 的
+        累计 |IC| 压过）也照样当选：审计量不进闸的实证——旧闸按率判决时正是
+        误杀 early、放行 late（与 2026-10-11 csi300 实跑 19/28 候选 0/3
+        同形态）。
         """
         panel = _make_panel()
         meta = _metadata(panel)
@@ -197,6 +202,11 @@ class TestFoldConsistencyGate:
         assert gated.selected == ("early",), "窗尾爆发不足以当选"
         late = _report(gated, "late")
         assert "折间符号不稳" in late.reject_reason
+        assert late.fdr_pass is False and "BH-FDR" in late.reject_reason, (
+            "T-FE-04（NW 修正）后 FDR 也独立拦下它：尾折爆发的 IC 序列自相关"
+            "极强，朴素 t 的假显著（同数据旧口径下 p<q 放行）被修正为 p≈0.2"
+            "——同一形态被两道闸独立识别"
+        )
         assert len(late.fold_ics) == 4 and late.reselect_checkpoints == 3, (
             "折结构足够：这是可判定状态下的判决（不是「折太薄不判」）"
         )
@@ -219,9 +229,20 @@ class TestFoldConsistencyGate:
         assert late.selection_score == pytest.approx(abs(late.rank_ic_mean) * 0.25)
         assert early.selection_score == pytest.approx(abs(early.rank_ic_mean))
 
+        # 单闸隔离（稳定性关、FDR 关）：只剩「整窗 |RankIC| 排序」——late
+        # 当选，证明它输掉 gated 局不是别的原因。
         _registry(monkeypatch, EARLY, LATE)
-        ungated = _run(panel, meta, _cfg(require_stability=False))
-        assert ungated.selected == ("late",), "关闸后整窗最强当选——闸不是装饰"
+        ungated = _run(panel, meta, _cfg(require_stability=False, require_fdr=False))
+        assert ungated.selected == ("late",), "只剩稳定性闸：关了它整窗最强当选——闸不是装饰"
+
+        # 单闸隔离（FDR 关、稳定性开）：late 被稳定性闸**独立**拦下——FDR
+        # 不是唯一拦它的闸（两道闸各自可拦，各有一个不依赖对方的实证）。
+        _registry(monkeypatch, EARLY, LATE)
+        stab_only = _run(panel, meta, _cfg(require_stability=True, require_fdr=False))
+        assert stab_only.selected == ("early",), "FDR 关了稳定性闸照样拦下 late"
+        late_only = _report(stab_only, "late")
+        assert "折间符号不稳" in late_only.reject_reason
+        assert "BH-FDR" not in late_only.reject_reason, "本局 FDR 未启用，拒因不该提它"
 
     def test_disabled_stability_leaves_evidence_empty_not_zero(self, monkeypatch):
         """闸关闭时稳定性字段如实留空：没有算过的证据不许显示成 0。"""

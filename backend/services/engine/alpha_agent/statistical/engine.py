@@ -120,10 +120,13 @@ class HorizonStats:
     ic_mean: float
     rank_ic_mean: float
     icir: float
-    rank_ic_t: float
+    rank_ic_t: float  # Newey–West 修正 t（规范；喂 p/FDR/落库）
     rank_ic_p: float
     rank_ic_win_rate: float
     fdr_pass: bool = False
+    #: 朴素 t 与 NW 带宽（审计对照；缺失期 = NaN/0）
+    rank_ic_t_naive: float = float("nan")
+    rank_ic_t_lags: int = 0
 
 
 @dataclass(frozen=True)
@@ -246,6 +249,8 @@ def _horizon_stats(horizon: int, summary: _ic.IcSummary | None) -> HorizonStats:
         rank_ic_t=summary.rank_ic_t,
         rank_ic_p=summary.rank_ic_p,
         rank_ic_win_rate=summary.rank_ic_win_rate,
+        rank_ic_t_naive=summary.rank_ic_t_naive,
+        rank_ic_t_lags=summary.rank_ic_t_lags,
     )
 
 

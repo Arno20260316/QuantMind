@@ -24,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.shared.factor_board import config as C  # noqa: E402
-from backend.shared.factor_board import write_board  # noqa: E402
+from backend.shared.factor_board import write_board, write_members_index  # noqa: E402
 from backend.shared.factor_board.builder import BuildError, build_board  # noqa: E402
 
 log = logging.getLogger("build_factor_board")
@@ -90,12 +90,14 @@ def main() -> int:
         return 2
 
     log.info("data_dir=%s out_dir=%s", data_dir, out_dir)
+    members_out: dict = {}
     try:
         board = build_board(
             data_dir,
             model_date=args.model_date,
             signals_csv=args.signals_csv,
             board_dir=out_dir,
+            members_out=members_out,
         )
     except BuildError as exc:
         log.error("构建失败（硬门）: %s", exc)
@@ -115,6 +117,15 @@ def main() -> int:
         log.error("产物校验失败: %s", exc)
         return 1
     print(f"[ok] 产物: {dated}；latest: {latest}")
+    if members_out:
+        try:
+            mpath = write_members_index(members_out, out_dir)
+            n_sectors = sum(len(v) for v in members_out["sectors"].values())
+            print(f"[ok] 板块成分明细: {mpath}（{n_sectors} 个板块）")
+        except (ValueError, OSError) as exc:
+            log.warning("板块成分明细落盘失败（板已落盘，钻取端点将 404）: %s", exc)
+    else:
+        log.warning("板块成分明细为空（生成异常），未落盘")
     return 0
 
 

@@ -104,7 +104,7 @@ export function RankRow({
   right?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0">
+    <div className="flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0 transition-colors hover:bg-slate-50/70">
       <span
         className={`w-5 h-5 rounded-md grid place-items-center text-[10px] font-extrabold ${
           rank <= 3 ? 'bg-purple-600 text-white' : 'bg-slate-100 text-slate-500'

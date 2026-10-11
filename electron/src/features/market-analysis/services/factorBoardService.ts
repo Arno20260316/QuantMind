@@ -240,3 +240,55 @@ export async function getFactorBoard(date?: string): Promise<FactorBoardResponse
   }
   return body as FactorBoardResponse;
 }
+
+// ── 板块成分钻取（/factor-board/members） ────────────────────────────────
+
+/** 板块成分行（含 ST 与无模型覆盖标的：quadrant 缺失为 null，绝不落 0/空串）。 */
+export interface FactorBoardSectorMember {
+  symbol: string;
+  name: string | null;
+  composite: number | null;
+  model_rank: number | null;
+  quadrant: string | null;
+}
+
+export interface FactorBoardMembersResponse {
+  schema_version: string | null;
+  decision_date: string | null;
+  type: string;
+  name: string;
+  n: number;
+  items: FactorBoardSectorMember[];
+}
+
+/**
+ * 板块成分明细（点击板块行时的按需取数）。
+ * 404=该决策日无明细（旧版产物未重跑产板）或板块名不存在（detail.message 直接可展示）。
+ */
+export async function getFactorBoardMembers(
+  type: string,
+  name: string,
+  date?: string,
+): Promise<FactorBoardMembersResponse> {
+  const token = localStorage.getItem('access_token') || '';
+  const qs = new URLSearchParams({ type, name });
+  if (date) qs.set('date', date);
+  const res = await fetch(`${MA_API}/factor-board/members?${qs.toString()}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    const msg =
+      typeof detail === 'string'
+        ? detail
+        : (detail as { message?: string } | null)?.message || `板块成分接口失败 ${res.status}`;
+    const dates = (detail as { available_dates?: string[] } | null)?.available_dates || [];
+    throw new FactorBoardError(msg, res.status, dates);
+  }
+  const items = (body as { items?: unknown } | null)?.items;
+  if (!Array.isArray(items)) {
+    throw new FactorBoardError('板块成分明细结构异常（items 非数组）', res.status);
+  }
+  return body as FactorBoardMembersResponse;
+}

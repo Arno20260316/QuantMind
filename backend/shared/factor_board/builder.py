@@ -156,7 +156,14 @@ def build_board(
     signals_csv: str | Path | None = None,
     board_dir: Path | None = None,
     today: _date | None = None,
+    members_out: dict | None = None,
 ) -> dict:
+    """构建决策板；``members_out`` 传入 dict 时填充板块成分明细（钻取伴生件）。
+
+    明细**不进板 JSON**（概念展开 6 万+ 行，内嵌会让产物膨胀数倍），由 CLI 另存
+    ``members/{decision_date}.json``。明细生成异常只记 warning，绝不拦板（板 JSON
+    契约与旧调用方零扰动——缺省 None 时行为不变）。
+    """
     today = today or _date.today()
     run = run_selection(quantdb_root, today=today)
     warnings = list(run.warnings)
@@ -251,6 +258,8 @@ def build_board(
 
     q = S.quadrant_frame(stock)
     rho = S.spearman(q["composite"], q["mdl_rank"])
+    # 全量注入象限列（缺双轴之一即 NaN）——供成分明细钻取行携带 quadrant
+    stock["quadrant"] = q["quadrant"].reindex(stock.index)
 
     sectors_payload: dict = {}
     for stype in C.SECTOR_TYPES:
@@ -314,6 +323,23 @@ def build_board(
         "regime": IO.regime_payload(regime_block),
         "dedup": dedup_block,
     }
+
+    # ── 7. 板块成分明细（钻取伴生件；异常只告警，绝不拦板） ────────
+    if members_out is not None:
+        try:
+            members_out.update(
+                {
+                    "decision_date": decision_date,
+                    "trade_date": trade_date_iso,
+                    "sectors": {
+                        C.SECTOR_KEY[t]: S.members_index(stock, members, t)
+                        for t in C.SECTOR_TYPES
+                    },
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — 伴生件不拦主产物
+            warnings.append(f"板块成分明细生成异常，未落盘：{exc}")
+            log.warning("板块成分明细生成异常", exc_info=True)
     return board
 
 

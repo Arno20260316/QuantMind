@@ -207,3 +207,40 @@ def _r(x, nd: int = 4):
     except (TypeError, ValueError):
         pass
     return round(float(x), nd)
+
+
+def members_index(
+    stock: pd.DataFrame, members: pd.DataFrame, stype: str
+) -> dict[str, list[dict]]:
+    """板块 → 成分明细（钻取件，板块名原样作键）。
+
+    ``stock``：index=symbol（后缀式），列含 composite/name/mdl_rank，``quadrant``
+    列由调用方先合入（双轴缺一即 NaN → 落 null）。**含 ST（名单层才剔）与无模型
+    覆盖标的**——钻取展示板块全量成员，不是名单。板块内按 composite 降序（缺失
+    垫底）。多对多（概念）与 sector_payload 同口径：同一标的可属多个板块。
+    """
+    sm = members[members["SectorType"] == stype]
+    if sm.empty:
+        return {}
+    base = stock.join(
+        sm.rename(columns={"Symbol": "symbol"}).set_index("symbol")["SectorName"],
+        how="inner",
+    )
+    out: dict[str, list[dict]] = {}
+    for name, g in base.groupby("SectorName", sort=False):
+        g = g.sort_values("composite", ascending=False, na_position="last")
+        rows = []
+        for sym, r in g.iterrows():
+            rows.append(
+                {
+                    "symbol": str(sym),
+                    "name": None if pd.isna(r["name"]) else str(r["name"]),
+                    "composite": _r(r["composite"]),
+                    "model_rank": _r(r["mdl_rank"]),
+                    "quadrant": None
+                    if pd.isna(r.get("quadrant"))
+                    else str(r["quadrant"]),
+                }
+            )
+        out[str(name)] = rows
+    return out

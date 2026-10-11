@@ -282,3 +282,60 @@ def available_dates(out_dir: Path) -> list[str]:
         if len(stem) == 10 and stem[4] == "-" and stem.replace("-", "").isdigit():
             out.append(stem)
     return sorted(out, reverse=True)
+
+
+# ── 板块成分明细（钻取伴生件；板 JSON 本身不含成员，保持 1.1 契约不膨胀） ──
+
+MEMBERS_DIRNAME = "members"
+MEMBERS_SCHEMA = "factor_board_members/1.0"
+_MEMBERS_CACHE_MAX = 8  # 每份 ~3MB（概念展开），封顶防内存无界
+
+
+def write_members_index(members: dict, out_dir: Path) -> Path:
+    """原子写 ``members/{decision_date}.json`` + ``members/latest.json``。
+
+    ``members``：builder 填充的 {decision_date, trade_date, sectors}；schema_version
+    由本函数补。同日重跑覆盖（与板同语义）；缺 decision_date 直接拒绝落盘。
+    """
+    decision = str(members.get("decision_date") or "")
+    if not decision:
+        raise ValueError("板块成分明细缺 decision_date，拒绝落盘")
+    payload = {"schema_version": MEMBERS_SCHEMA, **members}
+    text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    mdir = Path(out_dir) / MEMBERS_DIRNAME
+    mdir.mkdir(parents=True, exist_ok=True)
+    dated = mdir / f"{decision}.json"
+    _atomic_write(dated, text)
+    _atomic_write(mdir / "latest.json", text)
+    return dated
+
+
+_members_cache: dict[str, tuple[int, dict]] = {}
+
+
+def load_members_index(out_dir: Path, date: str | None = None) -> dict | None:
+    """读取成分明细：指定日期→该日文件；否则 ``latest.json``。
+
+    文件缺失/坏 JSON/顶层非对象 → None。进程内按 (路径, mtime_ns) 缓存——
+    产板同日重写后 mtime 变化即自动失效（有测试锁定该行为）。
+    """
+    path = Path(out_dir) / MEMBERS_DIRNAME / (f"{date}.json" if date else "latest.json")
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    key = str(path)
+    hit = _members_cache.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("读取板块成分明细失败 %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    if len(_members_cache) >= _MEMBERS_CACHE_MAX:
+        _members_cache.clear()
+    _members_cache[key] = (stamp, data)
+    return data

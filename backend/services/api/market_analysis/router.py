@@ -12,7 +12,7 @@ import time
 import datetime as _dt
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -343,6 +343,69 @@ async def get_factor_board(
             detail=f"产物内容 decision_date={decision or '缺失'} 与请求 {date} 不符",
         )
     return {**board, "available_dates": dates}
+
+
+@router.get("/factor-board/members")
+async def get_factor_board_members(
+    type: Literal["industry_l1", "industry_l2", "concept"] = Query(
+        ..., description="板块分类键（与 sectors 三个键一致）"
+    ),
+    name: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="板块名（sectors.items[].name 原样），如「航空机场」",
+    ),
+    date: str | None = Query(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="决策日 YYYY-MM-DD（产物文件名口径），默认最新",
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """板块成分钻取：读伴生明细 ``{out}/members/{decision_date}.json``。
+
+    口径：明细由产板 CLI 随板落盘（含 ST 与无模型覆盖标的，板块内按合成分降序；
+    板 JSON 本身不含成员，概念展开量太大）。404：该决策日无明细（旧版产物未重跑
+    产板）或板块名不存在（detail 带 available_dates 供纠正）。
+    """
+    _ = current_user
+    out_dir = _fb_config.resolve_board_dir()
+    dates = _fb_board_io.available_dates(out_dir)
+    decision = date or (dates[0] if dates else None)
+    index = _fb_board_io.load_members_index(out_dir, decision)
+    if index is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": (
+                    f"决策日 {decision} 无板块成分明细（旧版产物或产板未重跑——"
+                    "重跑 build_factor_board.py 即生成）"
+                    if decision
+                    else "板块成分明细尚未生成（需先产板）"
+                ),
+                "available_dates": dates,
+            },
+        )
+    sectors = index.get("sectors")
+    group = sectors.get(type) if isinstance(sectors, dict) else None
+    rows = group.get(name) if isinstance(group, dict) else None
+    if rows is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"板块成分不存在：{type} / {name}（板块名或已变更，以当日产物为准）",
+                "available_dates": dates,
+            },
+        )
+    return {
+        "schema_version": index.get("schema_version"),
+        "decision_date": index.get("decision_date"),
+        "type": type,
+        "name": name,
+        "n": len(rows),
+        "items": rows,
+    }
 
 
 @router.get("/indices/overview")

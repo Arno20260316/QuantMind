@@ -137,6 +137,55 @@ def test_四象限计数与名单_剔ST_缺失不落0():
 
 
 @pytest.mark.unit
+def test_members_index_分组降序_缺失落null_含ST_多对多():
+    # Arrange：5 只标的；板A/板B 共享一只（概念多对多），含 ST 与无模型覆盖标的
+    syms = [f"60{i:04d}.SH" for i in range(5)]
+    stock = pd.DataFrame(
+        {
+            "composite": [0.5, 0.3, np.nan, -0.2, 0.1],
+            "name": ["甲", "乙", "丙", None, "戊"],
+            "mdl_rank": [0.9, np.nan, 0.5, 0.2, 0.8],
+            "quadrant": ["HH", None, None, "LL", "HH"],  # 双轴缺一即 None
+            "st": [False, True, False, False, False],
+        },
+        index=syms,
+    )
+    members = pd.DataFrame(
+        {
+            "SectorType": ["概念板块"] * 6 + ["行业板块(二级)"] * 5,
+            "SectorName": ["板A"] * 3 + ["板B"] * 3 + ["行"] * 5,
+            "Symbol": syms[:3] + [syms[0], syms[4], syms[3]] + syms,
+        }
+    )
+
+    # Act
+    out = S.members_index(stock, members, "概念板块")
+    encoded = json.dumps(out, ensure_ascii=False, allow_nan=False)
+
+    # Assert：板A 按 composite 降序、NaN 垫底；ST 保留；缺失一律 null
+    assert set(out) == {"板A", "板B"}
+    a = out["板A"]
+    assert [r["symbol"] for r in a] == [syms[0], syms[1], syms[2]]
+    assert a[0]["quadrant"] == "HH"
+    assert a[1]["name"] == "乙" and a[1]["model_rank"] is None  # ST 不剔、模型缺失落 null
+    assert a[2]["composite"] is None and a[2]["quadrant"] is None
+    # 多对多：板B 与板A 共享 syms[0]，行序同为 composite 降序
+    assert [r["symbol"] for r in out["板B"]] == [syms[0], syms[4], syms[3]]
+    assert "NaN" not in encoded and "Infinity" not in encoded
+
+
+@pytest.mark.unit
+def test_members_index_空成员与未知类型返回空dict():
+    stock = pd.DataFrame(
+        {"composite": [0.1], "name": ["甲"], "mdl_rank": [0.6], "quadrant": ["HM"]},
+        index=["600001.SH"],
+    )
+    empty = pd.DataFrame(columns=["SectorType", "SectorName", "Symbol"])
+    assert S.members_index(stock, empty, "概念板块") == {}
+    assert S.members_index(stock, empty, "行业板块(二级)") == {}
+
+
+@pytest.mark.unit
 def test_合成_反向因子低值加分_覆盖门槛剔除():
     # Arrange：单库两个因子；B 在覆盖门槛内，C 只缺 1 个因子 → 该股被剔除
     selected = pd.DataFrame(

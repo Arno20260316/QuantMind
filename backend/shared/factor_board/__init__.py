@@ -7,8 +7,10 @@ CLI：``python backend/scripts/market_analysis/build_factor_board.py``。
 from backend.shared.factor_board.board_io import (
     available_dates,
     load_board,
+    load_members_index,
     validate_board,
     write_board,
+    write_members_index,
 )
 from backend.shared.factor_board.builder import BuildError, build_board
 
@@ -17,6 +19,8 @@ __all__ = [
     "available_dates",
     "build_board",
     "load_board",
+    "load_members_index",
     "validate_board",
     "write_board",
+    "write_members_index",
 ]

@@ -141,3 +141,90 @@ def test_decision_date_mismatch_returns_409(client, board_dir):
 def test_bad_date_format_returns_422(client, board_dir):
     r = client.get(BASE, params={"date": "2026/10/12"})
     assert r.status_code == 422
+
+
+# ── 板块成分钻取（/factor-board/members） ───────────────────────────────
+
+MEMBERS = BASE + "/members"
+
+
+def _members_index(decision: str = "2026-10-12") -> dict:
+    return {
+        "schema_version": "factor_board_members/1.0",
+        "decision_date": decision,
+        "trade_date": "2026-10-09",
+        "sectors": {
+            "industry_l2": {
+                "航空机场": [
+                    {"symbol": "600009.SH", "name": "上海机场", "composite": 0.1, "model_rank": 0.9, "quadrant": "HH"},
+                    {"symbol": "600004.SH", "name": "白云机场", "composite": -0.05, "model_rank": None, "quadrant": None},
+                ]
+            }
+        },
+    }
+
+
+def _write_members(dir_: Path, payload: dict, name: str = "2026-10-12") -> None:
+    mdir = dir_ / "members"
+    mdir.mkdir(exist_ok=True)
+    _write(mdir, f"{name}.json", payload)
+    _write(mdir, "latest.json", payload)
+
+
+def test_members_requires_jwt_without_credentials(raw_client, board_dir):
+    r = raw_client.get(MEMBERS, params={"type": "industry_l2", "name": "航空机场"})
+    assert r.status_code == 401
+
+
+def test_members_404_when_index_missing(client, board_dir):
+    # 板在、成分明细缺（旧版产物未重跑）→ 404 且提示语义
+    _write(board_dir, "2026-10-12.json", _board())
+    _write(board_dir, "latest.json", _board())
+
+    r = client.get(MEMBERS, params={"type": "industry_l2", "name": "航空机场"})
+
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert "成分" in detail["message"]
+    assert detail["available_dates"] == ["2026-10-12"]
+
+
+def test_members_returns_sector_items(client, board_dir):
+    _write(board_dir, "2026-10-12.json", _board())
+    _write(board_dir, "latest.json", _board())
+    _write_members(board_dir, _members_index())
+
+    r = client.get(MEMBERS, params={"type": "industry_l2", "name": "航空机场"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decision_date"] == "2026-10-12"
+    assert body["type"] == "industry_l2"
+    assert body["name"] == "航空机场"
+    assert body["n"] == 2
+    assert [x["symbol"] for x in body["items"]] == ["600009.SH", "600004.SH"]
+    assert body["items"][1]["quadrant"] is None  # 缺失不落 0/空串
+
+
+def test_members_unknown_sector_404(client, board_dir):
+    _write_members(board_dir, _members_index())
+
+    r = client.get(MEMBERS, params={"type": "industry_l2", "name": "不存在的板块"})
+
+    assert r.status_code == 404
+    assert "成分" in r.json()["detail"]["message"]
+
+
+def test_members_bad_type_422(client, board_dir):
+    r = client.get(MEMBERS, params={"type": "industry_l9", "name": "航空机场"})
+    assert r.status_code == 422
+
+
+def test_members_specific_date_reads_that_file(client, board_dir):
+    _write(board_dir, "2026-10-10.json", _board(decision="2026-10-10"))
+    _write_members(board_dir, _members_index(decision="2026-10-10"), name="2026-10-10")
+
+    r = client.get(MEMBERS, params={"type": "industry_l2", "name": "航空机场", "date": "2026-10-10"})
+
+    assert r.status_code == 200
+    assert r.json()["decision_date"] == "2026-10-10"

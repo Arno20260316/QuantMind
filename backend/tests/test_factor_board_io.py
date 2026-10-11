@@ -134,6 +134,69 @@ def test_load_board_缺文件坏JSON均null(tmp_path: Path):
     assert BIO.load_board(tmp_path) is None
 
 
+def _members_payload(decision: str = "2026-10-12", tag: str = "上海机场") -> dict:
+    return {
+        "decision_date": decision,
+        "trade_date": "2026-10-09",
+        "sectors": {
+            "industry_l2": {
+                "航空机场": [
+                    {
+                        "symbol": "600009.SH",
+                        "name": tag,
+                        "composite": 0.1234,
+                        "model_rank": 0.87,
+                        "quadrant": "HH",
+                    }
+                ]
+            }
+        },
+    }
+
+
+@pytest.mark.unit
+def test_write_load_members_index_子目录原子落盘_latest同内容(tmp_path: Path):
+    # Act
+    dated = BIO.write_members_index(_members_payload(), tmp_path)
+
+    # Assert
+    assert dated == tmp_path / "members" / "2026-10-12.json"
+    latest = tmp_path / "members" / "latest.json"
+    assert dated.read_text(encoding="utf-8") == latest.read_text(encoding="utf-8")
+    assert list((tmp_path / "members").glob("*.tmp")) == []
+    # 按日与 latest 各自可取，schema_version 由写方补
+    a = BIO.load_members_index(tmp_path, "2026-10-12")
+    b = BIO.load_members_index(tmp_path)
+    assert a is not None and a == b
+    assert a["schema_version"] == BIO.MEMBERS_SCHEMA
+    assert a["sectors"]["industry_l2"]["航空机场"][0]["name"] == "上海机场"
+
+
+@pytest.mark.unit
+def test_load_members_index_缺文件坏JSON均null(tmp_path: Path):
+    assert BIO.load_members_index(tmp_path) is None
+    assert BIO.load_members_index(tmp_path, "2026-10-12") is None
+    (tmp_path / "members").mkdir()
+    (tmp_path / "members" / "latest.json").write_text("{broken", encoding="utf-8")
+    assert BIO.load_members_index(tmp_path) is None
+
+
+@pytest.mark.unit
+def test_load_members_index_缓存随重写失效(tmp_path: Path):
+    # Arrange：写 A 读入（进缓存）
+    BIO.write_members_index(_members_payload(tag="旧名"), tmp_path)
+    first = BIO.load_members_index(tmp_path, "2026-10-12")
+    assert first["sectors"]["industry_l2"]["航空机场"][0]["name"] == "旧名"
+
+    # Act：同日重写（产板覆盖语义），再读须拾取新内容
+    BIO.write_members_index(_members_payload(tag="新名"), tmp_path)
+    second = BIO.load_members_index(tmp_path, "2026-10-12")
+
+    # Assert
+    assert second is not None
+    assert second["sectors"]["industry_l2"]["航空机场"][0]["name"] == "新名"
+
+
 @pytest.mark.unit
 def test_load_board_按日与latest各自取文件(tmp_path: Path):
     # Arrange

@@ -1,16 +1,19 @@
 /** 因子概率板（市场分析 Tab）——细案 §六 P1 展示面。
  *
  * 数据：GET /api/v1/market-analysis/factor-board（决策板：精选因子合成分位 +
- * 板块三层共振 + 个股四象限/名单 + 持有期画像 + meta 质检条）。
+ * 板块三层共振（点击行 → 右侧卡钻取板块成分）+ 个股名单 + 入选因子 +
+ * 持有期画像/个股四象限（末行并列）+ meta 质检条）。
  *
  * 展示纪律（CLAUDE.md「展示面/执行面用词边界」）：只说位置（靠前/靠后/居中），
  * 判定枚举经 VERDICT_META 映射，不出现买入/卖出字样。
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeft,
   CalendarDays,
+  ChevronRight,
   Gauge,
   Grid3x3,
   History,
@@ -28,8 +31,9 @@ import {
   FactorBoardMaskInfo,
   FactorBoardResponse,
   FactorBoardSectorItem,
-  FactorBoardStock,
+  FactorBoardSectorMember,
   getFactorBoard,
+  getFactorBoardMembers,
 } from '../services/factorBoardService';
 
 const SECTOR_TYPE_OPTIONS = [
@@ -102,47 +106,125 @@ function maskChip(mask: FactorBoardMaskInfo | null | undefined): { cls: string; 
   };
 }
 
-function SectorRow({ item }: { item: FactorBoardSectorItem }) {
-  const facAbs = item.fac === null ? 0 : Math.min(Math.abs(item.fac), 1);
+function SectorRow({
+  item,
+  rank,
+  q67,
+  q33,
+  scale,
+  active,
+  onPick,
+}: {
+  item: FactorBoardSectorItem;
+  rank: number;
+  q67: number | null;
+  q33: number | null;
+  /** 双向热力条比例尺（当日全部板块 |均分| 与 |q67|/|q33| 的最大值 ×1.12 留边）。 */
+  scale: number;
+  active: boolean;
+  onPick: (name: string) => void;
+}) {
+  const barPct = item.fac === null ? 0 : (Math.abs(item.fac) / scale) * 50;
+  const tick = (v: number | null) =>
+    v === null
+      ? null
+      : Math.min(Math.max(50 + (v / scale) * 50, 2), 98);
+  const q67Pos = tick(q67);
+  const q33Pos = tick(q33);
   return (
-    <div className="flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0">
-      {/* 名称列吸收余宽；指标列全部定宽右簇——行间对齐，热力条不再拉满全宽 */}
+    <div
+      onClick={() => onPick(item.name)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onPick(item.name);
+        }
+      }}
+      title={`${item.name}：点击查看成分股`}
+      className={`group flex items-center gap-2 px-1 py-1.5 border-b border-slate-50 last:border-0 cursor-pointer transition-colors ${
+        active ? 'bg-purple-50/70' : 'hover:bg-slate-50/80'
+      }`}
+    >
+      {/* 名称列吸收余宽；指标列定宽右簇——行间对齐 */}
+      <span
+        className={`w-5 h-5 rounded-md grid place-items-center text-[10px] font-extrabold flex-shrink-0 ${
+          rank <= 3 ? 'bg-purple-600 text-white' : 'bg-slate-100 text-slate-500'
+        }`}
+      >
+        {rank}
+      </span>
       <div className="flex-1 min-w-0 flex items-center gap-1.5">
-        <span className="text-xs font-bold text-slate-800 truncate" title={item.name}>
+        <span className={`text-xs font-bold truncate ${active ? 'text-purple-700' : 'text-slate-800'}`}>
           {item.name}
         </span>
         <span className="text-[10px] font-mono text-slate-400 flex-shrink-0">{item.n}只</span>
       </div>
-      {/* 合成分热力条（宽度=|fac|，红=正值/绿=负值；缺失一律 — 不落 0） */}
-      <div className="w-56 flex-shrink-0 flex items-center gap-2">
-        <div className="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+      {/* 双向热力条：中轴=0，右红（正）/左绿（负）；细刻度=三层判定入选线 q67/q33 */}
+      <div className="w-36 flex-shrink-0 flex items-center gap-1.5">
+        <div
+          className="relative flex-1 h-1.5 rounded-full bg-slate-100"
+          title={`板块均分 ${item.fac ?? '—'}（中轴=0）；刻度线=入选线 q67=${q67 ?? '—'} / q33=${q33 ?? '—'}`}
+        >
+          <div className="absolute left-1/2 -top-0.5 -bottom-0.5 w-px bg-slate-300/80 z-10" />
+          {q67Pos !== null && (
+            <div className="absolute -top-1 -bottom-1 w-px bg-red-300/90 z-10" style={{ left: `${q67Pos.toFixed(1)}%` }} />
+          )}
+          {q33Pos !== null && (
+            <div className="absolute -top-1 -bottom-1 w-px bg-green-400/80 z-10" style={{ left: `${q33Pos.toFixed(1)}%` }} />
+          )}
           {item.fac !== null && (
             <div
-              className={`h-full rounded-full ${item.fac >= 0 ? 'bg-red-400' : 'bg-green-500'}`}
-              style={{ width: `${Math.max(facAbs * 100, 3)}%` }}
+              className={`absolute top-0 bottom-0 ${
+                item.fac >= 0 ? 'left-1/2 rounded-r-full bg-red-400' : 'right-1/2 rounded-l-full bg-green-500'
+              }`}
+              style={{ width: `${Math.max(barPct, 1.5)}%` }}
             />
           )}
         </div>
-        <span className="w-14 text-right flex-shrink-0">
+        <span className="w-11 text-right flex-shrink-0">
           <NumText value={item.fac} digits={3} />
         </span>
       </div>
-      <div className="hidden md:flex items-center gap-3 w-44 flex-shrink-0 justify-end">
-        <span className="text-[10px] text-slate-400 font-mono whitespace-nowrap" title="个股广度（成分内合成分>0 占比）">
-          个股广度 <span className="text-slate-600 font-bold">{item.fbreadth === null ? '—' : item.fbreadth.toFixed(2)}</span>
-        </span>
-        <span className="text-[10px] text-slate-400 font-mono whitespace-nowrap" title="模型广度（成分内模型分位≥0.5 占比）">
-          模型广度 <span className="text-slate-600 font-bold">{item.mbreadth === null ? '—' : item.mbreadth.toFixed(2)}</span>
-        </span>
-      </div>
-      <div className="w-32 flex justify-end flex-shrink-0">
+      <span
+        className="hidden 2xl:inline-flex w-[86px] flex-shrink-0 justify-end text-[10px] font-mono text-slate-400 whitespace-nowrap"
+        title="个股广度（成分内合成分>0 占比）/ 模型广度（成分内模型分位≥0.5 占比）"
+      >
+        广 <span className="text-slate-600 font-bold">{item.fbreadth === null ? '—' : item.fbreadth.toFixed(2)}</span>
+        /<span className="text-slate-600 font-bold">{item.mbreadth === null ? '—' : item.mbreadth.toFixed(2)}</span>
+      </span>
+      <span className="flex-shrink-0">
         <VerdictChip verdict={item.verdict} />
-      </div>
+      </span>
+      <ChevronRight
+        className={`w-3.5 h-3.5 flex-shrink-0 transition-colors ${active ? 'text-purple-400' : 'text-slate-200 group-hover:text-purple-400'}`}
+      />
     </div>
   );
 }
 
-function StockRow({ rank, item }: { rank: number; item: FactorBoardStock }) {
+/** 行内标的（名单行与板块成分行共用；成分行无 sector_l2）。 */
+type StockRowItem = {
+  symbol: string;
+  name: string | null;
+  composite: number | null;
+  model_rank: number | null;
+  quadrant: string | null;
+  sector_l2?: string | null;
+};
+
+/** 象限 chip 着色（与四象限矩阵同口径）：HH 红 / LL 绿 / 背离琥珀 / 其余中性。 */
+function quadChipCls(q: string | null): string {
+  if (q === 'HH') return 'bg-red-50 text-red-600 border-red-200/70';
+  if (q === 'LL') return 'bg-green-50 text-green-700 border-green-200/70';
+  if (q && ((q[0] === 'H' && q[1] !== 'H') || (q[0] === 'L' && q[1] !== 'L'))) {
+    return 'bg-amber-50 text-amber-700 border-amber-200/70';
+  }
+  return 'bg-slate-50 text-slate-500 border-slate-200/60';
+}
+
+function StockRow({ rank, item }: { rank: number; item: StockRowItem }) {
   return (
     <RankRow
       rank={rank}
@@ -163,8 +245,11 @@ function StockRow({ rank, item }: { rank: number; item: FactorBoardStock }) {
           <span className="w-14 text-right">
             <NumText value={item.composite} digits={3} />
           </span>
-          <span className="w-7 text-center text-[10px] font-extrabold font-mono text-slate-500 bg-slate-100 rounded px-1" title="象限=因子分位+模型分位（高/中/低）">
-            {item.quadrant}
+          <span
+            className={`w-7 text-center text-[10px] font-extrabold font-mono rounded border px-0.5 ${quadChipCls(item.quadrant)}`}
+            title="象限=因子分位+模型分位（高/中/低）；HH 红 / LL 绿 / 背离琥珀；缺失显示 —"
+          >
+            {item.quadrant ?? '—'}
           </span>
         </div>
       }
@@ -179,6 +264,14 @@ export const FactorBoardPanel: React.FC = () => {
   const [selectedDate, setSelectedDate] = useState<string | undefined>();
   const [sectorType, setSectorType] = useState<string>('industry_l2');
   const [stockList, setStockList] = useState<string>('top');
+  // 板块成分钻取（master-detail：点左侧板块行 → 右侧卡切成分视图）
+  const [sectorPick, setSectorPick] = useState<{ type: string; name: string } | null>(null);
+  const [members, setMembers] = useState<FactorBoardSectorMember[] | null>(null);
+  /** `members` 当前归属的取数键（切板块时先失配 → 渲染走加载态，绝不闪现上一板块的成分）。 */
+  const [membersKey, setMembersKey] = useState<string | null>(null);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const membersCache = useRef<Map<string, FactorBoardSectorMember[]>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
@@ -208,6 +301,65 @@ export const FactorBoardPanel: React.FC = () => {
     const dates = board?.available_dates ?? [];
     return [{ id: '', label: '最新' }, ...dates.slice(0, 8).map((d) => ({ id: d, label: d.slice(5) }))];
   }, [board]);
+
+  // 板块成分取数（按 决策日|分类|板块名 缓存；再点同板块 = 收起，回名单视图）
+  useEffect(() => {
+    if (!sectorPick) return;
+    const key = `${selectedDate ?? ''}|${sectorPick.type}|${sectorPick.name}`;
+    const cached = membersCache.current.get(key);
+    if (cached) {
+      setMembers(cached);
+      setMembersKey(key);
+      setMembersError(null);
+      setMembersLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setMembers(null);
+    setMembersKey(null);
+    setMembersError(null);
+    setMembersLoading(true);
+    getFactorBoardMembers(sectorPick.type, sectorPick.name, selectedDate)
+      .then((d) => {
+        if (cancelled) return;
+        membersCache.current.set(key, d.items);
+        setMembers(d.items);
+        setMembersKey(key);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setMembersError(e instanceof Error ? e.message : '板块成分加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setMembersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sectorPick, selectedDate]);
+
+  // 双向热力条比例尺：当日板块 |均分| 与 |q67|/|q33| 的全局最大 ×1.12 留边（同日内部可比）
+  const sectorScale = useMemo(() => {
+    if (!board) return 0.01;
+    const group = board.sectors[sectorType as keyof typeof board.sectors];
+    let m = 0;
+    for (const it of group?.items ?? []) {
+      if (it.fac !== null) m = Math.max(m, Math.abs(it.fac));
+    }
+    for (const q of [group?.q67, group?.q33]) {
+      if (q !== null && q !== undefined) m = Math.max(m, Math.abs(q));
+    }
+    return m > 0 ? m * 1.12 : 0.01;
+  }, [board, sectorType]);
+
+  const pickSector = (name: string) => {
+    setSectorPick((prev) =>
+      prev && prev.type === sectorType && prev.name === name ? null : { type: sectorType, name },
+    );
+  };
+
+  // 当前钻取键与其归属数据（membersKey 失配 → 视为未就绪，走加载态）
+  const drillKey = sectorPick ? `${selectedDate ?? ''}|${sectorPick.type}|${sectorPick.name}` : null;
+  const drillMembers = drillKey !== null && membersKey === drillKey ? members : null;
 
   if (loading && !board) {
     return (
@@ -256,7 +408,14 @@ export const FactorBoardPanel: React.FC = () => {
         icon={<ShieldCheck className="w-3.5 h-3.5 text-purple-600" />}
         extra={
           <div className="flex items-center gap-2">
-            <PeriodChips options={dateOptions} value={selectedDate ?? ''} onChange={(id) => setSelectedDate(id || undefined)} />
+            <PeriodChips
+              options={dateOptions}
+              value={selectedDate ?? ''}
+              onChange={(id) => {
+                setSelectedDate(id || undefined);
+                setSectorPick(null);
+              }}
+            />
           </div>
         }
       >
@@ -372,86 +531,83 @@ export const FactorBoardPanel: React.FC = () => {
         )}
       </SectionCard>
 
-      {/* ── 板块三层共振 ─────────────────────────────────────── */}
-      <SectionCard
-        title={`板块共振（三层判定 · q67=${sectorGroup?.q67 ?? '—'} / q33=${sectorGroup?.q33 ?? '—'}）`}
-        icon={<Layers className="w-3.5 h-3.5 text-purple-600" />}
-        extra={<PeriodChips options={SECTOR_TYPE_OPTIONS} value={sectorType} onChange={setSectorType} />}
-      >
-        {sectorGroup && sectorGroup.items.length > 0 ? (
-          <div className="max-h-[400px] overflow-y-auto custom-scrollbar -mx-1 px-1">
-            {sectorGroup.items.map((it) => (
-              <SectorRow key={it.name} item={it} />
-            ))}
-          </div>
-        ) : (
-          <EmptyHint text="该分类无板块数据" />
-        )}
-      </SectionCard>
-
-      {/* ── 个股四象限 + 名单 ────────────────────────────────── */}
+      {/* ── 板块三层共振（左） + 个股名单/板块成分（右，master-detail） ── */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5 items-start">
         <SectionCard
-          title="个股四象限（因子分位 × 模型分位）"
-          icon={<Grid3x3 className="w-3.5 h-3.5 text-purple-600" />}
-          extra={<span className="text-[10px] font-mono text-slate-400">n={fmtInt(resonance.n)}</span>}
+          title={`板块共振（三层判定 · q67=${sectorGroup?.q67 ?? '—'} / q33=${sectorGroup?.q33 ?? '—'}）`}
+          icon={<Layers className="w-3.5 h-3.5 text-purple-600" />}
+          extra={
+            <PeriodChips
+              options={SECTOR_TYPE_OPTIONS}
+              value={sectorType}
+              onChange={(id) => {
+                setSectorType(id);
+                setSectorPick(null);
+              }}
+            />
+          }
         >
-          <div className="flex flex-col md:flex-row md:items-start gap-3">
-            <div className="grid grid-cols-[auto_repeat(3,minmax(84px,1fr))] gap-1.5 md:w-[420px] md:flex-shrink-0">
-              <span />
-              {QUAD_LEVELS.map((m) => (
-                <span key={m.id} className="text-center text-[10px] font-extrabold text-slate-400">
-                  模型·{m.label}（{m.id}）
-                </span>
-              ))}
-              {QUAD_LEVELS.map((f) => (
-                <React.Fragment key={f.id}>
-                  <span className="text-[10px] font-extrabold text-slate-400 flex items-center">
-                    因子·{f.label}（{f.id}）
-                  </span>
-                  {QUAD_LEVELS.map((m) => {
-                    const key = `${f.id}${m.id}`;
-                    const count = resonance.quadrants[key] ?? 0;
-                    const isResoLong = key === 'HH';
-                    const isResoShort = key === 'LL';
-                    const isDiverge = (f.id === 'H' && m.id !== 'H') || (f.id === 'L' && m.id !== 'L');
-                    return (
-                      <div
-                        key={key}
-                        title={`因子分位${f.label} × 模型分位${m.label}：${fmtInt(count)} 只${isResoLong ? '（共振·靠前名单）' : isResoShort ? '（共振·靠后名单）' : isDiverge ? '（背离区）' : ''}`}
-                        className={`rounded-lg border px-2 py-1.5 text-center ${
-                          isResoLong
-                            ? 'bg-red-50/80 border-red-200/70'
-                            : isResoShort
-                              ? 'bg-green-50/80 border-green-200/70'
-                              : isDiverge
-                                ? 'bg-amber-50/50 border-amber-100'
-                                : 'bg-slate-50/70 border-slate-200/60'
-                        }`}
-                      >
-                        <div className={`text-sm font-extrabold font-mono ${isResoLong ? 'text-red-700' : isResoShort ? 'text-green-700' : 'text-slate-700'}`}>
-                          {fmtInt(count)}
-                        </div>
-                        <div className="text-[9px] font-mono text-slate-400">{key}</div>
-                      </div>
-                    );
-                  })}
-                </React.Fragment>
+          {sectorGroup && sectorGroup.items.length > 0 ? (
+            <div className="max-h-[400px] overflow-y-auto custom-scrollbar -mx-1 px-1">
+              {sectorGroup.items.map((it, i) => (
+                <SectorRow
+                  key={it.name}
+                  item={it}
+                  rank={i + 1}
+                  q67={sectorGroup.q67}
+                  q33={sectorGroup.q33}
+                  scale={sectorScale}
+                  active={sectorPick?.type === sectorType && sectorPick?.name === it.name}
+                  onPick={pickSector}
+                />
               ))}
             </div>
-            <p className="text-[10px] text-slate-400 leading-relaxed md:flex-1 md:pt-5">
-              因子分位=合成分的截面分位（≥70% 高 / ≤30% 低）；模型分位=同批推理 rank_pct（≥0.7 高 / ≤0.3 低）。
-              HH 入「共振名单·靠前」、LL 入「共振名单·靠后」（剔 ST）。ρ 为两轴秩相关。
-            </p>
-          </div>
+          ) : (
+            <EmptyHint text="该分类无板块数据" />
+          )}
         </SectionCard>
 
         <SectionCard
-          title="个股名单"
+          title={sectorPick ? `板块成分 · ${sectorPick.name}` : '个股名单'}
           icon={<ListOrdered className="w-3.5 h-3.5 text-purple-600" />}
-          extra={<PeriodChips options={STOCK_LIST_OPTIONS} value={stockList} onChange={setStockList} />}
+          extra={
+            sectorPick ? (
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono text-slate-400">
+                  {drillMembers ? `${fmtInt(drillMembers.length)} 只` : membersLoading ? '…' : ''}
+                </span>
+                <button
+                  onClick={() => setSectorPick(null)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-100 text-[11px] font-extrabold text-slate-600 hover:bg-slate-200 transition-colors"
+                >
+                  <ArrowLeft className="w-3 h-3" /> 返回名单
+                </button>
+              </div>
+            ) : (
+              <PeriodChips options={STOCK_LIST_OPTIONS} value={stockList} onChange={setStockList} />
+            )
+          }
         >
-          {stocks.length > 0 ? (
+          {sectorPick ? (
+            membersLoading || (!drillMembers && !membersError) ? (
+              <EmptyHint loading />
+            ) : membersError ? (
+              <EmptyHint text={membersError} />
+            ) : drillMembers && drillMembers.length > 0 ? (
+              <>
+                <p className="text-[10px] text-slate-400 -mt-1">
+                  按合成分降序；含 ST 与无模型覆盖标的（象限/模型缺失显示 —）
+                </p>
+                <div className="max-h-[380px] overflow-y-auto custom-scrollbar">
+                  {drillMembers.map((s, i) => (
+                    <StockRow key={`${s.symbol}-${i}`} rank={i + 1} item={s} />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <EmptyHint text="该板块无成分数据" />
+            )
+          ) : stocks.length > 0 ? (
             <div className="max-h-[400px] overflow-y-auto custom-scrollbar">
               {stocks.map((s, i) => (
                 <StockRow key={`${s.symbol}-${i}`} rank={i + 1} item={s} />
@@ -587,48 +743,105 @@ export const FactorBoardPanel: React.FC = () => {
         </div>
       </SectionCard>
 
-      {/* ── 持有期画像 ──────────────────────────────────────── */}
-      <SectionCard title="持有期画像（方向对齐 IC 均值）" icon={<Gauge className="w-3.5 h-3.5 text-purple-600" />}>
-        <div className="flex flex-col lg:flex-row lg:items-start gap-3">
-          {/* 全局条形图：定宽左簇，不再摊满整行 */}
-          <div className="flex items-end gap-2 h-24 w-full lg:w-[420px] lg:flex-shrink-0 px-1">
-            {HORIZON_KEYS.map((h) => {
-              const v = board.horizon.global?.[h];
-              const abs = v === null || v === undefined ? 0 : Math.min(Math.abs(v) * 4, 1);
-              return (
-                <div key={h} className="flex flex-col items-center gap-1 flex-1 h-full justify-end" title={`h=${h} 日 方向对齐 IC=${v == null ? '—' : v.toFixed(4)}（sgn×RankIC 均值；负=跨日翻转占优）`}>
-                  <span className={`text-[10px] font-mono font-bold ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
-                    {v == null ? '—' : v.toFixed(3)}
+      {/* ── 持有期画像（左） + 个股四象限（右）· 页面末行 ────── */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5 items-start">
+        <SectionCard title="持有期画像（方向对齐 IC 均值）" icon={<Gauge className="w-3.5 h-3.5 text-purple-600" />}>
+          <div className="flex flex-col gap-3">
+            {/* 全局条形图：卡内定宽居中 */}
+            <div className="flex items-end gap-2 h-24 w-full max-w-[420px] mx-auto px-1">
+              {HORIZON_KEYS.map((h) => {
+                const v = board.horizon.global?.[h];
+                const abs = v === null || v === undefined ? 0 : Math.min(Math.abs(v) * 4, 1);
+                return (
+                  <div key={h} className="flex flex-col items-center gap-1 flex-1 h-full justify-end" title={`h=${h} 日 方向对齐 IC=${v == null ? '—' : v.toFixed(4)}（sgn×RankIC 均值；负=跨日翻转占优）`}>
+                    <span className={`text-[10px] font-mono font-bold ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                      {v == null ? '—' : v.toFixed(3)}
+                    </span>
+                    <div
+                      className={`w-full max-w-[46px] rounded-t-md ${v == null ? 'bg-slate-100' : v >= 0 ? 'bg-red-400/80' : 'bg-green-500/80'}`}
+                      style={{ height: `${Math.max(abs * 64, 4)}px` }}
+                    />
+                    <span className="text-[10px] font-extrabold text-slate-400">{h}日</span>
+                  </div>
+                );
+              })}
+            </div>
+            {/* 分组明细：卡内自适应多列 */}
+            <div className="flex flex-wrap gap-x-6 gap-y-0.5 border-t border-slate-50 pt-2">
+              {Object.entries(board.horizon.by_group ?? {}).map(([grp, vals]) => (
+                <div key={grp} className="flex items-center justify-between gap-2 text-[10px] font-mono py-0.5 flex-1 min-w-[250px]">
+                  <span className="text-slate-500 truncate" title={grp}>{grp}</span>
+                  <span className="whitespace-nowrap">
+                    {HORIZON_KEYS.map((h) => {
+                      const v = vals?.[h];
+                      return (
+                        <span key={h} className={`inline-block w-10 text-right ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                          {v == null ? '—' : v.toFixed(2)}
+                        </span>
+                      );
+                    })}
                   </span>
-                  <div
-                    className={`w-full max-w-[46px] rounded-t-md ${v == null ? 'bg-slate-100' : v >= 0 ? 'bg-red-400/80' : 'bg-green-500/80'}`}
-                    style={{ height: `${Math.max(abs * 64, 4)}px` }}
-                  />
-                  <span className="text-[10px] font-extrabold text-slate-400">{h}日</span>
                 </div>
-              );
-            })}
+              ))}
+            </div>
           </div>
-          {/* 分组明细：并列右侧两列 */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-0.5 w-full lg:flex-1 border-t lg:border-t-0 lg:border-l border-slate-50 pt-2 lg:pt-0 lg:pl-4">
-            {Object.entries(board.horizon.by_group ?? {}).map(([grp, vals]) => (
-              <div key={grp} className="flex items-center justify-between gap-2 text-[10px] font-mono py-0.5">
-                <span className="text-slate-500 truncate" title={grp}>{grp}</span>
-                <span className="whitespace-nowrap">
-                  {HORIZON_KEYS.map((h) => {
-                    const v = vals?.[h];
+        </SectionCard>
+
+        <SectionCard
+          title="个股四象限（因子分位 × 模型分位）"
+          icon={<Grid3x3 className="w-3.5 h-3.5 text-purple-600" />}
+          extra={<span className="text-[10px] font-mono text-slate-400">n={fmtInt(resonance.n)}</span>}
+        >
+          <div className="flex flex-col gap-3">
+            <div className="grid grid-cols-[auto_repeat(3,minmax(84px,1fr))] gap-1.5">
+              <span />
+              {QUAD_LEVELS.map((m) => (
+                <span key={m.id} className="text-center text-[10px] font-extrabold text-slate-400">
+                  模型·{m.label}（{m.id}）
+                </span>
+              ))}
+              {QUAD_LEVELS.map((f) => (
+                <React.Fragment key={f.id}>
+                  <span className="text-[10px] font-extrabold text-slate-400 flex items-center">
+                    因子·{f.label}（{f.id}）
+                  </span>
+                  {QUAD_LEVELS.map((m) => {
+                    const key = `${f.id}${m.id}`;
+                    const count = resonance.quadrants[key] ?? 0;
+                    const isResoLong = key === 'HH';
+                    const isResoShort = key === 'LL';
+                    const isDiverge = (f.id === 'H' && m.id !== 'H') || (f.id === 'L' && m.id !== 'L');
                     return (
-                      <span key={h} className={`inline-block w-10 text-right ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
-                        {v == null ? '—' : v.toFixed(2)}
-                      </span>
+                      <div
+                        key={key}
+                        title={`因子分位${f.label} × 模型分位${m.label}：${fmtInt(count)} 只${isResoLong ? '（共振·靠前名单）' : isResoShort ? '（共振·靠后名单）' : isDiverge ? '（背离区）' : ''}`}
+                        className={`rounded-lg border px-2 py-1.5 text-center ${
+                          isResoLong
+                            ? 'bg-red-50/80 border-red-200/70'
+                            : isResoShort
+                              ? 'bg-green-50/80 border-green-200/70'
+                              : isDiverge
+                                ? 'bg-amber-50/50 border-amber-100'
+                                : 'bg-slate-50/70 border-slate-200/60'
+                        }`}
+                      >
+                        <div className={`text-sm font-extrabold font-mono ${isResoLong ? 'text-red-700' : isResoShort ? 'text-green-700' : 'text-slate-700'}`}>
+                          {fmtInt(count)}
+                        </div>
+                        <div className="text-[9px] font-mono text-slate-400">{key}</div>
+                      </div>
                     );
                   })}
-                </span>
-              </div>
-            ))}
+                </React.Fragment>
+              ))}
+            </div>
+            <p className="text-[10px] text-slate-400 leading-relaxed border-t border-slate-50 pt-2">
+              因子分位=合成分的截面分位（≥70% 高 / ≤30% 低）；模型分位=同批推理 rank_pct（≥0.7 高 / ≤0.3 低）。
+              HH 入「共振名单·靠前」、LL 入「共振名单·靠后」（剔 ST）。ρ 为两轴秩相关。
+            </p>
           </div>
-        </div>
-      </SectionCard>
+        </SectionCard>
+      </div>
     </div>
   );
 };

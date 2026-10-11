@@ -24,7 +24,7 @@ from backend.shared.factor_board import config as _fb_config
 
 logger = logging.getLogger(__name__)
 
-from . import quantdb_feed, quantdb_snapshot as _snap
+from . import flow_panorama, quantdb_feed, quantdb_snapshot as _snap
 from .domain import SectorConflictError, SectorNotFoundError
 from .repository import MarketAnalysisRepository
 from .schemas import (
@@ -485,6 +485,72 @@ async def get_money_flow_sankey(
     if data:
         return data
     return {"nodes": [], "links": []}
+
+
+@router.get("/money-flow/panorama")
+async def get_money_flow_panorama(
+    period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
+    sectors: str = Query("industry2", description="板块体系: industry1 / industry2 / concept"),
+    top_sectors: int = Query(10, ge=2, le=30, description="桑基展示板块数（all 时按 6:4 拆流入/流出）"),
+    stocks_per_sector: int = Query(5, ge=1, le=20, description="每板块展示的个股数（主力净额 TopK）"),
+    direction: str = Query("all", description="方向: all / inflow / outflow"),
+    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """资金流全景：桑基 v2（4 层、符号双向、板块延续徽章）+ 板块 master 榜。"""
+    _ = current_user
+    if period.lower() not in quantdb_feed.PERIOD_DAYS:
+        raise HTTPException(status_code=400, detail="period_invalid")
+    if sectors not in flow_panorama.SECTOR_SET_TYPE:
+        raise HTTPException(status_code=400, detail="sector_set_invalid")
+    if direction not in flow_panorama.DIRECTIONS:
+        raise HTTPException(status_code=400, detail="direction_invalid")
+    return await asyncio.to_thread(
+        flow_panorama.get_panorama,
+        period=period, sector_set=sectors, top_sectors=top_sectors,
+        stocks_per_sector=stocks_per_sector, direction=direction, date=date,
+    )
+
+
+@router.get("/money-flow/sector")
+async def get_money_flow_sector(
+    name: str = Query(..., min_length=1, description="板块名称（精确）"),
+    sectors: str = Query("industry2", description="板块体系: industry1 / industry2 / concept"),
+    period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
+    top: int = Query(50, ge=1, le=200, description="成分行数上限"),
+    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """板块明细：窗口汇总 + 20 日趋势 + 成分贡献（master-detail 的 detail 面）。"""
+    _ = current_user
+    if period.lower() not in quantdb_feed.PERIOD_DAYS:
+        raise HTTPException(status_code=400, detail="period_invalid")
+    if sectors not in flow_panorama.SECTOR_SET_TYPE:
+        raise HTTPException(status_code=400, detail="sector_set_invalid")
+    data = await asyncio.to_thread(
+        flow_panorama.get_sector_detail,
+        name=name, sector_set=sectors, period=period, top=top, date=date,
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="sector_not_found")
+    return data
+
+
+@router.get("/money-flow/stock")
+async def get_money_flow_stock(
+    symbol: str = Query(..., min_length=1, description="股票代码（SH600036 / 600036.SH / 600036）"),
+    days: int = Query(20, ge=1, le=60, description="序列长度（交易日）"),
+    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """个股明细：20 日五档序列 + 板块归因（资金流「返回板块」的双向面）。"""
+    _ = current_user
+    data = await asyncio.to_thread(
+        flow_panorama.get_stock_detail, symbol=symbol, days=days, date=date,
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="stock_not_found")
+    return data
 
 
 # ---- Tag Dual Lookup Endpoints (标签双向查询) ----

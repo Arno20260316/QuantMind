@@ -331,6 +331,30 @@ def _detect_placeholder_symbols(flow: pd.DataFrame, share_thresh: int = 25) -> s
     return bad
 
 
+def placeholder_symbols_by_dt(hist: pd.DataFrame, share_thresh: int = 25) -> dict[str, set[str]]:
+    """逐日识别被整行占位（多只股票共享同一高精度常量）的 symbol。
+
+    与 :func:`_detect_placeholder_symbols` 同判据（值被 >=share_thresh 只共享），
+    但按 dt 分组——多日窗口里同一常量可能跨日巧合重复，按日判定防误伤。
+    返回 {dt(YYYYMMDD): {symbol, ...}}。
+    """
+    bad: dict[str, set[str]] = {}
+    if hist.empty or "flow_net_amount" not in hist.columns or "dt" not in hist.columns:
+        return bad
+    hng = hist[hist["flow_net_amount"].notna() & (hist["flow_net_amount"] != 0)]
+    if hng.empty:
+        return bad
+    hng = hng.assign(_dt=hng["dt"].astype(str))
+    cc = hng.groupby(["_dt", "flow_net_amount"])["symbol"].nunique().reset_index(name="n")
+    # itertuples 会把下划线开头的列名重命名为位置名，row._dt 必抛 AttributeError；
+    # 此处按位置解包（列序固定为 [_dt, flow_net_amount, n]）。
+    for _dt_val, _famt, _n in cc[cc["n"] >= share_thresh].itertuples(index=False):
+        dt = str(_dt_val)
+        syms = set(hng[(hng["_dt"] == dt) & (hng["flow_net_amount"] == _famt)]["symbol"])
+        bad.setdefault(dt, set()).update(syms)
+    return bad
+
+
 def get_stock_money_flow(limit: int = 20) -> list[dict[str, Any]]:
     """个股资金流向排行榜（当日主力净流入排序）。"""
     if not _available():
@@ -362,17 +386,7 @@ def _stock_money_flow_impl(limit: int) -> list[dict[str, Any]]:
 
     # 剔除 L2 占位污染（多只股票共享同一常量值=假数据），与离线快照/官网一致。
     # bad_by_dt 供 30 日明细逐日剔除；当日榜单先剔除占位股，否则假股票把真实榜挤下去。
-    bad_by_dt: dict[str, set[str]] = {}
-    if "flow_net_amount" in hist.columns:
-        hng = hist[hist["flow_net_amount"].notna() & (hist["flow_net_amount"] != 0)]
-        hng = hng.assign(_dt=hng["dt"].astype(str))
-        cc = hng.groupby(["_dt", "flow_net_amount"])["symbol"].nunique().reset_index(name="n")
-        # itertuples 会把下划线开头的列名重命名为位置名，row._dt 必抛 AttributeError；
-        # 此处按位置解包（列序固定为 [_dt, flow_net_amount, n]）。
-        for _dt_val, _famt, _n in cc[cc["n"] >= 25].itertuples(index=False):
-            dt = str(_dt_val)
-            syms = set(hng[(hng["_dt"] == dt) & (hng["flow_net_amount"] == _famt)]["symbol"])
-            bad_by_dt.setdefault(dt, set()).update(syms)
+    bad_by_dt = placeholder_symbols_by_dt(hist)
     today_bad = bad_by_dt.get(today, set())
     if today_bad:
         flow = flow[~flow["symbol"].isin(today_bad)]

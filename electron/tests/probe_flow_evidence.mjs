@@ -20,6 +20,10 @@
  *     DOM 渲染；逐日与 20 日涨幅一律带 % 书写（缺失显 —）；
  *   - 交互闭环：命中榜行 → 工作台板块明细（容忍自动选中同名不重取）→ 成分下钻个股卡
  *     → 归因 chip 回板块 → 命中 #2 联动切板块 → 关闭个股卡；
+ *   - v7 双向定位：板块跳转（命中行/榜单行/热门 chip/候选 chip）自动下钻首位成分
+ *     （个股卡取数=members[0] + 该行 aria-current 选中）；点行开卡 → 选中行=所点成分；
+ *     归因回板块保持个股锚点（选中行不变）；切板块 → 自动切新板块首位成分；
+ *     关闭个股卡 → 选中行清除；初始默认选板（非跳转）不自动开卡；
  *   - 徽章证据卡弹层：hover「连N」徽章 → 探针口径 / 可执行口径 / 分年 / 口径披露；
  *   - 展示面纪律：作用域内禁词（买入/卖出/前 20%）零命中、内部工单号零命中、
  *     「已实测不具预测力」文案在屏。
@@ -75,6 +79,23 @@ const clickAndExpectSector = async (locator, name, timeoutMs = 15000) => {
     await page.waitForTimeout(200);
   }
   return lastSectorJson;
+};
+
+// /money-flow/stock 响应跟踪（v7：板块跳转自动下钻首位成分 / 点行开卡均触发个股卡取数）
+let lastStockJson = null;
+page.on('response', (r) => {
+  if (!r.url().includes('/money-flow/stock')) return;
+  r.json().then((j) => { lastStockJson = j; }).catch(() => {});
+});
+
+/** 等待个股卡取数到位（载荷 symbol 匹配；容忍「已是目标」的零等待路径）。 */
+const waitStockJson = async (symbol, timeoutMs = 20000) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (lastStockJson?.symbol === symbol) break;
+    await page.waitForTimeout(200);
+  }
+  return lastStockJson;
 };
 
 console.log(`\n===== 资金流全景 · 延续证据台实机探针（v3） @ ${BASE} =====`);
@@ -427,6 +448,12 @@ const ticketHit = ticketRe.filter((re) => re.test(scopeText)).map(String);
 ok(ticketHit.length === 0, '内部工单号零命中', ticketHit.join(',') || '无');
 ok(scopeText.includes('不具预测力'), '展示面含「不具预测力」披露', '');
 
+// ── v7 反证：初始默认选板不是「跳转」——不自动开个股卡 ────────────────
+ok(
+  (await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) === 0,
+  'v7：初始默认选板不开个股卡（仅显式跳转 autoPick）',
+);
+
 // ── 交互①：命中榜行 → 工作台板块明细（容忍自动选中同名不重取）────────
 const hit0 = ev.hits[0];
 const escAttr = (s) => s.replace(/"/g, '\\"');
@@ -439,6 +466,19 @@ if (await card0.count()) {
 ok(sectorJson?.available === true && sectorJson?.name === hit0.name, '点命中行 → 工作台载入该板块明细', `detail=${sectorJson?.name}`);
 await page.getByText('成分贡献榜（窗口净额 · 点击下钻个股）', { exact: false }).first().waitFor({ timeout: 20000 }).catch(() => {});
 ok((await page.getByText('成分贡献榜（窗口净额 · 点击下钻个股）', { exact: false }).count()) > 0, '成分贡献榜在屏');
+
+// ── v7：板块跳转自动下钻首位成分（个股卡现于最右 + 该行选中）──────────
+const first0 = (sectorJson?.members ?? [])[0];
+if (first0) {
+  const autoStk = await waitStockJson(first0.symbol);
+  ok(autoStk?.symbol === first0.symbol, 'v7：板块跳转自动下钻首位成分（个股卡取数 = members[0]）', `symbol=${autoStk?.symbol} vs ${first0.symbol}`);
+  await page.waitForTimeout(800);
+  ok((await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) > 0, 'v7：自动下钻后个股卡在屏（板块→个股闭环）');
+  const act1 = page.locator('button[aria-current="true"]');
+  const n1 = await act1.count();
+  const txt1 = n1 ? await act1.first().innerText().catch(() => '') : '';
+  ok(n1 === 1 && txt1.includes(first0.symbol), 'v7：成分贡献榜选中首位成分行（aria-current）', `count=${n1} · ${txt1.replace(/\s+/g, ' ').slice(0, 70)}`);
+}
 
 // ── 交互②：徽章证据卡弹层（hover）────────────────────────────────────
 if (badgeHits.length) {
@@ -456,43 +496,75 @@ if (badgeHits.length) {
   await page.mouse.move(10, 10);
 }
 
-// ── 交互③：成分下钻个股卡 ────────────────────────────────────────────
-const m0 = (sectorJson?.members ?? []).find((m) => m.name);
+// ── 交互③：成分下钻个股卡（点非首位成分——首位已被自动下钻占用）──────
+const mems = sectorJson?.members ?? [];
+const m0 = mems.slice(1).find((m) => m.name) ?? mems.find((m) => m.name);
 let stockJson = null;
 if (m0) {
-  const [stkResp] = await Promise.all([
-    page.waitForResponse((r) => r.url().includes('/money-flow/stock'), { timeout: 60000 }),
-    page.getByRole('button', { name: m0.name }).first().click(),
-  ]);
-  stockJson = await stkResp.json();
+  await page.getByRole('button', { name: m0.name }).first().click();
+  stockJson = await waitStockJson(m0.symbol);
   await page.waitForTimeout(1500);
 }
 ok(stockJson?.available === true && stockJson?.symbol === m0?.symbol, '点成分股 → 个股卡取数', `symbol=${stockJson?.symbol}`);
 ok((await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) > 0, '个股卡「板块归因（回板块）」在屏');
-
-// ── 交互④：归因 chip 回板块（同板块 = 幂等回视）───────────────────────
-const chipName = (stockJson?.attribution ?? [])[0]?.name;
-if (chipName) {
-  // 归因 chip 为 rounded-full（工作台板块行是圆角矩形，避免误点）
-  await page.locator('button.rounded-full').filter({ hasText: chipName }).first().click().catch(() => {});
-  await page.waitForTimeout(1200);
-  ok((await page.getByText('成分贡献榜（窗口净额 · 点击下钻个股）', { exact: false }).count()) > 0, `归因 chip「${chipName}」回板块后工作台在屏`);
+{
+  const act2 = page.locator('button[aria-current="true"]');
+  const n2 = await act2.count();
+  const txt2 = n2 ? await act2.first().innerText().catch(() => '') : '';
+  ok(n2 === 1 && txt2.includes(stockJson?.symbol ?? '@@'), 'v7：点击行即选中（aria-current = 所点成分）', `count=${n2}`);
 }
 
-// ── 交互⑤：命中 #2 联动切板块（个股卡保持；容忍同名自动选中）──────────
+// ── 交互④：归因 chip 回板块（v7：点「当前板块」归因 chip——保持个股锚点）──
+// 选择器纪律：卡内归因 chip 的文本 = 体系 + 名称 + inner_rank/inner_total（如
+// 「行业二级 医疗器械 25/80」）；融合条热门 chip 只有纯名称——必须用「名称 + N/M」
+// 结构化正则锁定，否则 DOM 序上会误点顶部融合条的同名热门 chip（其 autoPick=true
+// 会把选中行翻成首位成分——这正是本断言要防的回归）。
+const attsIn = stockJson?.attribution ?? [];
+const chipEntry =
+  attsIn.find((a) => a.name === sectorJson?.name && a.sector_set === 'industry2') ??
+  attsIn.find((a) => a.name === sectorJson?.name) ??
+  attsIn[0];
+const chipName = chipEntry?.name;
+if (chipName) {
+  // 体系前缀一并纳入（行业一级/二级可能同名）——chip 首段 = type 去「板块()」残留
+  const typeLabel = (chipEntry?.type ?? '').replace('板块', '').replace('(', '').replace(')', '');
+  const chipRe = new RegExp(
+    `${typeLabel}\\s*${chipName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\d+\\s*/\\s*\\d+`,
+  );
+  await page.locator('button.rounded-full').filter({ hasText: chipRe }).first().click().catch(() => {});
+  await page.waitForTimeout(1200);
+  ok((await page.getByText('成分贡献榜（窗口净额 · 点击下钻个股）', { exact: false }).count()) > 0, `归因 chip「${chipName}」回板块后工作台在屏`);
+  ok((await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) > 0, 'v7：归因回板块保持当前个股卡（autoPick=false）');
+  const act3 = page.locator('button[aria-current="true"]');
+  const n3 = await act3.count();
+  const txt3 = n3 ? await act3.first().innerText().catch(() => '') : '';
+  ok(n3 === 1 && txt3.includes(stockJson?.symbol ?? '@@'), 'v7：个股锚点保持（选中行仍为所点成分）', `count=${n3}`);
+}
+
+// ── 交互⑤：命中 #2 联动切板块（v7：自动下钻新板块首位成分，旧卡让位）──
 const hit1 = ev.hits[1];
 if (hit1) {
   const card1 = page.locator(`button[title^="${escAttr(hit1.name)} ·"]`).first();
   const sectorJson2 = await clickAndExpectSector(card1, hit1.name);
   ok(sectorJson2?.name === hit1.name, `命中 #2「${hit1.name}」联动切换工作台`, `detail=${sectorJson2?.name}`);
-  ok(stockJson ? (await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) > 0 : true, '切板块后个股卡保持（个股↔板块双向不打断）');
+  const first1 = (sectorJson2?.members ?? [])[0];
+  if (first1) {
+    const auto2 = await waitStockJson(first1.symbol);
+    ok(auto2?.symbol === first1.symbol, 'v7：切板块自动下钻新板块首位成分（个股卡切新锚）', `symbol=${auto2?.symbol} vs ${first1.symbol}`);
+    await page.waitForTimeout(600);
+    const act4 = page.locator('button[aria-current="true"]');
+    const n4 = await act4.count();
+    const txt4 = n4 ? await act4.first().innerText().catch(() => '') : '';
+    ok(n4 === 1 && txt4.includes(first1.symbol), 'v7：新板块首位成分行选中（aria-current）', `count=${n4}`);
+  }
 }
 
-// ── 交互⑥：关闭个股卡 ───────────────────────────────────────────────
+// ── 交互⑥：关闭个股卡（v7：选中行同步清除）───────────────────────────
 if (await page.locator('button[aria-label="关闭个股详情"]').count()) {
   await page.locator('button[aria-label="关闭个股详情"]').first().click();
   await page.waitForTimeout(1000);
   ok((await page.getByText('所属板块归因（点击回板块视角）', { exact: false }).count()) === 0, '关闭个股卡后详情卡卸载');
+  ok((await page.locator('button[aria-current="true"]').count()) === 0, 'v7：关闭个股卡清除选中行（aria-current 归零）');
 }
 
 ok(pageErrors.length === 0, '无页面 JS 错误', pageErrors.slice(0, 2).join(' | '));

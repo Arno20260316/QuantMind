@@ -11,6 +11,10 @@
  * - 切体系 → 清板块选中（不同体系下名称不可混用）；切周期/方向/日期只重取；
  * - 外部 focusSymbol（顶栏搜索/其他面板）→ 打开个股卡；关闭时回报 onClearFocus
  *   以便同一代码可再次触发；
+ * - v7 双向定位：板块入口跳转（榜行/桑基板块节点/热门 chip/搜索候选/命中榜）→
+ *   明细到位自动下钻首位成分（开个股卡 + 高亮该行）；检索/聚焦个股 → 按
+ *   attribution 切到其所属体系板块并高亮其行（已在当前板块榜内则只高亮不切板）；
+ *   个股卡内「归因回板块」传 autoPick=false（保持当前个股锚点）；
  * - 证据 meta 缺失/陈旧/不适用一律显式披露，绝不假装有 streak 数据；
  * - 命中榜档位（hitLevel）由本面板持有：命中榜签切换 → 底部信号档案对应行高亮联动；
  * - 左列签（boardTab）null=按证据产物自动（有连N证据默认命中榜），用户点选后固定。
@@ -25,6 +29,7 @@ import { EvidenceHitList } from './EvidenceHitList';
 import { StockFlowDetailCard } from './StockFlowDetailCard';
 import { FlowEvidencePanel } from './FlowEvidencePanel';
 import { TagBrowserStrip } from './TagBrowserStrip';
+import { normalizeStockCode } from '../../../utils/portfolioUtils';
 import {
   getFlowPanorama,
   getFlowSector,
@@ -37,6 +42,7 @@ import {
   type FlowPeriod,
   type FlowSectorDetailResponse,
   type FlowSectorSet,
+  type FlowStockDetailResponse,
 } from '../services/moneyFlowService';
 
 const PERIODS: Array<{ id: FlowPeriod; label: string }> = [
@@ -154,6 +160,10 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
   const [detailError, setDetailError] = useState<string | null>(null);
 
   const [selectedStock, setSelectedStock] = useState<{ symbol: string; name?: string } | null>(null);
+  /** 成分贡献榜选中行（=当前个股卡个股）。面板级持有：检索个股打开卡片后，榜单据此高亮其所属板块内的该行。 */
+  const [highlightSymbol, setHighlightSymbol] = useState<string | null>(null);
+  /** 板块入口跳转后是否自动下钻首位成分（明细加载完成时消费一次；初始默认选板不消费）。 */
+  const autoPickFirstRef = useRef(false);
   /** 延续命中榜档位（命中榜签内切换；底部信号档案行高亮联动）。null=按产物默认档。 */
   const [hitLevel, setHitLevel] = useState<number | null>(null);
   /** 左列签（v5）：null=按证据产物自动（有连N证据默认命中榜，否则板块榜），用户点选后固定。 */
@@ -198,15 +208,21 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
     if (!selectedSector) {
       setDetail(null);
       setDetailError(null);
+      autoPickFirstRef.current = false;
       return;
     }
     const seq = ++detailSeq.current;
+    const autoPick = autoPickFirstRef.current; // 本次加载生效一次；期间新加载各自取值（seq 守卫丢弃晚到者）
+    autoPickFirstRef.current = false;
     setDetailLoading(true);
     setDetailError(null);
     getFlowSector(selectedSector, { sectorSet, period, top: 30, date })
       .then((d) => {
         if (seq !== detailSeq.current) return;
         setDetail(d);
+        // 板块入口跳转（v7）：明细到位即自动下钻首位成分（members 已按 |净额| 降序），
+        // 个股卡现于最右、该行选中——「点板块要能看到其中的第一只个股」。
+        if (autoPick && d.members[0]) handleSelectStock(d.members[0].symbol, d.members[0].name);
       })
       .catch((e: unknown) => {
         if (seq !== detailSeq.current) return;
@@ -222,9 +238,9 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
       });
   }, [selectedSector, sectorSet, period, date, detailTick]);
 
-  // ── 外部聚焦个股 → 打开个股卡 ──
+  // ── 外部聚焦个股 → 打开个股卡（v7：统一走 handleSelectStock，同步选中行） ──
   useEffect(() => {
-    if (focusSymbol) setSelectedStock({ symbol: focusSymbol });
+    if (focusSymbol) handleSelectStock(focusSymbol);
   }, [focusSymbol]);
 
   const handleSectorSetChange = (s: FlowSectorSet) => {
@@ -234,23 +250,56 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
   };
 
   const handleSelectStock = (symbol: string, name?: string) => {
-    setSelectedStock({ symbol, name });
+    // 入口统一归一化为前缀式（SH600519）：融合条个股 chip 来自 /stock-terminal/list
+    // （后缀式 600519.SH）、桑基/成分榜为前缀式——不归一化则选中行/定位比较全部错配
+    const norm = normalizeStockCode(symbol);
+    setSelectedStock({ symbol: norm, name });
+    setHighlightSymbol(norm);
   };
 
   const handleCloseStock = () => {
     setSelectedStock(null);
+    setHighlightSymbol(null);
     onClearFocus?.();
   };
 
-  /** 板块入口统一选板（榜行/桑基节点/热门 chip/归因 chip）：同名再点=重取明细。 */
-  const selectSector = (name: string) => {
+  /** 板块入口统一选板（榜行/桑基板块节点/热门 chip/搜索板块候选/命中榜）：同名再点=重取明细。
+   *  autoPick（默认开）：明细加载完成后自动下钻首位成分并开个股卡——板块跳转即见其中最强个股；
+   *  个股卡内「归因回板块」与其检索个股定位传 false（保持当前个股锚点，仅高亮其行）。 */
+  const selectSector = (name: string, opts?: { autoPick?: boolean }) => {
     setSelectedSector(name);
     setDetailTick((t) => t + 1);
+    autoPickFirstRef.current = opts?.autoPick !== false;
   };
 
   const handleNavigateSector = (name: string, set: string | null) => {
     if (set && set !== sectorSet) setSectorSet(set as FlowSectorSet);
     selectSector(name);
+  };
+
+  /** 个股卡内「归因回板块」：只切板块明细，不自动换股（当前个股卡保持并高亮）。 */
+  const handleCardNavigateSector = (name: string, set: string | null) => {
+    if (set && set !== sectorSet) setSectorSet(set as FlowSectorSet);
+    selectSector(name, { autoPick: false });
+  };
+
+  /** 检索/聚焦个股取数到位 → 成分贡献榜定位并选中其所属板块（v7）。
+   *  规则：该股已在当前板块成分榜内（含点行开卡）→ 只需行高亮，不切板块；
+   *  否则按 attribution 匹配当前体系板块（回退 行业二级 → 行业一级 → 任一有体系项）切过去，
+   *  明细加载后行高亮即出现——「检索个股跳转时也知道它属于哪个板块」。 */
+  const resolveStockSectors = (d: FlowStockDetailResponse) => {
+    if (normalizeStockCode(d.symbol ?? '') !== normalizeStockCode(selectedStock?.symbol ?? '')) return; // 陈旧响应（已换股；两侧归一化比较）
+    if (selectedSector && detail?.members.some((m) => m.symbol === d.symbol)) return;
+    const atts = d.attribution ?? [];
+    const pick =
+      atts.find((a) => a.sector_set === sectorSet) ??
+      atts.find((a) => a.sector_set === 'industry2') ??
+      atts.find((a) => a.sector_set === 'industry1') ??
+      atts.find((a) => a.sector_set != null);
+    if (!pick) return;
+    if (pick.name === selectedSector) return; // 同板块（该股在 top30 外时行不可见，重取无益）
+    if (pick.sector_set && pick.sector_set !== sectorSet) setSectorSet(pick.sector_set);
+    selectSector(pick.name, { autoPick: false });
   };
 
   // 证据可用性（契约：正常态 reason=null 且 available=true；降级态 reason ∈
@@ -452,6 +501,7 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
                 detailError={detailError}
                 refreshTick={detailTick}
                 onSelectStock={handleSelectStock}
+                highlightSymbol={highlightSymbol}
               />
             </div>
             {selectedStock && (
@@ -460,7 +510,8 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
                   symbol={selectedStock.symbol}
                   date={date}
                   onClose={handleCloseStock}
-                  onNavigateSector={handleNavigateSector}
+                  onNavigateSector={handleCardNavigateSector}
+                  onDetailLoaded={resolveStockSectors}
                 />
               </div>
             )}

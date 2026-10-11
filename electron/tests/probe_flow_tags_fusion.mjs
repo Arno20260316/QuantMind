@@ -16,6 +16,9 @@
  *     （/tags/stats?hot_type= 单体系 top-18 chips）；回切走缓存不重复取数；
  *   - v6 文字搜股：输入「茅台」并行触发 /stock-terminal/list 个股联想 → 个股候选
  *     chip「贵州茅台」→ 点击打开个股卡（SH600519）；
+ *   - v7 双向定位：热门 chip / 候选 chip 跳转自动下钻首位成分（个股卡取数 =
+ *     members[0] + 该行 aria-current 选中）；检索个股（茅台）→ 成分贡献榜自动
+ *     定位其归因 industry2 板块并选中该股行（不在 top30 则按契约不显选中行）；
  *   - 展示面纪律：融合条作用域内禁词（买入/卖出/前 20%）与内部工单号零命中。
  *
  * 用法：node electron/tests/probe_flow_tags_fusion.mjs
@@ -71,6 +74,41 @@ const clickAndExpectSector = async (locator, name, timeoutMs = 15000) => {
     await page.waitForTimeout(200);
   }
   return lastSectorJson;
+};
+
+/** 等待「指定名称」板块明细到位（v7：检索个股自动定位板块会异步触发取数）。 */
+const waitSectorNamed = async (name, timeoutMs = 20000) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (lastSectorJson?.name === name) break;
+    await page.waitForTimeout(200);
+  }
+  return lastSectorJson;
+};
+
+// /money-flow/stock 响应跟踪（v7：板块跳转自动下钻首位成分 / 检索个股定位均触发取数）
+let lastStockJson = null;
+page.on('response', (r) => {
+  if (!r.url().includes('/money-flow/stock')) return;
+  r.json().then((j) => { lastStockJson = j; }).catch(() => {});
+});
+
+/** 等待个股卡取数到位（载荷 symbol 匹配；容忍「已是目标」的零等待路径）。 */
+const waitStockJson = async (symbol, timeoutMs = 15000) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (lastStockJson?.symbol === symbol) break;
+    await page.waitForTimeout(200);
+  }
+  return lastStockJson;
+};
+
+/** 若个股卡在屏则关闭（v7：板块跳转会自动开卡，避免干扰后续「同码不重取」断言）。 */
+const closeStockIfAny = async () => {
+  if (await page.locator('button[aria-label="关闭个股详情"]').count()) {
+    await page.locator('button[aria-label="关闭个股详情"]').first().click();
+    await page.waitForTimeout(500);
+  }
 };
 
 console.log(`\n===== 资金流全景 v2 · P3 标签融合 + 因子板共振态探针 @ ${BASE} =====`);
@@ -145,6 +183,19 @@ if (await hotBtn.count()) {
 }
 ok(hotSector?.name === hot.name, '点热门 chip → 工作台载入该板块', `detail=${hotSector?.name}`);
 
+// v7：热门 chip 跳转自动下钻首位成分（开个股卡 + 选中该行）→ 随后关闭，
+// 避免与交互③ Enter 同码时不重取（个股卡 symbol 未变不发新请求）
+const hotFirst = (hotSector?.members ?? [])[0];
+if (hotFirst) {
+  const autoHot = await waitStockJson(hotFirst.symbol);
+  ok(autoHot?.symbol === hotFirst.symbol, 'v7：热门 chip 跳转自动下钻首位成分', `symbol=${autoHot?.symbol} vs ${hotFirst.symbol}`);
+  const actH = page.locator('button[aria-current="true"]');
+  const nH = await actH.count();
+  const txtH = nH ? await actH.first().innerText().catch(() => '') : '';
+  ok(nH === 1 && txtH.includes(hotFirst.symbol), 'v7：成分贡献榜选中首位成分行（aria-current）', `count=${nH}`);
+}
+await closeStockIfAny();
+
 // ── 交互②：搜索「航空」→ 候选 → 点候选联动 ─────────────────────────
 const matchP = page.waitForResponse((r) => r.url().includes('/tags/matches'), { timeout: 30000 });
 await input.fill('航空');
@@ -164,6 +215,14 @@ if (plane) {
   }
 }
 ok(planeSector?.name === '航空机场', '点候选 chip → 联动切板块（航空机场）', `detail=${planeSector?.name}`);
+
+// v7：候选 chip 跳转同样自动下钻首位成分 → 校验后关闭（同交互①）
+const planeFirst = (planeSector?.members ?? [])[0];
+if (planeFirst) {
+  const autoPlane = await waitStockJson(planeFirst.symbol);
+  ok(autoPlane?.symbol === planeFirst.symbol, 'v7：候选 chip 跳转自动下钻首位成分', `symbol=${autoPlane?.symbol} vs ${planeFirst.symbol}`);
+}
+await closeStockIfAny();
 
 // ── 交互③：代码路径（代码形态不发候选请求）→ Enter 打开个股卡 ───────
 await page.locator('button[aria-label="清空搜索"]').click();
@@ -317,8 +376,37 @@ if (await maotaiChip.count()) {
     `symbol=${mkJson?.symbol}`,
   );
   ok((await input.inputValue()) === '', '个股 chip 提交后搜索框清空');
-  await page.locator('button[aria-label="关闭个股详情"]').first().click();
-  await page.waitForTimeout(600);
+
+  // v7：检索个股 → 成分贡献榜自动定位到该股所属板块并选中其行。
+  // 重要事实：行业二级税目（80 板块）无酒类——茅台在上游成员表中**没有二级归属**，
+  // 归因回退链 industry2 → industry1 落到「酿酒」，页面体系随之同步切换（诚实呈现）。
+  const attsM = mkJson?.attribution ?? [];
+  const expectPick =
+    attsM.find((a) => a.sector_set === 'industry2') ??
+    attsM.find((a) => a.sector_set === 'industry1') ??
+    attsM.find((a) => a.sector_set != null);
+  if (expectPick) {
+    const sj = await waitSectorNamed(expectPick.name);
+    await page.waitForTimeout(800); // 等响应落地后的 DOM 渲染（明细头部/榜单行）
+    ok(
+      sj?.name === expectPick.name && sj?.sector_set === expectPick.sector_set,
+      `v7：检索个股自动定位所属板块「${expectPick.name}」（归因 ${expectPick.sector_set}）`,
+      `detail=${sj?.name}@${sj?.sector_set}`,
+    );
+    ok((await page.getByText(expectPick.name, { exact: true }).count()) > 0, 'v7：明细头部显示归属板块名');
+    const inTop = (sj?.members ?? []).some((m) => m.symbol === 'SH600519');
+    const actM = page.locator('button[aria-current="true"]');
+    const nM = await actM.count();
+    const txtM = nM ? await actM.first().innerText().catch(() => '') : '';
+    if (inTop) {
+      ok(nM === 1 && txtM.includes('SH600519'), 'v7：成分贡献榜选中该股行（aria-current）', `count=${nM}`);
+    } else {
+      ok(nM === 0, 'v7：该股不在 top30 成分榜（按契约不显选中行）', `count=${nM}`);
+    }
+  } else {
+    console.log('  （attribution 全部无体系项：跳过检索定位断言）');
+  }
+  await closeStockIfAny();
 }
 
 // ── 展示面纪律：融合条作用域禁词 / 工单号 ────────────────────────────

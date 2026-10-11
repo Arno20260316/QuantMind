@@ -231,6 +231,8 @@ export interface SectorDetailPanelProps {
   /** 每次点击板块入口（含同名再点=重取）递增——触发一次短暂高亮，给出可见反馈。 */
   refreshTick?: number;
   onSelectStock: (symbol: string, name: string) => void;
+  /** 选中行个股（=当前个股卡个股）：行常驻高亮 + `aria-current`，出现时自动滚入可视区。 */
+  highlightSymbol?: string | null;
 }
 
 export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
@@ -240,6 +242,7 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
   detailError,
   refreshTick = 0,
   onSelectStock,
+  highlightSymbol = null,
 }) => {
   const detailMaxAbs = useMemo(
     () => (detail ? Math.max(1, ...detail.members.map((m) => Math.abs(m.net_main))) : 1),
@@ -262,6 +265,11 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
     const m = detail?.members.find((x) => x.recent && x.recent.length > 0);
     return (m?.recent ?? []).map((p) => p.date);
   }, [detail]);
+  // v7 选中行：检索个股定位到本板块、或板块跳转自动下钻首位成分时，高亮行并滚入可视区
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (highlightSymbol) activeRowRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [highlightSymbol, detail]);
 
   return (
     <div
@@ -355,11 +363,17 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
                   </div>
                 )}
                 <div className="overflow-y-auto custom-scrollbar" style={{ maxHeight: 340 }}>
-                  {detail.members.map((m) => (
+                  {detail.members.map((m) => {
+                    const active = m.symbol === highlightSymbol;
+                    return (
                     <button
                       key={m.symbol}
+                      ref={active ? activeRowRef : undefined}
+                      aria-current={active ? 'true' : undefined}
                       onClick={() => onSelectStock(m.symbol, m.name)}
-                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left hover:bg-purple-50/70 transition-colors cursor-pointer"
+                      className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors cursor-pointer ${
+                        active ? 'bg-purple-50/90 ring-1 ring-inset ring-purple-300/70' : 'hover:bg-purple-50/70'
+                      }`}
                     >
                       <span className="w-7 text-[10px] font-mono text-slate-400 shrink-0">#{m.inner_rank}</span>
                       <span className="w-[118px] min-w-0 text-[11px] font-bold text-slate-700 truncate shrink-0">{m.name || '—'}</span>
@@ -394,7 +408,8 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
                         {m.pct_20d == null ? '—' : `${m.pct_20d > 0 ? '+' : ''}${m.pct_20d.toFixed(2)}%`}
                       </span>
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>

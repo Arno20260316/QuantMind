@@ -37,6 +37,8 @@ export interface StockFlowDetailCardProps {
   onClose: () => void;
   /** 点归因 chip → 回板块视角（sectorSet 为 null 时保持当前体系）。 */
   onNavigateSector: (name: string, sectorSet: string | null) => void;
+  /** 取数到位回调（v7：面板据此把成分贡献榜定位到该股所属板块并选中其行）。 */
+  onDetailLoaded?: (detail: FlowStockDetailResponse) => void;
 }
 
 const SeriesChart: React.FC<{ detail: FlowStockDetailResponse; height?: number }> = ({ detail, height = 168 }) => {
@@ -232,12 +234,18 @@ export const StockFlowDetailCard: React.FC<StockFlowDetailCardProps> = ({
   date,
   onClose,
   onNavigateSector,
+  onDetailLoaded,
 }) => {
   const [detail, setDetail] = useState<FlowStockDetailResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const reqSeq = useRef(0);
   const factor = detail?.factor ?? null;
+  // 回调 ref 镜像：取数 effect 不因回调身份变化而重取（父组件每次渲染都会传新闭包）
+  const onDetailLoadedRef = useRef(onDetailLoaded);
+  useEffect(() => {
+    onDetailLoadedRef.current = onDetailLoaded;
+  });
 
   useEffect(() => {
     const seq = ++reqSeq.current;
@@ -248,6 +256,7 @@ export const StockFlowDetailCard: React.FC<StockFlowDetailCardProps> = ({
       .then((d) => {
         if (seq !== reqSeq.current) return;
         setDetail(d);
+        onDetailLoadedRef.current?.(d);
       })
       .catch((e: unknown) => {
         if (seq !== reqSeq.current) return;

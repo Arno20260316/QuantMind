@@ -88,3 +88,18 @@ def test_param_validation():
         qm.paper.get_positions(market="XX")
     with pytest.raises(ValueError):
         QuantMindClient("http://x", "", "sk")
+
+
+def test_get_latest_signals_reads_items():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/open/auth/token":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"token": "T", "token_type": "bearer", "expires_in": 1, "scopes": []}})
+        if request.url.path == "/api/v1/open/inference/latest":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"run_id": "r1"}})
+        if request.url.path == "/api/v1/open/inference/runs/r1":
+            return httpx.Response(200, json={"code": 200, "message": "ok", "data": {"summary": {}, "total": 2, "items": [{"symbol": "600036.SH"}, {"symbol": "600519.SH"}]}})
+        return httpx.Response(404, json={"code": 404, "message": "no"})
+
+    qm = _client(handler)
+    sigs = qm.inference.get_latest_signals()
+    assert [s["symbol"] for s in sigs] == ["600036.SH", "600519.SH"]

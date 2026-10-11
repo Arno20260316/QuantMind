@@ -26,7 +26,7 @@ import logging
 import os
 
 import httpx
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
 from backend.services.api.routers.model_training import (
@@ -166,15 +166,24 @@ async def open_stock_history(
 
 @router.get("/paper/positions", summary="模拟盘持仓（SDK）")
 async def open_paper_positions(
+    request: Request,
     market: str = Query("CN", description="CN/HK/US/FUTURES/CRYPTO"),
     user: dict = Depends(require_openapi_scope(SCOPE_PAPER_READ)),
 ):
-    """转发 trade 服务的模拟盘账户接口（与 trade_proxy 同模式）。"""
+    """转发 trade 服务的模拟盘账户接口（与 trade_proxy 同模式）。
+
+    注意 trade 侧 get_auth_context 只认 Authorization Bearer JWT
+    （X-User-Id 仅为兼容保留），因此必须把 openapi 令牌原样透传，
+    否则 trade 直接 401。
+    """
     url = f"{TRADE_BASE_URL}/api/v1/simulation/account"
     headers = {
         "X-User-Id": str(user.get("user_id") or ""),
         "X-Tenant-Id": str(user.get("tenant_id") or "default"),
     }
+    incoming_auth = request.headers.get("authorization")
+    if incoming_auth:
+        headers["Authorization"] = incoming_auth
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=3.0), trust_env=False

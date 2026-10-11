@@ -12,7 +12,7 @@ from .resources.inference import InferenceResource
 from .resources.news import NewsResource
 from .resources.paper import PaperResource
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 _TOKEN_PATH = "/api/v1/open/auth/token"
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}

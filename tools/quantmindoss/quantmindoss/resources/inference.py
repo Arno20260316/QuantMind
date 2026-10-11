@@ -18,7 +18,7 @@ class InferenceResource:
         )
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        """推理批次明细。completed 批次含 signals[]，
+        """推理批次明细。返回 {summary, total, items[]}，
         每行 {symbol, fusion_score, signal_side, score_rank, ...}。"""
         return self._c._request("GET", f"/api/v1/open/inference/runs/{run_id}")
 
@@ -44,4 +44,7 @@ class InferenceResource:
         if not run_id:
             return []
         detail = self.get_run(run_id)
-        return list((detail or {}).get("signals") or [])
+        items = (detail or {}).get("items")
+        if items is None:  # 兼容 signals 键
+            items = (detail or {}).get("signals") or []
+        return list(items or [])

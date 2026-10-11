@@ -13,6 +13,8 @@
   防「选择过程偷看 OOS」。
 - K* = 训练窗 Sharpe argmax、平票取小；train/holdout Sharpe 比 >3 亮过拟合旗标
   （披露而非自动否决——这是研究工具，判断权交用户）。
+- **披露纪律**：候选整列缺席（快照无数据）/短历史剔除/比例不可计算（holdout≤0）/
+  朴素切分的前向标签窗重叠——一律进 ``notes`` 与 ``universe``，不静默蒸发。
 """
 
 from __future__ import annotations
@@ -61,6 +63,9 @@ MIN_CANDIDATES = 3
 MIN_SHARPE_DAYS = 20
 """单窗口 Sharpe 的最少有效天数（与 optimize.MIN_COMPOSITE_DAYS 同精神）。"""
 
+RELATIVE_SD_FLOOR = 1e-9
+"""SD 相对量级下界：sd ≤ 量级×此值视为浮点噪声级常数——见 ``_sharpe``。"""
+
 OVERFIT_ALERT_RATIO = 3.0
 """train/holdout Sharpe 比超过此值亮过拟合旗标（论文的样本内外 3× 判据）。"""
 
@@ -81,13 +86,18 @@ def _unavailable(reason: str) -> dict[str, Any]:
 
 
 def _sharpe(series, annualization: float = ANNUALIZATION) -> float | None:
-    """等权序列的 Sharpe：mean/std×√ann（ddof=0，与 optimize.composite_ic_series 同口径）。"""
+    """等权序列的 Sharpe：mean/std×√ann（ddof=0，与 optimize.composite_ic_series 同口径）。
+
+    近常数护栏：sd 低于「序列量级×``RELATIVE_SD_FLOOR``」视为浮点噪声级常数
+    （如 ULP 级扰动，std≈4e-19）→ None——否则 mean/sd 爆炸出 1e16 级假 Sharpe
+    劫持贪心选择。真实净收益序列的 sd/量级 ≳1e-2，护栏留 7 个数量级余量。
+    """
     s = np.asarray(series, dtype=np.float64)
     s = s[np.isfinite(s)]
     if s.size < MIN_SHARPE_DAYS:
         return None
     sd = float(s.std())
-    if sd <= 0:
+    if sd <= 0.0 or sd <= float(np.abs(s).max()) * RELATIVE_SD_FLOOR:
         return None
     v = float(s.mean()) / sd * np.sqrt(annualization)
     return v if np.isfinite(v) else None
@@ -229,6 +239,16 @@ def load_net_returns(
     if piv_to is not None:
         piv_to = piv_to.reindex(dates)
 
+    # 整列缺席的候选（快照里没有该因子的行）不得静默消失：服务端留痕，
+    # 用户面披露由 compute_best_subset 的 requested 参数负责（universe/notes）。
+    missing = [name for name in factors if name not in piv_ls.columns]
+    if missing:
+        log.warning(
+            "候选 %d 个在因子序列快照中无数据（未进精选子集）：%s",
+            len(missing),
+            missing[:10],
+        )
+
     dirs = directions or {}
     out: dict[str, pd.Series] = {}
     for name in factors:
@@ -250,6 +270,7 @@ def compute_best_subset(
     *,
     directions: dict[str, int] | None = None,
     current_rule: tuple[list[str], np.ndarray] | None = None,
+    requested: list[str] | None = None,
     k_min: int = K_MIN_DEFAULT,
     k_max: int = K_MAX_DEFAULT,
     train_frac: float = TRAIN_FRAC,
@@ -264,6 +285,8 @@ def compute_best_subset(
     ``returns``：index=日期，列=因子名（``load_net_returns`` 的输出）。
     ``current_rule``：现行规则的 ``(names, weights)``（带符号），权重按在场列
     ``|w|`` 归一后合成基准序列（``r`` 已含方向，权重取 |w|）。
+    ``requested``：调用方请求的候选全集（快照可能整列缺数据）——给出时，
+    缺席者在 ``universe`` 与 ``notes`` 如实披露，不从计数里静默蒸发。
     永不抛异常（除输入类型错误）；不可用情形返回 ``{available: false, reason}``。
     """
     df = returns.sort_index()
@@ -278,6 +301,8 @@ def compute_best_subset(
     valid_train = df.iloc[:split].notna().sum()
     kept = [c for c in df.columns if int(valid_train.get(c, 0)) >= MIN_FACTOR_DAYS]
     n_excluded = int(df.shape[1]) - len(kept)
+    # 请求了但整列不在 returns 里的候选（快照无数据）——与「在表但有效天不足」区分计数
+    absent = sorted(set(requested) - set(df.columns)) if requested else []
     if len(kept) < MIN_CANDIDATES:
         return _unavailable(f"候选不足 {MIN_CANDIDATES} 个（{len(kept)}）")
 
@@ -375,13 +400,29 @@ def compute_best_subset(
         notes.append(
             f"剔除 {n_excluded} 个训练窗有效天 < {MIN_FACTOR_DAYS} 的短历史因子"
         )
+    if absent:
+        shown = "、".join(absent[:10]) + ("…" if len(absent) > 10 else "")
+        notes.append(
+            f"{len(absent)} 个候选在序列快照中无数据（未进 universe）：{shown}"
+        )
     if overfit:
         notes.append(
             f"train/holdout Sharpe 比 {ratio} > {overfit_alert_ratio}——过拟合风险高"
             "（样本内外比 >3 判据），谨慎对待"
         )
+    if train_sharpe is not None and holdout_sharpe is not None and holdout_sharpe <= 0:
+        notes.append(
+            f"留出窗（holdout）无正收益（Sharpe {holdout_sharpe}）——train/holdout "
+            "比不可计算，过拟合旗标不适用（如实呈现，未否决）"
+        )
     if k_lo > k_min or k_hi < k_max:
         notes.append(f"候选数 {len(kept)} 不足，K 区间退化为 [{k_lo}, {k_hi}]")
+    # 切分点披露：ls_h 是前向标签，train 末 h 个交易日的标签窗与留出窗重叠
+    # （细案 D5 选的朴素切分）——不如实说明就等于宣称了不存在的严格无泄露
+    notes.append(
+        f"train/holdout 为朴素时序切分（无 purge/embargo）：切分点附近约 h={holding_days} "
+        "个训练日的前向标签窗伸入留出窗（固定口径，影响有限）"
+    )
 
     dirs = directions or {}
     factor_items = sorted(
@@ -406,7 +447,12 @@ def compute_best_subset(
             "beats_current_rule": _beats(cur_block),
         },
         "n_days": {"train": split, "holdout": total_days - split, "total": total_days},
-        "universe": {"n_candidates": len(kept), "n_excluded_short_history": n_excluded},
+        "universe": {
+            "n_candidates": len(kept),
+            "n_excluded_short_history": n_excluded,
+            "n_absent_from_series": len(absent),
+            "absent_from_series": absent[:10],
+        },
         "notes": notes,
         "rule": {
             "holding_days": holding_days,

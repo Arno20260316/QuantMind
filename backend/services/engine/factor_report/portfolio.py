@@ -198,6 +198,7 @@ def build_portfolio(
                 net_ret,
                 directions=dirs,
                 current_rule=(sel, w),
+                requested=cand,
                 holding_days=holding_days,
                 round_trip_cost=round_trip_cost,
             )

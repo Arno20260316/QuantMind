@@ -210,6 +210,37 @@ def test_load_net_returns_尾部全缺行两表对齐(tmp_path, monkeypatch):
     assert ret["a"].iloc[45:].isna().all()
 
 
+def test_load_net_returns_缺席候选记warning(tmp_path, monkeypatch, caplog):
+    """候选在快照里整列缺席：跳过但不得静默——服务端日志留痕。"""
+    monkeypatch.setattr(BS, "dataset_dir", lambda ds: tmp_path)
+    rep = tmp_path / "report"
+    rep.mkdir()
+    rows = [
+        {
+            "factor": "a",
+            "date": f"d{i:04d}",
+            "turnover": 0.2,
+            "coverage": 0.9,
+            "ls_20": 0.4,
+        }
+        for i in range(40)
+    ]
+    pd.DataFrame(rows).to_parquet(rep / "factor_series.parquet")
+    with caplog.at_level("WARNING", logger=BS.log.name):
+        ret = BS.load_net_returns(
+            "x",
+            ["a", "ghost"],
+            directions={"a": 1, "ghost": 1},
+            holding_days=20,
+            round_trip_cost=0.002,
+        )
+    assert ret is not None
+    assert list(ret.columns) == ["a"]
+    assert any("ghost" in r.getMessage() for r in caplog.records), (
+        "缺席候选必须 logging.warning 留痕"
+    )
+
+
 def test_load_net_returns_缺列或缺序列返回None(tmp_path, monkeypatch):
     monkeypatch.setattr(BS, "dataset_dir", lambda ds: tmp_path)
     rep = tmp_path / "report"
@@ -308,12 +339,32 @@ def test_swap纠正贪心局部最优():
     assert res["chosen"]["train_sharpe"] > g_pair, "交换后的 train Sharpe 必须严格提升"
 
 
+def test_sharpe_近常数序列返回None不造巨值():
+    """浮点噪声级「常数」序列（std~4e-19，ULP 级）Sharpe 无意义必须 None。
+
+    旧守卫 ``sd <= 0`` 拦不住（ULP 扰动 std 为正的极小值）→ mean/sd×√252 ≈ 1e16
+    会劫持贪心选择。护栏 = 相对量级下界（sd 低于量级×1e-9 视为常数）。
+    """
+    c = 0.0037
+    ulp = float(np.spacing(np.float64(c)))  # ≈4.34e-19：实测事故的 std 量级
+    rng = np.random.default_rng(101)
+    s = c + rng.integers(-3, 4, size=250) * ulp
+    assert float(np.std(s)) > 0.0, "前置：ULP 扰动必须给出正 std，否则测不到旧守卫的洞"
+    assert BS._sharpe(s) is None
+    # 对照：真实波动的序列照常出值（护栏不得误伤）
+    s2 = 0.002 + 0.01 * rng.normal(size=250)
+    v = BS._sharpe(s2)
+    assert v is not None and np.isfinite(v)
+
+
 def test_选择只看训练窗_留出窗强者不得泄露入选():
     t = 300
     rng = np.random.default_rng(9)
-    # X：训练窗无效、留出窗很强；Y：训练窗很强、留出窗无效；Z：全程噪声（凑候选数下限）
+    # X：训练窗无效、留出窗极强；Y：训练窗很强、留出窗无效；Z：全程噪声（凑候选数下限）。
+    # x_hold 均值 0.02 是**甄别性**关键：全样本口径下 X（0.02×90/300=0.006）反超 Y
+    # （0.004×210/300=0.0028）——若实现偷看全样本/留出窗，本测必红。
     x_train = _noise(rng, 210, 0.0, 0.01)
-    x_hold = _noise(rng, 90, 0.004, 0.01)
+    x_hold = _noise(rng, 90, 0.02, 0.01)
     y_train = _noise(rng, 210, 0.004, 0.01)
     y_hold = _noise(rng, 90, 0.0, 0.01)
     df = _mk_df(
@@ -324,11 +375,56 @@ def test_选择只看训练窗_留出窗强者不得泄露入选():
         }
     )
     res = BS.compute_best_subset(
-        df, k_min=1, k_max=1, train_frac=0.7, holding_days=20, round_trip_cost=0.002
+        df,
+        current_rule=(["X"], np.array([1.0])),  # 现行规则=X：_beats 比留出窗，Y 必输
+        k_min=1,
+        k_max=1,
+        train_frac=0.7,
+        holding_days=20,
+        round_trip_cost=0.002,
     )
     assert [f["name"] for f in res["factors"]] == ["Y"]
-    # 披露面：X 的 holdout 更强是事实，但选择面只认训练窗
+    # 披露面：X 的 holdout 更强是事实（选择面不看它）——布尔 False 有断言
     assert res["chosen"]["holdout_sharpe"] is not None
+    assert res["vs_benchmarks"]["beats_current_rule"] is False
+
+
+def test_扰动留出窗_选择与训练窗口径逐位不变():
+    """不变量：只改留出窗数据，选择与所有 train 口径数字必须逐位不变。
+
+    比「构造对手」更硬：任何偷看全样本/留出窗的实现都会在此暴露
+    （选择、curve.train_sharpe、基准 train 数字都会随留出窗漂移）。
+    """
+    t, split = 300, 210
+    rng = np.random.default_rng(13)
+    cols = {
+        f"f{i}": np.concatenate(
+            [
+                _noise(rng, split, 0.0022 - 0.0001 * i, 0.01),
+                _noise(rng, t - split, 0.0, 0.01),
+            ]
+        )
+        for i in range(12)
+    }
+    df = _mk_df(cols)
+    res1 = BS.compute_best_subset(df, holding_days=20, round_trip_cost=0.002)
+
+    df2 = df.copy()
+    ho = df2.iloc[split:].to_numpy().copy()
+    df2.iloc[split:] = ho[::-1] + np.linspace(-0.05, 0.05, ho.shape[0])[:, None]
+    res2 = BS.compute_best_subset(df2, holding_days=20, round_trip_cost=0.002)
+
+    assert [f["name"] for f in res1["factors"]] == [f["name"] for f in res2["factors"]]
+    assert res1["k"] == res2["k"]
+    assert res1["chosen"]["train_sharpe"] == res2["chosen"]["train_sharpe"]
+    assert [r["train_sharpe"] for r in res1["curve"]] == [
+        r["train_sharpe"] for r in res2["curve"]
+    ]
+    eqw1 = res1["benchmarks"]["equal_weight_all"]
+    eqw2 = res2["benchmarks"]["equal_weight_all"]
+    assert eqw1["train_sharpe"] == eqw2["train_sharpe"]
+    # 留出窗数字允许不同（披露面），但必须仍可算
+    assert res2["chosen"]["holdout_sharpe"] is not None
 
 
 def test_K规格与曲线_chosen取train最大值平票取小():
@@ -462,6 +558,74 @@ def test_过拟合旗标与样本提示():
     if ratio is not None:
         assert res["overfit_warning"] == bool(ratio > 3.0)
     assert any("1000" in n for n in res["notes"]), "样本 <1000 天须有论文口径提示"
+    # 朴素时序切分的披露：切分点处前向标签窗（h 日）与留出窗重叠，如实提示
+    assert any("purge" in n for n in res["notes"])
+
+
+def test_过拟合旗标真命中_训练强留出弱():
+    """True 路径有断言：train 强（0.004）、holdout 弱（0.0003）→ 比 >3 必亮旗标。"""
+    t, split = 300, 210
+    rng = np.random.default_rng(53)
+    cols = {
+        f"f{i}": np.concatenate(
+            [
+                _noise(rng, split, 0.004, 0.01),
+                _noise(rng, t - split, 0.0003, 0.01),
+            ]
+        )
+        for i in range(12)
+    }
+    res = BS.compute_best_subset(
+        _mk_df(cols),
+        current_rule=(["f0"], np.array([1.0])),  # 单因子现行规则：组合分散必跑赢 → True
+        holding_days=20,
+        round_trip_cost=0.002,
+    )
+    ratio = res["sharpe_ratio_train_holdout"]
+    assert ratio is not None and ratio > 3.0, f"前置：ratio 应 >3，实际 {ratio}"
+    assert res["overfit_warning"] is True
+    assert any("过拟合" in n for n in res["notes"])
+    assert res["vs_benchmarks"]["beats_current_rule"] is True
+
+
+def test_留出窗无正收益_比例缺失且note如实说明():
+    """holdout Sharpe ≤ 0：比值不可计算 → ratio None、旗标不亮，但必须如实进 notes。"""
+    t, split = 300, 210
+    rng = np.random.default_rng(59)
+    cols = {
+        f"f{i}": np.concatenate(
+            [
+                _noise(rng, split, 0.004, 0.01),
+                _noise(rng, t - split, -0.004, 0.01),
+            ]
+        )
+        for i in range(12)
+    }
+    res = BS.compute_best_subset(_mk_df(cols), holding_days=20, round_trip_cost=0.002)
+    assert res["sharpe_ratio_train_holdout"] is None
+    assert res["overfit_warning"] is False
+    assert any("无正收益" in n for n in res["notes"]), "比例缺失不得静默"
+
+
+def test_universe_序列缺席候选如实披露():
+    """请求的候选在序列快照里整列缺席：不得从 universe 计数静默蒸发。"""
+    t = 200
+    rng = np.random.default_rng(67)
+    cols = {f"f{i}": _noise(rng, t, 0.002, 0.01) for i in range(12)}
+    res = BS.compute_best_subset(
+        _mk_df(cols),
+        requested=[*cols, "ghost_a", "ghost_b"],
+        holding_days=20,
+        round_trip_cost=0.002,
+    )
+    assert res["available"] is True
+    assert res["universe"]["n_absent_from_series"] == 2
+    assert res["universe"]["absent_from_series"] == ["ghost_a", "ghost_b"]
+    assert any("ghost_a" in n and "无数据" in n for n in res["notes"])
+    # 旧调用方不给 requested：如实报 0，不误报
+    res2 = BS.compute_best_subset(_mk_df(cols), holding_days=20, round_trip_cost=0.002)
+    assert res2["universe"]["n_absent_from_series"] == 0
+    assert res2["universe"]["absent_from_series"] == []
 
 
 # ═══════════════ 5. portfolio.py 集成 ═══════════════

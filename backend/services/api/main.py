@@ -1,4 +1,5 @@
 import html as _html
+import asyncio
 import os
 import re
 from datetime import datetime, timezone
@@ -126,6 +127,17 @@ async def lifespan(app: FastAPI):
         start_run_reconciler()
     except Exception as e:
         logger.error(f"❌ run reconciler start failed: {e}", exc_info=True)
+
+    # 本地训练残留容器兜底清理（只删 DB 已终态/孤儿的 Exited qm-train-*，
+    # running/waiting_callback 一律跳过；失败不影响启动健康）
+    try:
+        from backend.services.engine.training.local_docker_orchestrator import (
+            cleanup_stale_training_containers,
+        )
+
+        asyncio.create_task(cleanup_stale_training_containers())
+    except Exception as e:
+        logger.error(f"❌ stale training cleanup schedule failed: {e}", exc_info=True)
 
     # 每日自动强制更新轮询（开关由管理后台保存于 Redis；不可用/异常均不影响启动健康）
     try:

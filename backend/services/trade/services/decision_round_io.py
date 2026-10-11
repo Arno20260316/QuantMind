@@ -272,6 +272,41 @@ def default_roster() -> tuple[AgentRun, ...]:
     return tuple(_run_for(config) for config in resolve_roster())
 
 
+def _load_pool_with_overlay(day: str) -> Any:
+    """池产物 + 可选因子概率板叠加（P3，细案 §十一）。
+
+    开关（``consume.OVERLAY_FLAG`` = ``QM_DECISION_BOARD_OVERLAY``，默认关；两处
+    字面量由测试锁死）**关态**：与 ``load_pool=load_pool_doc`` 直接接线逐字节一致
+    ——不 import 因子板、不读板盘、原对象原样返回。**开态**：只标注 + 稳定重排
+    （不新增行、不改 score/rank、不并名单——共振标的不获得新开仓资格，见
+    ``factor_board.consume`` 模块 docstring）；板缺失/叠加链任何异常 → 原 doc +
+    warning（增益组件永不拦决策轮）。
+    """
+    from backend.shared.decision_context_source import load_pool_doc
+    from backend.shared.env_flags import env_flag
+
+    if not env_flag("QM_DECISION_BOARD_OVERLAY"):
+        return load_pool_doc(day)
+
+    doc = load_pool_doc(day)
+    if doc is None:
+        return None
+    try:
+        from dataclasses import replace
+
+        from backend.shared.factor_board import consume
+
+        overlay = consume.load_overlay(as_of=day)
+        if overlay is None:
+            return doc
+        if overlay.note:
+            logger.warning("[DecisionRound] 板叠加注记：%s", overlay.note)
+        return replace(doc, rows=consume.annotate_pool(doc.rows, overlay))
+    except Exception as exc:  # noqa: BLE001 — 叠加是增益，坏掉不拦决策轮
+        logger.warning("[DecisionRound] 板叠加失败，用原池：%s", exc)
+        return doc
+
+
 def default_round_deps() -> RoundDeps:
     """生产接线（每项都指向既有唯一实现，本模块不复制任何取数口径）。"""
     from backend.services.trade.services.decision_executor import run_round
@@ -339,7 +374,7 @@ def default_round_deps() -> RoundDeps:
         load_positions=load_real_positions,
         load_account=load_account_numbers,
         load_agent_ledger=load_agent_ledger,
-        load_pool=load_pool_doc,
+        load_pool=_load_pool_with_overlay,
         load_excluded=load_excluded_symbols,
         quote_client=make_sync_client,
         read_snaps=read_snapshots,

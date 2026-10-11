@@ -2,7 +2,7 @@
 
 快速开始::
 
-    from qm_openapi import QuantMindClient
+    from quantmindoss import QuantMindClient
 
     qm = QuantMindClient(
         "http://<服务器IP>:8000",

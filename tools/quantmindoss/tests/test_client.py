@@ -1,4 +1,4 @@
-"""qm_openapi 单测（httpx.MockTransport，不依赖真实服务）。"""
+"""quantmindoss 单测（httpx.MockTransport，不依赖真实服务）。"""
 
 import sys
 from pathlib import Path
@@ -6,12 +6,12 @@ from pathlib import Path
 import httpx
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.qm_openapi import QuantMindClient
-from tools.qm_openapi.errors import AuthError, NotFoundError, PermissionError
+from quantmindoss import QuantMindClient
+from quantmindoss.errors import AuthError, NotFoundError, PermissionError
 
 
 def _client(handler):

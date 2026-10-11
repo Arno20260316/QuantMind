@@ -1,16 +1,14 @@
-# qm_openapi — QuantMind OpenAPI SDK（v1）
+# quantmindoss — QuantMind OpenAPI SDK（v1）
 
 Python SDK，用 AK/SK 访问 QuantMind 只读接口：系统新闻情绪、模型推理结果、模拟盘持仓。
 
-> 包名说明：PyPI 上的 `quantmind` 已被他人占用（无关的数学小库），本包暂不发 PyPI，
-> 直接随仓库 `tools/` 分发使用。
+> 包名说明：PyPI 上的 `quantmind` 已被他人占用（无关的数学小库），
+> 本包以 `quantmindoss` 发布：`pip install quantmindoss`，`from quantmindoss import QuantMindClient`。
 
 ## 安装
 
 ```bash
-pip install httpx>=0.27
-# SDK 本体（仓库内引用）
-export PYTHONPATH=/path/to/QuantMInd/tools:$PYTHONPATH
+pip install quantmindoss
 ```
 
 ## AK/SK 获取
@@ -22,7 +20,7 @@ export PYTHONPATH=/path/to/QuantMInd/tools:$PYTHONPATH
 ## 快速开始
 
 ```python
-from qm_openapi import QuantMindClient
+from quantmindoss import QuantMindClient
 
 qm = QuantMindClient(
     "http://<服务器IP>:8000",

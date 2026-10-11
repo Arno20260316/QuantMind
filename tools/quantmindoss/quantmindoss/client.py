@@ -23,7 +23,7 @@ class QuantMindClient:
 
     用法::
 
-        from qm_openapi import QuantMindClient
+        from quantmindoss import QuantMindClient
         qm = QuantMindClient("http://192.168.1.10:8000",
                              access_key="qm_live_xxx", secret_key="sk_xxx")
         qm.news.get_sentiment(tickers="600036.SH")

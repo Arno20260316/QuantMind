@@ -106,14 +106,15 @@ function SectorRow({ item }: { item: FactorBoardSectorItem }) {
   const facAbs = item.fac === null ? 0 : Math.min(Math.abs(item.fac), 1);
   return (
     <div className="flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0">
-      <div className="w-40 min-w-0 flex items-center gap-1.5">
+      {/* 名称列吸收余宽；指标列全部定宽右簇——行间对齐，热力条不再拉满全宽 */}
+      <div className="flex-1 min-w-0 flex items-center gap-1.5">
         <span className="text-xs font-bold text-slate-800 truncate" title={item.name}>
           {item.name}
         </span>
         <span className="text-[10px] font-mono text-slate-400 flex-shrink-0">{item.n}只</span>
       </div>
       {/* 合成分热力条（宽度=|fac|，红=正值/绿=负值；缺失一律 — 不落 0） */}
-      <div className="flex-1 min-w-0 flex items-center gap-2">
+      <div className="w-56 flex-shrink-0 flex items-center gap-2">
         <div className="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
           {item.fac !== null && (
             <div
@@ -122,7 +123,7 @@ function SectorRow({ item }: { item: FactorBoardSectorItem }) {
             />
           )}
         </div>
-        <span className="w-16 text-right flex-shrink-0">
+        <span className="w-14 text-right flex-shrink-0">
           <NumText value={item.fac} digits={3} />
         </span>
       </div>
@@ -241,6 +242,9 @@ export const FactorBoardPanel: React.FC = () => {
   const mask = maskChip(meta.coverage.mask);
   const rollingOos = validation.rolling_oos;
   const dedupCut = dedup ? dedup.dropped.length + dedup.pruned.length : 0;
+  // 「二次去重：…」类 meta.warnings（builder.py 产出）与 dedup 块重复 → 并入下方去重 chip；
+  // 无 dedup 块（异常回退）时保留原文，绝不吞告警。
+  const nonDedupWarnings = dedup ? meta.warnings.filter((w) => !w.startsWith('二次去重：')) : meta.warnings;
   // 1.1 因子列（近 20 日 / 净 IC）：按行键探测——1.0 历史产物无键 → 整列隐藏
   const hasNetCols = board.factors.some((f) => 'decay' in f || 'net_ic60' in f);
 
@@ -302,7 +306,7 @@ export const FactorBoardPanel: React.FC = () => {
               <ShieldCheck className="w-3 h-3" /> 质检无告警
             </span>
           ) : (
-            meta.warnings.map((w, i) => (
+            nonDedupWarnings.map((w, i) => (
               <span
                 key={i}
                 className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200/80 text-[10px] font-extrabold text-amber-700"
@@ -326,9 +330,10 @@ export const FactorBoardPanel: React.FC = () => {
                   ? 'bg-amber-50 border-amber-200/80 text-amber-700'
                   : 'bg-slate-50 border-slate-200/80 text-slate-600'
               }`}
-              title={`入选内二次去重：族头替补池 ${dedup.n_reserves}；|ρ|≥${dedup.reject} 判重、[${dedup.warn},${dedup.reject}) 记警 ${dedup.warnings.length} 对。ρ=快照窗内合成序列的逐日 Spearman（近重因子按 |IC60| 降序占席，被拒者由替补递补）`}
+              title={`入选内二次去重：族头替补池 ${dedup.n_reserves}；|ρ|≥${dedup.reject} 判重、[${dedup.warn},${dedup.reject}) 记警 ${dedup.warnings.length} 对。本版：席位置换 ${dedup.dropped.length}、族修剪 ${dedup.pruned.length}。ρ=快照窗内合成序列的逐日 Spearman（近重因子按 |IC60| 降序占席，被拒者由替补递补）`}
             >
-              去重：池 {fmtInt(dedup.n_pool)} → 入选 {fmtInt(dedup.n_kept)}（剔 {fmtInt(dedupCut)}）
+              去重：池 {fmtInt(dedup.n_pool)} → 入选 {fmtInt(dedup.n_kept)}（剔 {fmtInt(dedupCut)}
+              {dedup.warnings.length > 0 ? ` · 警 ${dedup.warnings.length} 对` : ''}）
             </span>
           )}
           {regime && (
@@ -385,58 +390,60 @@ export const FactorBoardPanel: React.FC = () => {
       </SectionCard>
 
       {/* ── 个股四象限 + 名单 ────────────────────────────────── */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5 items-start">
         <SectionCard
           title="个股四象限（因子分位 × 模型分位）"
           icon={<Grid3x3 className="w-3.5 h-3.5 text-purple-600" />}
           extra={<span className="text-[10px] font-mono text-slate-400">n={fmtInt(resonance.n)}</span>}
         >
-          <div className="grid grid-cols-[auto_repeat(3,1fr)] gap-1.5">
-            <span />
-            {QUAD_LEVELS.map((m) => (
-              <span key={m.id} className="text-center text-[10px] font-extrabold text-slate-400">
-                模型·{m.label}（{m.id}）
-              </span>
-            ))}
-            {QUAD_LEVELS.map((f) => (
-              <React.Fragment key={f.id}>
-                <span className="text-[10px] font-extrabold text-slate-400 flex items-center">
-                  因子·{f.label}（{f.id}）
+          <div className="flex flex-col md:flex-row md:items-start gap-3">
+            <div className="grid grid-cols-[auto_repeat(3,minmax(84px,1fr))] gap-1.5 md:w-[420px] md:flex-shrink-0">
+              <span />
+              {QUAD_LEVELS.map((m) => (
+                <span key={m.id} className="text-center text-[10px] font-extrabold text-slate-400">
+                  模型·{m.label}（{m.id}）
                 </span>
-                {QUAD_LEVELS.map((m) => {
-                  const key = `${f.id}${m.id}`;
-                  const count = resonance.quadrants[key] ?? 0;
-                  const isResoLong = key === 'HH';
-                  const isResoShort = key === 'LL';
-                  const isDiverge = (f.id === 'H' && m.id !== 'H') || (f.id === 'L' && m.id !== 'L');
-                  return (
-                    <div
-                      key={key}
-                      title={`因子分位${f.label} × 模型分位${m.label}：${fmtInt(count)} 只${isResoLong ? '（共振·靠前名单）' : isResoShort ? '（共振·靠后名单）' : isDiverge ? '（背离区）' : ''}`}
-                      className={`rounded-lg border px-2 py-2 text-center ${
-                        isResoLong
-                          ? 'bg-red-50/80 border-red-200/70'
-                          : isResoShort
-                            ? 'bg-green-50/80 border-green-200/70'
-                            : isDiverge
-                              ? 'bg-amber-50/50 border-amber-100'
-                              : 'bg-slate-50/70 border-slate-200/60'
-                      }`}
-                    >
-                      <div className={`text-sm font-extrabold font-mono ${isResoLong ? 'text-red-700' : isResoShort ? 'text-green-700' : 'text-slate-700'}`}>
-                        {fmtInt(count)}
+              ))}
+              {QUAD_LEVELS.map((f) => (
+                <React.Fragment key={f.id}>
+                  <span className="text-[10px] font-extrabold text-slate-400 flex items-center">
+                    因子·{f.label}（{f.id}）
+                  </span>
+                  {QUAD_LEVELS.map((m) => {
+                    const key = `${f.id}${m.id}`;
+                    const count = resonance.quadrants[key] ?? 0;
+                    const isResoLong = key === 'HH';
+                    const isResoShort = key === 'LL';
+                    const isDiverge = (f.id === 'H' && m.id !== 'H') || (f.id === 'L' && m.id !== 'L');
+                    return (
+                      <div
+                        key={key}
+                        title={`因子分位${f.label} × 模型分位${m.label}：${fmtInt(count)} 只${isResoLong ? '（共振·靠前名单）' : isResoShort ? '（共振·靠后名单）' : isDiverge ? '（背离区）' : ''}`}
+                        className={`rounded-lg border px-2 py-1.5 text-center ${
+                          isResoLong
+                            ? 'bg-red-50/80 border-red-200/70'
+                            : isResoShort
+                              ? 'bg-green-50/80 border-green-200/70'
+                              : isDiverge
+                                ? 'bg-amber-50/50 border-amber-100'
+                                : 'bg-slate-50/70 border-slate-200/60'
+                        }`}
+                      >
+                        <div className={`text-sm font-extrabold font-mono ${isResoLong ? 'text-red-700' : isResoShort ? 'text-green-700' : 'text-slate-700'}`}>
+                          {fmtInt(count)}
+                        </div>
+                        <div className="text-[9px] font-mono text-slate-400">{key}</div>
                       </div>
-                      <div className="text-[9px] font-mono text-slate-400">{key}</div>
-                    </div>
-                  );
-                })}
-              </React.Fragment>
-            ))}
+                    );
+                  })}
+                </React.Fragment>
+              ))}
+            </div>
+            <p className="text-[10px] text-slate-400 leading-relaxed md:flex-1 md:pt-5">
+              因子分位=合成分的截面分位（≥70% 高 / ≤30% 低）；模型分位=同批推理 rank_pct（≥0.7 高 / ≤0.3 低）。
+              HH 入「共振名单·靠前」、LL 入「共振名单·靠后」（剔 ST）。ρ 为两轴秩相关。
+            </p>
           </div>
-          <p className="text-[10px] text-slate-400 leading-relaxed">
-            因子分位=合成分的截面分位（≥70% 高 / ≤30% 低）；模型分位=同批推理 rank_pct（≥0.7 高 / ≤0.3 低）。
-            HH 入「共振名单·靠前」、LL 入「共振名单·靠后」（剔 ST）。ρ 为两轴秩相关。
-          </p>
         </SectionCard>
 
         <SectionCard
@@ -463,7 +470,20 @@ export const FactorBoardPanel: React.FC = () => {
         extra={<span className="text-[10px] text-slate-400">近 60 评估日自算 IC 过闸（|IC60|≥0.02 ∧ 同号 ∧ 胜率≥0.5）× 族封顶（每族≤3，rd≤4）</span>}
       >
         <div className="overflow-x-auto custom-scrollbar">
-          <table className="w-full text-[11px]">
+          {/* table-fixed + 列宽配额：数值列定宽右对齐、名称列吸收余宽——不再整行拉散 */}
+          <table className="w-full table-fixed text-[11px]">
+            <colgroup>
+              <col className="w-[25%]" />
+              <col className="w-[10.5%]" />
+              <col className="w-[6.5%]" />
+              <col className="w-[6.5%]" />
+              {hasNetCols && <col className="w-[9.5%]" />}
+              {hasNetCols && <col className="w-[9.5%]" />}
+              <col className="w-[5.5%]" />
+              <col className="w-[5.5%]" />
+              <col className="w-[7.5%]" />
+              <col className="w-[14%]" />
+            </colgroup>
             <thead>
               <tr className="text-[10px] text-slate-400 border-b border-slate-100">
                 <th className="text-left font-extrabold py-1.5 px-1">因子</th>
@@ -496,10 +516,12 @@ export const FactorBoardPanel: React.FC = () => {
               {board.factors.map((f) => (
                 <tr key={`${f.lib}/${f.name}`} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/60">
                   <td className="py-1.5 px-1">
-                    <div className="font-bold text-slate-800 whitespace-nowrap">{f.display}</div>
-                    <div className="text-[9px] font-mono text-slate-400">{f.name}</div>
+                    <div className="font-bold text-slate-800 truncate" title={f.display}>{f.display}</div>
+                    <div className="text-[9px] font-mono text-slate-400 truncate" title={f.name}>{f.name}</div>
                   </td>
-                  <td className="py-1.5 px-1 text-[10px] font-mono text-slate-500 whitespace-nowrap">{f.group}</td>
+                  <td className="py-1.5 px-1 text-[10px] font-mono text-slate-500">
+                    <div className="truncate" title={f.group}>{f.group}</div>
+                  </td>
                   <td className="py-1.5 px-1 text-center">
                     <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-extrabold ${f.sign > 0 ? 'bg-indigo-50 text-indigo-600' : 'bg-slate-100 text-slate-500'}`}>
                       {f.sign > 0 ? '正向' : '反向'}
@@ -552,7 +574,7 @@ export const FactorBoardPanel: React.FC = () => {
                     {HORIZON_KEYS.map((h) => {
                       const v = f.horizon?.[h];
                       return (
-                        <span key={h} className={`inline-block w-11 ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                        <span key={h} className={`inline-block w-10 ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
                           {v == null ? '—' : v.toFixed(2)}
                         </span>
                       );
@@ -567,40 +589,44 @@ export const FactorBoardPanel: React.FC = () => {
 
       {/* ── 持有期画像 ──────────────────────────────────────── */}
       <SectionCard title="持有期画像（方向对齐 IC 均值）" icon={<Gauge className="w-3.5 h-3.5 text-purple-600" />}>
-        <div className="flex items-end gap-3 h-24 px-1">
-          {HORIZON_KEYS.map((h) => {
-            const v = board.horizon.global?.[h];
-            const abs = v === null || v === undefined ? 0 : Math.min(Math.abs(v) * 4, 1);
-            return (
-              <div key={h} className="flex flex-col items-center gap-1 flex-1 h-full justify-end" title={`h=${h} 日 方向对齐 IC=${v == null ? '—' : v.toFixed(4)}（sgn×RankIC 均值；负=跨日翻转占优）`}>
-                <span className={`text-[10px] font-mono font-bold ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
-                  {v == null ? '—' : v.toFixed(3)}
+        <div className="flex flex-col lg:flex-row lg:items-start gap-3">
+          {/* 全局条形图：定宽左簇，不再摊满整行 */}
+          <div className="flex items-end gap-2 h-24 w-full lg:w-[420px] lg:flex-shrink-0 px-1">
+            {HORIZON_KEYS.map((h) => {
+              const v = board.horizon.global?.[h];
+              const abs = v === null || v === undefined ? 0 : Math.min(Math.abs(v) * 4, 1);
+              return (
+                <div key={h} className="flex flex-col items-center gap-1 flex-1 h-full justify-end" title={`h=${h} 日 方向对齐 IC=${v == null ? '—' : v.toFixed(4)}（sgn×RankIC 均值；负=跨日翻转占优）`}>
+                  <span className={`text-[10px] font-mono font-bold ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                    {v == null ? '—' : v.toFixed(3)}
+                  </span>
+                  <div
+                    className={`w-full max-w-[46px] rounded-t-md ${v == null ? 'bg-slate-100' : v >= 0 ? 'bg-red-400/80' : 'bg-green-500/80'}`}
+                    style={{ height: `${Math.max(abs * 64, 4)}px` }}
+                  />
+                  <span className="text-[10px] font-extrabold text-slate-400">{h}日</span>
+                </div>
+              );
+            })}
+          </div>
+          {/* 分组明细：并列右侧两列 */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-0.5 w-full lg:flex-1 border-t lg:border-t-0 lg:border-l border-slate-50 pt-2 lg:pt-0 lg:pl-4">
+            {Object.entries(board.horizon.by_group ?? {}).map(([grp, vals]) => (
+              <div key={grp} className="flex items-center justify-between gap-2 text-[10px] font-mono py-0.5">
+                <span className="text-slate-500 truncate" title={grp}>{grp}</span>
+                <span className="whitespace-nowrap">
+                  {HORIZON_KEYS.map((h) => {
+                    const v = vals?.[h];
+                    return (
+                      <span key={h} className={`inline-block w-10 text-right ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
+                        {v == null ? '—' : v.toFixed(2)}
+                      </span>
+                    );
+                  })}
                 </span>
-                <div
-                  className={`w-full max-w-[46px] rounded-t-md ${v == null ? 'bg-slate-100' : v >= 0 ? 'bg-red-400/80' : 'bg-green-500/80'}`}
-                  style={{ height: `${Math.max(abs * 64, 4)}px` }}
-                />
-                <span className="text-[10px] font-extrabold text-slate-400">{h}日</span>
               </div>
-            );
-          })}
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-x-4 gap-y-1 pt-1 border-t border-slate-50">
-          {Object.entries(board.horizon.by_group ?? {}).map(([grp, vals]) => (
-            <div key={grp} className="flex items-center justify-between gap-2 text-[10px] font-mono py-0.5">
-              <span className="text-slate-500 truncate" title={grp}>{grp}</span>
-              <span className="whitespace-nowrap">
-                {HORIZON_KEYS.map((h) => {
-                  const v = vals?.[h];
-                  return (
-                    <span key={h} className={`inline-block w-11 text-right ${v == null ? 'text-slate-300' : v >= 0 ? 'text-red-600' : 'text-green-600'}`}>
-                      {v == null ? '—' : v.toFixed(2)}
-                    </span>
-                  );
-                })}
-              </span>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       </SectionCard>
     </div>

@@ -314,6 +314,26 @@ export interface FactorMaterialization {
   supersededAt?: string;
 }
 
+/** 因子生命周期视图（T-FE-06；后端 `_decorate_factor_rows` 行装配，读时派生） */
+export interface FactorLifecycle {
+  /** experiment | observing | active | downweighted */
+  state: string;
+  /** 展示成熟度：实验 | 验证中 | 观察 | 在用 | 退役 */
+  maturity: string;
+  /** 盲窗终点（UTC ISO；因子与 run 都没有时间锚点时 null） */
+  blind_until?: string | null;
+  /** 最近评估快照；**观察态（盲窗内）后端恒不返回（null）**——OOS 读数对研究面不可见 */
+  last_eval?: {
+    month_end?: string | null;
+    n_days?: number | null;
+    icir?: number | null;
+    status?: string;
+    streak?: number;
+    decision?: string | null;
+    evaluated_at?: string;
+  } | null;
+}
+
 // Factor information
 export interface Factor {
   factorId: string;
@@ -339,6 +359,14 @@ export interface Factor {
   materialization?: FactorMaterialization;
   /** 历史因子（user_id IS NULL）：只读，物化/回测入口禁用 */
   ownerless?: boolean;
+
+  // —— 生命周期与六维标签（T-FE-06/07；后端行装饰字段）——
+  /** 旧后端 / 因子工厂行不返回（undefined）→ 界面不渲染生命周期 chip；
+   *  run 台账降级时后端**不作声明**（null）——证据不足不冒充「实验」 */
+  lifecycle?: FactorLifecycle | null;
+  /** 六维标签：data_source / frequency / family / transform / target / maturity；
+   *  缺失值为 'unknown'（界面显「—」，禁止猜造） */
+  tags?: Record<string, string>;
 
   // —— 机构级指标（metadata_json；缺失保持 undefined，界面显「—」）——
   rre?: number;

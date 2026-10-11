@@ -16,7 +16,7 @@
 import React from 'react';
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
-import { FactorTable } from '../FactorTable';
+import { FactorTable, blindLineText, lifecycleChip } from '../FactorTable';
 import type { FactorTableProps } from '../FactorTable';
 import type { Factor } from '../../types-v2';
 import type { BacktestRunEntry } from '../../context-v2/RunQueueContext';
@@ -285,5 +285,137 @@ describe('FactorTable：物化 chip 与扩展列', () => {
 
     fireEvent.click(second.container.querySelector('button[title="净ARR / 年化换手 / PFS / RRE / 公式"]') as HTMLElement);
     expect(localStorage.getItem('qa_factor_cols_ext')).toBe('0');
+  });
+});
+
+describe('FactorTable：生命周期 chip（T-FE-06）', () => {
+  test('observing → 「观察」chip；title 带盲窗截止，倒计时用确定性时钟验证', () => {
+    const f = mkFactor({
+      factorId: 'lc1',
+      factorName: 'LcObserve',
+      lifecycle: {
+        state: 'observing',
+        maturity: '观察',
+        blind_until: '2026-11-09T00:00:00Z',
+        // 回归哨兵（评审 MEDIUM-2）：后端若回归泄漏读数，chip 也不显示
+        last_eval: {
+          month_end: '2026-10-31',
+          n_days: 199,
+          icir: 0.8765,
+          status: 'ok',
+          streak: 0,
+          decision: 'hold',
+        },
+      },
+    });
+    renderTable([f]);
+
+    const chip = screen.getByText('观察');
+    const title = chip.getAttribute('title') ?? '';
+    expect(title).toContain('盲窗观察期至 2026-11-09');
+    expect(title).toContain('样本外读数对研究面不可见');
+    // 确定性倒计时：固定 now=2026-10-11 → 2026-11-09 恰 29 天
+    const spec = lifecycleChip(f, new Date('2026-10-11T00:00:00Z'));
+    expect(spec?.title).toContain('剩 29 天');
+    // 盲窗内不得出现任何评估读数（后端裁剪 + 前端不编造）
+    expect(spec?.title).not.toContain('ICIR');
+    expect(spec?.title).not.toContain('最近评估');
+  });
+
+  test('blindLineText：按 state/终点分支，不虚构「已过盲窗」（评审 LOW-3）', () => {
+    const now = new Date('2026-10-11T00:00:00Z');
+    // 观察态 → 倒计时（复用 blindCountdownText）
+    expect(
+      blindLineText(
+        { state: 'observing', blind_until: '2026-11-09T00:00:00Z' },
+        now,
+      ),
+    ).toContain('盲窗观察期至 2026-11-09');
+    // 非观察态：未到期 / 已过 / 无锚点——各有其形
+    expect(
+      blindLineText(
+        { state: 'experiment', blind_until: '2099-01-01T00:00:00Z' },
+        now,
+      ),
+    ).toBe('未到期（至 2099-01-01）');
+    expect(
+      blindLineText(
+        { state: 'downweighted', blind_until: '2026-07-09T00:00:00Z' },
+        now,
+      ),
+    ).toBe('已过（2026-07-09）');
+    expect(blindLineText({ state: 'experiment', blind_until: null }, now)).toBe('—');
+    expect(blindLineText(null, now)).toBe('—');
+  });
+
+  test('downweighted → 「退役」chip：title 带连击期数与最近评估证据', () => {
+    const f = mkFactor({
+      factorId: 'lc2',
+      factorName: 'LcDown',
+      lifecycle: {
+        state: 'downweighted',
+        maturity: '退役',
+        blind_until: '2026-07-09T00:00:00Z',
+        last_eval: {
+          month_end: '2026-09-30',
+          n_days: 241,
+          icir: -0.0916,
+          status: 'ok',
+          streak: 4,
+          decision: 'downweight',
+          evaluated_at: '2026-10-11T00:00:00Z',
+        },
+      },
+    });
+    renderTable([f]);
+
+    const chip = screen.getByText('退役');
+    expect(chip.className).toContain('text-rose-500');
+    const title = chip.getAttribute('title') ?? '';
+    expect(title).toContain('连续 4 期');
+    expect(title).toContain('2026-09-30');
+    expect(title).toContain('-0.0916');
+  });
+
+  test('active → 「在用」；experiment → maturity 原文（含「验证中」）', () => {
+    const active = mkFactor({
+      factorId: 'lc3',
+      factorName: 'LcActive',
+      lifecycle: { state: 'active', maturity: '在用', blind_until: '2026-07-09T00:00:00Z', last_eval: null },
+    });
+    const exp = mkFactor({
+      factorId: 'lc4',
+      factorName: 'LcExp',
+      lifecycle: { state: 'experiment', maturity: '验证中', blind_until: null, last_eval: null },
+    });
+    renderTable([active, exp]);
+
+    expect(screen.getByText('在用').className).toContain('text-emerald-600');
+    expect(screen.getByText('验证中')).toBeTruthy();
+    expect(lifecycleChip(active, new Date()).title).toContain('已过盲窗');
+  });
+
+  test('无 lifecycle 字段（工厂/旧后端行）→ 状态列零影响、空态仍是「—」', () => {
+    const { container } = renderTable([mkFactor({ factorId: 'nl', factorName: 'NoLife' })]);
+
+    expect(screen.queryByText('观察')).toBeNull();
+    expect(screen.queryByText('在用')).toBeNull();
+    expect(screen.queryByText('退役')).toBeNull();
+    // 状态 td（勾选/序号/名/市场/5 指标之后）空态不变
+    const statusCell = rowOf(container, 'NoLife').querySelectorAll('td');
+    expect(statusCell[statusCell.length - 2].textContent).toBe('—');
+  });
+
+  test('blinded 视图字段缺失（blind_until=null）→ 观察 chip 仍渲染，title 退化为盲窗说明', () => {
+    const f = mkFactor({
+      factorId: 'lc5',
+      factorName: 'LcNoAnchor',
+      lifecycle: { state: 'observing', maturity: '观察', blind_until: null, last_eval: null },
+    });
+    renderTable([f]);
+
+    const chip = screen.getByText('观察');
+    expect(chip.getAttribute('title')).toContain('盲窗观察期内');
+    expect(chip.getAttribute('title')).not.toContain('剩');
   });
 });

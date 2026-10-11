@@ -19,8 +19,23 @@ vi.mock('../../../../services/aiStrategyClients', () => ({
 
 // vi.mock 工厂被提升到文件顶部执行——夹具必须走 vi.hoisted，否则工厂里
 // 引用普通 const 会在初始化前被求值（ReferenceError）
-const { libraryFactors } = vi.hoisted(() => ({
-  libraryFactors: Array.from({ length: 13 }, (_, i) => ({
+const { libraryFactors } = vi.hoisted(() => {
+  type FixtureRow = {
+    factorId: string;
+    factorName: string;
+    factorExpression: string;
+    factorDescription: string;
+    quality: 'medium';
+    market: string;
+    universe: string;
+    ic?: number;
+    round: number;
+    direction: string;
+    createdAt: string;
+    lifecycle?: unknown;
+    tags?: Record<string, string>;
+  };
+  const rows: FixtureRow[] = Array.from({ length: 13 }, (_, i) => ({
     factorId: `f${i + 1}`,
     factorName: `因子${i + 1}`,
     factorExpression: 'close/mean(close,5)',
@@ -32,8 +47,73 @@ const { libraryFactors } = vi.hoisted(() => ({
     round: 0,
     direction: '正向',
     createdAt: '2026-10-01T00:00:00Z',
-  })),
-}));
+  }));
+  // 生命周期/六维标签装饰（T-FE-06/07；后端行装配字段）：
+  // f1 = 盲窗观察（带「回归哨兵」last_eval——后端若回归泄漏读数，前端仍
+  // 不得显示，评审 MEDIUM-2 的防御）；f2 = 已降权退役（带证据）；
+  // f11 = 实验态盲窗未到期；f12 = 实验态无锚点（盲窗行必须「—」）
+  rows[0] = {
+    ...rows[0],
+    lifecycle: {
+      state: 'observing',
+      maturity: '观察',
+      blind_until: '2026-11-09T00:00:00Z',
+      last_eval: {
+        month_end: '2026-10-31',
+        n_days: 199,
+        icir: 0.8765,
+        status: 'ok',
+        streak: 0,
+        decision: 'hold',
+        evaluated_at: '2026-11-01T00:00:00Z',
+      },
+    },
+    tags: {
+      data_source: 'statistical',
+      frequency: 'daily',
+      family: 'momentum',
+      transform: 'unknown',
+      target: 'fwd_ret_1d',
+      maturity: '观察',
+    },
+  };
+  rows[1] = {
+    ...rows[1],
+    lifecycle: {
+      state: 'downweighted',
+      maturity: '退役',
+      blind_until: '2026-07-09T00:00:00Z',
+      last_eval: {
+        month_end: '2026-09-30',
+        n_days: 241,
+        icir: -0.0916,
+        status: 'ok',
+        streak: 4,
+        decision: 'downweight',
+        evaluated_at: '2026-10-11T00:00:00Z',
+      },
+    },
+  };
+  rows[10] = {
+    ...rows[10],
+    lifecycle: {
+      state: 'experiment',
+      maturity: '实验',
+      blind_until: '2099-01-01T00:00:00Z',
+      last_eval: null,
+    },
+  };
+  rows[11] = {
+    ...rows[11],
+    lifecycle: {
+      state: 'experiment',
+      maturity: '实验',
+      blind_until: null,
+      last_eval: null,
+    },
+  };
+  return { libraryFactors: rows };
+});
 
 vi.mock('../../services-v2/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services-v2/api')>();
@@ -138,5 +218,89 @@ describe('FactorLibraryPage：列表默认 + 视图切换持久化', () => {
     fireEvent.click(screen.getByTitle('列表视图'));
     expect(localStorage.getItem('qa_factor_lib_view')).toBe('list');
     await screen.findByText(/共 13 行/);
+  });
+});
+
+describe('FactorLibraryPage：生命周期与六维标签（T-FE-06/07）', () => {
+  test('列表视图：观察/退役 chip 随行渲染，无 lifecycle 行零影响', async () => {
+    const { container } = render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    expect(screen.getAllByText('观察').length).toBe(1);
+    expect(screen.getAllByText('退役').length).toBe(1);
+    // 第 3 行无 lifecycle → 状态列空态仍是「—」
+    const thirdRow = container.querySelectorAll('tbody tr')[2];
+    expect(thirdRow.textContent).toContain('—');
+  });
+
+  test('详情弹窗：观察因子 → chip + 盲窗倒计时 + 六维标签（unknown 显「—」）', async () => {
+    render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    fireEvent.click(screen.getByText('因子1'));
+
+    expect(await screen.findByText('生命周期与标签')).toBeTruthy();
+    // 弹窗头部 chip（读数行 chip 之外再出 1 个）
+    expect(screen.getAllByText('观察').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/盲窗观察期至 2026-11-09（剩 \d+ 天）/)).toBeTruthy();
+    // 六维标签：值原样展示，unknown → 「—」
+    expect(screen.getByText('数据源')).toBeTruthy();
+    expect(screen.getByText('statistical')).toBeTruthy();
+    expect(screen.getByText('fwd_ret_1d')).toBeTruthy();
+    expect(screen.getByText('变换').parentElement?.textContent).toContain('—');
+    // 盲窗内不出现任何评估读数——fixture 刻意带「回归哨兵」last_eval
+    // （评审 MEDIUM-2：后端若回归泄漏，前端仍不得显示）
+    expect(screen.queryByText(/最近评估/)).toBeNull();
+    expect(screen.queryByText(/0\.8765/)).toBeNull();
+  });
+
+  test('详情弹窗：退役因子 → 显示最近评估证据行（无 tags 也不丢证据）', async () => {
+    render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    fireEvent.click(screen.getByText('因子2'));
+
+    expect(await screen.findByText('生命周期与标签')).toBeTruthy();
+    expect(
+      screen.getByText('最近评估：2026-09-30（241 天） ICIR -0.0916 · 连续 4 期偏弱'),
+    ).toBeTruthy();
+    // 盲窗行按实际终点分支（LOW-3）：退役 ≠ 凭空「已过盲窗」，带日期
+    expect(screen.getByText('盲窗:').parentElement?.textContent).toContain(
+      '已过（2026-07-09）',
+    );
+    // 该因子无 tags → 六维标签网格不渲染
+    expect(screen.queryByText('数据源')).toBeNull();
+  });
+
+  test('详情弹窗：实验态盲窗未到期 → 「未到期（至 …）」（不再冒充已过盲窗）', async () => {
+    render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    fireEvent.click(screen.getByText('因子11'));
+
+    expect(await screen.findByText('生命周期与标签')).toBeTruthy();
+    expect(screen.getByText('盲窗:').parentElement?.textContent).toContain(
+      '未到期（至 2099-01-01）',
+    );
+  });
+
+  test('详情弹窗：实验态无时间锚点 → 盲窗行「—」（宁缺勿造）', async () => {
+    render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    fireEvent.click(screen.getByText('因子12'));
+
+    expect(await screen.findByText('生命周期与标签')).toBeTruthy();
+    expect(screen.getByText('盲窗:').parentElement?.textContent).toContain('—');
+    expect(screen.queryByText(/已过盲窗/)).toBeNull();
+  });
+
+  test('卡片视图：生命周期 chip 进卡片徽章行', async () => {
+    localStorage.setItem('qa_factor_lib_view', 'cards');
+    render(<FactorLibraryPage onNavigate={noop} />);
+    await screen.findByText('因子13');
+
+    expect(screen.getAllByText('观察').length).toBe(1);
+    expect(screen.getAllByText('退役').length).toBe(1);
   });
 });

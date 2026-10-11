@@ -12,7 +12,7 @@
 
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, ChevronsUpDown, Loader2, SlidersHorizontal } from 'lucide-react';
-import type { Factor } from '../types-v2';
+import type { Factor, FactorLifecycle } from '../types-v2';
 import type { BacktestRunEntry } from '../context-v2/RunQueueContext';
 import { formatMetricValue } from '../services-v2/metricRegistry';
 import { cn, getQualityBadgeClass, metricToneClass } from '../utils-v2';
@@ -187,6 +187,95 @@ export function backtestChip(entry: BacktestRunEntry | undefined): ChipSpec {
   }
 }
 
+// -------------------------- 生命周期 chip（T-FE-06） --------------------------
+
+/** 成熟度 → tone（text 取后端 maturity 原文，前端不翻译、不猜造） */
+const LIFECYCLE_TONES: Record<string, string> = {
+  观察: 'bg-sky-500/10 text-sky-600 border-sky-500/30',
+  在用: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/30',
+  验证中: 'bg-amber-500/10 text-amber-600 border-amber-500/30',
+  退役: 'bg-rose-500/10 text-rose-500 border-rose-500/30',
+  实验: 'bg-muted/40 text-muted-foreground border-border/60',
+};
+
+/**
+ * 盲窗倒计时文案（chip title 与详情弹窗共用一份实现）。
+ * ``now`` 可注入以做确定性测试；解析失败返回 null（宁缺勿造）。
+ */
+export function blindCountdownText(
+  blindUntil?: string | null,
+  now: Date = new Date(),
+): string | null {
+  if (!blindUntil) return null;
+  const end = new Date(blindUntil);
+  if (Number.isNaN(end.getTime())) return null;
+  const day = blindUntil.slice(0, 10);
+  const days = Math.ceil((end.getTime() - now.getTime()) / 86400000);
+  if (days > 0) return `盲窗观察期至 ${day}（剩 ${days} 天）`;
+  return `盲窗已于 ${day} 到期，等待月末评估`;
+}
+
+/**
+ * 弹窗「盲窗」行文案（评审 LOW-3，2026-10-11）：按 lifecycle 实际终点分支。
+ * 旧实现对一切非观察态宣称「已过盲窗」——实验行（无锚点）也被说成已过，
+ * 未到期行同样错标。无 blind_until → 「—」（宁缺勿造）。
+ * ``now`` 可注入以做确定性测试。
+ */
+export function blindLineText(
+  lifecycle: Pick<FactorLifecycle, 'state' | 'blind_until'> | null | undefined,
+  now: Date = new Date(),
+): string {
+  if (!lifecycle) return '—';
+  if (lifecycle.state === 'observing') {
+    return blindCountdownText(lifecycle.blind_until, now) || '—';
+  }
+  const blindUntil = lifecycle.blind_until;
+  if (!blindUntil) return '—';
+  const end = new Date(blindUntil);
+  if (Number.isNaN(end.getTime())) return '—';
+  const day = blindUntil.slice(0, 10);
+  return end.getTime() > now.getTime() ? `未到期（至 ${day}）` : `已过（${day}）`;
+}
+
+/** 生命周期 chip：无 lifecycle（旧后端/工厂行）→ null（状态列零影响）。
+ *  观察态 title 只讲盲窗——盲窗内后端已裁剪 last_eval，前端不得编造读数。 */
+export function lifecycleChip(factor: Factor, now: Date = new Date()): ChipSpec {
+  const life = factor.lifecycle;
+  if (!life) return null;
+  const text = life.maturity || life.state;
+  if (!text) return null;
+  const className =
+    LIFECYCLE_TONES[text] ?? 'bg-muted/40 text-muted-foreground border-border/60';
+  const le = life.last_eval ?? null;
+  const evalNote =
+    le && le.month_end
+      ? `；最近评估 ${le.month_end}${typeof le.icir === 'number' ? `：ICIR ${le.icir.toFixed(4)}` : ''}`
+      : '';
+  switch (life.state) {
+    case 'observing': {
+      const countdown = blindCountdownText(life.blind_until, now);
+      return {
+        text,
+        className,
+        title: countdown
+          ? `${countdown}：其间样本外读数对研究面不可见`
+          : '盲窗观察期内：样本外读数对研究面不可见',
+      };
+    }
+    case 'active':
+      return { text, className, title: `已过盲窗、进入在用口径${evalNote}` };
+    case 'downweighted': {
+      const streakNote =
+        le && typeof le.streak === 'number' && le.streak > 0
+          ? `连续 ${le.streak} 期`
+          : '滚动 ICIR';
+      return { text, className, title: `${streakNote}低于阈值 → 已降权退役${evalNote}` };
+    }
+    default:
+      return { text, className, title: `实验阶段：待盲窗期满后的样本外评估${evalNote}` };
+  }
+}
+
 // ========================== 行 ==========================
 
 interface FactorRowProps {
@@ -219,6 +308,7 @@ const FactorRow = memo<FactorRowProps>(function FactorRow({
   const quality = QUALITY_LABELS[factor.quality] ?? QUALITY_LABELS.unknown;
   const matChip = materializationChip(factor, isMaterializing);
   const btChip = backtestChip(btEntry);
+  const lifeChip = lifecycleChip(factor);
   const readOnly = Boolean(factor.ownerless || factor.readOnly);
   const readOnlyTitle = factor.ownerless ? '历史因子（无归属），只读' : '共享因子，只读';
   const runningBt = btEntry?.status === 'running' || btEntry?.status === 'queued';
@@ -298,6 +388,14 @@ const FactorRow = memo<FactorRowProps>(function FactorRow({
       )}
       <td className="px-2 text-center">
         <span className="inline-flex items-center gap-1">
+          {lifeChip && (
+            <span
+              className={cn('rounded border px-1 text-[9px] leading-4', lifeChip.className)}
+              title={lifeChip.title}
+            >
+              {lifeChip.text}
+            </span>
+          )}
           {matChip && (
             <span
               className={cn('rounded border px-1 text-[9px] leading-4', matChip.className)}
@@ -318,7 +416,9 @@ const FactorRow = memo<FactorRowProps>(function FactorRow({
               {btChip.text}
             </span>
           )}
-          {!matChip && !btChip && <span className="text-[10px] text-muted-foreground/40">—</span>}
+          {!lifeChip && !matChip && !btChip && (
+            <span className="text-[10px] text-muted-foreground/40">—</span>
+          )}
         </span>
       </td>
       <td className="px-2">

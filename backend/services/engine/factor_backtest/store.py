@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -388,6 +389,31 @@ async def latest_cells(
             params,
         )
         return [_unpack(dict(r)) for r in rows.mappings().all()]
+
+
+async def first_completed_at(factor_ids: list[str]) -> dict[str, datetime]:
+    """每因子**首个** completed run 的 created_at（盲窗锚点；无则键缺省）。
+
+    盲窗要「最早一次成功回测」而非最近一次——生命周期状态机
+    （``shared/factor_lifecycle``）据此派生 observing/active。
+    调用方只传**已鉴权**的 factor_id（本函数不做归属过滤，无独立鉴权面）。
+    """
+    if not factor_ids:
+        return {}
+    async with get_session(read_only=True) as session:
+        rows = await session.execute(
+            text(
+                """
+                SELECT factor_id, MIN(created_at) AS first_at
+                FROM rd_agent_factor_backtests
+                WHERE factor_id = ANY(:factor_ids)
+                  AND status = 'completed'
+                GROUP BY factor_id
+                """
+            ),
+            {"factor_ids": list(factor_ids)},
+        )
+        return {str(r["factor_id"]): r["first_at"] for r in rows.mappings()}
 
 
 async def get_run(run_id: str) -> dict[str, Any] | None:

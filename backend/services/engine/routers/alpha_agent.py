@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -1666,6 +1666,94 @@ async def list_tasks(
     return {"code": 200, "data": {"tasks": tasks, "total": len(tasks)}}
 
 
+async def _decorate_factor_rows(
+    rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """因子行附加六维标签 + 生命周期视图（T-FE-06/07 装配层）。
+
+    - ``tags``：``shared/factor_tags.derive_tags``（成熟度取生命周期派生值，
+      单一 source of truth）；
+    - ``lifecycle``：``shared/factor_lifecycle.lifecycle_view``——盲窗裁剪
+      （observing 不返回 ``last_eval``）在视图函数内，「验证中」展示态由
+      批量查询 running 验证行供给。
+    附加件是**纯增量**字段（原行字段原样保留），前端未消费也无副作用。
+
+    Fail-closed（评审 2026-10-11，HIGH-1 + security-MEDIUM）：
+
+    - 两个装饰查询**各自**降级（run 台账 / 验证表互不拖累），新装部署表未建
+      时列表端点不可 500；
+    - run 台账失败 = 证据不足：既不得把无成功回测痕迹的行冒充「实验」
+      （``lifecycle=None`` 不作声明），也不得放行任何读数（盲窗终点不可
+      证实 → 全行脱下 ``last_eval``）；
+    - ``metadata_json`` 与 ``lifecycle`` 视图是同源数据的两个出口——观测态
+      或降级时两处同裁（``redact_blind_readings``），只裁视图等于没裁。
+    """
+    from backend.services.engine.factor_backtest import store as fb_store
+    from backend.services.engine.mining_plugins import validation_store
+    from backend.shared.factor_lifecycle import (
+        MATURITY_UNKNOWN,
+        STATE_EXPERIMENT,
+        STATE_OBSERVING,
+        lifecycle_view,
+        redact_blind_readings,
+    )
+    from backend.shared.factor_tags import derive_tags
+    from backend.shared.utc_datetime import utc_now
+
+    ids = [str(r.get("factor_id") or "") for r in rows]
+    ids = [i for i in ids if i]
+    run_ledger_degraded = False
+    first_at: dict[str, Any] = {}
+    try:
+        first_at = await fb_store.first_completed_at(ids)
+    except Exception:  # noqa: BLE001 — 装饰层降级，核心列表不可被拖垮
+        run_ledger_degraded = True
+        logger.warning(
+            "因子库 run 台账查询失败（生命周期按保守口径装饰）", exc_info=True
+        )
+    running: set[str] = set()
+    try:
+        running = await validation_store.running_factor_ids(ids)
+    except Exception:  # noqa: BLE001 — 仅「验证中」展示态降级，不波及其他装饰
+        logger.warning("因子库验证查询失败（「验证中」展示态缺省关闭）", exc_info=True)
+    now = utc_now()
+    decorated: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        fid = str(item.get("factor_id") or "")
+        lifecycle: dict[str, Any] | None = lifecycle_view(
+            item,
+            first_completed_run_at=first_at.get(fid),
+            now=now,
+            has_active_validation=fid in running,
+        )
+        if (
+            run_ledger_degraded
+            and lifecycle["state"] == STATE_EXPERIMENT
+            and str(item.get("status") or "") != "completed"
+        ):
+            # 证据不足 + 无行内成功痕迹（跨市场回测流不写 status）→ 不冒充「实验」
+            lifecycle = None
+        show_readings = (
+            not run_ledger_degraded
+            and lifecycle is not None
+            and lifecycle["state"] != STATE_OBSERVING
+        )
+        if not show_readings:
+            if lifecycle is not None:
+                lifecycle = {**lifecycle, "last_eval": None}
+            meta = item.get("metadata")
+            if isinstance(meta, Mapping):
+                item["metadata"] = redact_blind_readings(meta)
+        item["lifecycle"] = lifecycle
+        item["tags"] = derive_tags(
+            item,
+            maturity=(lifecycle or {}).get("maturity") or MATURITY_UNKNOWN,
+        )
+        decorated.append(item)
+    return decorated
+
+
 @router.get("/factors")
 async def list_factors(
     request: Request,
@@ -1718,7 +1806,7 @@ async def list_factors(
     return {
         "code": 200,
         "data": {
-            "factors": factors,
+            "factors": await _decorate_factor_rows(factors),
             "total": scope["total"],
             "limit": limit,
             "offset": offset,
@@ -2012,9 +2100,9 @@ async def get_factor_recovery_status(request: Request):
 
 @router.get("/factors/{factor_id}")
 async def get_factor(factor_id: str, request: Request):
-    """获取单个因子详情"""
+    """获取单个因子详情（附六维标签与生命周期视图，T-FE-06/07）"""
     factor = await _require_owned_factor(factor_id, request)
-    return {"code": 200, "data": factor}
+    return {"code": 200, "data": (await _decorate_factor_rows([factor]))[0]}
 
 
 @router.get("/metrics/registry")

@@ -39,7 +39,13 @@ import {
 } from 'lucide-react';
 import { useTaskContext } from '../context-v2/TaskContext';
 import { useBacktestQueue, useMaterializeRun } from '../context-v2/RunQueueContext';
-import { FactorTable, backtestChip, materializationChip } from '../components-v2/FactorTable';
+import {
+  FactorTable,
+  backtestChip,
+  blindLineText,
+  lifecycleChip,
+  materializationChip,
+} from '../components-v2/FactorTable';
 import { MaterializeBar } from '../components-v2/MaterializeBar';
 import { PageHeader } from '../components-v2/layout/PageHeader';
 
@@ -59,6 +65,16 @@ const MARKET_COLORS: Record<string, string> = {
 
 const QUALITY_SHORT: Record<string, string> = { high: '高', medium: '中', low: '低', unknown: '—' };
 const QUALITY_FULL: Record<string, string> = { high: '高质量', medium: '中等质量', low: '低质量', unknown: '质量未知' };
+
+/** 六维标签展示序（键与后端 derive_tags 对齐；'unknown' 显「—」，禁止猜造） */
+const TAG_DIMS: Array<[string, string]> = [
+  ['data_source', '数据源'],
+  ['frequency', '频率'],
+  ['family', '因子族'],
+  ['transform', '变换'],
+  ['target', '目标'],
+  ['maturity', '成熟度'],
+];
 
 /** 视图持久化：默认列表（用户反馈「现在是方块的、列表不能显示吗」） */
 const VIEW_STORAGE_KEY = 'qa_factor_lib_view';
@@ -576,6 +592,25 @@ export const FactorLibraryPage: React.FC<FactorLibraryPageProps> = ({
         ? '该任务没有已落库的因子（可能尚未物化或被门禁拒绝）'
         : '开始挖掘因子后，结果将显示在这里';
 
+  // 详情弹窗（T-FE-06/07）：生命周期 chip / 盲窗行 / 最近评估证据行。
+  // 观察态后端恒裁剪 last_eval——这里同样不编造读数（宁可缺，不可假）；
+  // 防御（评审 MEDIUM-2，2026-10-11）：即使装配层回归把读数带出来，
+  // 观察态前端也不显示。
+  const selectedLifeChip = selectedFactor ? lifecycleChip(selectedFactor) : null;
+  const selectedLastEval =
+    selectedFactor?.lifecycle && selectedFactor.lifecycle.state !== 'observing'
+      ? (selectedFactor.lifecycle.last_eval ?? null)
+      : null;
+  const selectedEvalLine = selectedLastEval?.month_end
+    ? `最近评估：${selectedLastEval.month_end}${
+        selectedLastEval.n_days ? `（${selectedLastEval.n_days} 天）` : ''
+      }${
+        typeof selectedLastEval.icir === 'number'
+          ? ` ICIR ${selectedLastEval.icir.toFixed(4)}`
+          : ''
+      }${selectedLastEval.streak ? ` · 连续 ${selectedLastEval.streak} 期偏弱` : ''}`
+    : null;
+
   return (
     <div className="space-y-4 animate-fade-in-up">
       <PageHeader
@@ -875,6 +910,7 @@ export const FactorLibraryPage: React.FC<FactorLibraryPageProps> = ({
                 factor,
                 Boolean(materialize.running && materialize.runningIds.has(factor.factorId)),
               );
+              const lifeChip = lifecycleChip(factor);
               return (
                 <Card
                   key={factor.factorId}
@@ -907,6 +943,14 @@ export const FactorLibraryPage: React.FC<FactorLibraryPageProps> = ({
                       <Badge className={getQualityBadgeClass(factor.quality)}>
                         {QUALITY_SHORT[factor.quality] ?? factor.quality}
                       </Badge>
+                      {lifeChip && (
+                        <span
+                          className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${lifeChip.className}`}
+                          title={lifeChip.title}
+                        >
+                          {lifeChip.text}
+                        </span>
+                      )}
                       {factor.readOnly && (
                         <span className="inline-flex items-center rounded-md border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                           工厂
@@ -1055,6 +1099,14 @@ export const FactorLibraryPage: React.FC<FactorLibraryPageProps> = ({
                         ] || selectedFactor.universe || selectedFactor.metadata?.universe}
                       </span>
                     )}
+                    {selectedLifeChip && (
+                      <span
+                        className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium ${selectedLifeChip.className}`}
+                        title={selectedLifeChip.title}
+                      >
+                        {selectedLifeChip.text}
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-2">
                     质量按 |IC| 分级（≥0.05 高 / ≥0.02 中）；IC 为负表示因子与收益负相关，可反向使用。
@@ -1104,6 +1156,48 @@ export const FactorLibraryPage: React.FC<FactorLibraryPageProps> = ({
                       {selectedFactor.factorFormulation || selectedFactor.factor_formulation}
                     </code>
                   </div>
+                </div>
+              )}
+
+              {/* 生命周期与六维标签（T-FE-06/07） */}
+              {(selectedFactor.lifecycle || selectedFactor.tags) && (
+                <div>
+                  <h4 className="text-sm font-medium mb-2">生命周期与标签</h4>
+                  {selectedFactor.lifecycle && (
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">成熟度:</span>
+                        <span>
+                          {selectedFactor.lifecycle.maturity || selectedFactor.lifecycle.state}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">盲窗:</span>
+                        <span>{blindLineText(selectedFactor.lifecycle)}</span>
+                      </div>
+                      {selectedEvalLine && (
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">评估:</span>
+                          <span className="font-mono text-xs">{selectedEvalLine}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {selectedFactor.tags && (
+                    <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3">
+                      {TAG_DIMS.map(([key, label]) => {
+                        const v = selectedFactor.tags?.[key];
+                        return (
+                          <div key={key} className="rounded-lg bg-secondary/30 p-3">
+                            <div className="text-xs text-muted-foreground">{label}</div>
+                            <div className="text-sm font-medium mt-1">
+                              {v && v !== 'unknown' ? v : '—'}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -150,3 +150,26 @@ async def get_validation(factor_id: str, market: str) -> dict[str, Any] | None:
             raw = None
     item["report"] = raw if isinstance(raw, dict) else None
     return item
+
+
+async def running_factor_ids(factor_ids: list[str]) -> set[str]:
+    """该批因子中当前验证在跑（``status='running'``）的 id 集合。
+
+    供因子库「验证中」展示态（成熟度装饰）；空输入零查询。
+    调用方只传**已鉴权**的 factor_id（本函数不做归属过滤，无独立鉴权面）。
+    """
+    if not factor_ids:
+        return set()
+    async with get_session(read_only=True) as session:
+        rows = await session.execute(
+            text(
+                """
+                SELECT DISTINCT factor_id
+                FROM rd_agent_factor_validations
+                WHERE factor_id = ANY(:factor_ids)
+                  AND status = 'running'
+                """
+            ),
+            {"factor_ids": list(factor_ids)},
+        )
+        return {str(r["factor_id"]) for r in rows.mappings()}

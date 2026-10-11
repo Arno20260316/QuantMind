@@ -48,8 +48,15 @@ export function getDirectionLabel(item: MiningDirectionItem): string {
   return typeof item === 'string' ? item : item.label;
 }
 
+/**
+ * 方向调度模式（T-FE-10 起三值）：selected=按序取一条；random=空白度加权随机；
+ * quota=方向配额（探索/利用/变异三档，抽样决策在后端 direction_quota）。
+ * 存储里出现未知值一律归一为 selected（宁保守勿猜测）。
+ */
+export type MiningDirectionMode = 'selected' | 'random' | 'quota';
+
 interface StoredMiningDirectionConfig {
-  miningDirectionMode?: 'selected' | 'random';
+  miningDirectionMode?: MiningDirectionMode;
   /** 选中的挖掘方向（存 label，避免与动态 L1 类别列表下标错位） */
   selectedMiningDirections?: string[];
   /** 入库闸门开关（T-MV-05，设置页写） */
@@ -59,17 +66,19 @@ interface StoredMiningDirectionConfig {
 /** 读取本地保存的挖掘方向选择（label 列表 + 模式） */
 export function getStoredDirectionConfig(): {
   labels: string[];
-  mode: 'selected' | 'random';
+  mode: MiningDirectionMode;
 } {
   try {
     const raw = localStorage.getItem('quantaalpha_config');
     if (!raw) return { labels: [], mode: 'selected' };
     const config = JSON.parse(raw) as StoredMiningDirectionConfig;
+    const storedMode = config?.miningDirectionMode;
     return {
       labels: Array.isArray(config?.selectedMiningDirections)
         ? config.selectedMiningDirections.filter((l) => typeof l === 'string' && l.trim())
         : [],
-      mode: config?.miningDirectionMode === 'random' ? 'random' : 'selected',
+      mode:
+        storedMode === 'random' || storedMode === 'quota' ? storedMode : 'selected',
     };
   } catch {
     return { labels: [], mode: 'selected' };

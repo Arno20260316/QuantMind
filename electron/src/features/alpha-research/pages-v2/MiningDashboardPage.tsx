@@ -1,9 +1,10 @@
-import React, { useCallback } from 'react';
-import { Square } from 'lucide-react';
+import React, { useCallback, useState } from 'react';
+import { Activity, GitBranch, Square } from 'lucide-react';
 import { ProgressSidebar } from '../components-v2/ProgressSidebar';
 import { LiveCharts } from '../components-v2/LiveCharts';
 import { FactorStatsRow } from '../components-v2/FactorStatsRow';
 import { FactorList } from '../components-v2/FactorList';
+import { TrajectoryView } from '../components-v2/TrajectoryView';
 import { useTaskContext } from '../context-v2/TaskContext';
 import { useBacktestQueue } from '../context-v2/RunQueueContext';
 import { Layout } from '../components-v2/layout/Layout';
@@ -39,6 +40,11 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
     refreshMiningFactors,
   } = useTaskContext();
   const backtestQueue = useBacktestQueue();
+
+  // 视图切换：「实时演化台」（进度侧栏+图表，默认）|「决策轨迹」（T-FM-07 只读扫描）
+  const [viewMode, setViewMode] = useState<'live' | 'trajectory'>('live');
+  // 轨迹按焦点任务拉取；无焦点回退当前任务（无任务时空串——下方有专属空态分支）
+  const trajectoryTaskId = focusedTaskId || task?.taskId || '';
 
   // 一键回测：真入队（并发 2）；每行终结后拉一次权威清单刷新指标
   const handleQuickBacktest = useCallback(
@@ -156,6 +162,49 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
         )}
       </div>
 
+      {/* 视图切换（实时演化台 / 决策轨迹） */}
+      <div
+        role="tablist"
+        aria-label="任务视图"
+        className="mb-4 flex w-fit items-center gap-1 rounded-full border border-slate-200/80 bg-white/80 p-1 shadow-2xs"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={viewMode === 'live'}
+          onClick={() => setViewMode('live')}
+          className={`inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-black transition-colors cursor-pointer ${
+            viewMode === 'live'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-500 hover:text-blue-600'
+          }`}
+        >
+          <Activity className="h-3.5 w-3.5" />
+          实时演化台
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={viewMode === 'trajectory'}
+          onClick={() => setViewMode('trajectory')}
+          className={`inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-black transition-colors cursor-pointer ${
+            viewMode === 'trajectory'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-500 hover:text-blue-600'
+          }`}
+        >
+          <GitBranch className="h-3.5 w-3.5" />
+          决策轨迹
+        </button>
+      </div>
+
+      {viewMode === 'trajectory' && (
+        <div className="rounded-2xl border border-white/90 bg-white/80 backdrop-blur-xl shadow-xs p-4">
+          <TrajectoryView taskId={trajectoryTaskId} />
+        </div>
+      )}
+
+      {viewMode === 'live' && (
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         <div className="lg:col-span-1">
           <ProgressSidebar
@@ -186,6 +235,7 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
            <FactorList metrics={task.metrics || null} onNavigate={onNavigate} />
         </div>
       </div>
+      )}
     </Layout>
   );
 };

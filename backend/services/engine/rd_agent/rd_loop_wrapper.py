@@ -101,9 +101,7 @@ class MinuteDataError(RuntimeError):
     """
 
 
-def _h5_cache_name(
-    debug: bool, start: date, end: date, datasets: Sequence[str]
-) -> str:
+def _h5_cache_name(debug: bool, start: date, end: date, datasets: Sequence[str]) -> str:
     """共享缓存文件名：默认组合沿用旧名，自定义窗口/数据集按内容分文件。
 
     「窗口 A 生成的缓存冒充窗口 B 的数据面」是静默错数据（LLM 引用到的列、
@@ -112,7 +110,10 @@ def _h5_cache_name(
     旧名，存量缓存与外部脚本（rd_mined_materialize / 回测同源读取）零变化。
     """
     base = "daily_pv_debug" if debug else "daily_pv_all"
-    if (start, end) == (_H5_DEFAULT_START, _H5_DEFAULT_END) and datasets == SUPPORTED_DATASETS:
+    if (start, end) == (
+        _H5_DEFAULT_START,
+        _H5_DEFAULT_END,
+    ) and datasets == SUPPORTED_DATASETS:
         return f"{base}.h5"
     short = "+".join(DATASET_SHORT_NAMES[d] for d in datasets)
     return f"{base}__{start.isoformat()}_{end.isoformat()}__{short}.h5"
@@ -162,7 +163,9 @@ _QLIB_PROVIDER_KEY_BY_MARKET: dict[str, str] = {
 }
 
 
-def quantdb_coverage_from_dir(quantdb_dir: str | os.PathLike[str] | None) -> Window | None:
+def quantdb_coverage_from_dir(
+    quantdb_dir: str | os.PathLike[str] | None,
+) -> Window | None:
     """QuantDB 日线覆盖窗口（挖掘数据面同源）。
 
     覆盖 = ``1_kline_data/daily_forward`` 分区目录 ``dt=YYYYMMDD`` 的 min/max
@@ -177,7 +180,9 @@ def quantdb_coverage_from_dir(quantdb_dir: str | os.PathLike[str] | None) -> Win
         return None
     daily_dir = Path(quantdb_dir) / "1_kline_data" / "daily_forward"
     days = sorted(
-        d.name[3:] for d in daily_dir.iterdir() if d.is_dir() and d.name.startswith("dt=")
+        d.name[3:]
+        for d in daily_dir.iterdir()
+        if d.is_dir() and d.name.startswith("dt=")
     )
     if not days:
         return None
@@ -244,7 +249,9 @@ class RDLoopWrapper:
     def __init__(self, market: str = "a_share") -> None:
         self.adapter: MarketAdapter = get_adapter(market)
         if self.adapter is None:
-            raise ValueError(f"Unknown market: {market}. Available: {[m['market_id'] for m in list_markets()]}")
+            raise ValueError(
+                f"Unknown market: {market}. Available: {[m['market_id'] for m in list_markets()]}"
+            )
         self.market = market
         self._loop = None
         self._running = False
@@ -401,7 +408,9 @@ class RDLoopWrapper:
             env["CHAT_MODEL"] = os.getenv("CHAT_MODEL", "")
         # litellm needs provider prefix for non-OpenAI models
         model = env.get("CHAT_MODEL", "")
-        if model and not model.startswith(("openai/", "azure/", "anthropic/", "huggingface/")):
+        if model and not model.startswith(
+            ("openai/", "azure/", "anthropic/", "huggingface/")
+        ):
             env["CHAT_MODEL"] = f"openai/{model}"
         env["REASONING_MODEL"] = env.get("CHAT_MODEL", "")
         env["CHAT_STREAM"] = "false"
@@ -424,15 +433,32 @@ class RDLoopWrapper:
             )
         else:
             # 无自定义窗口：保持旧静态兜底（手动运行/直跑脚本场景）
-            env.setdefault("QLIB_FACTOR_TRAIN_START", os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"))
+            env.setdefault(
+                "QLIB_FACTOR_TRAIN_START",
+                os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"),
+            )
             # TRAIN_END 曾缺失 → FactorBasePropSetting 落到类默认 2014-12-31，
             # 与这里的 train_start 2016-01-01 组成倒置区间（train 段恒为空）。
             # 2020-12-31 与既有 valid（2021~2022）/test（2023~2025）首尾相接。
-            env.setdefault("QLIB_FACTOR_TRAIN_END", os.getenv("QLIB_FACTOR_TRAIN_END", "2020-12-31"))
-            env.setdefault("QLIB_FACTOR_VALID_START", os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"))
-            env.setdefault("QLIB_FACTOR_VALID_END", os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"))
-            env.setdefault("QLIB_FACTOR_TEST_START", os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"))
-            env.setdefault("QLIB_FACTOR_TEST_END", os.getenv("QLIB_FACTOR_TEST_END", "2025-12-31"))
+            env.setdefault(
+                "QLIB_FACTOR_TRAIN_END",
+                os.getenv("QLIB_FACTOR_TRAIN_END", "2020-12-31"),
+            )
+            env.setdefault(
+                "QLIB_FACTOR_VALID_START",
+                os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"),
+            )
+            env.setdefault(
+                "QLIB_FACTOR_VALID_END",
+                os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"),
+            )
+            env.setdefault(
+                "QLIB_FACTOR_TEST_START",
+                os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"),
+            )
+            env.setdefault(
+                "QLIB_FACTOR_TEST_END", os.getenv("QLIB_FACTOR_TEST_END", "2025-12-31")
+            )
         # mlflow 3.x 默认拒绝 filesystem tracking backend（"maintenance mode"），而
         # qlib 的 MLflowExpManager（qrun）与 read_exp_res.py 用的就是 ./mlruns 文件
         # 后端 → 不开此开关，qrun 在建实验时即抛 MlflowException 退出（2026-10-10
@@ -442,6 +468,7 @@ class RDLoopWrapper:
         env.setdefault("MULTI_PROC_N", os.getenv("MULTI_PROC_N", "4"))
         # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
         from backend.services.engine.rd_agent.llm_env import build_llm_env
+
         build_llm_env(env)
         return env
 
@@ -457,6 +484,9 @@ class RDLoopWrapper:
 
     #: 因子池注入文件路径（launcher 在 spawn 前写好、经 env 传入）
     _ENV_POOL_CONTEXT = "QMF_POOL_CONTEXT_PATH"
+
+    #: 经验记忆/禁区注入文件路径（T-FM-04；launcher 在 spawn 前原子写好、经 env 传入）
+    _ENV_EXPERIENCE_CONTEXT = "QMF_EXPERIENCE_CONTEXT_PATH"
 
     def _build_prompt_suffix(self) -> str:
         """构造追加到因子背景 prompt 末尾的静态指令（读时一次，随背景冻结）。"""
@@ -478,6 +508,7 @@ class RDLoopWrapper:
         suffix += render_eval_criteria_block()
         suffix += self._minute_prompt_block()
         suffix += self._pool_context_block()
+        suffix += self._experience_context_block()
         return suffix
 
     def _minute_prompt_block(self) -> str:
@@ -491,7 +522,11 @@ class RDLoopWrapper:
         if self._freq() != FREQ_MINUTE:
             return ""
         window = getattr(self, "_minute_window", None)
-        cover = f"{window[0].isoformat()} ~ {window[1].isoformat()}" if window else "见数据文件说明"
+        cover = (
+            f"{window[0].isoformat()} ~ {window[1].isoformat()}"
+            if window
+            else "见数据文件说明"
+        )
         return (
             "\n\n====== 分钟级挖掘 / 1-Minute Frequency ======\n"
             "本任务在 **1 分钟 bar** 上做原生因子挖掘（不是日线！）：数据文件里的索引是分钟"
@@ -541,6 +576,26 @@ class RDLoopWrapper:
         if not content:
             return ""
         return f"\n\n====== 历史挖掘记忆 / Past Mining Memory ======\n{content}\n"
+
+    def _experience_context_block(self) -> str:
+        """历史经验/禁区段（T-FM-04 拒因聚类 + 饱和方向，launcher 交付的文件）。
+
+        与 ``_pool_context_block`` 同纪律：只读文件、不做 DB（本函数运行在
+        RD-Agent 子进程内），文件缺失/为空 → 空串，注入失败绝不拦挖掘。
+        """
+        path = os.getenv(self._ENV_EXPERIENCE_CONTEXT, "").strip()
+        if not path:
+            return ""
+        try:
+            content = Path(path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning(
+                "[%s] 经验记忆注入文件读取失败(%s): %s", self.market, path, exc
+            )
+            return ""
+        if not content:
+            return ""
+        return f"\n\n====== 经验记忆 / Experience Memory ======\n{content}\n"
 
     def _patch_prompts_for_chinese(self):
         """注入中文/方向/评估口径（静态）与阶段化课程（动态）到 RD-Agent 提示词。
@@ -661,15 +716,24 @@ class RDLoopWrapper:
             if task_log_dir:
                 os.environ["WORKSPACE_PATH"] = task_log_dir
                 os.environ["FACTOR_CoSTEER_data_folder"] = os.path.join(
-                    task_log_dir, "git_ignore_folder", "factor_implementation_source_data"
+                    task_log_dir,
+                    "git_ignore_folder",
+                    "factor_implementation_source_data",
                 )
                 os.environ["FACTOR_CoSTEER_data_folder_debug"] = os.path.join(
-                    task_log_dir, "git_ignore_folder", "factor_implementation_source_data_debug"
+                    task_log_dir,
+                    "git_ignore_folder",
+                    "factor_implementation_source_data_debug",
                 )
                 os.chdir(task_log_dir)
 
-            logger.info("[%s] RDLoop starting: market=%s, loops=%d, log_dir=%s",
-                        self.market, self.adapter.market_name, loop_n, task_log_dir)
+            logger.info(
+                "[%s] RDLoop starting: market=%s, loops=%d, log_dir=%s",
+                self.market,
+                self.adapter.market_name,
+                loop_n,
+                task_log_dir,
+            )
 
             # 创建 RDLoop
             self._loop = self._create_loop()
@@ -678,13 +742,26 @@ class RDLoopWrapper:
             base_features_path = getattr(self, "_base_features_path", None)
             if base_features_path:
                 self._loop._init_base_features(base_features_path)
-                logger.info("[%s] Loaded base features from %s", self.market, base_features_path)
+                logger.info(
+                    "[%s] Loaded base features from %s", self.market, base_features_path
+                )
             step_count = len(self._loop.steps)
             total_steps = loop_n * step_count
 
-            logger.info("[%s] Steps per loop: %d, total steps: %d", self.market, step_count, total_steps)
-            logger.info("[%s] Step flow: %s", self.market,
-                        " → ".join(getattr(s, '__name__', s.__class__.__name__) for s in self._loop.steps))
+            logger.info(
+                "[%s] Steps per loop: %d, total steps: %d",
+                self.market,
+                step_count,
+                total_steps,
+            )
+            logger.info(
+                "[%s] Step flow: %s",
+                self.market,
+                " → ".join(
+                    getattr(s, "__name__", s.__class__.__name__)
+                    for s in self._loop.steps
+                ),
+            )
 
             # 运行循环
             t0 = time.time()
@@ -710,11 +787,21 @@ class RDLoopWrapper:
         except asyncio.CancelledError:
             self._cancelled = True
             logger.info("[%s] RDLoop cancelled", self.market)
-            return {"market": self.market, "cancelled": True, "factors": [], "success": False}
+            return {
+                "market": self.market,
+                "cancelled": True,
+                "factors": [],
+                "success": False,
+            }
 
         except Exception as e:
             logger.exception("[%s] RDLoop failed: %s", self.market, e)
-            return {"market": self.market, "error": str(e), "factors": [], "success": False}
+            return {
+                "market": self.market,
+                "error": str(e),
+                "factors": [],
+                "success": False,
+            }
 
         finally:
             self._running = False
@@ -764,12 +851,15 @@ class RDLoopWrapper:
         }
 
         # 默认 A 股
-        market_cfg = market_data_map.get(self.market, {
-            "source_all": "/app/alphaagent/scenarios/qlib/experiment/factor_data_template/daily_pv_all.h5",
-            "source_debug": "/app/alphaagent/scenarios/qlib/experiment/factor_data_template/daily_pv_debug.h5",
-            "qlib_source": "/data/qlib/cn_data",
-            "qlib_target_name": "cn_data",
-        })
+        market_cfg = market_data_map.get(
+            self.market,
+            {
+                "source_all": "/app/alphaagent/scenarios/qlib/experiment/factor_data_template/daily_pv_all.h5",
+                "source_debug": "/app/alphaagent/scenarios/qlib/experiment/factor_data_template/daily_pv_debug.h5",
+                "qlib_source": "/data/qlib/cn_data",
+                "qlib_target_name": "cn_data",
+            },
+        )
 
         source_all = market_cfg["source_all"]
         source_debug = market_cfg["source_debug"]
@@ -778,8 +868,13 @@ class RDLoopWrapper:
         base_dir = task_log_dir if task_log_dir else os.getcwd()
 
         # RD-Agent data folders (relative to subprocess cwd)
-        target_all = os.path.join(base_dir, "git_ignore_folder/factor_implementation_source_data/daily_pv.h5")
-        target_debug = os.path.join(base_dir, "git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5")
+        target_all = os.path.join(
+            base_dir, "git_ignore_folder/factor_implementation_source_data/daily_pv.h5"
+        )
+        target_debug = os.path.join(
+            base_dir,
+            "git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5",
+        )
 
         # 分钟原生挖掘（P1.5）：数据面换成 1min h5（与 provider bins 同源）；
         # **不动** ~/.qlib 全局 symlink——分钟任务的 provider_uri 由 conf 渲染层
@@ -821,11 +916,18 @@ class RDLoopWrapper:
             quantdb_dir = self._resolve_quantdb_dir()
             h5_generated = False
             if quantdb_dir:
-                ok_all = self._generate_h5_from_parquet(quantdb_dir, target_all, debug=False)
-                ok_debug = self._generate_h5_from_parquet(quantdb_dir, target_debug, debug=True)
+                ok_all = self._generate_h5_from_parquet(
+                    quantdb_dir, target_all, debug=False
+                )
+                ok_debug = self._generate_h5_from_parquet(
+                    quantdb_dir, target_debug, debug=True
+                )
                 h5_generated = ok_all and ok_debug
             if not h5_generated:
-                logger.warning("[%s] H5 generation failed or QuantDB dir missing, falling back to copy", self.market)
+                logger.warning(
+                    "[%s] H5 generation failed or QuantDB dir missing, falling back to copy",
+                    self.market,
+                )
                 self._copy_h5_source(source_all, target_all, source_debug, target_debug)
         elif self.market == "futures":
             # 期货：从 QuantFutures parquet 生成（无预生成文件，fut_ 前缀 instrument）
@@ -833,7 +935,9 @@ class RDLoopWrapper:
             h5_generated = False
             if futures_dir.is_dir():
                 ok_all = self._generate_futures_h5(futures_dir, target_all, debug=False)
-                ok_debug = self._generate_futures_h5(futures_dir, target_debug, debug=True)
+                ok_debug = self._generate_futures_h5(
+                    futures_dir, target_debug, debug=True
+                )
                 h5_generated = ok_all and ok_debug
             if not h5_generated:
                 logger.warning(
@@ -856,10 +960,13 @@ class RDLoopWrapper:
         }
         if self.market in market_cache:
             mkt_key, (base_dir_cfg, cache_sub, leaf) = market_cache[self.market]
-            candidates = [Path(base_dir_cfg) / cache_sub / leaf,
-                          self._resolve_market_data_dir(base_dir_cfg) / cache_sub / leaf]
+            candidates = [
+                Path(base_dir_cfg) / cache_sub / leaf,
+                self._resolve_market_data_dir(base_dir_cfg) / cache_sub / leaf,
+            ]
             try:
                 from backend.shared.qlib_paths import resolve_qlib_provider_uri
+
                 candidates.insert(0, Path(resolve_qlib_provider_uri(mkt_key)))
             except Exception:
                 pass
@@ -875,22 +982,36 @@ class RDLoopWrapper:
             if os.path.islink(qlib_target):
                 current_target = os.readlink(qlib_target)
                 if os.path.abspath(current_target) != os.path.abspath(qlib_source):
-                    logger.info("[%s] Replacing stale symlink: %s -> %s (was %s)",
-                                self.market, qlib_target, qlib_source, current_target)
+                    logger.info(
+                        "[%s] Replacing stale symlink: %s -> %s (was %s)",
+                        self.market,
+                        qlib_target,
+                        qlib_source,
+                        current_target,
+                    )
                     os.unlink(qlib_target)
                     need_create = True
             elif os.path.isdir(qlib_target):
                 # 真实目录而非 symlink，rename 后建 symlink
                 backup = qlib_target + "_backup"
-                logger.info("[%s] Replacing real directory with symlink: %s -> %s (backup: %s)",
-                            self.market, qlib_target, qlib_source, backup)
+                logger.info(
+                    "[%s] Replacing real directory with symlink: %s -> %s (backup: %s)",
+                    self.market,
+                    qlib_target,
+                    qlib_source,
+                    backup,
+                )
                 try:
                     if os.path.exists(backup):
                         shutil.rmtree(backup)
                     os.rename(qlib_target, backup)
                     need_create = True
                 except Exception as e:
-                    logger.warning("[%s] Failed to replace directory with symlink: %s", self.market, e)
+                    logger.warning(
+                        "[%s] Failed to replace directory with symlink: %s",
+                        self.market,
+                        e,
+                    )
             else:
                 need_create = True
 
@@ -898,13 +1019,24 @@ class RDLoopWrapper:
                 try:
                     os.makedirs(os.path.dirname(qlib_target), exist_ok=True)
                     os.symlink(qlib_source, qlib_target)
-                    logger.info("[%s] Created symlink: %s -> %s", self.market, qlib_target, qlib_source)
+                    logger.info(
+                        "[%s] Created symlink: %s -> %s",
+                        self.market,
+                        qlib_target,
+                        qlib_source,
+                    )
                 except Exception as e:
-                    logger.warning("[%s] Failed to create Qlib symlink: %s", self.market, e)
+                    logger.warning(
+                        "[%s] Failed to create Qlib symlink: %s", self.market, e
+                    )
 
         # A 股：生成 base_factors.json 供 RD-Agent LLM 参考
-        if self.market == "a_share" and hasattr(self.adapter, "generate_base_factors_json"):
-            data_dir = os.path.join(base_dir, "git_ignore_folder", "factor_implementation_source_data")
+        if self.market == "a_share" and hasattr(
+            self.adapter, "generate_base_factors_json"
+        ):
+            data_dir = os.path.join(
+                base_dir, "git_ignore_folder", "factor_implementation_source_data"
+            )
             os.makedirs(data_dir, exist_ok=True)
             bf_path = self.adapter.generate_base_factors_json(data_dir)
             if bf_path:
@@ -919,16 +1051,27 @@ class RDLoopWrapper:
         """从预生成的 h5 文件复制。"""
         for target, source in [(target_all, source_all), (target_debug, source_debug)]:
             if not os.path.exists(source):
-                logger.warning("[%s] Source data file not found: %s", self.market, source)
+                logger.warning(
+                    "[%s] Source data file not found: %s", self.market, source
+                )
                 continue
             target_dir = os.path.dirname(target)
             os.makedirs(target_dir, exist_ok=True)
-            if not os.path.exists(target) or os.path.getmtime(source) > os.path.getmtime(target):
+            if not os.path.exists(target) or os.path.getmtime(
+                source
+            ) > os.path.getmtime(target):
                 try:
                     shutil.copy2(source, target)
-                    logger.info("[%s] Copied data file: %s -> %s", self.market, source, target)
+                    logger.info(
+                        "[%s] Copied data file: %s -> %s", self.market, source, target
+                    )
                 except Exception as e:
-                    logger.warning("[%s] Failed to copy data file to %s: %s", self.market, target, e)
+                    logger.warning(
+                        "[%s] Failed to copy data file to %s: %s",
+                        self.market,
+                        target,
+                        e,
+                    )
 
     @staticmethod
     def _resolve_quantdb_dir() -> str | None:
@@ -980,7 +1123,9 @@ class RDLoopWrapper:
             env_val = os.getenv(env_name, "").strip()
             if env_val:
                 return Path(env_val)
-        project_data = Path(__file__).resolve().parents[4] / "data" / Path(container_path).name
+        project_data = (
+            Path(__file__).resolve().parents[4] / "data" / Path(container_path).name
+        )
         return project_data
 
     def _generate_h5_from_parquet(
@@ -1046,9 +1191,12 @@ class RDLoopWrapper:
 
         try:
             from backend.services.engine.data_platform.quantdb_hub import QuantDBDataHub
+
             hub = QuantDBDataHub(quantdb_dir)
             if not hub.available:
-                logger.error("[%s] QuantDBDataHub not available for h5 generation", self.market)
+                logger.error(
+                    "[%s] QuantDBDataHub not available for h5 generation", self.market
+                )
                 return self._use_stale_cache(cache_path, output_path, allow=use_cache)
 
             # 获取股票列表
@@ -1078,7 +1226,9 @@ class RDLoopWrapper:
             if df is None or df.empty:
                 logger.error("[%s] No K-line data read from QuantDB", self.market)
                 return self._use_stale_cache(cache_path, output_path, allow=use_cache)
-            df_unadj = hub.fetch_daily_kline_batch(symbols, start_d, end_d, adjust="none")
+            df_unadj = hub.fetch_daily_kline_batch(
+                symbols, start_d, end_d, adjust="none"
+            )
 
             # 前复权价可能为负（高分红股票多年除权后 qfq 价转负），会污染 Qlib 因子
             # 计算，这里整体剔除这些行。
@@ -1092,7 +1242,9 @@ class RDLoopWrapper:
                 )
                 df = df.loc[valid].reset_index(drop=True)
             if df.empty:
-                logger.error("[%s] No positive-price K-line rows from QuantDB", self.market)
+                logger.error(
+                    "[%s] No positive-price K-line rows from QuantDB", self.market
+                )
                 return self._use_stale_cache(cache_path, output_path, allow=use_cache)
 
             # 按 (symbol, trade_date) 对齐不复权收盘价以计算 $factor
@@ -1180,7 +1332,9 @@ class RDLoopWrapper:
             return True
 
         except Exception as exc:
-            logger.error("[%s] Failed to generate h5 from parquet: %s", self.market, exc)
+            logger.error(
+                "[%s] Failed to generate h5 from parquet: %s", self.market, exc
+            )
             return self._use_stale_cache(cache_path, output_path, allow=use_cache)
 
     def _merge_enrich(
@@ -1209,17 +1363,26 @@ class RDLoopWrapper:
                     dataset, list(mapping.keys()), start, end, symbols=symbols
                 )
             except Exception as exc:
-                logger.warning("[%s] Enrich from %s failed: %s", self.market, dataset, exc)
+                logger.warning(
+                    "[%s] Enrich from %s failed: %s", self.market, dataset, exc
+                )
                 continue
             if sub is None or sub.empty:
                 logger.warning("[%s] No enrich data from %s", self.market, dataset)
                 continue
             sub = sub.rename(columns=mapping)
             sub["trade_date"] = pd.to_datetime(sub["trade_date"])
-            keep = [c for c in ("symbol", "trade_date", *mapping.values()) if c in sub.columns]
+            keep = [
+                c
+                for c in ("symbol", "trade_date", *mapping.values())
+                if c in sub.columns
+            ]
             df = df.merge(sub[keep], on=["symbol", "trade_date"], how="left")
             logger.info(
-                "[%s] Enriched h5 with %d cols from %s", self.market, len(keep) - 2, dataset
+                "[%s] Enriched h5 with %d cols from %s",
+                self.market,
+                len(keep) - 2,
+                dataset,
             )
         return df
 
@@ -1308,7 +1471,9 @@ class RDLoopWrapper:
         if not base.is_dir():
             return 0.0
         try:
-            dirs = [d for d in base.iterdir() if d.is_dir() and d.name.startswith("dt=")]
+            dirs = [
+                d for d in base.iterdir() if d.is_dir() and d.name.startswith("dt=")
+            ]
             if not dirs:
                 return 0.0
             latest = max(dirs, key=lambda d: d.name)
@@ -1450,11 +1615,20 @@ class RDLoopWrapper:
                 h5_mtime = os.path.getmtime(output_path)
                 kline_dir = Path(futures_dir) / "1_kline_data" / "daily_forward"
                 if kline_dir.is_dir():
-                    partitions = sorted(d for d in os.listdir(kline_dir) if d.startswith("dt="))
+                    partitions = sorted(
+                        d for d in os.listdir(kline_dir) if d.startswith("dt=")
+                    )
                     if partitions:
                         latest_parquet = kline_dir / partitions[-1] / "data.parquet"
-                        if os.path.exists(latest_parquet) and os.path.getmtime(latest_parquet) > h5_mtime:
-                            logger.info("[%s] Parquet newer than h5, regenerating: %s", self.market, output_path)
+                        if (
+                            os.path.exists(latest_parquet)
+                            and os.path.getmtime(latest_parquet) > h5_mtime
+                        ):
+                            logger.info(
+                                "[%s] Parquet newer than h5, regenerating: %s",
+                                self.market,
+                                output_path,
+                            )
                         else:
                             return True
                     else:
@@ -1471,7 +1645,10 @@ class RDLoopWrapper:
 
             hub = QuantFuturesDataHub(Path(futures_dir))
             if not hub.available:
-                logger.error("[%s] QuantFuturesDataHub not available for h5 generation", self.market)
+                logger.error(
+                    "[%s] QuantFuturesDataHub not available for h5 generation",
+                    self.market,
+                )
                 return False
 
             # 期货无 instrument_detail parquet，从 daily_forward 分区推导 symbol 列表
@@ -1513,7 +1690,9 @@ class RDLoopWrapper:
             ).all(axis=1)
             dropped = int((~valid).sum())
             if dropped:
-                logger.warning("[%s] Dropped %d invalid futures rows", self.market, dropped)
+                logger.warning(
+                    "[%s] Dropped %d invalid futures rows", self.market, dropped
+                )
                 df = df.loc[valid].reset_index(drop=True)
             if df.empty:
                 logger.error("[%s] No valid futures K-line rows", self.market)
@@ -1540,12 +1719,17 @@ class RDLoopWrapper:
             combined.to_hdf(output_path, key="data", mode="w")
             logger.info(
                 "[%s] Generated futures h5 from parquet: %s (%d rows, %d symbols)",
-                self.market, output_path, len(combined), len(symbol_list),
+                self.market,
+                output_path,
+                len(combined),
+                len(symbol_list),
             )
             return True
 
         except Exception as exc:
-            logger.error("[%s] Failed to generate futures h5 from parquet: %s", self.market, exc)
+            logger.error(
+                "[%s] Failed to generate futures h5 from parquet: %s", self.market, exc
+            )
             return False
 
     @property
@@ -1566,7 +1750,9 @@ class RDLoopWrapper:
             return []
 
         pkl_count = len(list(log_path.glob("**/*.pkl")))
-        logger.info("[%s] Scanning log dir: %s (%d pkl files)", self.market, log_dir, pkl_count)
+        logger.info(
+            "[%s] Scanning log dir: %s (%d pkl files)", self.market, log_dir, pkl_count
+        )
 
         # 1. Factor metadata
         factor_meta: dict[str, dict] = {}
@@ -1648,21 +1834,25 @@ class RDLoopWrapper:
         factors: list[dict] = []
         for name, code in sorted(factor_code.items()):
             meta = factor_meta.get(name, {})
-            factors.append({
-                "name": meta.get("name", name),
-                "formulation": meta.get("formulation", ""),
-                "description": meta.get("description", ""),
-                "category": meta.get("category", ""),
-                "code": code,
-                "market": self.market,
-                "feedback": feedback_text[:5000] if feedback_text else "",
-            })
+            factors.append(
+                {
+                    "name": meta.get("name", name),
+                    "formulation": meta.get("formulation", ""),
+                    "description": meta.get("description", ""),
+                    "category": meta.get("category", ""),
+                    "code": code,
+                    "market": self.market,
+                    "feedback": feedback_text[:5000] if feedback_text else "",
+                }
+            )
 
         missing = sorted(set(factor_meta.keys()) - set(factor_code.keys()))
         if missing:
             logger.info(
                 "[%s] %d factors generated without code (partial/incomplete loop), skipped: %s",
-                self.market, len(missing), missing,
+                self.market,
+                len(missing),
+                missing,
             )
 
         logger.info("[%s] Extracted %d factors", self.market, len(factors))
@@ -1685,12 +1875,16 @@ def run_factor_mining_subprocess(
     这是同步入口点，由 launcher 的 subprocess 调用。
     """
     wrapper = RDLoopWrapper(market=market)
-    logger.info("Starting factor mining: market=%s, task=%s, loops=%d", market, task_id, loop_n)
-    result = asyncio.run(wrapper.run(
-        loop_n=loop_n,
-        task_log_dir=log_dir,
-        direction=direction,
-    ))
+    logger.info(
+        "Starting factor mining: market=%s, task=%s, loops=%d", market, task_id, loop_n
+    )
+    result = asyncio.run(
+        wrapper.run(
+            loop_n=loop_n,
+            task_log_dir=log_dir,
+            direction=direction,
+        )
+    )
     result["task_id"] = task_id
     result["user_id"] = user_id
     return result

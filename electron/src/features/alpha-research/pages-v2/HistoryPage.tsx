@@ -13,9 +13,10 @@
  *    本组件不自己拼装新任务、不直接换页。
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { History, RefreshCw, FileText, RotateCcw, ExternalLink, AlertCircle, Inbox, FileSearch } from 'lucide-react';
+import { History, RefreshCw, FileText, RotateCcw, ExternalLink, AlertCircle, Inbox, FileSearch, GitBranch, X } from 'lucide-react';
 import { PageHeader } from '../components-v2/layout/PageHeader';
 import { DocsHistoryTab } from '../components-v2/DocsHistoryTab';
+import { TrajectoryView } from '../components-v2/TrajectoryView';
 import { isDocMiningEnabled } from '../../../config/docMiningFlags';
 import { formatShortTime, taskStatusMeta } from '../utils-v2';
 import type { DocRow } from '../services-v2/docMiningApi';
@@ -55,24 +56,82 @@ function marketLabel(row: MiningHistoryRow): string {
   return row.universe ? `${market} · ${row.universe}` : market;
 }
 
-/** 方向模式文案（T-MV-02）。未知值原样呈现——后端将来加模式不能静默消失。 */
+/** 方向模式文案（T-MV-02 / T-FE-10）。未知值原样呈现——后端将来加模式不能静默消失。 */
 const DIRECTION_MODE_LABELS: Record<string, string> = {
   selected: '类别选定',
   random: '随机抽取',
+  quota: '配额调度',
 };
 
 function directionModeLabel(mode: string): string {
   return DIRECTION_MODE_LABELS[mode] ?? mode;
 }
 
+/** 配额档位/加权/回退文案（与设置页 DirectionQuotaPanel 同词表）。 */
+const QUOTA_TIER_LABELS: Record<string, string> = {
+  explore: '探索',
+  exploit: '利用',
+  mutate: '变异',
+};
+
+const QUOTA_WEIGHTING_LABELS: Record<string, string> = {
+  blankness: '空白度加权',
+  proxy_score: '打分归一',
+  uniform: '均匀抽取',
+};
+
+const QUOTA_FALLBACK_LABELS: Record<string, string> = {
+  saturated: '饱和剔尽·回退同档全集',
+  mutate_empty: '无成功史·退利用档',
+};
+
 /**
- * 抽样证据摘要（T-MV-03）：把 direction_meta 的复现凭证压成一行工具提示文案。
- * 解析失败/无证据 → null（宁缺勿错）；权重只标注口径，不铺数值。
+ * 配额证据摘要（T-FE-10）：档位/加权/回退 + seed + 候选（带打分）。
+ * `quota_fallback=true` 的兜底凭证（抽样模块失败后落样）如实标注——
+ * 假装配额成功比兜底更坏。
+ */
+function quotaMetaSummary(meta: any): string {
+  const parts: string[] = [];
+  if (meta?.quota_fallback === true) {
+    parts.push('配额兜底（方向史读取失败，退空白度随机）');
+  } else {
+    const tier = QUOTA_TIER_LABELS[meta?.tier] ?? (typeof meta?.tier === 'string' ? meta.tier : '');
+    parts.push(tier ? `配额·${tier}档` : '配额调度');
+  }
+  const weighting =
+    typeof meta?.weighting === 'string'
+      ? (QUOTA_WEIGHTING_LABELS[meta.weighting] ?? meta.weighting)
+      : '';
+  if (weighting) parts.push(weighting);
+  if (typeof meta?.tier_fallback === 'string') {
+    parts.push(QUOTA_FALLBACK_LABELS[meta.tier_fallback] ?? meta.tier_fallback);
+  }
+  if (typeof meta?.seed === 'number') parts.push(`seed=${meta.seed}`);
+  const candidates = Array.isArray(meta?.candidates)
+    ? meta.candidates
+        .map((c: { direction?: string; attempts?: number; score?: number }) =>
+          typeof c?.score === 'number'
+            ? `${c.direction}=${c.score.toFixed(3)}分`
+            : `${c?.direction}=${c?.attempts ?? '—'}次`
+        )
+        .join('，')
+    : '';
+  if (candidates) parts.push(candidates);
+  return parts.join('；');
+}
+
+/**
+ * 抽样证据摘要（T-MV-03 / T-FE-10）：把 direction_meta 的复现凭证压成一行
+ * 工具提示文案。quota 凭证走 quotaMetaSummary；解析失败/无证据 → null
+ * （宁缺勿错）；权重只标注口径，不铺数值。
  */
 function directionMetaSummary(metaJson: string | null | undefined): string | null {
   if (!metaJson) return null;
   try {
     const meta = JSON.parse(metaJson);
+    if (meta?.mode === 'quota' || meta?.quota_fallback === true) {
+      return quotaMetaSummary(meta);
+    }
     const weighting =
       meta?.weighting === 'uniform_fallback'
         ? '均匀兜底（史读取失败）'
@@ -112,6 +171,8 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({
   const [error, setError] = useState<string | null>(null);
   // 文档解析 Tab（构建期开关关时整排 Tab 不渲染，挖掘任务 Tab 不受影响）
   const docsEnabled = isDocMiningEnabled();
+  // 「查看轨迹」抽屉（T-FM-07）：只读扫描，按行 task_id 拉取；只存行不存轨迹
+  const [trajectoryRow, setTrajectoryRow] = useState<MiningHistoryRow | null>(null);
   const [activeTab, setActiveTab] = useState<'tasks' | 'docs'>('tasks');
   const [docsRefreshSeq, setDocsRefreshSeq] = useState(0);
   const tabsShown = docsEnabled;
@@ -377,6 +438,15 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({
                         <div className="flex items-center justify-end gap-1.5">
                           <button
                             type="button"
+                            onClick={() => setTrajectoryRow(row)}
+                            title="查看这次挖掘的决策轨迹（各环节耗时与因子结局，只读）"
+                            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-600 hover:border-blue-300 hover:text-blue-600 cursor-pointer"
+                          >
+                            <GitBranch className="h-3 w-3" />
+                            查看轨迹
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => onViewResults?.(row)}
                             disabled={!canView || !onViewResults}
                             title={canView ? '在因子库中查看该任务的产出' : '该任务没有已落库因子'}
@@ -426,6 +496,50 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({
             </button>
           </div>
         </div>
+        </div>
+      )}
+
+      {/* 决策轨迹抽屉（T-FM-07，复用 TrajectoryView；只读，不换页不打断列表状态） */}
+      {trajectoryRow && (
+        <div
+          className="fixed inset-0 z-50 flex justify-end"
+          role="dialog"
+          aria-modal="true"
+          aria-label="任务决策轨迹"
+        >
+          <button
+            type="button"
+            aria-label="关闭轨迹"
+            className="absolute inset-0 bg-black/30 backdrop-blur-[1px]"
+            onClick={() => setTrajectoryRow(null)}
+          />
+          <aside className="relative z-10 flex h-full w-[520px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl">
+            <header className="flex items-start justify-between gap-2 border-b border-slate-100 px-4 py-3">
+              <div className="min-w-0">
+                <h3 className="m-0 truncate text-sm font-black text-slate-800">任务决策轨迹</h3>
+                <div className="mt-0.5 flex flex-wrap gap-x-3 text-[10px] text-slate-400">
+                  <span className="font-mono" title={trajectoryRow.task_id}>
+                    任务 {trajectoryRow.task_id.slice(0, 8)}
+                  </span>
+                  <span className="truncate" title={trajectoryRow.direction || undefined}>
+                    {trajectoryRow.direction || '—'}
+                  </span>
+                  <span>{marketLabel(trajectoryRow)}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTrajectoryRow(null)}
+                className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </header>
+            <div className="flex-1 overflow-y-auto px-4 py-3">
+              <TrajectoryView taskId={trajectoryRow.task_id} />
+            </div>
+          </aside>
         </div>
       )}
     </div>

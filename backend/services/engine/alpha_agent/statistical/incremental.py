@@ -235,6 +235,76 @@ def _sequential_residual(
     return res
 
 
+def residual_ic_ir(
+    values: pd.Series,
+    basis_values: pd.Series,
+    *,
+    basis_name: str,
+    fwd_ret: pd.Series | None,
+    sample_days: set[str] | None = None,
+    min_pairs: int = DEFAULT_MIN_PAIRS_PER_DAY,
+    min_sample_days: int = DEFAULT_MIN_SAMPLE_DAYS,
+    min_ic_days: int = DEFAULT_MIN_IC_DAYS,
+    min_names: int = DEFAULT_MIN_NAMES,
+) -> IncrementalResult:
+    """单基残差 IC_IR（T-FE-09）：对**指定父本**正交后的残差口径。
+
+    与 :func:`incremental_ic_ir` 是同一残差口径的两个视图，差别只有两点：
+
+    - **不做 |ρ|≥0.3 筛选**：变体台账记录的是「家族×窗口/变换」子变体对
+      父本的残差——父子（如 rev5×rev20）秩相关常 < 0.3，走增量闸口径会
+      判 ``no_basis`` 拿不到残差；这里**无条件**以传入的父本为基。
+    - ``max_basis_abs_corr`` 记**真实** ρ（可为 0~1 任意值）——绝不为了
+      复用筛选路径伪造 1.0 的审计字段。
+
+    ``fwd_ret`` **必传**（调用方持全交易日帧的预计算前向收益）：缺省/None
+    响亮拒绝（ValueError）——绝不回退到按 values 帧自己 shift（采样截断
+    陷阱的另一条静默入口）。
+
+    ``status``：``ok`` / ``insufficient_days`` / ``unavailable``（单基无
+    ``no_basis`` 概念；父本列全 NaN / 对域不足算不出 ρ → unavailable，
+    宁缺勿凑）。
+    """
+    if values is None or len(values) == 0 or basis_values is None:
+        return IncrementalResult("unavailable", None, None, 0, (), None)
+    if fwd_ret is None:
+        raise ValueError("residual_ic_ir 要求显式 fwd_ret（全交易日帧预计算）")
+    if len(fwd_ret) == 0:
+        return IncrementalResult("unavailable", None, None, 0, (), None)
+    days = set(sample_days) if sample_days is not None else None
+    controls = pd.DataFrame({str(basis_name): basis_values})
+    rho = mean_rho_by_column(
+        values,
+        controls,
+        sample_days=days,
+        min_pairs=min_pairs,
+        min_sample_days=min_sample_days,
+    )
+    # 算不出 ρ（父本全 NaN / 对域不足）→ 残差同样不可信：unavailable。
+    # 单基下不存在「无对照列」情形（基恒被传入），唯一诚实出口是「不可算」。
+    if str(basis_name) not in rho.index or not math.isfinite(
+        float(rho[str(basis_name)])
+    ):
+        return IncrementalResult("unavailable", None, None, 0, (), None)
+    abs_corr = abs(float(rho[str(basis_name)]))
+    basis = (str(basis_name),)
+    res = _sequential_residual(values, controls, days=days, min_pairs=min_pairs)
+    daily = ic_stats.daily_ic(res, fwd_ret, min_names=min_names)
+    summary = ic_stats.summarize_ic(daily, min_days=min_ic_days)
+    if summary is None or not math.isfinite(summary.icir):
+        return IncrementalResult(
+            "insufficient_days", None, None, int(len(daily)), basis, abs_corr
+        )
+    return IncrementalResult(
+        "ok",
+        abs(float(summary.icir)),
+        _finite_or_none(summary.rank_ic_mean),
+        int(summary.n_days),
+        basis,
+        abs_corr,
+    )
+
+
 def incremental_ic_ir(
     values: pd.Series,
     controls: pd.DataFrame,

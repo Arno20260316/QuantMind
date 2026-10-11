@@ -358,6 +358,134 @@ def test_empty_rho_stays_no_basis_and_below_threshold_stays_pass():
     assert below.ic_ir is None
 
 
+# ── 变体残差（T-FE-09 residual_ic_ir）：单基、不做 |ρ| 阈值筛选 ─────────
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_below_screen_threshold_still_computes():
+    """家族父子（ρ<0.3）在增量闸口径下判 no_basis，但变体台账要的正是
+    「对父本的残差」——必须照算，且 max_basis_abs_corr 记**真实** ρ。"""
+    days, idx, close, noise1, _noise2, alpha = _panel()
+    controls = _controls(idx, close, noise1=noise1)
+    # 与 noise1 低相关（<0.3，过不了增量闸筛选）但含独立信号
+    values = alpha + 0.1 * noise1
+    rho = inc.mean_rho_by_column(values, controls, sample_days=set(days))
+    assert abs(rho["noise1"]) < 0.3, "前提：ρ 低于筛选线"
+
+    via_screen = inc.incremental_ic_ir(values, controls, sample_days=set(days))
+    single = inc.residual_ic_ir(
+        values,
+        noise1,
+        basis_name="noise1",
+        fwd_ret=inc.forward_return_series(controls),
+        sample_days=set(days),
+    )
+
+    assert via_screen.status == "no_basis", "前提：增量闸口径看不到这条基"
+    assert single.status == "ok"
+    assert single.ic_ir is not None and single.ic_ir > 0.3
+    assert single.basis == ("noise1",)
+    assert single.max_basis_abs_corr == pytest.approx(abs(rho["noise1"]), abs=1e-9)
+    assert 0 < single.max_basis_abs_corr < 0.3, "记真实 ρ，绝不伪造 1.0"
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_matches_incremental_when_rho_above_threshold():
+    """ρ≥0.3 且单基时，两条入口必须逐位同源（同一残差口径的两个视图）。"""
+    days, idx, close, _noise1, noise2, alpha = _panel()
+    controls = _controls(idx, close, noise2=noise2)
+    values = alpha + 0.5 * noise2
+    fwd = inc.forward_return_series(controls)
+
+    via_inc = inc.incremental_ic_ir(values, controls, sample_days=set(days))
+    single = inc.residual_ic_ir(
+        values, noise2, basis_name="noise2", fwd_ret=fwd, sample_days=set(days)
+    )
+
+    assert via_inc.status == single.status == "ok"
+    assert single.basis == via_inc.basis == ("noise2",)
+    assert single.ic_ir == pytest.approx(via_inc.ic_ir, rel=1e-12)
+    assert single.ic_mean == pytest.approx(via_inc.ic_mean, rel=1e-12)
+    assert single.n_days == via_inc.n_days
+    assert single.max_basis_abs_corr == pytest.approx(
+        via_inc.max_basis_abs_corr, rel=1e-12
+    )
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_requires_fwd_ret():
+    """fwd_ret 必须由调用方显式给出（全交易日帧）——缺省/None 响亮拒绝，
+    绝不回退到按 values 帧自己 shift（采样截断陷阱的另一条入口）。"""
+    days, idx, _close, noise1, _noise2, alpha = _panel()
+    with pytest.raises(ValueError, match="fwd_ret"):
+        inc.residual_ic_ir(
+            alpha, noise1, basis_name="noise1", fwd_ret=None, sample_days=set(days)
+        )
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_perfect_clone_is_insufficient_not_zero():
+    """与父本同秩（克隆）→ 残差恒 0 → 不可验证，绝不误报 IC_IR=0。"""
+    days, idx, _close, noise1, _noise2, _alpha = _panel()
+    controls = _controls(idx, _close, noise1=noise1)
+
+    res = inc.residual_ic_ir(
+        noise1 * 3.0 + 1.0,
+        noise1,
+        basis_name="noise1",
+        fwd_ret=inc.forward_return_series(controls),
+        sample_days=set(days),
+    )
+
+    assert res.status == "insufficient_days"
+    assert res.ic_ir is None
+    assert res.basis == ("noise1",)
+    assert res.max_basis_abs_corr == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_all_nan_basis_is_unavailable():
+    """父本列全 NaN（算不出 ρ）→ unavailable——不许冒充「无冗余」或数字。"""
+    days, idx, close, _noise1, _noise2, alpha = _panel()
+    controls = _controls(idx, close)
+
+    res = inc.residual_ic_ir(
+        alpha,
+        pd.Series(np.nan, index=idx),
+        basis_name="ghost",
+        fwd_ret=inc.forward_return_series(controls),
+        sample_days=set(days),
+    )
+
+    assert res.status == "unavailable"
+    assert res.ic_ir is None and res.n_basis == 0
+
+
+@pytest.mark.unit
+def test_residual_ic_ir_respects_sample_days_window():
+    """残差 IC 只在 sample_days 上取日（窗口径与主 IC 一致）。"""
+    days, idx, close, noise1, _noise2, alpha = _panel()
+    controls = _controls(idx, close, noise1=noise1)
+    fwd = inc.forward_return_series(controls)
+    values = alpha + 0.1 * noise1
+    half = set(days[: N_DAYS // 2])
+
+    full = inc.residual_ic_ir(
+        values, noise1, basis_name="noise1", fwd_ret=fwd, sample_days=set(days)
+    )
+    part = inc.residual_ic_ir(
+        values, noise1, basis_name="noise1", fwd_ret=fwd, sample_days=half
+    )
+
+    assert full.status == "ok" and part.status == "ok"
+    assert part.n_days <= full.n_days
+    # 不足 20 日 → insufficient_days（宁缺勿凑）
+    tiny = inc.residual_ic_ir(
+        values, noise1, basis_name="noise1", fwd_ret=fwd, sample_days=set(days[:10])
+    )
+    assert tiny.status == "insufficient_days"
+
+
 # ── 替换判据用的同窗 |rankIC| ──────────────────────────────────────────
 
 

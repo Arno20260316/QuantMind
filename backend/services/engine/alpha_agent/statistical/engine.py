@@ -58,10 +58,12 @@ from . import composite as _composite
 from . import costs as _costs
 from . import dedup as _dedup
 from . import ic_stats as _ic
+from . import incremental as _inc
 from . import neutralize as _nz
 from . import panel as _panel
 from . import stability as _stab
 from . import tradability as _td
+from . import variant_ledger as _var
 
 #: 样本外最低 RankIC 保留比例（OOS/IS），低于即判「衰减过大」
 DEFAULT_OOS_MIN_RATIO = 0.3
@@ -216,6 +218,11 @@ class CandidateReport:
     ic_net_mean: float = float("nan")  # 扣费净 RankIC 均值（成本率单源）
     ic_net_days: int = 0
     regime_ic: tuple[RegimeStat, ...] = ()  # 分状态 IC（月标签 join；()=无时间线）
+    # ── T-FE-09 变体残差（编辑模因台账的引擎侧出口；根/无母本键为 None/()）──
+    variant_of: str | None = None  # 父本（基线）key；None = 根或池内无母本
+    #: 逐周期残差观测（``incremental.residual_ic_ir`` 结果 + horizon 键）；
+    #: 父本本轮被冷却时逐周期记 status=no_baseline_in_run（不判，绝不冒充）
+    variant_residual: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -280,6 +287,9 @@ class MiningResult:
     dedup: _dedup.DedupReport | None = None
     #: Tier 3：IC 加权合成因子报告（未启用/分量 < 2/退化 → None）
     composite: CompositeReport | None = None
+    #: T-FE-09：本轮因变体台账冷却名单被**实际跳过**的候选键（审计留痕；
+    #: 被评集缩小 → BH-FDR 的 m 随之缩减，是预期行为，报告必须可见）
+    cooled_keys: tuple[str, ...] = ()
 
 
 # ── 内部工具 ─────────────────────────────────────────────────────────
@@ -400,6 +410,7 @@ def run_statistical_mining(
     universe: str = "all_a",
     progress: Callable[[str, str], None] | None = None,
     regime_by_month: Mapping[str, str] | None = None,
+    cooled_keys: frozenset[str] = frozenset(),
 ) -> MiningResult:
     """跑一轮统计派挖掘（``price_panel``/``metadata`` 可注入：离线测试全链路）。
 
@@ -414,6 +425,11 @@ def run_statistical_mining(
     只影响报告的「分市场状态 IC」列；不给（None）该列留空，其余证据照算——
     拿不到 regime 数据不牵连其它列。月标签是**整月多数票**，月内换档的月份
     含前视（样本内展示口径，见 ``RegimeStat`` 口径警示）。
+
+    ``cooled_keys``（T-FE-09）：变体台账冷却名单（本池生效的变体键）——这些
+    候选**本轮不评估**（减少多重检验数 m 是预期行为，被实际跳过的键随
+    ``MiningResult.cooled_keys`` 返回留痕）；其子变体本轮不判残差（逐周期
+    记 ``no_baseline_in_run``）。默认空集 → 现网口径零变化。
     """
     cfg = cfg or StatisticalConfig()
     emit = progress or (lambda _stage, _detail: None)
@@ -484,20 +500,60 @@ def run_statistical_mining(
     emit("data", f"前向收益（周期 {cfg.horizons}）")
     fwd = {h: _ic.forward_returns(panel, h) for h in cfg.horizons}
 
-    emit("evaluate", f"逐候选计算 + 多周期 IC（{len(_candidates.CANDIDATES)} 个）")
+    active = tuple(c for c in _candidates.CANDIDATES if c.key not in cooled_keys)
+    active_keys = {c.key for c in active}
+    cooled_applied = tuple(
+        c.key for c in _candidates.CANDIDATES if c.key in cooled_keys
+    )
+    emit(
+        "evaluate",
+        f"逐候选计算 + 多周期 IC（{len(active)} 个"
+        + (f"，变体台账冷却减免 {len(cooled_applied)}" if cooled_applied else "")
+        + "）",
+    )
+    if cooled_applied:
+        emit("evaluate", f"冷却名单（本轮不评估）：{'、'.join(cooled_applied)}")
     horizon_stats: dict[str, list[HorizonStats]] = {}
     oos_stats: dict[str, HorizonStats | None] = {}
     #: (候选, 周期) → 挖掘窗逐日 IC 序列——Tier 3 的折/再选择/相关性都从
     #: 这份「已算出的逐日原始证据」出发，不再重算 IC（内存 = 每格三列小数）
     daily_is: dict[tuple[str, int], pd.DataFrame] = {}
-    nz_report: _nz.NeutralizeReport | None = None
-    for candidate in _candidates.CANDIDATES:
+    by_key = {c.key: c for c in active}
+    # 评估顺序：注册序 + 父本先于子变体（残差需要父本序列在场，T-FE-09）。
+    # 现网注册表里子总跟在父后，序列恒等于注册序——BLOCK 不变量不破。
+    remaining = set(by_key)
+    sequence: list[str] = []
+    while remaining:
+        for c in _candidates.CANDIDATES:
+            if c.key not in remaining:
+                continue
+            base = _var.BASELINE_BY_KEY.get(c.key)
+            if base is None or base not in remaining:
+                sequence.append(c.key)
+                remaining.discard(c.key)
+                break
+        else:  # 父链成环（映射测试先拦）——防御性直取，绝不空转
+            key = next(iter(remaining))
+            sequence.append(key)
+            remaining.discard(key)
+    # 需要保留到子变体算完残差的父本序列（内存纪律：子算完即弃，峰值≈链深）
+    pending_children: dict[str, int] = {}
+    for c in active:
+        base = _var.BASELINE_BY_KEY.get(c.key)
+        if base is not None and base in active_keys:
+            pending_children[base] = pending_children.get(base, 0) + 1
+    is_days = set(panel.index.get_level_values(0)[in_is])
+    held: dict[str, pd.Series] = {}
+    order_idx = {c.key: i for i, c in enumerate(_candidates.CANDIDATES)}
+    nz_by_order: dict[int, _nz.NeutralizeReport] = {}
+    variant_residual_by_key: dict[str, tuple[dict, ...]] = {}
+    for key in sequence:
+        candidate = by_key[key]
         factor, candidate_nz = _compute_factor(
             candidate, panel, trad_mask, position, neutralize, industry, size
         )
-        nz_report = (
-            candidate_nz if candidate_nz is not None else nz_report
-        )  # 形状报告取最后非空
+        if candidate_nz is not None:
+            nz_by_order[order_idx[key]] = candidate_nz  # 形状报告取注册序最后非空
         stats = []
         for h in cfg.horizons:
             daily = _ic.daily_ic(
@@ -522,6 +578,49 @@ def run_statistical_mining(
                     min_days=cfg.oos_min_days,
                 ),
             )
+        # ── T-FE-09 变体残差：对父本正交，与主 IC 同窗同池同管线 ──────
+        base_key = _var.BASELINE_BY_KEY.get(candidate.key)
+        if base_key is not None:
+            parent_series = held.get(base_key)
+            if base_key not in active_keys:
+                # 父本本轮被冷却：不判残差（绝不拿旧值顶替），逐周期如实记录
+                variant_residual_by_key[key] = tuple(
+                    {
+                        "horizon": h,
+                        "status": "no_baseline_in_run",
+                        "ic_ir": None,
+                        "ic_mean": None,
+                        "n_days": 0,
+                        "basis": [],
+                        "n_basis": 0,
+                        "max_basis_abs_corr": None,
+                    }
+                    for h in cfg.horizons
+                )
+            elif parent_series is not None:
+                entries = []
+                for h in cfg.horizons:
+                    res = _inc.residual_ic_ir(
+                        factor,
+                        parent_series,
+                        basis_name=base_key,
+                        fwd_ret=fwd[h],
+                        sample_days=is_days,
+                        min_names=cfg.min_names_per_day,
+                        min_ic_days=cfg.min_valid_days,
+                    )
+                    entries.append({"horizon": h, **res.to_dict()})
+                variant_residual_by_key[key] = tuple(entries)
+        # 内存纪律：本序列留给子变体的暂存 / 父本用毕即弃
+        if pending_children.get(key):
+            held[key] = factor
+        if base_key is not None and base_key in pending_children:
+            pending_children[base_key] -= 1
+            if pending_children[base_key] <= 0:
+                held.pop(base_key, None)
+    nz_report: _nz.NeutralizeReport | None = (
+        nz_by_order[max(nz_by_order)] if nz_by_order else None
+    )
 
     if cfg.require_fdr:
         emit("select", "多重检验修正（BH-FDR，跨 候选×周期）")
@@ -535,7 +634,7 @@ def run_statistical_mining(
             f"滚动再选择审计，逐检查点重排 Top-{cfg.top_k}）",
         )
         rank_series: dict[str, pd.Series] = {}
-        for candidate in _candidates.CANDIDATES:
+        for candidate in active:
             best = _best_horizon(horizon_stats[candidate.key])
             if best is not None:
                 rank_series[candidate.key] = daily_is[(candidate.key, best.horizon)][
@@ -556,9 +655,10 @@ def run_statistical_mining(
 
     emit("select", "样本外一致性 + 选择分排序（Top-K 席位）")
     drafts: list[CandidateReport] = []
-    for candidate in _candidates.CANDIDATES:
+    for candidate in active:
         stats = horizon_stats[candidate.key]
         best = _best_horizon(stats)
+        variant_of = _var.BASELINE_BY_KEY.get(candidate.key)
         # T-FE-05：结构复杂度从表达式字符串计入（口径单源 complexity.py）；
         # 简单性因子只乘进选择分（排序偏好），不进任何闸
         cx = _cplx.expression_complexity(candidate.expression)
@@ -629,6 +729,8 @@ def run_statistical_mining(
                 reselect_checkpoints=stability.reselect_checkpoints if stability else 0,
                 ic_half_life=half_life,
                 ic_decay_slope=decay,
+                variant_of=variant_of,
+                variant_residual=variant_residual_by_key.get(candidate.key, ()),
             )
         )
     ranked_keys = _rank_eligible(drafts)
@@ -800,6 +902,7 @@ def run_statistical_mining(
         n_symbols=int(panel.index.get_level_values(1).nunique()),
         dedup=dedup_report,
         composite=composite_report,
+        cooled_keys=cooled_applied,
     )
 
 

@@ -19,6 +19,7 @@ import { Badge } from '../components-v2/ui/Badge';
 import { ComboLabTab } from '../components-v2/ComboLabTab';
 import { FactorPoolGraph } from '../components-v2/FactorPoolGraph';
 import { PoolCleanupTab } from '../components-v2/PoolCleanupTab';
+import { VariantLedgerTab } from '../components-v2/VariantLedgerTab';
 import { MISSING_METRIC_TEXT } from '../services-v2/metricRegistry';
 import { alphaAgentService } from '../services/alphaAgentService';
 import {
@@ -46,6 +47,7 @@ import {
   ChevronRight,
   Eye,
   FlaskConical,
+  History,
   LayoutGrid,
   Network,
   Play,
@@ -56,13 +58,14 @@ import {
   X,
 } from 'lucide-react';
 
-type PoolTab = 'overview' | 'factors' | 'graph' | 'gates' | 'cleanup' | 'combo';
+type PoolTab = 'overview' | 'factors' | 'graph' | 'gates' | 'variant-ledger' | 'cleanup' | 'combo';
 
 const TAB_ITEMS: { id: PoolTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'overview', label: '池总览', icon: LayoutGrid },
   { id: 'factors', label: '池因子', icon: Table2 },
   { id: 'graph', label: '谱系图', icon: Network },
   { id: 'gates', label: '门禁状态', icon: ShieldCheck },
+  { id: 'variant-ledger', label: '变体台账', icon: History },
   { id: 'cleanup', label: '清理建议', icon: Archive },
   { id: 'combo', label: '组合实验室', icon: FlaskConical },
 ];
@@ -1050,6 +1053,9 @@ export const FactorPoolPage: React.FC = () => {
           </Card>
         </div>
       )}
+
+      {/* ── 变体台账（T-FE-09）：残差证据与冷却态；作用域随页头市场/股票池 ── */}
+      {tab === 'variant-ledger' && <VariantLedgerTab market={market} universe={universe} />}
 
       {/* ── 清理建议（P3）：只建议不自动删；归档 ≠ 删除 ── */}
       {tab === 'cleanup' && <PoolCleanupTab market={market} universe={universe} />}

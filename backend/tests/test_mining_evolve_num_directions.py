@@ -10,6 +10,10 @@
 3. **selected 不抽样**：按序取前 N，meta=NULL——没抽签就没有抽签凭证。
 4. **一条不拖垮整批**：QueueFullError/意外异常 → 该条目 failed，其余照派。
 5. **请求级问题整包 400**：任一命中方向超长，一条都不派（与 /mining/batch 同纪律）。
+6. **quota 模式（T-FE-10）**：多/单两条路径都经 ``direction_quota.allocate``
+   取样、meta 原样落档（可重放）、mode 记 ``quota``；allocate 整体失败 →
+   普通随机兜底（fail-open，绝不拦派发）；未识别模式串归一为 selected；
+   统计派 + 方向文本的 400 闸在配额之前（quota 不能搭方向通道进统计派）。
 
 纪律：计数用假 store 注入——本文件是纯路由单测，不碰真库（asyncpg 池按 loop
 绑定，单测里开的池会毒化后续真库用例的探活，表现为静默 skip）。
@@ -57,7 +61,9 @@ class FakeLauncher:
         if outcome is not None:
             return outcome
         return SimpleNamespace(
-            task_id=f"t{idx}", status="running", queue_position=None,
+            task_id=f"t{idx}",
+            status="running",
+            queue_position=None,
             deduplicated=False,
         )
 
@@ -365,3 +371,161 @@ async def test_sampler_failure_falls_back_to_plain_sample(monkeypatch) -> None:
     assert len(data["items"]) == 2 and data["failed"] == 0
     assert all(it["direction_meta"] is None for it in data["items"])
     assert len({it["direction"] for it in data["items"]}) == 2
+
+
+# ── T-FE-10：quota 模式路由接线 ─────────────────────────────────────────
+
+
+def _quota_meta(direction: str, tier: str) -> dict:
+    """最小可重放 meta（键与 direction_quota._allocate_pure 同构）。"""
+    return {
+        "mode": "quota",
+        "tier": tier,
+        "weighting": "proxy_score",
+        "seed": 20261012,
+        "picked": direction,
+        "candidates": [
+            {"direction": direction, "score": 0.75, "weight": 1.0},
+            {"direction": "备选", "score": 0.125, "weight": 0.0},
+        ],
+        "scores_snapshot": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_quota_multi_dispatch_writes_replayable_meta_and_mode(
+    monkeypatch,
+) -> None:
+    """quota N=2：allocate 逐槽出 (direction, meta)，meta 原样落档、mode 记 quota。"""
+    launcher = FakeLauncher()
+    _calls, _store = _wire(monkeypatch, launcher)
+    seen: list[dict] = []
+
+    async def fake_allocate(dirs, n, *, user_id, market):
+        seen.append({"dirs": list(dirs), "n": n, "user_id": user_id, "market": market})
+        return [("方向B", _quota_meta("方向B", "explore")), ("方向A", None)]
+
+    monkeypatch.setattr(router_mod.direction_quota, "allocate", fake_allocate)
+
+    out = await _call(
+        directions=["方向A", "方向B", "方向C"],
+        direction_mode="quota",
+        num_directions=2,
+    )
+
+    assert seen == [
+        {
+            "dirs": ["方向A", "方向B", "方向C"],
+            "n": 2,
+            "user_id": "u-1",
+            "market": "a_share",
+        }
+    ], "候选集/名额/本用户×本市场 真到 allocate"
+    data = out["data"]
+    assert [it["direction"] for it in data["items"]] == ["方向B", "方向A"]
+    assert data["direction_mode"] == "quota"
+    meta = json.loads(data["items"][0]["direction_meta"])
+    assert meta["tier"] == "explore" and meta["mode"] == "quota"
+    assert _replay(meta) == meta["picked"], "meta 过路由仍可独立重放"
+    assert data["items"][1]["direction_meta"] is None, "meta=None 不得伪造凭证"
+    assert [c["direction_mode"] for c in launcher.calls] == ["quota", "quota"]
+    assert [c["direction"] for c in launcher.calls] == ["方向B", "方向A"]
+    assert launcher.calls[0]["direction_meta"] == data["items"][0]["direction_meta"]
+
+
+@pytest.mark.asyncio
+async def test_quota_single_path_samples_one_through_allocate(monkeypatch) -> None:
+    """单条路径 quota：allocate(n=1)，抽中方向与 meta 落 start_evolution。"""
+    launcher = FakeLauncher()
+    _calls, _store = _wire(monkeypatch, launcher)
+    seen: list[dict] = []
+
+    async def fake_allocate(dirs, n, *, user_id, market):
+        seen.append({"dirs": list(dirs), "n": n})
+        return [("方向B", _quota_meta("方向B", "exploit"))]
+
+    monkeypatch.setattr(router_mod.direction_quota, "allocate", fake_allocate)
+
+    await _call(directions=["方向A", "方向B"], direction_mode="quota")
+
+    assert seen == [{"dirs": ["方向A", "方向B"], "n": 1}]
+    assert launcher.calls == [], "单条路径不走并行派发环"
+    sent = launcher.evolve_calls[0]
+    assert sent["direction"] == "方向B"
+    assert sent["direction_mode"] == "quota"
+    assert json.loads(sent["direction_meta"])["tier"] == "exploit"
+
+
+@pytest.mark.asyncio
+async def test_quota_allocate_failure_falls_back_plain(monkeypatch) -> None:
+    """allocate 整体炸了：退普通不放回随机 + meta NULL，绝不拦派发。"""
+    launcher = FakeLauncher()
+    _calls, _store = _wire(monkeypatch, launcher)
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("quota exploded")
+
+    monkeypatch.setattr(router_mod.direction_quota, "allocate", _boom)
+
+    out = await _call(
+        directions=["方向一", "方向二", "方向三"],
+        direction_mode="quota",
+        num_directions=2,
+    )
+
+    data = out["data"]
+    assert len(data["items"]) == 2 and data["failed"] == 0
+    assert all(it["direction_meta"] is None for it in data["items"])
+    assert len({it["direction"] for it in data["items"]}) == 2
+    assert data["direction_mode"] == "quota", "兜底不改用户选的模式记录"
+
+
+@pytest.mark.asyncio
+async def test_unknown_direction_mode_normalizes_to_selected(monkeypatch) -> None:
+    """未识别模式串（含大小写变体）：归一为 selected——不抽样、不读史。"""
+    launcher = FakeLauncher()
+    _calls, store = _wire(monkeypatch, launcher)
+    called: list[int] = []
+
+    async def fake_allocate(*a, **kw):
+        called.append(1)
+        return []
+
+    monkeypatch.setattr(router_mod.direction_quota, "allocate", fake_allocate)
+
+    out = await _call(
+        directions=["方向一", "方向二"], direction_mode="QUOTA", num_directions=2
+    )
+
+    assert [it["direction"] for it in out["data"]["items"]] == ["方向一", "方向二"]
+    assert all(it["direction_meta"] is None for it in out["data"]["items"])
+    assert [c["direction_mode"] for c in launcher.calls] == ["selected", "selected"]
+    assert called == [] and store.scopes == [], "未识别模式不得触发配额取样"
+
+
+@pytest.mark.asyncio
+async def test_quota_cannot_ride_direction_channel_into_statistical(
+    monkeypatch,
+) -> None:
+    """统计派 + 方向文本：400 闸在配额之前，allocate 一次都不调。"""
+    launcher = FakeLauncher()
+    _calls, _store = _wire(monkeypatch, launcher)
+    called: list[int] = []
+
+    async def fake_allocate(*a, **kw):
+        called.append(1)
+        return []
+
+    monkeypatch.setattr(router_mod.direction_quota, "allocate", fake_allocate)
+
+    with pytest.raises(HTTPException) as ei:
+        await _call(
+            algorithm="statistical",
+            directions=["类别方向"],
+            direction_mode="quota",
+        )
+
+    assert ei.value.status_code == 400
+    assert "不消费方向文本" in ei.value.detail
+    assert called == []
+    assert launcher.calls == [] and launcher.evolve_calls == []

@@ -13,6 +13,11 @@
 - **进度**：``$LOG_DIR/progress.jsonl`` 每事件**追加**一行 JSON（阶段/说明/时刻）
   ——launcher 轮询读末行做实时进度、全量行做时间线（覆盖写会丢历史，进度面板
   只剩最后一个阶段）。阶段 key 与 manifest ``stages`` 一一对应。
+- **变体台账（T-FE-09）**：开跑前读 ``variant_ledger.json`` 冷却名单传给引擎
+  （``--no-cooling`` 绕过读名单，观测照记）；收尾把本次子变体对父本的残差
+  观测并入台账并执行非对称否决（flock 读-改-写、原子换体）。台账环节失败
+  **只留痕不拦收尾**：``mining_report.json`` 的 ``variant_ledger`` 块记
+  ``cooled_applied / observations_written / cooling_updates``，失败记 ``error``。
 
 不做的事（都要写在明面上）：
 
@@ -43,6 +48,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -503,6 +509,66 @@ def _spawn_validation_and_write_result(
     return validation_spawned
 
 
+# ── 变体台账（T-FE-09）───────────────────────────────────────────────
+
+
+def _update_variant_ledger(
+    result,
+    *,
+    universe: str,
+    run_id: str,
+    cooled_applied: Sequence[str] = (),
+    ledger_path: Path | None = None,
+) -> dict:
+    """收尾：本 run 的子变体残差观测并入台账 + 非对称否决；返回报告块。
+
+    只有**有父本的子变体**（``variant_of`` 非空）入账——残差是引擎在环内
+    同窗同池同管线算好的，这里原样搬运，不重算。写失败**不拦收尾**：台账
+    是审计面，挖掘主链（落库/验证）已完成，失败如实记进 ``error`` 块。
+    零观测（全被冷却/无子变体）不触台账文件。
+    """
+    from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+        variant_ledger as vl,
+    )
+
+    path = Path(ledger_path) if ledger_path is not None else vl.default_ledger_path()
+    block: dict = {
+        "schema_version": vl.LEDGER_SCHEMA_VERSION,
+        "ledger_path": str(path),
+        "cooled_applied": sorted(str(k) for k in cooled_applied),
+        "observations_written": 0,
+        "cooling_updates": [],
+    }
+    window = dict(result.window or {})
+    try:
+        observations = [
+            vl.make_observation(
+                variant_key=report.key,
+                universe=result.universe or universe,
+                window_start=window.get("mining_start") or "",
+                window_end=window.get("mining_end") or "",
+                run_id=run_id,
+                horizons=report.variant_residual or (),
+                best_horizon=report.best_horizon,
+            )
+            for report in result.candidates
+            if getattr(report, "variant_of", None) is not None
+        ]
+        if not observations:
+            return block
+        with vl.ledger_lock(path):
+            ledger = vl.load_ledger(path)
+            ledger = vl.upsert_observations(ledger, observations)
+            ledger, updates = vl.decide_cooling(ledger)
+            vl.save_ledger(path, ledger)
+        block["observations_written"] = len(observations)
+        block["cooling_updates"] = updates
+    except Exception as exc:  # noqa: BLE001 - 台账失败绝不拦收尾
+        logger.warning("变体台账更新失败（不拦收尾）：%s", exc, exc_info=True)
+        block["error"] = str(exc)[:200]
+    return block
+
+
 # ── 主流程 ───────────────────────────────────────────────────────────
 
 
@@ -514,6 +580,11 @@ def main() -> None:
     parser.add_argument("--universe", default="all_a")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--log-dir", default="")
+    parser.add_argument(
+        "--no-cooling",
+        action="store_true",
+        help="本轮忽略变体台账冷却名单（观测照记，仍参与冷却判定）",
+    )
     args = parser.parse_args()
 
     log_dir = Path(
@@ -539,6 +610,9 @@ def main() -> None:
     )
     from backend.services.engine.alpha_agent.statistical import engine as eng  # noqa: PLC0415
     from backend.services.engine.alpha_agent.statistical import serialize as ser  # noqa: PLC0415
+    from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+        variant_ledger as vl,
+    )
 
     # P3 指纹（launcher 注入）：决定落库因子 id 的身份口径；空 = 任务级兜底
     task_fingerprint = task_fingerprint_from_env()
@@ -578,6 +652,27 @@ def main() -> None:
         except OSError as exc:  # noqa: BLE001 - 进度面不是主链
             logger.warning("进度写入失败：%s", exc)
 
+    # T-FE-09：变体台账冷却名单（前置读取；只读不加锁——save 走原子换体，
+    # 读者永不见半截 JSON）。读失败 = 本轮无冷却，不拦开跑。
+    ledger_path = vl.default_ledger_path()
+    cooled_keys: frozenset[str] = frozenset()
+    if args.no_cooling:
+        logger.info("--no-cooling：本轮忽略台账冷却名单（观测照记）")
+    else:
+        try:
+            cooled_keys = vl.active_cooled_keys(
+                vl.load_ledger(ledger_path), universe=args.universe
+            )
+        except Exception as exc:  # noqa: BLE001 - 读失败不拦开跑
+            logger.warning("变体台账读取失败（本轮无冷却）：%s", exc)
+    if cooled_keys:
+        logger.info(
+            "冷却名单（%s，%d 键）：%s",
+            args.universe,
+            len(cooled_keys),
+            "、".join(sorted(cooled_keys)),
+        )
+
     # T-FE-03：regime 月状态（取不到 → None，报告少一列不拖垮主链；
     # regime_source 是降级/就绪的可追溯痕迹，落进审计报告）
     regime_by_month, regime_source = _load_regime_by_month()
@@ -593,6 +688,7 @@ def main() -> None:
             universe=args.universe,
             progress=emit,
             regime_by_month=regime_by_month,
+            cooled_keys=cooled_keys,
         )
     except Exception as exc:  # noqa: BLE001 - 子进程出口：日志 + 非零码
         logger.exception("统计量价挖掘失败：%s", exc)
@@ -602,6 +698,25 @@ def main() -> None:
     audit = ser.result_to_dict(result)
     audit["window_kind"] = window_kind
     audit["regime_source"] = regime_source
+    # T-FE-09：子变体残差观测并入台账 + 非对称否决（失败只留痕，不拦收尾；
+    # 名单实际生效集以引擎回传的 result.cooled_keys 为准）
+    audit["variant_ledger"] = _update_variant_ledger(
+        result,
+        universe=args.universe,
+        run_id=args.task_id,
+        cooled_applied=result.cooled_keys,
+        ledger_path=ledger_path,
+    )
+    ledger_block = audit["variant_ledger"]
+    if ledger_block.get("error"):
+        logger.warning("变体台账未更新：%s", ledger_block["error"])
+    else:
+        logger.info(
+            "变体台账（%s）：观测 %d 条入账，冷却动作 %d 次",
+            ledger_path,
+            ledger_block["observations_written"],
+            len(ledger_block["cooling_updates"]),
+        )
     # 落盘也用 json_safe：裸 NaN 是 Python 方言，JSON.parse / Postgres 都不认
     (log_dir / "mining_report.json").write_text(
         json.dumps(ser.json_safe(audit), ensure_ascii=False, indent=2), encoding="utf-8"

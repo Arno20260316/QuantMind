@@ -611,8 +611,13 @@ class AlphaAgentLauncher:
             algorithm, market=market, freq=freq, datasets=list(datasets or [])
         )
         cfg = normalize_mining_config(
-            mining_start, mining_end, valid_start, valid_end, datasets,
-            freq=freq, market=market,
+            mining_start,
+            mining_end,
+            valid_start,
+            valid_end,
+            datasets,
+            freq=freq,
+            market=market,
         )
         params = _fingerprint_params(
             algo_key=algo.key,
@@ -746,8 +751,13 @@ class AlphaAgentLauncher:
             algorithm, market=market, freq=freq, datasets=list(datasets or [])
         )
         cfg = normalize_mining_config(
-            mining_start, mining_end, valid_start, valid_end, datasets,
-            freq=freq, market=market,
+            mining_start,
+            mining_end,
+            valid_start,
+            valid_end,
+            datasets,
+            freq=freq,
+            market=market,
         )
         params = _fingerprint_params(
             algo_key=algo.key,
@@ -1489,6 +1499,7 @@ class AlphaAgentLauncher:
         # 绝不拦住一次挖矿。只对消费提示词的算法（uses_llm）注入：往统计派
         # 的日志目录写一份没人读的提示词文件，只会污染审计面。
         injection = None
+        experience_path = None
         if algo.uses_llm:
             from backend.services.engine.mining_plugins import pool_service
 
@@ -1496,6 +1507,18 @@ class AlphaAgentLauncher:
                 user_id=task.user_id,
                 market=task.market,
                 universe=task.universe,
+                task_id=task.task_id,
+                log_dir=task_log_dir,
+            )
+
+            # T-FM-04 经验记忆/禁区注入：与池注入同一单通道纪律（只写提示词
+            # 文件，零运行时副作用）。纯派生层、任何失败返回 None 且只告警，
+            # 绝不拦住一次挖矿；落盘文件本身即注入内容的审计凭证。
+            from backend.services.engine.alpha_agent import experience_memory
+
+            experience_path = await experience_memory.prepare_injection(
+                user_id=task.user_id,
+                market=task.market,
                 task_id=task.task_id,
                 log_dir=task_log_dir,
             )
@@ -1525,7 +1548,9 @@ class AlphaAgentLauncher:
         # 知识库、用户级 Key/向量检索覆盖、提示词池上下文。统计派子进程根本不
         # 读它们——把用户 API Key 注入一个不消费 LLM 的进程是白扩凭据暴露面。
         if algo.uses_llm:
-            openai_base = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or ""
+            openai_base = (
+                os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or ""
+            )
             openai_api_key = (
                 os.getenv("AI_IDE_LLM_API_KEY")
                 or os.getenv("AI_IDE_API_KEY")
@@ -1559,6 +1584,9 @@ class AlphaAgentLauncher:
             if injection is not None and injection.path is not None:
                 # rd_loop_wrapper._build_prompt_suffix 读这个文件追加「历史挖掘记忆」段
                 env["QMF_POOL_CONTEXT_PATH"] = str(injection.path)
+            if experience_path is not None:
+                # rd_loop_wrapper._experience_context_block 读这个文件追加「经验记忆」段
+                env["QMF_EXPERIENCE_CONTEXT_PATH"] = str(experience_path)
 
             # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
             if llm_overrides:

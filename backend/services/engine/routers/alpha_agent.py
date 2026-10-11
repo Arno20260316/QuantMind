@@ -23,7 +23,7 @@ import httpx
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from backend.services.engine.alpha_agent import profile_gateway
+from backend.services.engine.alpha_agent import direction_quota, profile_gateway
 from backend.services.engine.alpha_agent.algorithm_registry import (
     DEFAULT_ALGORITHM_KEY,
     AlgorithmError,
@@ -635,6 +635,43 @@ async def _resolve_multi_picks(
         ]
 
 
+def _sampling_record_mode(direction_mode: str | None) -> str:
+    """方向抽样模式归一（T-FE-10 三值）：random/quota 原样，其余（含空/脏值）→ selected。"""
+    return direction_mode if direction_mode in ("random", "quota") else "selected"
+
+
+async def _resolve_quota_picks(
+    clean_dirs: list[str],
+    num_directions: int,
+    *,
+    user_id: str,
+    market: str,
+) -> list[tuple[str, str | None]]:
+    """方向配额（T-FE-10）：三档预算抽 N 条，返回 ``(direction, meta_json)``。
+
+    ``direction_quota.allocate`` 内部已有两层兜底（输入读失败 → random 空白度
+    加权 + ``quota_fallback`` 标注；N ≥ 候选数 → 全集直派 meta=None）——这里
+    再兜一层 last-resort（与 ``_resolve_multi_picks`` 同纪律）：抽样证据绝不
+    拦任务创建。
+    """
+    try:
+        pairs = await direction_quota.allocate(
+            clean_dirs, num_directions, user_id=user_id, market=market
+        )
+        return [
+            (d, json.dumps(meta, ensure_ascii=False) if meta else None)
+            for d, meta in pairs
+        ]
+    except Exception as e:  # noqa: BLE001 - 抽样证据不许拦任务创建
+        logger.warning("[alpha-agent] quota allocation failed, plain sample: %s", e)
+        import random as _random
+
+        return [
+            (d, None)
+            for d in _random.sample(clean_dirs, k=min(num_directions, len(clean_dirs)))
+        ]
+
+
 #: QuantDB 数据覆盖缓存时长（秒）。覆盖只随日更变化，按请求现读分区目录
 #: （2000+ 个 dt= 目录）没必要；TTL 内复用同一份 Window。
 _COVERAGE_TTL_S = 300.0
@@ -875,7 +912,11 @@ async def start_evolution(
         default=[], description="L1 因子类别方向列表（多选）"
     ),
     direction_mode: str = Query(
-        "selected", description="类别选择模式: selected=取第一条, random=随机一条"
+        "selected",
+        description=(
+            "类别选择模式: selected=取第一条, random=随机一条, "
+            "quota=方向配额（探索/利用/变异三档，T-FE-10）"
+        ),
     ),
     num_directions: int = Query(
         1, ge=1, le=10, description="并行方向数：类别路径一次派 N 条任务（T-MV-04）"
@@ -1077,14 +1118,22 @@ async def start_evolution(
     direction_meta_json: str | None = None
     picked_pairs: list[tuple[str, str | None]] = []
     if multi_dispatch:
-        record_mode = "random" if direction_mode == "random" else "selected"
-        picked_pairs = await _resolve_multi_picks(
-            clean_dirs,
-            num_directions,
-            record_mode,
-            user_id=auth_user_id,
-            market=market,
-        )
+        record_mode = _sampling_record_mode(direction_mode)
+        if record_mode == "quota":
+            picked_pairs = await _resolve_quota_picks(
+                clean_dirs,
+                num_directions,
+                user_id=auth_user_id,
+                market=market,
+            )
+        else:
+            picked_pairs = await _resolve_multi_picks(
+                clean_dirs,
+                num_directions,
+                record_mode,
+                user_id=auth_user_id,
+                market=market,
+            )
         # 请求级长度闸：一条超长整包 400（与 /mining/batch 同纪律——不半批派）
         for idx, (picked_dir, _meta) in enumerate(picked_pairs, start=1):
             if len(picked_dir) > MAX_SUBMIT_DIRECTION_CHARS:
@@ -1103,8 +1152,13 @@ async def start_evolution(
             [d for d, _ in picked_pairs],
         )
     elif clean_dirs:
-        record_mode = "random" if direction_mode == "random" else "selected"
-        if record_mode == "random":
+        record_mode = _sampling_record_mode(direction_mode)
+        if record_mode == "quota":
+            _quota_pairs = await _resolve_quota_picks(
+                clean_dirs, 1, user_id=auth_user_id, market=market
+            )
+            direction, direction_meta_json = _quota_pairs[0]
+        elif record_mode == "random":
             try:
                 direction, _sampling_meta = await sample_weighted_direction(
                     clean_dirs, user_id=auth_user_id, market=market
@@ -1644,6 +1698,41 @@ async def get_task_log(
     }
 
 
+@router.get("/tasks/{task_id}/trajectory")
+async def get_task_trajectory(task_id: str, request: Request):
+    """任务决策轨迹（T-FM-07，只读归档：五环节节点 + 因子结局 + 低奖励定位）。
+
+    组装于读时（零持久化）。任务行取 PG（重启不失忆；归属收口 = 他人任务
+    404，不泄露存在性）——与内存版 ``/tasks/{task_id}`` 的差异即在此：历史
+    任务在进程重启后仍可看轨迹。两类 404 detail 可区分：任务不存在 vs 任务
+    存在但日志目录缺失（日志被 GC / 宿主机直跑未留档）。运行中任务返回当前
+    已落目录（``partial:true``）。
+    """
+    auth_user_id, _ = get_authenticated_identity(request)
+    from backend.services.engine.alpha_agent import trajectory_store
+    from backend.services.engine.alpha_agent.task_store import (
+        get_mining_task_store,
+    )
+
+    task = await get_mining_task_store().get_task(task_id, user_id=auth_user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    try:
+        log_dir = trajectory_store.resolve_task_log_dir(task_id)
+    except ValueError as exc:
+        # 形状不合法的 task_id 不可能有归属行（上面已 404）——防御纵深，同一文案
+        raise HTTPException(
+            status_code=404, detail=f"Task {task_id} trajectory not found"
+        ) from exc
+    if not log_dir.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} trajectory not found (log dir missing)",
+        )
+    trajectory = await trajectory_store.load_trajectory(task=task, log_dir=log_dir)
+    return {"code": 200, "data": trajectory.to_dict()}
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,
@@ -1818,6 +1907,95 @@ async def list_factors(
             },
         },
     }
+
+
+@router.get("/variant-ledger")
+async def get_variant_ledger(
+    request: Request,
+    universe: str = Query(
+        "", max_length=128, description="按股票池过滤冷却（空=全量原样）"
+    ),
+):
+    """变体残差台账（T-FE-09）：32 骨架 ×（最新观测 + 冷却态），只读投影。
+
+    统计派 runner 收尾把子变体对父本的残差观测并入台账、按非对称否决维护
+    冷却名单；本端点只读该文件（口径单源 ``statistical/variant_ledger``）。
+    台账文件缺席（从未跑过统计派）返回空骨架 ``available=false``，不 404
+    ——「没跑过」不是接口错误；``universe`` 给了就过滤冷却并给出该池生效集。
+
+    共享语义（评审 2026-10-12）：台账是**平台级共享事实池**——因子库本身
+    共享，冷却名单是池级安全事实（谁跑统计派都要避让），故不按用户过滤；
+    投影层已脱敏 ``run_id``（security-F2），身份校验仍必须（401 面）。
+    """
+    # 只做鉴权（401 面）：返回值不参与过滤——本投影是全平台共享读面
+    get_authenticated_identity(request)
+
+    from backend.services.engine.alpha_agent.statistical import variant_ledger as vl
+
+    path = vl.default_ledger_path()
+    data = vl.ledger_view(
+        vl.load_ledger(path), universe=(universe or "").strip() or None
+    )
+    data["available"] = path.is_file()
+    return {"code": 200, "data": data}
+
+
+@router.get("/experience-memory")
+async def get_experience_memory(
+    request: Request,
+    market: str = Query(
+        "a_share", max_length=32, description="市场词汇（仓库现行口径，默认 a_share）"
+    ),
+):
+    """经验记忆/禁区（T-FM-04）：拒因聚类 + 饱和方向 + 方向任务史，读时组装。
+
+    与提示词注入**同源同一** ``build_memory``（口径单源
+    ``alpha_agent/experience_memory``）：数据源全部既有事实（任务史 /
+    rd_mined 物化清单 / T-FM-01 统计派报告 / rd_agent_factors 归因），
+    纯派生零持久化。口径 = 本用户 × 本市场；任何源缺席如实降级，
+    全空 → ``available=false``（不是接口错误，不 404）。
+    """
+    user_id, _ = get_authenticated_identity(request)
+
+    from backend.services.engine.alpha_agent import experience_memory
+
+    memory = await experience_memory.load_memory(user_id=str(user_id), market=market)
+    return {"code": 200, "data": memory.to_dict()}
+
+
+@router.get("/direction-quota")
+async def get_direction_quota(
+    request: Request,
+    market: str = Query(
+        "a_share", max_length=32, description="市场词汇（仓库现行口径，默认 a_share）"
+    ),
+    directions: list[str] = Query(
+        default=[],
+        description="候选方向词表（可重复；留空=只出全史打分表，无档位预演）",
+    ),
+    n: int = Query(
+        direction_quota.DEFAULT_PREVIEW_N,
+        ge=1,
+        le=10,
+        description="预演名额数（与 /evolve 的 num_directions 同口径）",
+    ),
+):
+    """方向配额预览（T-FE-10）：代理模型打分表 + 三档名额预演，只读投影。
+
+    与派发侧**同源同一** ``direction_quota``（口径单源）：成功率 =
+    经验贝叶斯平滑（Jeffreys 先验）+ 饱和惩罚（T-FM-04 的 90 天重复命中）。
+    零持久化；读取失败 → ``available=false`` + 稳定文案（不是接口错误，
+    不 5xx）；``n`` 上限与 /evolve 的 num_directions 同闸。
+    """
+    user_id, _ = get_authenticated_identity(request)
+
+    data = await direction_quota.preview(
+        user_id=str(user_id),
+        market=market,
+        directions=[d.strip() for d in directions if isinstance(d, str) and d.strip()],
+        n=n,
+    )
+    return {"code": 200, "data": data}
 
 
 class FactorMaterializeRequest(BaseModel):

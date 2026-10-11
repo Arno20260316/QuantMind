@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from backend.services.engine.alpha_agent import (
+    experience_memory as experience_memory_mod,
+)  # noqa: E402
 from backend.services.engine.alpha_agent import launcher as launcher_mod  # noqa: E402
 from backend.services.engine.alpha_agent.launcher import (  # noqa: E402
     AlphaAgentLauncher,
@@ -60,6 +63,41 @@ class TestWrapperPoolBlock:
         ctx.write_text("   \n")
         monkeypatch.setenv("QMF_POOL_CONTEXT_PATH", str(ctx))
         assert "历史挖掘记忆" not in self._wrapper()._build_prompt_suffix()
+
+
+class TestWrapperExperienceBlock:
+    """T-FM-04：经验记忆段读文件接线（无 env / 文件缺 / 空 → 段不存在）。"""
+
+    def _wrapper(self) -> RDLoopWrapper:
+        return RDLoopWrapper(market="a_share")
+
+    def test_no_env_no_experience_block(self, monkeypatch):
+        monkeypatch.delenv("QMF_EXPERIENCE_CONTEXT_PATH", raising=False)
+        suffix = self._wrapper()._build_prompt_suffix()
+        assert "语言要求" in suffix
+        assert "经验记忆 / Experience Memory" not in suffix
+
+    def test_env_file_content_is_appended(self, tmp_path, monkeypatch):
+        ctx = tmp_path / "experience_context.md"
+        ctx.write_text("【历史经验·禁区】\n- 值级重复（库内已有高度相关列）×4\n")
+        monkeypatch.setenv("QMF_EXPERIENCE_CONTEXT_PATH", str(ctx))
+        suffix = self._wrapper()._build_prompt_suffix()
+        assert "经验记忆 / Experience Memory" in suffix
+        assert "【历史经验·禁区】" in suffix
+
+    def test_missing_file_degrades_to_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("QMF_EXPERIENCE_CONTEXT_PATH", str(tmp_path / "nope.md"))
+        suffix = self._wrapper()._build_prompt_suffix()
+        assert "语言要求" in suffix
+        assert "经验记忆 / Experience Memory" not in suffix
+
+    def test_empty_file_degrades_to_empty(self, tmp_path, monkeypatch):
+        ctx = tmp_path / "empty.md"
+        ctx.write_text("   \n")
+        monkeypatch.setenv("QMF_EXPERIENCE_CONTEXT_PATH", str(ctx))
+        assert (
+            "经验记忆 / Experience Memory" not in self._wrapper()._build_prompt_suffix()
+        )
 
 
 class _FakeProc:
@@ -108,7 +146,7 @@ def _launcher_for(task: EvolutionTask, tmp_path) -> AlphaAgentLauncher:
 
 
 class TestLauncherInjectionWiring:
-    def _run(self, tmp_path, monkeypatch, injection):
+    def _run(self, tmp_path, monkeypatch, injection, experience_path=None):
         task = EvolutionTask(
             task_id="t-inject", user_id="u-1", market="a_share", universe="csi300"
         )
@@ -119,11 +157,16 @@ class TestLauncherInjectionWiring:
             calls["prepare"] = kwargs
             return injection
 
+        async def fake_experience(**kwargs):
+            calls["experience"] = kwargs
+            return experience_path
+
         async def fake_mark(ids):
             calls["mark"] = tuple(ids)
             return len(ids)
 
         monkeypatch.setattr(pool_service, "prepare_injection", fake_prepare)
+        monkeypatch.setattr(experience_memory_mod, "prepare_injection", fake_experience)
         monkeypatch.setattr(pool_service, "mark_retrieved", fake_mark)
         monkeypatch.setattr(launcher_mod.subprocess, "Popen", _FakeProc)
 
@@ -161,3 +204,27 @@ class TestLauncherInjectionWiring:
         assert task.status == TaskStatus.COMPLETED
         assert "QMF_POOL_CONTEXT_PATH" not in _FakeProc.last.env
         assert "mark" not in calls, "空注入不该记疲劳"
+
+    def test_experience_path_lands_in_child_env(self, tmp_path, monkeypatch):
+        ctx = tmp_path / "experience_context.md"
+        ctx.write_text("【历史经验·禁区】")
+        task, launcher, calls = self._run(
+            tmp_path,
+            monkeypatch,
+            pool_service.PoolInjection(path=None),
+            experience_path=ctx,
+        )
+        assert task.status == TaskStatus.COMPLETED
+        assert _FakeProc.last.env.get("QMF_EXPERIENCE_CONTEXT_PATH") == str(ctx)
+        prepared = calls["experience"]
+        assert prepared["user_id"] == "u-1"
+        assert prepared["market"] == "a_share"
+        assert prepared["task_id"] == "t-inject"
+        assert prepared["log_dir"] == launcher._log_dir / "t-inject"
+
+    def test_no_experience_means_no_env(self, tmp_path, monkeypatch):
+        task, _launcher, _calls = self._run(
+            tmp_path, monkeypatch, pool_service.PoolInjection(path=None)
+        )
+        assert task.status == TaskStatus.COMPLETED
+        assert "QMF_EXPERIENCE_CONTEXT_PATH" not in _FakeProc.last.env

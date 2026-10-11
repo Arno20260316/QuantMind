@@ -71,9 +71,7 @@ def _coverage(monkeypatch):
 def _guard(monkeypatch):
     """回测可用末端固定为 2026-10-08（覆盖末端 2026-10-09 的前一个交易日）。"""
     monkeypatch.setattr(aa, "_quantdb_coverage", lambda: _w("2016-01-04", "2026-10-09"))
-    monkeypatch.setattr(
-        aa, "_backtest_guard", lambda coverage=None: date(2026, 10, 8)
-    )
+    monkeypatch.setattr(aa, "_backtest_guard", lambda coverage=None: date(2026, 10, 8))
 
 
 # ── 1. 请求归一 ──────────────────────────────────────────────────────
@@ -229,9 +227,7 @@ def test_backtest_guard_applies_even_without_coverage(monkeypatch):
     后者是 qlib 回测的硬约束（t+1 成交需要次日行情）。
     """
     monkeypatch.setattr(aa, "_quantdb_coverage", lambda: None)
-    monkeypatch.setattr(
-        aa, "_backtest_guard", lambda coverage=None: date(2026, 10, 8)
-    )
+    monkeypatch.setattr(aa, "_backtest_guard", lambda coverage=None: date(2026, 10, 8))
     got = aa._normalize_request_mining_config(
         market="a_share",
         mining_start="2000-01-01",
@@ -395,13 +391,15 @@ def test_config_options_defaults(client, _coverage):
         "l2_factors",
     ]
     assert d["coverage"] == {"start": "2016-01-04", "end": "2026-10-09"}
-    # 默认窗口：覆盖末端前推 5 年 = 4 年挖掘 + 1 年检验
+    # 默认窗口：覆盖末端前推 5 年 = 4 年挖掘 + 1 年检验；检验自挖掘终点
+    # **次日**起算（两窗不共享边界日——共享日的前向收益会在样本内外各算
+    # 一次，「样本外」名不副实；口径见 mining_config.default_windows）
     assert d["defaults"]["mining"] == {"start": "2021-10-09", "end": "2025-10-09"}
-    assert d["defaults"]["validation"] == {"start": "2025-10-09", "end": "2026-10-09"}
+    assert d["defaults"]["validation"] == {"start": "2025-10-10", "end": "2026-10-09"}
     assert d["windows"]["is_default"] is True
     assert d["windows"]["mining"] == d["defaults"]["mining"]
     # 分段与提交路径同源：test = 检验区间
-    assert d["segments"]["test"] == {"start": "2025-10-09", "end": "2026-10-09"}
+    assert d["segments"]["test"] == {"start": "2025-10-10", "end": "2026-10-09"}
     # 无回测末端保护（本 fixture 关掉了）→ 字段在位但为 None（前端据此判断
     # 日期选择器上限；None = 不设上限）
     assert d["backtest_end_guard"] is None
@@ -442,7 +440,8 @@ def test_config_options_defaults_anchor_backtest_guard(client, _guard):
     d = r.json()["data"]
     assert d["backtest_end_guard"] == "2026-10-08"
     assert d["coverage"] == {"start": "2016-01-04", "end": "2026-10-09"}
-    assert d["defaults"]["validation"] == {"start": "2025-10-08", "end": "2026-10-08"}
+    # 检验自挖掘终点次日（2025-10-08 → 10-09），同 default_windows 口径
+    assert d["defaults"]["validation"] == {"start": "2025-10-09", "end": "2026-10-08"}
     assert d["defaults"]["mining"] == {"start": "2021-10-08", "end": "2025-10-08"}
     assert d["segments"]["test"]["end"] == "2026-10-08"
 
@@ -726,9 +725,7 @@ def test_config_options_unknown_freq_400(client, _coverage):
 
 
 def test_evolve_rejects_minute_for_other_market(client, _coverage, _evolve_stubs):
-    r = client.post(
-        f"{_PREFIX}/evolve", json={"market": "us_stock", "freq": "1min"}
-    )
+    r = client.post(f"{_PREFIX}/evolve", json={"market": "us_stock", "freq": "1min"})
     assert r.status_code == 400
     assert "A 股" in r.json()["detail"]
 
@@ -736,9 +733,7 @@ def test_evolve_rejects_minute_for_other_market(client, _coverage, _evolve_stubs
 def test_evolve_rejects_minute_without_provider(
     client, _minute_provider_missing, _coverage, _evolve_stubs
 ):
-    r = client.post(
-        f"{_PREFIX}/evolve", json={"market": "a_share", "freq": "1min"}
-    )
+    r = client.post(f"{_PREFIX}/evolve", json={"market": "a_share", "freq": "1min"})
     assert r.status_code == 400
     assert "分钟数据面未构建" in r.json()["detail"]
 

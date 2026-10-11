@@ -286,8 +286,11 @@ export interface MiningStartParams {
   parallelEnabled?: boolean;
   /** L1 因子类别方向（多选，label） */
   directions?: string[];
-  /** 类别选择模式：selected=取第一条，random=随机一条 */
-  directionMode?: 'selected' | 'random';
+  /**
+   * 类别选择模式：selected=取第一条，random=随机一条，quota=方向配额
+   * （探索/利用/变异三档，T-FE-10；抽样决策与证据在后端 direction_quota）
+   */
+  directionMode?: 'selected' | 'random' | 'quota';
   /**
    * 文档血统：来自文档链的挖掘带上它。**带 docId 时改走 JSON body 变体**
    * （后端 EvolveRequest.doc_id → 落任务 source=doc + 回写文档 task_id）；
@@ -696,6 +699,152 @@ export async function getTaskLog(
     return { lines: data.lines ?? [], total: data.total ?? 0 };
   } catch {
     return { lines: [], total: 0 };
+  }
+}
+
+// ==================== 决策轨迹（T-FM-07，只读） ====================
+
+/**
+ * 五环节节点状态（后端 trajectory_store 同词表）：
+ * ok=有载荷且时长可解（running 免载荷）/ partial=其余 / absent=无载荷且无计时证据。
+ */
+export type TrajectoryNodeStatus = 'ok' | 'partial' | 'absent';
+
+export interface TrajectoryNode {
+  /** hypothesis / experiment / coding / running / feedback */
+  phase: string;
+  status: TrajectoryNodeStatus | string;
+  start: string | null;
+  end: string | null;
+  durationS: number | null;
+  /** 该环节扫到的载荷文件数（running 无独立载荷，恒 0） */
+  pklCount: number | null;
+}
+
+export interface TrajectoryFactor {
+  name: string;
+  /** 是否进入本轮实现；null = 未知（coder 结果解析失败，不判） */
+  selected: boolean | null;
+  /** materialized / rejected_duplicate / rejected_gate / superseded / pending */
+  outcome: string | null;
+  reason: string | null;
+}
+
+export interface TrajectoryLoop {
+  loop: number;
+  nodes: TrajectoryNode[];
+  factors: TrajectoryFactor[];
+  flagged: boolean;
+  flags: string[];
+  /** 旗标中文归因（「；」拼接；只标位置与事实） */
+  flagReason: string | null;
+}
+
+export interface TaskTrajectory {
+  taskId: string;
+  direction: string | null;
+  status: string | null;
+  market: string | null;
+  /** 任务未到终态（pending/running）：低奖励定位仅为当时快照 */
+  partial: boolean;
+  /** loop=逐轮归因；task_level=某轮载荷解析失败，降级为任务级因子清单 */
+  attribution: string;
+  loops: TrajectoryLoop[];
+  /** task_level 降级时的任务级因子清单（逐轮 factors 被置空） */
+  factors: TrajectoryFactor[];
+  /** 超长任务只保尾部：truncated=true 且 droppedLoops=被裁轮数 */
+  truncated: boolean;
+  droppedLoops: number;
+  generatedAt: string | null;
+}
+
+type RawDict = Record<string, unknown>;
+
+function rawStr(v: unknown): string | null {
+  return typeof v === 'string' && v ? v : null;
+}
+
+function rawNum(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function normalizeTrajectoryFactor(raw: RawDict): TrajectoryFactor {
+  return {
+    name: typeof raw.name === 'string' ? raw.name : '',
+    selected: typeof raw.selected === 'boolean' ? raw.selected : null,
+    outcome: rawStr(raw.outcome),
+    reason: rawStr(raw.reason),
+  };
+}
+
+function normalizeTrajectoryNode(raw: RawDict): TrajectoryNode {
+  return {
+    phase: typeof raw.phase === 'string' ? raw.phase : '',
+    status: typeof raw.status === 'string' ? raw.status : 'partial',
+    start: rawStr(raw.start),
+    end: rawStr(raw.end),
+    durationS: rawNum(raw.duration_s),
+    pklCount: rawNum(raw.pkl_count),
+  };
+}
+
+function normalizeTrajectoryLoop(raw: RawDict): TrajectoryLoop {
+  return {
+    loop: rawNum(raw.loop) ?? 0,
+    nodes: Array.isArray(raw.nodes)
+      ? raw.nodes.map((n) => normalizeTrajectoryNode((n ?? {}) as RawDict))
+      : [],
+    factors: Array.isArray(raw.factors)
+      ? raw.factors.map((f) => normalizeTrajectoryFactor((f ?? {}) as RawDict))
+      : [],
+    flagged: raw.flagged === true,
+    flags: Array.isArray(raw.flags) ? raw.flags.filter((v) => typeof v === 'string') : [],
+    flagReason: rawStr(raw.flag_reason),
+  };
+}
+
+/**
+ * 任务决策轨迹（GET /alpha-agent/tasks/{id}/trajectory）。
+ *
+ * 后端只标「位置 + 事实」（哪个环节多久/哪轮产出没进实现/因子结局），
+ * 绝不做因果归因——前端同理：旗标只显示定位，不显示建议。
+ * 404 = 轨迹不存在（任务无日志目录或已被清理），与网络错误分开报。
+ */
+export async function getTaskTrajectory(
+  taskId: string,
+): Promise<ApiResponse<TaskTrajectory>> {
+  try {
+    const res = await apiClient.get(
+      `/alpha-agent/tasks/${encodeURIComponent(taskId)}/trajectory`,
+    );
+    const data = (res.data?.data ?? {}) as RawDict;
+    return makeOk({
+      taskId: typeof data.task_id === 'string' ? data.task_id : taskId,
+      direction: rawStr(data.direction),
+      status: rawStr(data.status),
+      market: rawStr(data.market),
+      partial: data.partial === true,
+      attribution: typeof data.attribution === 'string' ? data.attribution : 'loop',
+      loops: Array.isArray(data.loops)
+        ? data.loops.map((l) => normalizeTrajectoryLoop((l ?? {}) as RawDict))
+        : [],
+      factors: Array.isArray(data.factors)
+        ? data.factors.map((f) => normalizeTrajectoryFactor((f ?? {}) as RawDict))
+        : [],
+      truncated: data.truncated === true,
+      droppedLoops: rawNum(data.dropped_loops) ?? 0,
+      generatedAt: rawStr(data.generated_at),
+    });
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } })?.response?.status;
+    if (status === 404) {
+      return {
+        success: false,
+        error: '轨迹不存在：该任务没有可读的日志目录（或已被清理）',
+      };
+    }
+    const msg = error instanceof Error ? error.message : String(error);
+    return { success: false, error: `轨迹读取失败：${msg}` };
   }
 }
 
@@ -1481,6 +1630,87 @@ export interface PoolGraph {
   maxNodes?: number;
 }
 
+// ── 变体残差台账（T-FE-09）───────────────────────────────────────────
+
+/** 单变体 × 单周期的残差统计（对父本残差 ICIR；缺失一律 null → 界面显「—」）。 */
+export interface VariantLedgerStat {
+  horizon: number | null;
+  /** ok=可验证 / insufficient_days=有效日不足 / unavailable=不可用 /
+   *  no_baseline_in_run=父本本轮缺席（后三者永不判失败） */
+  status: string;
+  icIr: number | null;
+  icMean: number | null;
+  nDays: number | null;
+  /** 残差所对基线（父本）键 */
+  basis: string[];
+  nBasis: number | null;
+  /** 与父本的最大 |ρ|（真实冗余度） */
+  maxBasisAbsCorr: number | null;
+}
+
+export interface VariantLedgerObservation {
+  windowStart: string;
+  windowEnd: string;
+  universe: string;
+  bestHorizon: number | null;
+  at: string | null;
+  horizons: VariantLedgerStat[];
+}
+
+export interface VariantLedgerCoolingEvidence {
+  residualIcIr: number | null;
+  nDays: number | null;
+  horizon: number | null;
+  windowEnd: string | null;
+}
+
+export interface VariantLedgerCoolingEntry {
+  variantKey: string;
+  universe: string;
+  baselineKey: string | null;
+  since: string | null;
+  until: string | null;
+  evidence: VariantLedgerCoolingEvidence | null;
+}
+
+export interface VariantLedgerRow {
+  key: string;
+  name: string;
+  family: string;
+  formulation: string;
+  /** 父本键（根与无母本键 = null → 界面显「—」，不臆造父本） */
+  baselineKey: string | null;
+  /** 编辑类型（调窗/加门/…）；无映射 = null */
+  editType: string | null;
+  /** 是否参与失败判定（根 / 父本保护 = false：不判不冷） */
+  coolable: boolean;
+  observationsCount: number;
+  latest: VariantLedgerObservation | null;
+  /** 最新观测 best_horizon 那格（判定实际读数）；无观测 = null */
+  latestStat: VariantLedgerStat | null;
+  cooling: VariantLedgerCoolingEntry[];
+  /** 当前池下冷却是否生效；范围未限定池 = null（不可判定 → 显「—」） */
+  coolingActive: boolean | null;
+}
+
+export interface VariantLedgerView {
+  /** 台账文件是否存在——false = 统计派从未跑过（骨架照列，全部「—」） */
+  available: boolean;
+  schemaVersion: number | null;
+  updatedAt: string | null;
+  universe: string | null;
+  constants: {
+    cooldownDays: number | null;
+    highConfDays: number | null;
+    coolIcirFloor: number | null;
+    maxObservations: number | null;
+  };
+  cooling: VariantLedgerCoolingEntry[];
+  /** 当前池生效冷却键；未限定池 = null（「生效」不可判定） */
+  coolingActive: string[] | null;
+  variants: VariantLedgerRow[];
+}
+
 export interface PoolRefreshStatus {
   status: string;
   running: boolean;
@@ -1718,6 +1948,105 @@ export async function getPoolGraph(params: {
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : '谱系图获取失败';
+    return { success: false, error: message };
+  }
+}
+
+function mapVariantStat(raw: any): VariantLedgerStat {
+  return {
+    // horizon/nBasis 与其余读数同纪律：缺失 → null → 界面「—」，
+    // 绝不 Number(?? 0) 伪造一个真的 0（评审 code-review CR3）
+    horizon: poolNum(raw?.horizon),
+    status: String(raw?.status ?? 'unavailable'),
+    icIr: poolNum(raw?.ic_ir),
+    icMean: poolNum(raw?.ic_mean),
+    nDays: poolNum(raw?.n_days),
+    basis: Array.isArray(raw?.basis) ? raw.basis.map(String) : [],
+    nBasis: poolNum(raw?.n_basis),
+    maxBasisAbsCorr: poolNum(raw?.max_basis_abs_corr),
+  };
+}
+
+function mapVariantObservation(raw: any): VariantLedgerObservation {
+  return {
+    windowStart: String(raw?.window_start ?? ''),
+    windowEnd: String(raw?.window_end ?? ''),
+    universe: String(raw?.universe ?? ''),
+    bestHorizon: poolNum(raw?.best_horizon),
+    at: raw?.at != null ? String(raw.at) : null,
+    horizons: (Array.isArray(raw?.horizons) ? raw.horizons : []).map(mapVariantStat),
+  };
+}
+
+function mapVariantCooling(raw: any): VariantLedgerCoolingEntry {
+  const ev = raw?.evidence;
+  return {
+    variantKey: String(raw?.variant_key ?? ''),
+    universe: String(raw?.universe ?? ''),
+    baselineKey: raw?.baseline_key != null ? String(raw.baseline_key) : null,
+    since: raw?.since != null ? String(raw.since) : null,
+    until: raw?.until != null ? String(raw.until) : null,
+    evidence:
+      ev && typeof ev === 'object'
+        ? {
+            residualIcIr: poolNum(ev.residual_ic_ir),
+            nDays: poolNum(ev.n_days),
+            horizon: poolNum(ev.horizon),
+            windowEnd: ev.window_end != null ? String(ev.window_end) : null,
+          }
+        : null,
+  };
+}
+
+function mapVariantRow(raw: any): VariantLedgerRow {
+  return {
+    key: String(raw?.key ?? ''),
+    name: String(raw?.name ?? ''),
+    family: String(raw?.family ?? ''),
+    formulation: String(raw?.formulation ?? ''),
+    baselineKey: raw?.baseline_key != null ? String(raw.baseline_key) : null,
+    editType: raw?.edit_type != null ? String(raw.edit_type) : null,
+    coolable: raw?.coolable === true,
+    observationsCount: Number(raw?.observations_count ?? 0) || 0,
+    latest: raw?.latest ? mapVariantObservation(raw.latest) : null,
+    latestStat: raw?.latest_stat ? mapVariantStat(raw.latest_stat) : null,
+    cooling: (Array.isArray(raw?.cooling) ? raw.cooling : []).map(mapVariantCooling),
+    coolingActive: typeof raw?.cooling_active === 'boolean' ? raw.cooling_active : null,
+  };
+}
+
+/** 变体残差台账（T-FE-09）：32 骨架 ×（最新观测 + 冷却态），只读投影。
+ *  台账缺席 = 空骨架 available=false（不报错）；池限定下观测与冷却同裁
+ *  （残差是池内口径，跨池证据不可比）。 */
+export async function getVariantLedger(params: {
+  universe?: string;
+} = {}): Promise<ApiResponse<VariantLedgerView>> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.universe) qs.set('universe', params.universe);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const res = await apiClient.get(`/alpha-agent/variant-ledger${suffix}`);
+    const raw = res.data?.data ?? {};
+    const constants = raw?.constants ?? {};
+    return makeOk({
+      available: raw?.available === true,
+      schemaVersion: poolNum(raw?.schema_version),
+      updatedAt: raw?.updated_at != null ? String(raw.updated_at) : null,
+      universe: raw?.universe != null ? String(raw.universe) : null,
+      constants: {
+        cooldownDays: poolNum(constants?.cooldown_days),
+        highConfDays: poolNum(constants?.high_conf_days),
+        coolIcirFloor: poolNum(constants?.cool_icir_floor),
+        maxObservations: poolNum(constants?.max_observations),
+      },
+      cooling: (Array.isArray(raw?.cooling) ? raw.cooling : []).map(mapVariantCooling),
+      coolingActive: Array.isArray(raw?.cooling_active)
+        ? raw.cooling_active.map(String)
+        : null,
+      variants: (Array.isArray(raw?.variants) ? raw.variants : []).map(mapVariantRow),
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : '变体台账获取失败';
     return { success: false, error: message };
   }
 }

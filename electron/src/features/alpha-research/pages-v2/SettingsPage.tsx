@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '../components-v2/ui/Card';
 import { Button } from '../components-v2/ui/Button';
 import { Badge } from '../components-v2/ui/Badge';
-import { Settings, Save, RotateCcw, Check, X, AlertCircle, Loader2, Database, Sliders, Box, Cpu, Compass, Shuffle, Info, Bot, BarChart3, Layers, Eye, EyeOff } from 'lucide-react';
+import { Settings, Save, RotateCcw, Check, X, AlertCircle, Loader2, Database, Sliders, Box, Cpu, Compass, Shuffle, Gauge, Info, Bot, BarChart3, Layers, Eye, EyeOff } from 'lucide-react';
 import { healthCheck, getDataSummary, getUniverses, getLlmConfig, saveEmbeddingConfig, type LlmConfigStatus } from '../services-v2/api';
 import { extractApiError } from '../../../utils/apiError';
 import { apiClient } from '../../../services/aiStrategyClients';
@@ -11,6 +11,8 @@ import { buildEmbeddingSavePayload } from '../utils-v2/embeddingPayload';
 import type { DataSummary, UniverseId, UniverseInfo } from '../types-v2';
 import { PageHeader } from '../components-v2/layout/PageHeader';
 import { SupplyFacePanel } from '../components-v2/SupplyFacePanel';
+import { ExperienceMemoryPanel } from '../components-v2/ExperienceMemoryPanel';
+import { DirectionQuotaPanel } from '../components-v2/DirectionQuotaPanel';
 import { Modal } from 'antd';
 
 interface SystemConfig {
@@ -30,8 +32,8 @@ interface SystemConfig {
   qualityGateEnabled: boolean;
   backtestTimeout: number;
   defaultLibrarySuffix: string;
-  // Mining direction: use selected directions / random
-  miningDirectionMode: 'selected' | 'random';
+  // Mining direction: use selected directions / random / quota（T-FE-10 三值）
+  miningDirectionMode: 'selected' | 'random' | 'quota';
   /** 选中的挖掘方向（存 label，避免与动态 L1 类别列表下标错位） */
   selectedMiningDirections: string[];
 }
@@ -1004,7 +1006,23 @@ export const SettingsPage: React.FC = () => {
                       随机（从选中方向中随机选一条）
                     </span>
                   </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="miningDirectionMode"
+                      checked={config.miningDirectionMode === 'quota'}
+                      onChange={() => updateConfigField('miningDirectionMode', 'quota')}
+                      className="h-4 w-4 text-primary focus:ring-primary"
+                    />
+                    <span className="flex items-center gap-1.5">
+                      <Gauge className="h-4 w-4" />
+                      方向配额（按探索/利用/变异三档预算抽样，见下方预演）
+                    </span>
+                  </label>
                 </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  配额模式只对消费方向的挖掘算法生效（统计派会被显式拒绝）；单条任务恒为「利用」档。
+                </p>
               </div>
 
               <div>
@@ -1114,6 +1132,12 @@ export const SettingsPage: React.FC = () => {
 
               {/* 池内供给面（T-MV-02）：选方向前先看哪类挖过、哪类还空着 */}
               <SupplyFacePanel />
+
+              {/* 经验记忆/禁区（T-FM-04）：下一轮 LLM 挖掘会读到的历史拒因与饱和方向 */}
+              <ExperienceMemoryPanel />
+
+              {/* 方向配额（T-FE-10）：quota 模式的代理模型打分与三档名额预演 */}
+              <DirectionQuotaPanel directions={config.selectedMiningDirections} />
 
               {/* Import from Feature Catalog */}
               <div className="pt-4 border-t border-border/50">

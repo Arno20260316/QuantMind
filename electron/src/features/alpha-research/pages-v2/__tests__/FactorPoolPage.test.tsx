@@ -75,6 +75,14 @@ vi.mock('../../components-v2/ComboLabTab', () => ({
   ),
 }));
 
+// 变体台账自持 api 调用（自己的测试文件覆盖行为）；页面侧只钉
+// 「tab 挂载 + 作用域透传」，与组合实验室同一策略。
+vi.mock('../../components-v2/VariantLedgerTab', () => ({
+  VariantLedgerTab: ({ market, universe }: { market: string; universe: string }) => (
+    <div data-testid="variant-ledger">{`${market}|${universe}`}</div>
+  ),
+}));
+
 const ok = <T,>(data: T) => ({ success: true as const, data });
 
 const OVERVIEW = {
@@ -510,6 +518,23 @@ describe('FactorPoolPage 组合实验室', () => {
     fireEvent.change(screen.getByLabelText('股票池'), { target: { value: 'csi300' } });
     await waitFor(() =>
       expect(screen.getByTestId('combo-lab').textContent).toBe('a_share|csi300'),
+    );
+  });
+});
+
+describe('FactorPoolPage 变体台账', () => {
+  test('切到变体台账 tab 才挂载，作用域随页头透传', async () => {
+    render(<FactorPoolPage />);
+    await screen.findByText('12');
+    expect(screen.queryByTestId('variant-ledger')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /变体台账/ }));
+    expect(await screen.findByTestId('variant-ledger')).toBeTruthy();
+    expect(screen.getByTestId('variant-ledger').textContent).toBe('a_share|');
+
+    fireEvent.change(screen.getByLabelText('股票池'), { target: { value: 'csi300' } });
+    await waitFor(() =>
+      expect(screen.getByTestId('variant-ledger').textContent).toBe('a_share|csi300'),
     );
   });
 });

@@ -759,7 +759,9 @@ class TestMainWiring:
     状态必须真进 ``run_statistical_mining``，降级痕迹必须真落
     ``mining_report.json``。用替身记账，不取数、不写生产表。"""
 
-    def _stub_everything(self, runner, monkeypatch, tmp_path, *, regime_result, calls):
+    def _stub_everything(
+        self, runner, monkeypatch, tmp_path, *, regime_result, calls, extra_argv=()
+    ):
         from backend.services.engine.alpha_agent.statistical import engine as eng
         from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
             tradability as td,
@@ -771,6 +773,11 @@ class TestMainWiring:
 
         monkeypatch.setattr(runner, "_resolve_windows", lambda: (_Win(), None, "stub"))
         monkeypatch.setattr(runner, "_load_regime_by_month", lambda: regime_result)
+        # T-FE-09：台账落点指向 tmp——main 会读冷却名单并在收尾记账，
+        # 测试绝不碰容器卷 /data/factor_variants/
+        monkeypatch.setenv(
+            "QM_VARIANT_LEDGER_PATH", str(tmp_path / "variant_ledger.json")
+        )
 
         def _fake_run(*args, **kwargs):
             calls["engine"] = kwargs
@@ -817,6 +824,8 @@ class TestMainWiring:
                 panel_rows=100,
                 n_symbols=10,
                 universe="all_a",
+                # 与真引擎同契约：回传实际生效的冷却集（报告留痕取它）
+                cooled_keys=tuple(sorted(kwargs.get("cooled_keys") or ())),
             )
 
         monkeypatch.setattr(eng, "run_statistical_mining", _fake_run)
@@ -849,6 +858,7 @@ class TestMainWiring:
                 "3",
                 "--log-dir",
                 str(tmp_path),
+                *extra_argv,
             ],
         )
 
@@ -904,3 +914,244 @@ class TestMainWiring:
             (tmp_path / "mining_report.json").read_text(encoding="utf-8")
         )
         assert report["regime_source"] == source
+
+    def test_variant_ledger_cooling_reaches_engine_and_report(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """T-FE-09 全接线：台账里的生效冷却必须真进引擎调用，实际生效集
+        （引擎回传）必须落 ``mining_report.json`` 的 ``variant_ledger`` 块。"""
+        import json  # noqa: PLC0415
+
+        _seed_active_cooling(tmp_path / "variant_ledger.json", "reversal_60d")
+        calls: dict = {}
+        self._stub_everything(
+            runner,
+            monkeypatch,
+            tmp_path,
+            regime_result=(None, {"market": "CN", "error": "stub"}),
+            calls=calls,
+        )
+
+        runner.main()
+
+        assert calls["engine"]["cooled_keys"] == frozenset({"reversal_60d"}), (
+            "台账生效冷却必须真进引擎——接线断=冷却名单纯装饰"
+        )
+        report = json.loads(
+            (tmp_path / "mining_report.json").read_text(encoding="utf-8")
+        )
+        block = report["variant_ledger"]
+        assert block["cooled_applied"] == ["reversal_60d"]
+        assert block["ledger_path"] == str(tmp_path / "variant_ledger.json")
+        assert block["observations_written"] == 0, "替身无子变体候选 → 零观测不写账"
+        assert "error" not in block
+
+    def test_no_cooling_flag_bypasses_read(self, runner, monkeypatch, tmp_path):
+        """``--no-cooling`` 是运维泄压阀：绕过名单（引擎收空集），观测照记。"""
+        import json  # noqa: PLC0415
+
+        _seed_active_cooling(tmp_path / "variant_ledger.json", "reversal_60d")
+        calls: dict = {}
+        self._stub_everything(
+            runner,
+            monkeypatch,
+            tmp_path,
+            regime_result=(None, {"market": "CN", "error": "stub"}),
+            calls=calls,
+            extra_argv=("--no-cooling",),
+        )
+
+        runner.main()
+
+        assert calls["engine"]["cooled_keys"] == frozenset()
+        report = json.loads(
+            (tmp_path / "mining_report.json").read_text(encoding="utf-8")
+        )
+        assert report["variant_ledger"]["cooled_applied"] == []
+
+
+def _variant_report(
+    runner,
+    *,
+    key: str = "reversal_60d",
+    parent: str = "reversal_20d",
+    status: str = "ok",
+    ic_ir: float | None = 0.1,
+    n_days: int = 60,
+):
+    """子变体报告：带父本与残差观测（形状 = 引擎出口 ``variant_residual``）。"""
+    from backend.services.engine.alpha_agent.statistical import engine as eng
+
+    nan = float("nan")
+    stat = {
+        "horizon": 1,
+        "status": status,
+        "ic_ir": ic_ir,
+        "ic_mean": 0.012 if ic_ir is not None else None,
+        "n_days": n_days,
+        "basis": [parent] if status == "ok" else [],
+        "n_basis": 1 if status == "ok" else 0,
+        "max_basis_abs_corr": 0.42,
+    }
+    return eng.CandidateReport(
+        key=key,
+        name=f"{key} 变体",
+        family="reversal",
+        formulation="x",
+        source="s",
+        expression="$close",
+        min_history=60,
+        horizons=(),
+        best_horizon=1,
+        rank_ic_mean=nan,
+        icir=nan,
+        t_stat=nan,
+        p_value=nan,
+        fdr_pass=False,
+        fdr_horizons=(),
+        oos_verified=False,
+        oos_horizon=None,
+        oos_rank_ic=nan,
+        oos_n_days=0,
+        quantile_monotonicity=nan,
+        spread_mean=nan,
+        selected=False,
+        reject_reason="稳定性窗不过",
+        variant_of=parent,
+        variant_residual=(stat,),
+    )
+
+
+def _seed_active_cooling(
+    ledger_path, key: str = "reversal_60d", universe: str = "all_a"
+) -> None:
+    """向台账种一条生效中的冷却（低 ICIR 高置信失败 → decide_cooling → save）。"""
+    from backend.services.engine.alpha_agent.statistical import variant_ledger as vl
+
+    obs = {
+        "variant_key": key,
+        "universe": universe,
+        "window_start": "2023-01-01",
+        "window_end": "2023-12-31",
+        "run_id": "seed",
+        "horizons": [
+            {
+                "horizon": 1,
+                "status": "ok",
+                "ic_ir": 0.1,
+                "ic_mean": 0.01,
+                "n_days": 60,
+                "basis": [vl.BASELINE_BY_KEY[key]],
+                "n_basis": 1,
+                "max_basis_abs_corr": 0.5,
+            }
+        ],
+        "best_horizon": 1,
+        "at": "2026-01-01T00:00:00Z",
+    }
+    ledger = vl.upsert_observations(vl.empty_ledger(), [obs])
+    ledger, updates = vl.decide_cooling(ledger)
+    assert any(u["action"] == "cooled" for u in updates), "种子前提：已入冷却"
+    vl.save_ledger(ledger_path, ledger)
+
+
+class TestVariantLedgerWiring:
+    """``_update_variant_ledger``（T-FE-09 收尾记账）的契约。
+
+    两条纪律各钉一测：非对称否决（不可验证观测照记不判失败）与
+    「写失败只留痕不拦收尾」（台账是审计面，挖掘主链已完成）。
+    """
+
+    def _result(self, runner, *, candidates, universe: str = "all_a"):
+        import types  # noqa: PLC0415
+
+        return types.SimpleNamespace(
+            candidates=tuple(candidates),
+            window={"mining_start": "2024-01-01", "mining_end": "2024-12-31"},
+            universe=universe,
+            cooled_keys=(),
+        )
+
+    def test_observations_written_and_cooling_decided(self, runner, tmp_path):
+        from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+            variant_ledger as vl,
+        )
+
+        ledger_path = tmp_path / "variant_ledger.json"
+        block = runner._update_variant_ledger(
+            self._result(runner, candidates=[_variant_report(runner)]),
+            universe="all_a",
+            run_id="t1",
+            cooled_applied=["reversal_60d"],
+            ledger_path=ledger_path,
+        )
+
+        assert block["observations_written"] == 1
+        assert block["cooled_applied"] == ["reversal_60d"]
+        assert block["ledger_path"] == str(ledger_path)
+        assert not block.get("error")
+        # 高置信失败（ok ∧ n_days=60 ≥ 40 ∧ ic_ir=0.1 < 0.3）→ 冷却
+        assert [u["action"] for u in block["cooling_updates"]] == ["cooled"]
+        ledger = vl.load_ledger(ledger_path)
+        obs = ledger["variants"]["reversal_60d"]["observations"]
+        assert len(obs) == 1
+        assert obs[0]["baseline_key"] == "reversal_20d"
+        assert obs[0]["window_end"] == "2024-12-31"
+        assert obs[0]["run_id"] == "t1"
+        assert ledger["cooling"][0]["variant_key"] == "reversal_60d"
+
+    def test_unverifiable_observation_recorded_not_cooled(self, runner, tmp_path):
+        """不可验证（insufficient_days）观测照记，但绝不判失败。"""
+        from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+            variant_ledger as vl,
+        )
+
+        ledger_path = tmp_path / "variant_ledger.json"
+        block = runner._update_variant_ledger(
+            self._result(
+                runner,
+                candidates=[
+                    _variant_report(
+                        runner, status="insufficient_days", ic_ir=None, n_days=0
+                    )
+                ],
+            ),
+            universe="all_a",
+            run_id="t1",
+            ledger_path=ledger_path,
+        )
+
+        assert block["observations_written"] == 1
+        assert block["cooling_updates"] == []
+        assert vl.load_ledger(ledger_path)["cooling"] == []
+
+    def test_no_variant_candidates_leaves_ledger_untouched(self, runner, tmp_path):
+        """零观测不建文件（台账只记子变体；根候选不入账）。"""
+        ledger_path = tmp_path / "variant_ledger.json"
+        block = runner._update_variant_ledger(
+            self._result(runner, candidates=[_tier3_report(runner)]),
+            universe="all_a",
+            run_id="t1",
+            ledger_path=ledger_path,
+        )
+        assert block["observations_written"] == 0
+        assert not ledger_path.exists()
+
+    def test_write_failure_is_recorded_not_raised(self, runner, monkeypatch, tmp_path):
+        """台账写失败：不抛、不拦收尾，报告块如实记 error（不静默）。"""
+        from backend.services.engine.alpha_agent.statistical import (  # noqa: PLC0415
+            variant_ledger as vl,
+        )
+
+        def _boom(path, ledger):
+            raise OSError("磁盘满")
+
+        monkeypatch.setattr(vl, "save_ledger", _boom)
+        block = runner._update_variant_ledger(
+            self._result(runner, candidates=[_variant_report(runner)]),
+            universe="all_a",
+            run_id="t1",
+            ledger_path=tmp_path / "variant_ledger.json",
+        )
+        assert "磁盘满" in block["error"]
+        assert block["observations_written"] == 0

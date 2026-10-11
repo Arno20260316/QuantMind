@@ -142,6 +142,26 @@ def _run_data_sync(date_str: str | None, force: bool) -> int:
     return 0 if completed.returncode == 0 else 1
 
 
+def _run_factor_board(date_str: str | None, force: bool) -> int:
+    """因子概率板「重跑」= 立刻按日更形态再构建一份（同日覆盖，原子写）。
+
+    ``--date`` = 决策日（模型信号目标交易日 YYYY-MM-DD）；不给则 CLI 取 PG
+    最新批量信号日期。``--force`` 无特殊语义（本就无条件重建，硬门不豁免）。
+    退码透传 CLI 语义：0 成功 / 1 硬门不过（**未落盘**，旧产物保持原样）/ 2 参数错误。
+    """
+    script = os.path.join(
+        PROJECT_ROOT, "backend", "scripts", "market_analysis", "build_factor_board.py"
+    )
+    cmd = [sys.executable, script]
+    if date_str:
+        cmd += ["--model-date", date_str]
+    print(f"执行 {' '.join(cmd)}（输出直通）...")
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode in (0, 2):
+        return completed.returncode
+    return 1
+
+
 def _run_retrain_dispatch(date_str: str | None, force: bool) -> int:
     """滚动重训「重跑」= 按配置试一轮（``--force`` 不看 enabled/到点/本期标记）。
 
@@ -560,6 +580,7 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     "sim_eod": _run_sim_eod,
     "auto_inference": _run_inference,
     "market_sync_dispatch": _run_data_sync,
+    "factor_board": _run_factor_board,
     "dual_book": _run_dual_book,
     "mirror_shadow": _run_shadow_compare,
     "eval_scores": _run_eval_scores,

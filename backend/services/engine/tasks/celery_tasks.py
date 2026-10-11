@@ -1515,3 +1515,72 @@ def run_market_snapshot() -> dict[str, Any]:
     except Exception as e:
         logger.exception("[MarketSnapshot] 失败: %s", e)
         return {"status": "failed", "error": str(e)}
+
+
+@celery_app.task(name="engine.tasks.factor_board_build")
+def run_factor_board_build() -> dict[str, Any]:
+    """因子概率板每日产物（市场分析 · 细案 §六，2026-10-11）。
+
+    T 日批量模型信号（PG ``engine_signal_scores``：前一晚链首更 + T 日 08:00
+    auto-inference 盘前刷新，本任务 08:40 读到的即当日最新批）× 因子 T-1 截面
+    → 精选因子合成分位板 + 三层共振/四象限 → ``{decision_date}.json`` + ``latest.json``
+    （``QM_FACTOR_BOARD_DIR``，原子写，同日重跑覆盖）。
+
+    与 market_snapshot 同为子进程模式：构建口径全在
+    ``backend/scripts/market_analysis/build_factor_board.py``（硬门/警告分级也在那儿），
+    本任务只负责「按日跑一次 + 心跳 + 留痕」。CLI 退码 1 = 硬门不过（清单缺失/
+    入选过少/当日覆盖不足/schema 不过）**不落盘**——如实转 failed，绝不静默产出
+    坏板；退码 2 = 参数错误（配置问题，同样 failed）。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("factor_board")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = (
+            root / "backend" / "scripts" / "market_analysis" / "build_factor_board.py"
+        )
+        data_dir = os.getenv("QM_QUANTDB_DATA_DIR", "/data/quantdb")
+        out_dir = os.getenv("QM_FACTOR_BOARD_DIR", "/data/market-analysis/factor_board")
+        _Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--data-dir",
+            data_dir,
+            "--out-dir",
+            out_dir,
+        ]
+        started = datetime.now()
+        logger.info("[FactorBoard] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0:
+            logger.error(
+                "[FactorBoard] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info("[FactorBoard] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:])
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "out_dir": out_dir,
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[FactorBoard] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}

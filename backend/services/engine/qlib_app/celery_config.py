@@ -239,6 +239,23 @@ if os.getenv("MARKET_SNAPSHOT_ENABLED", "true").lower() == "true":
         "schedule": crontab(minute="*/10", hour="4-5", day_of_week="mon-sat"),
     }
 
+# 因子概率板（市场分析 · 细案 §六，2026-10-11）：T 日批量模型信号（前一晚链已
+# 首更，T 日 08:00 auto-inference 盘前再刷——实测：10-12 批 10-10 03:06 已落
+# PG，工作日批 08:00 落）× 因子 T-1 截面 → 当日决策板（精选因子合成分位 +
+# 三层共振 + 四象限），落 QM_FACTOR_BOARD_DIR=/data/market-analysis/factor_board，
+# API/前端读取。
+# 08:40 选点：盘前（09:10 risk_tier 之前）且晚于 08:00 auto-inference（读当日
+# 最新批），也避开 08:00 同分钟挤 engine。独立开关 FACTOR_BOARD_ENABLED——注册
+# 表按 switch_env 判「关闭/停摆」，借别的开关会让体检把「本就没开」报成「停摆」
+#（同 TCA/regime 的理由）。
+# 只跑周一~五：板是盘前消费物，每个交易日 08:40 建当日一版；周六就算跑，建的
+# 也是下周一那份（周一 08:40 随即同日期重建覆盖）——纯冗余，不排它。
+if os.getenv("FACTOR_BOARD_ENABLED", "true").lower() == "true":
+    beat_schedule["factor-board-daily"] = {
+        "task": "engine.tasks.factor_board_build",
+        "schedule": crontab(minute="40", hour="8", day_of_week="1-5"),
+    }
+
 celery_app.conf.update(
     # 序列化
     task_serializer="json",

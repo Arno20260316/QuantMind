@@ -314,6 +314,17 @@ JOBS: tuple[JobSpec, ...] = (
         "指数历史 → qm_regime_daily（生效日口径，历史行冻结）：每市场重算尾部 10 个"
         "生效日吸收迟到数据；表外市场诚实拒绝；重跑 = 立刻按日更形态再写一遍（0 新行即幂等）",
     ),
+    # 心跳 TTL 4 天（同 tca/regime）：cron 是 mon-fri，周末最长间隔 72h。
+    JobSpec(
+        "factor_board", "因子概率板（市场分析）", "celery_beat", "celery",
+        "交易日 08:40",
+        "FACTOR_BOARD_ENABLED", True, 345600,
+        "python backend/scripts/schedule_ctl.py run factor_board [--date YYYY-MM-DD]",
+        "精选因子（联合筛选 ∩ 近60日 IC 闸 × 族封顶）→ 合成分位板 + 行业/概念三层"
+        "共振 + 四象限 → data/market-analysis/factor_board/{decision_date}.json；"
+        "硬门不过退码 1 且不落盘；重跑 = 立刻按日更形态再构建一份（同日覆盖，"
+        "--date 指定决策日=模型信号目标交易日，不给则取 PG 最新批量信号）",
+    ),
 )
 
 JOBS_BY_KEY: dict[str, JobSpec] = {job.key: job for job in JOBS}

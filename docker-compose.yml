@@ -324,6 +324,8 @@ services:
       - QUANTDB_STATE_DIR=/data/quantdb/.sync_state
       # 市场分析快照目录（脚本 compute.py 产出后经 scp 部署到宿主机 ./data/market-analysis）
       - QM_MARKET_SNAPSHOT_DIR=/data/market-analysis
+      # 因子概率板目录（celery 每日构建 {decision_date}.json + latest.json，API 读取）
+      - QM_FACTOR_BOARD_DIR=/data/market-analysis/factor_board
       # QuantUS / QuantHK 本地数据中枢（美股/港股，Yahoo Finance 摄取）
       - QM_QUANTUS_DATA_DIR=/data/quantus
       - QM_QUANTHK_DATA_DIR=/data/quanthk
@@ -595,6 +597,8 @@ services:
       - QM_QUANTDB_DATA_DIR=/data/quantdb
       # QuantDB 同步状态库（避免容器内空库导致全量重下）
       - QUANTDB_STATE_DIR=/data/quantdb/.sync_state
+      # 因子概率板目录（factor_board_build 任务子进程产出，API 读取）
+      - QM_FACTOR_BOARD_DIR=/data/market-analysis/factor_board
 
       # Huntly 资讯 enrich (news_enrich_recent 任务在 worker 执行, 需要凭据)
       - HUNTLY_BASE_URL=${HUNTLY_BASE_URL:-http://quantmind-huntly}

@@ -1,0 +1,21 @@
+{
+  "description": "因子概率板：三层判定真值表 + 契约边界（后端单测之金样；跨端共用防漂移）",
+  "thresholds": { "fb_hi": 0.5, "fb_lo": 0.5, "mb_hi": 0.55, "mb_lo": 0.45 },
+  "verdictTruthTable": [
+    { "case": "共振看多", "fac": 0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.6, "mbreadth": 0.6, "expect": "resonant_long" },
+    { "case": "共振看多_边界全取等", "fac": 0.0, "q67": 0.0, "q33": -0.1, "fbreadth": 0.5, "mbreadth": 0.55, "expect": "resonant_long" },
+    { "case": "因子多模型弱", "fac": 0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": 0.3, "expect": "diverge_model_weak" },
+    { "case": "因子多模型弱_模型广度在带内", "fac": 0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": 0.5, "expect": "diverge_model_weak" },
+    { "case": "共振看空", "fac": -0.2, "q67": 0.0, "q33": -0.1, "fbreadth": 0.3, "mbreadth": 0.3, "expect": "resonant_short" },
+    { "case": "共振看空_边界全取等", "fac": -0.1, "q67": 0.0, "q33": -0.1, "fbreadth": 0.5, "mbreadth": 0.45, "expect": "resonant_short" },
+    { "case": "因子空模型抗", "fac": -0.2, "q67": 0.0, "q33": -0.1, "fbreadth": 0.2, "mbreadth": 0.8, "expect": "diverge_model_resilient" },
+    { "case": "因子空模型抗_带内", "fac": -0.2, "q67": 0.0, "q33": -0.1, "fbreadth": 0.2, "mbreadth": 0.5, "expect": "diverge_model_resilient" },
+    { "case": "均分高但个股广度不足_不入选", "fac": 0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.4, "mbreadth": 0.9, "expect": "neutral" },
+    { "case": "均分低但个股广度偏多_不判定", "fac": -0.2, "q67": 0.0, "q33": -0.1, "fbreadth": 0.6, "mbreadth": 0.1, "expect": "neutral" },
+    { "case": "模型广度缺失_不判定", "fac": 0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": null, "expect": "neutral" },
+    { "case": "均分缺失", "fac": null, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": 0.9, "expect": "neutral" },
+    { "case": "均分居中", "fac": -0.05, "q67": 0.0, "q33": -0.1, "fbreadth": 0.9, "mbreadth": 0.9, "expect": "neutral" }
+  ],
+  "coverageGate": { "ramp": 0.7 },
+  "boardRequiredTop": ["schema_version", "meta", "factors", "horizon", "validation", "resonance", "sectors", "stocks"]
+}

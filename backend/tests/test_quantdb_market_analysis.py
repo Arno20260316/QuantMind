@@ -141,6 +141,66 @@ def test_get_tag_matches_real_members():
         assert isinstance(r["count"], int) and r["count"] > 0
 
 
+def test_get_tag_stats_hot_type_filter(monkeypatch):
+    """hot_type 单体系过滤（纯函数路径）：全局混合 top-N 会被大连体体系挤空，
+    按体系取数才凑得齐热门列表；统计四数恒为全量口径。"""
+    members = pd.DataFrame(
+        [{"sector_name": "概念AAA", "sector_type": "概念板块", "symbol": f"SZ{i:06d}"} for i in range(40)]
+        + [{"sector_name": "概念BBB", "sector_type": "概念板块", "symbol": f"SZ1{i:05d}"} for i in range(30)]
+        + [{"sector_name": "行业二级A", "sector_type": "行业板块(二级)", "symbol": f"SH{i:06d}"} for i in range(9)]
+        + [{"sector_name": "行业二级B", "sector_type": "行业板块(二级)", "symbol": f"SH2{i:05d}"} for i in range(7)]
+        + [{"sector_name": "行业二级C", "sector_type": "行业板块(二级)", "symbol": f"SH3{i:05d}"} for i in range(5)]
+        + [{"sector_name": "行业一级X", "sector_type": "行业板块(一级)", "symbol": f"BJ{i:06d}"} for i in range(3)]
+    )
+    monkeypatch.setattr(quantdb_feed, "_available", lambda: True)
+    monkeypatch.setattr(quantdb_feed, "_sector_members", lambda: members)
+    quantdb_feed.clear_cache()
+
+    mixed = quantdb_feed.get_tag_stats(limit=3)
+    assert [t["name"] for t in mixed["hot_tags"]] == ["概念AAA", "概念BBB", "行业二级A"]
+
+    l2 = quantdb_feed.get_tag_stats(limit=2, hot_type="行业板块(二级)")
+    assert [t["name"] for t in l2["hot_tags"]] == ["行业二级A", "行业二级B"]
+    assert all(t["type"] == "行业板块(二级)" for t in l2["hot_tags"])
+    # 统计四数不随 hot_type 变化（全量口径）
+    assert l2["total_sectors"] == mixed["total_sectors"] == 6
+    assert l2["total_relations"] == mixed["total_relations"] == 94
+    # 该体系无板块 → 空热门，不报错
+    assert quantdb_feed.get_tag_stats(limit=5, hot_type="地区板块")["hot_tags"] == []
+
+
+def test_snapshot_tag_stats_hot_type_filter(tmp_path, monkeypatch):
+    """SQLite 快照路径同参过滤：hot_type 只出该体系、按成分数降序、统计四数不减。"""
+    import sqlite3
+
+    from backend.services.api.market_analysis import quantdb_snapshot as snap
+
+    db = sqlite3.connect(tmp_path / "latest.db")
+    db.execute("CREATE TABLE tags (sector_name TEXT, sector_type TEXT, symbol TEXT)")
+    db.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+    rows = (
+        [("概念AAA", "概念板块", f"SZ{i:06d}") for i in range(40)]
+        + [("行业二级A", "行业板块(二级)", f"SH{i:06d}") for i in range(9)]
+        + [("行业二级B", "行业板块(二级)", f"BJ{i:06d}") for i in range(5)]
+    )
+    db.executemany("INSERT INTO tags VALUES (?,?,?)", rows)
+    db.execute("INSERT INTO meta VALUES ('trade_date', '2026-10-10')")
+    db.commit()
+    db.close()
+
+    monkeypatch.setenv("QM_MARKET_SNAPSHOT_DIR", str(tmp_path))
+    st = snap.tag_stats(limit=2, hot_type="行业板块(二级)")
+    assert [t["name"] for t in st["hot_tags"]] == ["行业二级A", "行业二级B"]
+    assert all(t["type"] == "行业板块(二级)" for t in st["hot_tags"])
+    assert st["total_sectors"] == 3 and st["total_relations"] == 54
+    assert st["trade_date"] == "2026-10-10"
+    # 缺省无过滤：全局混合按成分数降序（概念 40 > 行业二级 9）
+    mixed = snap.tag_stats(limit=2)
+    assert [t["name"] for t in mixed["hot_tags"]] == ["概念AAA", "行业二级A"]
+    # 该体系无板块 → 空热门，不报错
+    assert snap.tag_stats(limit=5, hot_type="地区板块")["hot_tags"] == []
+
+
 def test_quantdb_money_flow_period():
     """验证多周期资金流向排行数据"""
     periods = ["1d", "3d", "5d", "10d", "20d"]

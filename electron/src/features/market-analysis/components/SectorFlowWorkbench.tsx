@@ -332,12 +332,12 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
               <span className="text-[10px] font-bold text-slate-400">成分贡献榜（窗口净额 · 点击下钻个股）</span>
               <span className="text-[10px] font-mono text-slate-400">
                 {recentDates.length > 0
-                  ? `前排按净额绝对值 · 右列近 ${recentDates.length} 日涨跌幅`
+                  ? `前排按净额绝对值 · 右列近 ${recentDates.length} 日逐日与 20 日累计涨幅（%）`
                   : '前排为净额绝对值最大'}
               </span>
             </div>
             <div className="overflow-x-auto custom-scrollbar">
-              <div className="min-w-[760px] flex flex-col gap-1">
+              <div className="min-w-[860px] flex flex-col gap-1">
                 {recentDates.length > 0 && (
                   <div className="flex items-center gap-2 px-2 pb-1 border-b border-slate-100">
                     <span className="w-7 shrink-0" />
@@ -347,10 +347,11 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
                     <span className="w-[88px] text-right shrink-0 text-[10px] font-bold text-slate-400">窗口净额</span>
                     <span className="w-[54px] text-right shrink-0 text-[10px] font-bold text-slate-400">占比</span>
                     {recentDates.map((d) => (
-                      <span key={d} className="w-[42px] text-right shrink-0 text-[10px] font-mono text-slate-400">
+                      <span key={d} className="w-[48px] text-right shrink-0 text-[10px] font-mono text-slate-400">
                         {d.slice(5)}
                       </span>
                     ))}
+                    <span className="w-[68px] text-right shrink-0 text-[10px] font-bold text-slate-400">20日涨幅</span>
                   </div>
                 )}
                 <div className="overflow-y-auto custom-scrollbar" style={{ maxHeight: 340 }}>
@@ -376,14 +377,22 @@ export const SectorDetailPanel: React.FC<SectorDetailPanelProps> = ({
                           <span
                             key={d}
                             title={`${d} 涨跌幅 ${fmtPct(p?.pct)}`}
-                            className={`w-[42px] text-right text-[10px] font-mono shrink-0 ${
+                            className={`w-[48px] text-right text-[10px] font-mono shrink-0 ${
                               p?.pct == null ? 'text-slate-300' : flowTextClass(p.pct)
                             }`}
                           >
-                            {p?.pct == null ? '—' : `${p.pct > 0 ? '+' : ''}${p.pct.toFixed(1)}`}
+                            {p?.pct == null ? '—' : `${p.pct > 0 ? '+' : ''}${p.pct.toFixed(1)}%`}
                           </span>
                         );
                       })}
+                      <span
+                        title="近 20 交易日累计涨幅（官方逐日涨跌幅复利；有效日不足 10 日显 —）"
+                        className={`w-[68px] text-right text-[11px] font-mono font-bold shrink-0 ${
+                          m.pct_20d == null ? 'text-slate-300' : flowTextClass(m.pct_20d)
+                        }`}
+                      >
+                        {m.pct_20d == null ? '—' : `${m.pct_20d > 0 ? '+' : ''}${m.pct_20d.toFixed(2)}%`}
+                      </span>
                     </button>
                   ))}
                 </div>

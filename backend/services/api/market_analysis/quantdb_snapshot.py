@@ -230,15 +230,26 @@ def trade_date(date: str | None = None) -> str | None:
 # 标签双向查询（SQLite）
 # ---------------------------------------------------------------------------
 
-def tag_stats(limit: int = 30, date: str | None = None) -> dict | None:
+def tag_stats(
+    limit: int = 30, date: str | None = None, hot_type: str | None = None
+) -> dict | None:
     db = _open_tags_db(date)
     if db is None:
         return None
     try:
-        hot = db.execute(
-            "SELECT sector_name, sector_type, COUNT(*) AS n FROM tags "
-            "GROUP BY sector_name, sector_type ORDER BY n DESC LIMIT ?", (limit,)
-        ).fetchall()
+        # hot_type 按体系过滤：全局混合 top-N 会被成分数大的体系（概念/地区）
+        # 挤空——行业一级在全局 top-100 里为 0 条，单体系过滤才凑得齐热门列表。
+        if hot_type:
+            hot = db.execute(
+                "SELECT sector_name, sector_type, COUNT(*) AS n FROM tags "
+                "WHERE sector_type = ? GROUP BY sector_name, sector_type "
+                "ORDER BY n DESC LIMIT ?", (hot_type, limit)
+            ).fetchall()
+        else:
+            hot = db.execute(
+                "SELECT sector_name, sector_type, COUNT(*) AS n FROM tags "
+                "GROUP BY sector_name, sector_type ORDER BY n DESC LIMIT ?", (limit,)
+            ).fetchall()
         agg = db.execute(
             "SELECT COUNT(DISTINCT sector_name), COUNT(DISTINCT symbol), COUNT(*) FROM tags"
         ).fetchone()

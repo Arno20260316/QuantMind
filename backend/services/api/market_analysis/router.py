@@ -549,18 +549,22 @@ async def get_money_flow_evidence(
 async def get_tag_stats(
     limit: int = Query(default=30, ge=1, le=100),
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
+    hot_type: str | None = Query(
+        default=None,
+        description="按板块体系过滤热门（如：行业板块(二级)）；缺省为全局混合 top-N",
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """标签体系统计与热门标签（优先 SQLite 快照，缺失回退 sector_members 聚合）"""
     _ = current_user
-    st = _snap.tag_stats(limit=limit, date=date)
+    st = _snap.tag_stats(limit=limit, date=date, hot_type=hot_type)
     if st:
         return st
     if date:
         return {"trade_date": date, "total_sectors": 0, "total_stocks": 0,
                 "avg_tags_per_stock": 0.0, "max_tags_per_stock": 0,
                 "total_relations": 0, "hot_tags": []}
-    return quantdb_feed.get_tag_stats(limit=limit)
+    return quantdb_feed.get_tag_stats(limit=limit, hot_type=hot_type)
 
 
 @router.get("/tags/by-tag")

@@ -13,7 +13,9 @@ import {
   AlertTriangle,
   ArrowLeft,
   CalendarDays,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Gauge,
   Grid3x3,
   History,
@@ -50,6 +52,9 @@ const STOCK_LIST_OPTIONS = [
 ];
 
 const HORIZON_KEYS = ['1', '2', '5', '10', '20'];
+
+/** 入选因子清单默认折叠预览行数（清单长时卡片过高；点展开看全量，按次会话状态）。 */
+const FACTOR_PREVIEW_ROWS = 4;
 
 /** 象限键序 = 因子分位在前、模型分位在后（sectors.quadrant_frame: fq+mq）。 */
 const QUAD_LEVELS = [
@@ -261,6 +266,7 @@ export const FactorBoardPanel: React.FC = () => {
   const [membersKey, setMembersKey] = useState<string | null>(null);
   const [membersLoading, setMembersLoading] = useState(false);
   const [membersError, setMembersError] = useState<string | null>(null);
+  const [factorsExpanded, setFactorsExpanded] = useState(false);
   const membersCache = useRef<Map<string, FactorBoardSectorMember[]>>(new Map());
 
   useEffect(() => {
@@ -389,6 +395,10 @@ export const FactorBoardPanel: React.FC = () => {
   const nonDedupWarnings = dedup ? meta.warnings.filter((w) => !w.startsWith('二次去重：')) : meta.warnings;
   // 1.1 因子列（近 20 日 / 净 IC）：按行键探测——1.0 历史产物无键 → 整列隐藏
   const hasNetCols = board.factors.some((f) => 'decay' in f || 'net_ic60' in f);
+  const factorsFoldable = board.factors.length > FACTOR_PREVIEW_ROWS;
+  const shownFactors = factorsFoldable && !factorsExpanded
+    ? board.factors.slice(0, FACTOR_PREVIEW_ROWS)
+    : board.factors;
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -659,7 +669,7 @@ export const FactorBoardPanel: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {board.factors.map((f) => (
+              {shownFactors.map((f) => (
                 <tr key={`${f.lib}/${f.name}`} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/60">
                   <td className="py-1.5 px-1">
                     <div className="font-bold text-slate-800 truncate" title={f.display}>{f.display}</div>
@@ -731,6 +741,23 @@ export const FactorBoardPanel: React.FC = () => {
             </tbody>
           </table>
         </div>
+        {factorsFoldable && (
+          <button
+            onClick={() => setFactorsExpanded((v) => !v)}
+            aria-expanded={factorsExpanded}
+            className="self-center inline-flex items-center gap-1 px-3 py-1 rounded-full text-[11px] font-extrabold bg-slate-100 text-slate-600 hover:bg-purple-50 hover:text-purple-700 transition-colors cursor-pointer"
+          >
+            {factorsExpanded ? (
+              <>
+                <ChevronUp className="w-3 h-3" /> 收起
+              </>
+            ) : (
+              <>
+                <ChevronDown className="w-3 h-3" /> 展开全部 {board.factors.length} 条
+              </>
+            )}
+          </button>
+        )}
       </SectionCard>
 
       {/* ── 持有期画像（左） + 个股四象限（右）· 页面末行 ────── */}

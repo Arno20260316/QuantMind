@@ -379,6 +379,8 @@ def test_sector_detail_members_contract():
     assert abs_vals == sorted(abs_vals, reverse=True)
     for r in rows:
         assert r["symbol"].startswith(("SH", "SZ", "BJ"))
+        # 20 日累计涨幅：数值或 null（缺价显 —，绝不落 0）
+        assert r["pct_20d"] is None or isinstance(r["pct_20d"], (int, float))
         if r["share"] is not None:
             # share = 成员净额 / 板块净额（两值皆 2 位小数舍入，容差放宽）
             assert r["share"] == pytest.approx(
@@ -419,6 +421,49 @@ def test_sector_detail_members_recent_pct_window():
             assert got is None
         else:
             assert got == pytest.approx(float(val), abs=1e-6)
+
+
+def test_sector_detail_member_pct_20d_compound():
+    """成员行 pct_20d = 近 20 交易日官方逐日涨跌幅复利（独立重算逐行对齐）。
+
+    复利连乘等价于区间收盘比（官方口径已含除权调整）；有效日 < 10 必须显 null
+    而非零值——零会把「停牌/次新无数据」伪装成「20 日零涨幅」。
+    """
+    from backend.shared.stock_utils import StockCodeUtil
+
+    pan = flow_panorama.get_panorama(period="1d")
+    name = pan["sectors"][0]["name"]
+    detail = flow_panorama.get_sector_detail(name=name, top=5)
+    assert detail is not None and detail["available"] is True
+    rows = detail["members"]
+    assert rows
+    days20 = sorted(
+        flow_panorama._l2_dates_upto(None, flow_panorama.SECTOR_TREND_DAYS)
+    )
+    px = quantdb_feed._load_prices(days20)
+    checked = 0
+    for r in rows:
+        assert "pct_20d" in r
+        got = r["pct_20d"]
+        assert got is None or isinstance(got, (int, float))
+        if got is None:
+            continue
+        raw = StockCodeUtil.to_suffix(r["symbol"])
+        sub = px[px["symbol"] == raw].sort_values("dt")
+        acc = 1.0
+        n_ok = 0
+        for v in sub["pct_change"]:
+            if pd.isna(v):
+                continue
+            acc *= 1.0 + float(v) / 100.0
+            n_ok += 1
+        assert n_ok >= flow_panorama.SECTOR_PCT_MIN_DAYS, (
+            f"{raw} 有效日仅 {n_ok} 却给了 pct_20d"
+        )
+        assert got == pytest.approx((acc - 1.0) * 100.0, abs=0.01)
+        checked += 1
+    if checked == 0:
+        pytest.skip("实机数据该板块无 20 日有效价（全 null），跳过复利对齐断言")
 
 
 def test_sector_detail_day_stats_only_latest_day(monkeypatch):

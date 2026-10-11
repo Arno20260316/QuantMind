@@ -957,8 +957,11 @@ def get_tags_by_stock(symbol: str) -> dict[str, list[str]] | None:
     return tags if tags else None
 
 
-def get_tag_stats(limit: int = 30) -> dict[str, Any]:
-    """标签体系统计与热门标签（按成分股数量排序，真实 sector_members 聚合）。"""
+def get_tag_stats(limit: int = 30, hot_type: str | None = None) -> dict[str, Any]:
+    """标签体系统计与热门标签（按成分股数量排序，真实 sector_members 聚合）。
+
+    hot_type 按体系过滤热门（呼应 SQLite 快照侧同参）；统计四数恒为全量口径。
+    """
     if not _available():
         return {
             "total_sectors": 0,
@@ -998,6 +1001,8 @@ def get_tag_stats(limit: int = 30) -> dict[str, Any]:
             .reset_index(name="count")
             .sort_values("count", ascending=False)
         )
+        if hot_type:
+            grp = grp[grp["sector_type"].astype(str) == hot_type]
         hot: list[dict[str, Any]] = [
             {
                 "name": str(r.sector_name),
@@ -1015,4 +1020,4 @@ def get_tag_stats(limit: int = 30) -> dict[str, Any]:
             "hot_tags": hot[:limit],
         }
 
-    return _cached(f"tag_stats_{limit}", 300.0, _load)
+    return _cached(f"tag_stats_{limit}_{hot_type or 'all'}", 300.0, _load)

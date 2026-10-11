@@ -64,6 +64,7 @@ STOCKS_PER_SECTOR_DEFAULT = 5
 STOCKS_PER_SECTOR_MAX = 20
 SECTOR_TREND_DAYS = 20  # 板块明细趋势窗口（交易日）
 SECTOR_RECENT_DAYS = 5  # 成分行近 N 日逐日涨跌幅窗口（升序日期组）
+SECTOR_PCT_MIN_DAYS = 10  # 20 日累计涨幅的最少有效日（停牌/次新不足则显 —）
 MIN_BREADTH_MEMBERS = 5  # 广度计算的最小成分样本
 MIN_SHARE_DENOM = 1e6  # |板块净额| 低于此值（100 万元）时占比落 null（分母过小不稳定）
 MAX_STOCK_DAYS = 60  # 个股详情的最大序列长度
@@ -770,7 +771,9 @@ def _sector_detail_impl(
             )
 
     recent_days = sorted(days[:SECTOR_RECENT_DAYS])
-    prices = _load_prices(recent_days)
+    # 价格窗一次读满 20 日：近 5 日逐日涨幅与 20 日累计涨幅共用（20 日窗 ⊇ 5 日窗）。
+    pct_days = sorted(days[:SECTOR_TREND_DAYS])
+    prices = _load_prices(pct_days)
     # _day_sector_stats 按 symbol 直接 merge 价格：多日价格会把均值跨日放大，
     # 广度/成分均涨幅只准用当日切片；近 N 日序列另行逐日对齐（见下）。
     price_today = prices[prices["dt"] == days[0]] if not prices.empty else prices
@@ -794,6 +797,19 @@ def _sector_detail_impl(
             recent_pct.setdefault(str(pr.symbol), {})[str(pr.dt)] = _f_or_none(
                 pr.pct_change
             )
+    # 近 20 交易日累计涨幅：官方逐日涨跌幅复利连乘（= 区间收盘比，官方口径已含
+    # 除权调整，对复权断点免疫）；有效日 < SECTOR_PCT_MIN_DAYS（停牌/次新）不给值
+    # 显 —，绝不落 0。
+    pct20: dict[str, float | None] = {}
+    for sym, by_day in recent_pct.items():
+        vals = [v for v in (by_day.get(d) for d in pct_days) if v is not None]
+        if len(vals) < SECTOR_PCT_MIN_DAYS:
+            pct20[sym] = None
+            continue
+        acc = 1.0
+        for v in vals:
+            acc *= 1.0 + v / 100.0
+        pct20[sym] = round((acc - 1.0) * 100.0, 2)
     member_rows: list[dict[str, Any]] = []
     for sym, r in ranked.iterrows():
         m = float(r["main"])
@@ -816,6 +832,7 @@ def _sector_detail_impl(
                     {"date": _dash(d), "pct": recent_pct.get(sym, {}).get(d)}
                     for d in recent_days
                 ],
+                "pct_20d": pct20.get(sym),
             }
         )
     member_rows.sort(key=lambda x: abs(x["net_main"]), reverse=True)

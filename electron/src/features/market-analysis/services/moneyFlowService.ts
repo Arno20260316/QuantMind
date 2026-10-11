@@ -144,6 +144,8 @@ export interface FlowSectorMember {
   inner_total: number;
   /** 近 ≤5 个 L2 分区日逐日涨跌幅（升序统一日期组；缺价 pct=null 显 —）。 */
   recent?: { date: string; pct: number | null }[];
+  /** 近 20 交易日累计涨幅（%）：官方逐日涨跌幅复利；有效日 <10（停牌/次新）为 null 显 —，绝非 0。 */
+  pct_20d: number | null;
 }
 
 export interface FlowSectorDetailResponse {
@@ -433,8 +435,15 @@ export interface FlowTagMatch {
   count: number;
 }
 
-export async function getTagStats(): Promise<FlowTagStats> {
-  return flowGet<FlowTagStats>('/tags/stats?limit=100');
+/**
+ * 标签统计 + 热门板块。hotType（后端板块体系字符串，如 `行业板块(二级)`）按体系过滤
+ * 热门：全局混合 top-N 会被成分数大的体系（概念/地区）挤空——行业一级在全局
+ * top-100 里一条都没有；单体系过滤才凑得齐热门列表。缺省仍为全局混合。
+ */
+export async function getTagStats(limit = 100, hotType?: string): Promise<FlowTagStats> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (hotType) qs.set('hot_type', hotType);
+  return flowGet<FlowTagStats>(`/tags/stats?${qs.toString()}`);
 }
 
 export async function getTagMatches(q: string): Promise<FlowTagMatch[]> {

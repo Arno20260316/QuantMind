@@ -344,6 +344,8 @@ export const FlowPanoramaPanel: React.FC<FlowPanoramaPanelProps> = ({ date, focu
       {/* ── 板块标签融合条（统一搜索 + 热门板块；数据面 /tags/*，不依赖全景取数） ── */}
       <TagBrowserStrip
         currentSectors={data?.sectors?.map((s) => s.name) ?? []}
+        sectorSet={sectorSet}
+        onSectorSetChange={handleSectorSetChange}
         onNavigateSector={handleNavigateSector}
         onSelectStock={handleSelectStock}
       />

@@ -16,6 +16,8 @@
  *     （truncate + title 全文，全页恰 2 处）；
  *   - 档位标签：≥2/≥3/≥5 在场且计数与 JSON 一致，切换即过滤（空档显式空态）；
  *   - 成分贡献榜：成员行 recent（近 ≤5 交易日逐日涨跌幅）契约与单元格渲染；
+ *   - v6 成分贡献榜：成员行 pct_20d（近 20 交易日累计涨幅，复利）契约；「20日涨幅」列
+ *     DOM 渲染；逐日与 20 日涨幅一律带 % 书写（缺失显 —）；
  *   - 交互闭环：命中榜行 → 工作台板块明细（容忍自动选中同名不重取）→ 成分下钻个股卡
  *     → 归因 chip 回板块 → 命中 #2 联动切板块 → 关闭个股卡；
  *   - 徽章证据卡弹层：hover「连N」徽章 → 探针口径 / 可执行口径 / 分年 / 口径披露；
@@ -181,6 +183,21 @@ ok(
 );
 const recentCells = await page.locator('span[title*="涨跌幅"]').count();
 ok(recentCells >= 10, 'recent 单元格渲染（近5日涨跌幅 span）', `${recentCells} 个`);
+
+// ── v6：成分贡献榜 20 日涨幅（pct_20d 契约 + 列渲染 + % 书写） ────────
+ok(
+  mAuto?.pct_20d === null || typeof mAuto?.pct_20d === 'number',
+  '成分行 pct_20d 契约（number|null；缺失不落 0）',
+  `pct_20d=${mAuto?.pct_20d}`,
+);
+const pct20Vals = (sectorJsonAuto?.members ?? []).map((m) => m.pct_20d).filter((v) => typeof v === 'number');
+ok(pct20Vals.length >= 1, '成员 pct_20d 有实值（20 日窗复利）', `${pct20Vals.length}/${sectorJsonAuto?.members?.length} 行有值`);
+const pct20Cells = page.locator('span[title*="20 交易日累计涨幅"]');
+ok((await pct20Cells.count()) >= 1, '「20日涨幅」单元格渲染', `${await pct20Cells.count()} 个`);
+const pct20Text = (await pct20Cells.first().innerText().catch(() => '')).trim();
+ok(/%$/.test(pct20Text) || pct20Text === '—', '20日涨幅按百分比书写（带 % 或缺失显 —）', `样例「${pct20Text}」`);
+const dayCellText = (await page.locator('span[title*="涨跌幅"]:not([title*="累计涨幅"])').first().innerText().catch(() => '')).trim();
+ok(/%$/.test(dayCellText) || dayCellText === '—', '逐日涨幅按百分比书写（带 %）', `样例「${dayCellText}」`);
 
 // ── JSON 侧：panorama 四层与契约 ─────────────────────────────────────
 ok(pan?.available === true, 'panorama available:true', `trade_date=${pan?.trade_date}`);

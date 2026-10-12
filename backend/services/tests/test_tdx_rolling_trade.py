@@ -292,9 +292,20 @@ class TestRunRollingPushExecuteMode:
         svc = TdxRollingTradeService()
         fake_tdx = MagicMock()
         fake_tdx.enabled = False
+        notifier, redis = _SpyNotifier(), _FakeRedis()
         with (
-            patch(f"{ROLLING_MODULE}.load_rolling_config", return_value=(2.2, 10000.0, "tdx")),
+            patch(
+                f"{ROLLING_MODULE}.load_rolling_config",
+                return_value=(2.2, 10000.0, "tdx"),
+            ),
             patch(f"{ROLLING_MODULE}.tdx_pusher", fake_tdx),
+            # 告警面必须走替身：此前漏铺通知桩，用例把「桥未配置」假告警
+            # 直投真通知表 + QQ（2026-10-12 实测三连发污染）。
+            patch(f"{ROLLING_MODULE}.trade_redis", redis),
+            patch(
+                "backend.services.live_trading.services.tdx_exec_alerts.default_notifier",
+                new=lambda: notifier,
+            ),
             patch(
                 "backend.services.trade.services.member_gate.is_paid_member",
                 new=AsyncMock(return_value=True),
@@ -304,6 +315,7 @@ class TestRunRollingPushExecuteMode:
 
         assert result["success"] is False
         assert "TDX_BRIDGE_URL" in result["error"]
+        assert len(notifier.calls) == 1
 
     @pytest.mark.asyncio
     async def test_warning_only_mode_needs_no_member_and_no_bridge(self):

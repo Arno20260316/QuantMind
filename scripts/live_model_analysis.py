@@ -15,12 +15,25 @@
 * **桥挂 = 无账户模板**：没有账户数据时提示词**禁止要求点评持仓**（也不许模型
   编造持仓/账户数字），并给日志落 ``data_gaps=['account_unreachable']`` 机器
   可读标记 → 前端卡片挂「无实盘账户数据」横幅；
-* **截断不落盘**：``finish_reason=='length'`` 的回复整轮作废（重试 1 次后仍截断
+* **截断不落盘**：``finish_reason=='length'`` 的回复整轮作废（重试 1 次**并追加
+  「精简输出」提示**——2026-10-12 实测同一 payload 原样重试再撞上限；仍截断
   即放弃并如实报错）——半截分析混进「模型对话」与完整分析无法区分。
 
+提醒（2026-10-12 补：当日桥失联 5 轮、截断 3 轮全程无任何告警）：
+* 桥失联/恢复：状态翻转沿各推一条 QQ（状态持久化在
+  ``data/logs/.live_model_analysis_alert_state.json``，不重复刷）；
+* 轮次不满员（或全败）：推一条 QQ，1 小时限流（每小时一轮 = 每轮最多一条）；
+* 复盘轮卡片：``--mode review`` 完成后推「📋 收盘复盘」合集（每模型一段摘要）。
+
 用法：
-    python3 scripts/live_model_analysis.py                 # 全部模型（名册）
+    python3 scripts/live_model_analysis.py                 # 盘中轮：全部模型（名册）
     python3 scripts/live_model_analysis.py --agents deepseek-v4-flash
+    python3 scripts/live_model_analysis.py --mode review   # 盘后复盘轮（北京 15:30 档）
+
+开关（``.env``，缺省全开；写 ``0/false/no/off`` 关，词表同 switch_enabled）：
+    QM_DIALOGUE_ALERTS=off        # 桥失联/恢复 + 轮次不满员 两类提醒
+    QM_DIALOGUE_REVIEW_PUSH=off   # 收盘复盘 QQ 卡片
+    QM_DIALOGUE_MAX_TOKENS=8000   # 输出上限覆盖（默认 8000）
 """
 
 from __future__ import annotations
@@ -28,19 +41,39 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# 本脚本目录（``import push_notify`` 同目录解析；keeper 系列脚本同口径）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 CN_TZ = timezone(timedelta(hours=8))
 LOCK = ROOT / "data" / "logs" / ".live_model_analysis.lock"
 LOG_DIR = ROOT / "data" / "agent_data_astock"
 BRIEF_FILE = ROOT / "data" / "news_brief" / "latest.json"
+ALERT_STATE_FILE = ROOT / "data" / "logs" / ".live_model_analysis_alert_state.json"
 TIMEOUT_S = 180
-MAX_TOKENS = 4000
+#: 输出上限：2026-10-12 实测 4000 会整轮截断（推理型模型的 reasoning 也吃预算），
+#: 三家供应商实测均接受 8000（finish=stop）。env ``QM_DIALOGUE_MAX_TOKENS`` 可覆盖。
+MAX_TOKENS = 8000
+#: 截断重试时的精简提示（只追加在第 2 次尝试；抄一份 payload 原样重试大概率再撞）。
+RETRY_BREVITY_NOTE = (
+    "\n\n【系统提示】你上一次的回复超过输出长度上限被截断（该轮已作废）。"
+    "本轮请**大幅精简**：只给结论与关键理由，省去铺陈与重复，全文控制在 800 字以内。"
+)
+#: 轮次不满员提醒的限流间隔（秒）：每小时一轮，1h 即每轮最多一条。
+ROUND_ALERT_MIN_INTERVAL_S = 3600
+#: 复盘轮的指数（suffix 式直查桥快照；拿不到就当该行缺失，绝不编数）。
+REVIEW_INDEXES: tuple[tuple[str, str], ...] = (
+    ("000001.SH", "上证指数"),
+    ("399001.SZ", "深证成指"),
+    ("399006.SZ", "创业板指"),
+)
 
 #: 名册：签名 →（凭据 env 前缀, 实际调用的模型名）。签名即落盘目录名，与前端
 #: 模型列表（扫描 agent_data_astock/ 目录）天然一致。
@@ -107,8 +140,11 @@ def _bridge_account(env: dict[str, str]) -> dict | None:
         return None
 
 
-def _bridge_price(env: dict[str, str], code: str) -> float:
-    """单只现价（桥 get_market_snapshot 直查）；失败返回 0（提示词留空）。"""
+def _bridge_snapshot(env: dict[str, str], code: str) -> dict:
+    """单只快照（桥 get_market_snapshot 直查）；失败返回 ``{}``（该行留空）。
+
+    返回 ``{"now": float, "last_close": float}``——复盘轮要昨收算当日涨跌。
+    """
     import requests
 
     from backend.shared.stock_utils import StockCodeUtil
@@ -116,7 +152,7 @@ def _bridge_price(env: dict[str, str], code: str) -> float:
     url = (env.get("TDX_BRIDGE_URL") or "").rstrip("/")
     token = env.get("TDX_BRIDGE_TOKEN") or ""
     if not url:
-        return 0.0
+        return {}
     try:
         resp = requests.post(
             f"{url}/api/v1/tdx/call",
@@ -130,10 +166,25 @@ def _bridge_price(env: dict[str, str], code: str) -> float:
         resp.raise_for_status()
         result = resp.json().get("result") or {}
         if not isinstance(result, dict):
-            return 0.0
-        return float(result.get("Now") or result.get("now") or 0) or 0.0
+            return {}
+        now = float(result.get("Now") or result.get("now") or 0) or 0.0
+        last_close = (
+            float(
+                result.get("LastClose")
+                or result.get("last_close")
+                or result.get("PreClose")
+                or 0
+            )
+            or 0.0
+        )
+        return {"now": now, "last_close": last_close}
     except Exception:  # noqa: BLE001 单只失败静默（该行现价留空）
-        return 0.0
+        return {}
+
+
+def _bridge_price(env: dict[str, str], code: str) -> float:
+    """单只现价（``_bridge_snapshot`` 的 now 取用）；失败返回 0（提示词留空）。"""
+    return float(_bridge_snapshot(env, code).get("now") or 0.0)
 
 
 def _news_block() -> str:
@@ -174,6 +225,8 @@ def build_user_content(
     *,
     account_reader=None,
     price_reader=None,
+    snapshot_reader=None,
+    mode: str = "intraday",
 ) -> tuple[str, list[str]]:
     """拼账户 + 持仓 + 新闻的提示词正文（供所有模型共用）。
 
@@ -182,15 +235,39 @@ def build_user_content(
     同时降级为「无账户模板」（**绝不要求点评持仓**，C5：编出来的持仓点评比
     不分析更坏）。
 
-    ``account_reader``/``price_reader`` 缺省走真实桥；测试注入替身。
+    ``mode='review'``（盘后复盘轮）：附三大指数当日表现，持仓表加「今日」涨跌
+    列，要求模板换成复盘三问（今日复盘 / 持仓回顾 / 明日计划 + 开头 ≤120 字摘要）。
+
+    ``account_reader``/``price_reader``/``snapshot_reader`` 缺省走真实桥；
+    测试注入替身。
     """
     read_account = account_reader or _bridge_account
     read_price = price_reader or _bridge_price
+    read_snapshot = snapshot_reader or _bridge_snapshot
+    is_review = mode == "review"
     now = datetime.now(CN_TZ)
     gaps: list[str] = []
     parts = [
         f"【时间】{now.strftime('%Y-%m-%d %H:%M')}（北京时间，{_session_label(now)}）"
     ]
+
+    if is_review:
+        idx_lines = ["【收盘行情】指数当日表现"]
+        got_idx = False
+        for idx_code, idx_name in REVIEW_INDEXES:
+            snap = read_snapshot(env, idx_code) or {}
+            idx_now = float(snap.get("now") or 0)
+            idx_prev = float(snap.get("last_close") or 0)
+            if idx_now > 0 and idx_prev > 0:
+                idx_lines.append(
+                    f"- {idx_name} {idx_now:.2f}（{(idx_now / idx_prev - 1) * 100:+.2f}%）"
+                )
+                got_idx = True
+        parts.append(
+            "\n".join(idx_lines)
+            if got_idx
+            else "【收盘行情】指数数据不可用（只按新闻面复盘）"
+        )
 
     acct = read_account(env)
     has_positions = False
@@ -204,26 +281,48 @@ def build_user_content(
         )
         if positions:
             has_positions = True
-            rows = [
-                "【当前持仓】",
-                "| 代码 | 名称 | 持仓 | 可用 | 成本 | 现价 | 浮动盈亏 |",
-                "|---|---|---|---|---|---|---|",
-            ]
+            if is_review:
+                rows = [
+                    "【当前持仓】",
+                    "| 代码 | 名称 | 持仓 | 可用 | 成本 | 现价 | 浮动盈亏 | 今日 |",
+                    "|---|---|---|---|---|---|---|---|",
+                ]
+            else:
+                rows = [
+                    "【当前持仓】",
+                    "| 代码 | 名称 | 持仓 | 可用 | 成本 | 现价 | 浮动盈亏 |",
+                    "|---|---|---|---|---|---|---|",
+                ]
             for p in positions:
                 code = str(p.get("stock_code") or "")
                 name = str(p.get("stock_name") or p.get("name") or "")
                 total = p.get("total_volume")
                 avail = p.get("available_volume")
                 cost = float(p.get("cost_price") or 0)
-                last = read_price(env, code) if code else 0.0
+                if is_review:
+                    snap = read_snapshot(env, code) if code else {}
+                    last = float(snap.get("now") or 0)
+                    prev = float(snap.get("last_close") or 0)
+                    day_pct = (
+                        f"{(last / prev - 1) * 100:+.2f}%"
+                        if last > 0 and prev > 0
+                        else "—"
+                    )
+                else:
+                    last = read_price(env, code) if code else 0.0
+                    day_pct = ""
                 if last > 0 and cost > 0:
                     pnl = f"{(last / cost - 1) * 100:+.2f}%"
                     last_s = f"{last:.2f}"
                 else:
                     pnl, last_s = "—", "—"
-                rows.append(
-                    f"| {code} | {name} | {total} | {avail} | {cost:.3f} | {last_s} | {pnl} |"
+                row = (
+                    f"| {code} | {name} | {total} | {avail} | {cost:.3f} | "
+                    f"{last_s} | {pnl}"
                 )
+                if is_review:
+                    row += f" | {day_pct}"
+                rows.append(row + " |")
             parts.append("\n".join(rows))
         else:
             parts.append("【当前持仓】空仓")
@@ -236,21 +335,43 @@ def build_user_content(
         parts.append("【当日新闻分子】\n" + news)
 
     parts.append(
-        _requirement_block(has_account=bool(acct), has_positions=has_positions)
+        _requirement_block(
+            has_account=bool(acct), has_positions=has_positions, mode=mode
+        )
     )
     return "\n\n".join(parts), gaps
 
 
-def _requirement_block(*, has_account: bool, has_positions: bool) -> str:
+#: 复盘轮的统一开头要求（各态模板共用；「先行输出」保证 QQ 摘要抽取拿到干货）。
+REVIEW_SUMMARY_INSTRUCTION = (
+    "4) 【先行输出】开头先给一段 ≤120 字的「收盘复盘摘要」（一段话：大盘一句、"
+    "持仓一句、明日一句），随后再展开全文。"
+)
+
+
+def _requirement_block(
+    *, has_account: bool, has_positions: bool, mode: str = "intraday"
+) -> str:
     """尾段要求模板——**随数据齐缺三态降级**（C5 核心）。
 
     无账户数据时逐字禁止「点评持仓/编造持仓」：桥挂的轮次只许按新闻面说话。
+    ``mode='review'`` 换成收盘复盘三问（今日复盘 / 持仓回顾 / 明日计划）。
     """
     tail = (
         "输出中文 markdown，简洁、先结论后理由；你的输出展示在实盘看板的「模型对话」里，"
         "只输出观点与建议（本系统不会据此自动下单）。"
     )
+    is_review = mode == "review"
     if not has_account:
+        if is_review:
+            return (
+                "【要求】本轮**没有**实盘账户与持仓数据（桥不可达），给出今日收盘复盘：\n"
+                "1) **禁止**点评持仓、禁止编造任何持仓或账户数字——你没有这些数据；\n"
+                "2) 按上述指数与新闻面复盘今日大盘与板块；\n"
+                "3) 给出明日关注方向（仅为观察，不是指令）；\n"
+                "4) 【先行输出】开头先给一段 ≤120 字的「收盘复盘摘要」（大盘与明日，"
+                "一段话），随后再展开全文；并在文中明确说明缺少账户上下文。\n" + tail
+            )
         return (
             "【要求】本轮**没有**实盘账户与持仓数据（桥不可达），给出本轮盘中分析：\n"
             "1) **禁止**点评持仓、禁止编造任何持仓或账户数字——你没有这些数据；\n"
@@ -258,11 +379,30 @@ def _requirement_block(*, has_account: bool, has_positions: bool) -> str:
             "3) 明确说明本轮结论缺少账户上下文，仅供参考。\n" + tail
         )
     if not has_positions:
+        if is_review:
+            return (
+                "【要求】账户当前**空仓**（无持仓），给出今日收盘复盘：\n"
+                "1) 不要点评持仓——当前没有持仓，也禁止编造；\n"
+                "2) 按上述指数与新闻面复盘今日大盘与板块；\n"
+                "3) 给出明日候选方向与入场触发条件（仅为观察，不是指令）；\n"
+                + REVIEW_SUMMARY_INSTRUCTION
+                + "\n"
+                + tail
+            )
         return (
             "【要求】账户当前**空仓**（无持仓），给出本轮盘中分析：\n"
             "1) 不要点评持仓——当前没有持仓，也禁止编造；\n"
             "2) 结合新闻面指出风险与机会；\n"
-            "3) 如认为值得关注，给出候选方向与入场触发条件（仅为观察，不是指令）。\n" + tail
+            "3) 如认为值得关注，给出候选方向与入场触发条件（仅为观察，不是指令）。\n"
+            + tail
+        )
+    if is_review:
+        return (
+            "【要求】围绕上述实盘账户给出今日收盘复盘：\n"
+            "1) 复盘今日大盘与板块（结合指数与新闻面）；\n"
+            "2) 逐一回顾持仓今日表现，判断各持仓逻辑是否变化；\n"
+            "3) 给出明日计划：持仓处置倾向（持有/减仓/加仓）与候选方向/触发条件"
+            "（仅为观察，不是指令）；\n" + REVIEW_SUMMARY_INSTRUCTION + "\n" + tail
         )
     return (
         "【要求】围绕上述实盘账户给出本轮盘中分析：\n"
@@ -301,17 +441,30 @@ def call_model(
         f"你是 {model} 模型驱动的 A股 实盘交易助手盘中持仓分析师。"
         "分析冷静客观，给可执行的操作建议，注意 A股 T+1 规则与风险。输出中文 markdown。"
     )
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.3,
-        "max_tokens": MAX_TOKENS,
-    }
+    max_tokens = MAX_TOKENS
+    try:
+        override = int(str(env.get("QM_DIALOGUE_MAX_TOKENS") or "").strip() or "0")
+        if override > 0:
+            max_tokens = override
+    except ValueError:
+        pass
+
+    def _payload(user_text: str) -> dict:
+        return {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": max_tokens,
+        }
+
     last_exc: Exception | None = None
     for attempt in range(2):
+        # 第 2 次尝试追加「精简输出」提示：截断轮首因是话太长，同一 payload 原样
+        # 重试大概率再撞上限（2026-10-12 实测）；其余失败（网络等）追加也无害。
+        payload = _payload(user_content + (RETRY_BREVITY_NOTE if attempt else ""))
         try:
             resp = requests.post(
                 f"{base}/chat/completions",
@@ -354,11 +507,13 @@ def append_log(
     sig: str,
     usage: dict | None = None,
     data_gaps: list[str] | None = None,
+    mode: str = "intraday",
 ) -> Path:
     """落盘对话日志（与 news_brief.append_log 同结构 → 前端直接可读）。
 
     ``data_gaps`` 随条目落盘（前端据此在卡片挂「无实盘账户数据」横幅）；
-    截断轮**根本不会走到这里**（call_model 直接 raise）。
+    截断轮**根本不会走到这里**（call_model 直接 raise）。``mode='review'`` 的
+    条目附 ``"mode":"review"`` 标记（前端/审计据此区分复盘轮）。
     """
     now = datetime.now(CN_TZ)
     log_dir = LOG_DIR / sig / "log" / now.strftime("%Y-%m-%d")
@@ -375,15 +530,128 @@ def append_log(
         entry["usage"] = usage
     if data_gaps:
         entry["data_gaps"] = list(data_gaps)
+    if mode != "intraday":
+        entry["mode"] = mode
     path = log_dir / "log.jsonl"
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return path
 
 
+def extract_summary(content: str, limit: int = 160) -> str:
+    """从模型回复抽一段话摘要（复盘 QQ 卡片用，纯函数）。
+
+    取第一段非空文本（首个空行前的连续行合并），去掉 markdown 装饰符号；
+    超 ``limit`` 字截断加省略号。模型若按提示词首段给摘要即得摘要；否则退化为
+    「开头一段」——只做裁剪，绝不改写或编造。
+    """
+    para: list[str] = []
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            if para:
+                break
+            continue
+        line = re.sub(r"^[#>\-*\s]+", "", line).replace("**", "").replace("`", "")
+        if line.strip():
+            para.append(line.strip())
+    joined = " ".join(para).strip()
+    if len(joined) > limit:
+        joined = joined[: limit - 1].rstrip() + "…"
+    return joined
+
+
+def _flag_on(env: dict[str, str], key: str, default: bool = True) -> bool:
+    """提醒开关判定（默认开的词表口径，同 ``scheduler_registry.switch_enabled``）：
+    未配置用默认值；``0/false/no/off`` 视为关（大小写不敏感）。"""
+    raw = str(env.get(key, "") or "").strip().lower()
+    if raw == "":
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _load_alert_state() -> dict:
+    try:
+        data = json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_alert_state(state: dict) -> None:
+    try:
+        ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ALERT_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass  # 状态落盘失败只影响提醒去重，不挡分析
+
+
+def decide_transition_alert(prev_down: bool, is_down: bool) -> str | None:
+    """桥可达性翻转判定（纯函数）：``'down'``/``'up'``/``None``（无变化不推）。"""
+    if is_down and not prev_down:
+        return "down"
+    if prev_down and not is_down:
+        return "up"
+    return None
+
+
+def format_round_alert(failed: list[str], ok_count: int, total: int) -> tuple[str, str]:
+    """轮次不满员/全失败的 QQ 文案（纯函数）→ ``(title, content)``。"""
+    failed_sigs = "、".join(f.split(":", 1)[0] for f in failed)
+    if ok_count:
+        title = "⚠️ 模型对话轮不满员"
+        content = (
+            f"本轮 {ok_count}/{total} 个模型完成，未完成：{failed_sigs}。\n"
+            "多为输出超长截断（已带精简提示重试一次）；明细见 "
+            "logs/keepers/live_model_analysis.log，完整对话见 交易台 › 模型对话。"
+        )
+    else:
+        title = "❌ 模型对话轮全部失败"
+        content = (
+            f"本轮 {total} 个模型全部失败：{failed_sigs}。\n"
+            "明细见 logs/keepers/live_model_analysis.log。"
+        )
+    return title, content
+
+
+def format_review_card(
+    summaries: list[tuple[str, str]], now: datetime
+) -> tuple[str, str]:
+    """收盘复盘 QQ 卡片（纯函数）→ ``(title, content)``；卡片式纯文本（QQ 拒 markdown）。"""
+    divider = "━" * 14
+    lines = [divider]
+    for sig, summary in summaries:
+        lines.append(f"◆ {sig}")
+        lines.append(summary or "（本轮无摘要）")
+    lines.append(divider)
+    lines.append("详情见 交易台 › 模型对话")
+    return f"📋 收盘复盘 · {now.strftime('%m-%d')}", "\n".join(lines)
+
+
+def notify_qq(title: str, content: str) -> bool:
+    """推一条 QQ（best-effort）：失败只打印，绝不挡分析（更不挡交易）。"""
+    try:
+        import push_notify  # scripts/ 同目录（keeper 系列同口径）
+
+        push_notify.notify(title, content, channel="default")
+        print(f"📨 QQ 已推送：{title}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ QQ 推送失败（不影响分析）: {e}")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="实盘模型对话轮（只出观点，不下单）")
     ap.add_argument("--agents", default="", help="逗号分隔的模型签名；缺省=名册全部")
+    ap.add_argument(
+        "--mode",
+        default="intraday",
+        choices=["intraday", "review"],
+        help="intraday=盘中轮（缺省）；review=盘后复盘轮（北京 15:30 档）",
+    )
     args = ap.parse_args()
 
     LOCK.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +667,9 @@ def main() -> int:
             ROSTER
         )
         env = _load_env()
+        mode = args.mode
+        alerts_on = _flag_on(env, "QM_DIALOGUE_ALERTS", default=True)
+        now = datetime.now(CN_TZ)
         unknown = [t for t in targets if t not in ROSTER]
         for u in unknown:
             print(f"⚠️ 跳过 {u}：不在模型名册（{', '.join(ROSTER)}）")
@@ -407,28 +678,81 @@ def main() -> int:
             print("没有可运行的模型")
             return 2
 
-        user_content, data_gaps = build_user_content(env)
+        user_content, data_gaps = build_user_content(env, mode=mode)
+        bridge_down = "account_unreachable" in data_gaps
         if data_gaps:
             print(
-                "⚠️ 数据缺口：" + ",".join(data_gaps)
+                "⚠️ 数据缺口："
+                + ",".join(data_gaps)
                 + "（提示词已降级为无账户模板，日志将带缺口标记）"
             )
-        ok, failed = [], []
+        # 桥失联/恢复：只在翻转沿推（状态文件去重，morning 失联 5 轮只吵一次）
+        if alerts_on:
+            state = _load_alert_state()
+            transition = decide_transition_alert(
+                bool(state.get("bridge_down")), bridge_down
+            )
+            if transition == "down":
+                notify_qq(
+                    "⚠️ 模型对话轮降级",
+                    f"{now.strftime('%H:%M')} 起 TDX 桥不可达，模型对话轮已降级为"
+                    "无持仓上下文（恢复前每轮都如此）。请检查桥机（Windows）开机"
+                    "状态、桥进程与看门狗。",
+                )
+            elif transition == "up":
+                notify_qq(
+                    "✅ 模型对话轮恢复",
+                    f"{now.strftime('%H:%M')} 桥已恢复，模型对话轮恢复正常持仓上下文。",
+                )
+            if transition:
+                state["bridge_down"] = bridge_down
+                _save_alert_state(state)
+
+        ok, failed, summaries = [], [], []
         for sig in runnable:
             _, model = ROSTER[sig]
             try:
                 content, usage = call_model(env, sig, model, user_content)
-                append_log(user_content, content, sig, usage, data_gaps)
+                append_log(user_content, content, sig, usage, data_gaps, mode=mode)
                 ok.append(f"{sig} {len(content)}字")
+                if mode == "review":
+                    summaries.append((sig, extract_summary(content)))
                 print(f"✅ {sig} 完成（{len(content)} 字）")
             except Exception as e:  # noqa: BLE001 单模型失败不挡其余
                 failed.append(f"{sig}:{e}")
                 print(f"❌ {sig} 失败: {e}")
-        if ok:
-            print(f"[SUMMARY] {len(ok)}/{len(runnable)} 模型完成：" + " · ".join(ok))
-            return 0
-        print("[SUMMARY] 全部模型失败：" + " · ".join(failed)[:180])
-        return 2
+
+        ok_count = len(ok)
+        if ok_count:
+            print(f"[SUMMARY] {ok_count}/{len(runnable)} 模型完成：" + " · ".join(ok))
+        else:
+            print("[SUMMARY] 全部模型失败：" + " · ".join(failed)[:180])
+
+        # 轮次不满员/全败提醒（1h 限流——每小时一轮即每轮最多一条）
+        if failed and alerts_on:
+            state = _load_alert_state()
+            last_ts = float(state.get("last_round_alert_ts") or 0)
+            if time.time() - last_ts >= ROUND_ALERT_MIN_INTERVAL_S:
+                title, content = format_round_alert(failed, ok_count, len(runnable))
+                if notify_qq(title, content):
+                    state["last_round_alert_ts"] = time.time()
+                    _save_alert_state(state)
+
+        # 复盘轮 QQ 卡片（同日只推一次——手动重跑不重复打扰）
+        if (
+            mode == "review"
+            and ok_count
+            and _flag_on(env, "QM_DIALOGUE_REVIEW_PUSH", default=True)
+        ):
+            state = _load_alert_state()
+            today = now.strftime("%Y-%m-%d")
+            if state.get("review_pushed_on") != today:
+                title, content = format_review_card(summaries, now)
+                if notify_qq(title, content):
+                    state["review_pushed_on"] = today
+                    _save_alert_state(state)
+
+        return 0 if ok_count else 2
     finally:
         try:
             fcntl.flock(lock, fcntl.LOCK_UN)

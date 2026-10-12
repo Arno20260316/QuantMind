@@ -231,6 +231,54 @@ class TestSnapshotSourceForBroker:
         assert out["SH600036"]["sources"] == ["qmt_exec", "tdx_bridge"]
 
 
+# ══ 真单能力判据（镜像账户闸门的唯一出处）════════════════════════════
+class TestRealBrokerCapable:
+    """``real_broker_capable`` = 「该券商键能否承载真单」的唯一判据。
+
+    镜像的账户/资金闸门原先写死 ``selected != "qmt_exec"``：选定 TDX 的部署**永远不会**
+    镜像（同一账户的直单路径却照常下单），且不抛异常——静默空转整晚才被发现。
+    本判据不另抄一份券商清单，而是复用 ``snapshot_source_for_broker``（「该券商在
+    ``real_account_snapshots`` 里有源」= 一条真实资金账户的接入面）。抄一份清单就是
+    第二个漂移点：加了新 CN 券商、改了路由表而这里忘改 → 镜像对新券商静默不生效。
+
+    ``test_trade_trading_precheck`` 已锁定该映射与 ``MARKET_BROKERS["CN"]`` 互逆，
+    所以这里只需锁「谁能过、谁不能过」。
+    """
+
+    def test_cn_real_money_brokers_are_capable(self):
+        # A 股可选券商（MARKET_BROKERS["CN"] = qmt_exec / tdx）都必须能过
+        assert rp.real_broker_capable("qmt_exec") is True
+        assert rp.real_broker_capable("tdx") is True
+
+    def test_alias_and_case_forms_are_capable(self):
+        # 桥侧历史写法（tdx_bridge）与大小写都要认——判据自己不 trim，因为选定键的
+        # 读入口（``_selected_real_broker`` / ``active_broker_type``）已经归一过；
+        # 这里再 trim 一次就是第二个归一化点，与 ``snapshot_source_for_broker`` 分叉。
+        assert rp.real_broker_capable("tdx_bridge") is True
+        assert rp.real_broker_capable("TDX") is True
+        assert rp.real_broker_capable("QMT_EXEC") is True
+
+    def test_paper_and_overseas_channels_are_not_capable(self):
+        # 纸面/海外通道不是真实资金账户的接入面 → 不能承载真单
+        assert rp.real_broker_capable("paper") is False
+        assert rp.real_broker_capable("tiger") is False
+        assert rp.real_broker_capable("futu") is False
+        assert rp.real_broker_capable("ib") is False
+
+    def test_missing_selection_is_not_capable(self):
+        # 「没选」与「选了但没有真单能力」必须都判 False（调用方再按空串分出原因）
+        assert rp.real_broker_capable(None) is False
+        assert rp.real_broker_capable("") is False
+        assert rp.real_broker_capable("   ") is False
+
+    def test_agrees_with_the_snapshot_source_mapping(self):
+        """判据与 ``snapshot_source_for_broker`` 同源——两者分叉即意味着判据被改写。"""
+        for broker in ("qmt_exec", "tdx", "tdx_bridge", "paper", "tiger", "", None):
+            assert rp.real_broker_capable(broker) is (
+                snapshot_source_for_broker(broker) is not None
+            )
+
+
 # ══ 券商选定键的读法（H2）══════════════════════════════════════════
 class FakeRawRedis:
     """``RedisClient.client``（原生 redis-py 形态）的替身：只认 ``get``。"""

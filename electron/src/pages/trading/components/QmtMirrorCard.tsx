@@ -1,4 +1,4 @@
-/** 大 QMT 真单镜像控制卡：热开关 / 急停 / 限额 / 白黑名单 / 队列 + 虚拟 vs 真单对账。 */
+/** 真单镜像控制卡（券商无关）：热开关 / 急停 / 限额 / 白黑名单 / 队列 + 虚拟 vs 真单对账。 */
 import React, { useCallback, useEffect, useState } from 'react';
 import {
     Alert,
@@ -87,7 +87,7 @@ const BLOCKED_REASON_LABEL: Record<string, string> = {
     kill_switch: '急停已置位',
     disabled: '镜像开关未开启',
     no_whitelist: '白名单为空（未点名任何策略）',
-    not_ready: '实盘通道未就绪（券商未选 qmt_exec 或 ENABLE_REAL_TRADING=false）',
+    not_ready: '实盘通道未就绪（券商未选择，或所选券商无真单能力，或 ENABLE_REAL_TRADING=false）',
     outside_hours: '非交易时段',
 };
 
@@ -292,10 +292,10 @@ const QmtMirrorCard: React.FC = () => {
             <div className="flex items-start justify-between gap-3">
                 <div>
                     <div className="text-sm font-bold text-gray-900 flex items-center gap-1.5">
-                        <ShieldAlert className="text-rose-500" size={16} /> 大 QMT 真单镜像
+                        <ShieldAlert className="text-rose-500" size={16} /> 真单镜像
                     </div>
                     <p className="text-xs text-gray-500 mt-1">
-                        模拟盘虚拟成交后，按下列限额把同向同量委托同步到大 QMT 真实账户（双轨并行，虚拟账本不受影响）。
+                        模拟盘虚拟成交后，按下列限额把同向同量委托同步到当前券商的真实账户（双轨并行，虚拟账本不受影响）。
                         仅白名单点名的策略会被镜像。
                     </p>
                 </div>
@@ -354,7 +354,7 @@ const QmtMirrorCard: React.FC = () => {
                     showIcon
                     className="!text-xs"
                     message="实盘通道未就绪"
-                    description="需要 ENABLE_REAL_TRADING=true，且「券商实盘接入」中把 A 股券商选为「大 QMT(执行端)」并测试连接通过，镜像单才会真正下发。"
+                    description="需要 ENABLE_REAL_TRADING=true，且「券商实盘接入」中把 A 股券商选为「大 QMT(执行端)」或「通达信(TDX 桥)」并测试连接通过，镜像单才会真正下发。"
                 />
             )}
 

@@ -66,7 +66,7 @@ const tabLabels = (): string[] => {
 describe('SettingsCenter 实盘配置闸门', () => {
     beforeEach(() => {
         liveFlag = true;
-        // 大 QMT 真单镜像只在 A 股出现，钉住市场免得到别的机器上少一个页签
+        // 真单镜像只在 A 股出现，钉住市场免得到别的机器上少一个页签
         store.dispatch(setMarket('CN'));
         // 挂载即拉 /api-keys/init。**永不落地**：本文件只断言页签，凭证数据回来与否
         // 无关，而落地后的 setState 会落在 act() 之外刷一屏警告（真返回也没意义）。
@@ -82,21 +82,21 @@ describe('SettingsCenter 实盘配置闸门', () => {
         renderSettings();
 
         expect(screen.queryByText('券商实盘接入')).not.toBeNull();
-        expect(screen.queryByText('大 QMT 真单镜像')).not.toBeNull();
+        expect(screen.queryByText('真单镜像')).not.toBeNull();
     });
 
     it('显式 true：与缺省一致', () => {
         renderSettings(true);
 
         expect(screen.queryByText('券商实盘接入')).not.toBeNull();
-        expect(screen.queryByText('大 QMT 真单镜像')).not.toBeNull();
+        expect(screen.queryByText('真单镜像')).not.toBeNull();
     });
 
     it('显式 false（模拟栏）：实盘两个入口一个都不渲染', () => {
         renderSettings(false);
 
         expect(screen.queryByText('券商实盘接入')).toBeNull();
-        expect(screen.queryByText('大 QMT 真单镜像')).toBeNull();
+        expect(screen.queryByText('真单镜像')).toBeNull();
         // 不是整块塌掉：凭证页还在，且只剩它一个页签
         expect(tabLabels()).toEqual(['接入凭证 / API 密钥']);
     });

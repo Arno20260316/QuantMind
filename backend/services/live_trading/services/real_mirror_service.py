@@ -1,7 +1,15 @@
-"""模拟盘 → 大 QMT 真单镜像（双轨并行）。
+"""模拟盘 → 真实账户真单镜像（双轨并行）。
 
-模拟盘（虚拟撮合）成交后，按配置**额外**向大 QMT 提交一笔真实委托；虚拟账本
+模拟盘（虚拟撮合）成交后，按配置**额外**向实盘券商提交一笔真实委托；虚拟账本
 行为完全不变（双轨），两边靠 ``client_order_id`` 关联，供对账视图比对滑点/费用。
+
+**券商无关**：就绪判据与账户闸门一律按「当前选定券商」（``broker:selected:{market}``
+→ ``REAL_BROKER_TYPE``）取数，不再写死大 QMT。历史上两处硬绑 ``qmt_exec``（就绪判据
+``selected != "qmt_exec"``；账户快照直连 ``get_qmt_exec_client``）——在一个选定 TDX 桥
+的部署上，镜像**永远** ``skipped(broker_not_qmt_exec:tdx)``：直单路径照常下单、镜像却从不
+下发，且全链无异常，是「装了但永不生效」的结构性空转（2026-10-13 实测）。券商的「能查
+真账户」判据复用 ``shared.real_positions.real_broker_capable``（与 ``MARKET_BROKERS["CN"]``
+的互逆性由测试锁定），账户出口统一归一为后缀式可用持仓。
 
 调用点（两处，均只调本模块一个函数，禁止各写一份逻辑）：
   * ``simulation/engine.py::SimulationEngine._execute_order`` —— 调度器自动调仓
@@ -14,14 +22,14 @@
     ``tenant:user:strategy``；**空集合 = 不镜像任何策略**
   * 黑名单：Redis SET ``mirror:blacklist``（symbol，前缀式如 ``SH600519``）
   * 限额（小额试水口径）：单笔 ≤1 万、单日 ≤5 万、单日 ≤5 只标的、单日 ≤20 笔
-  * 资金/持仓闸门：买入校验 QMT 可用资金，卖出校验 QMT 可用持仓
+  * 资金/持仓闸门：买入校验券商可用资金，卖出校验券商可用持仓
   * 熔断：连续拒单 ≥ N（默认 3）自动置 ``mirror:kill`` 并推送通知
   * 时段：非交易时段入队（Redis ``mirror:queue``），由 ``run_mirror_queue_drainer``
     在下一交易时段开盘提交，滑点在对账中标注
 
 限额计数用 Lua 脚本**原子**预留，提交失败会回滚预留，避免并发下的超额。
 
-限额口径只覆盖**镜像路径**：绕开镜像直接走 REAL 下单（``broker:selected:CN=qmt_exec``
+限额口径只覆盖**镜像路径**：绕开镜像直接走 REAL 下单（``broker:selected:CN=<券商>``
 + ``trading_mode=REAL``）不受本模块的名单/限额约束，那属于既有的实盘通道口径。
 """
 
@@ -37,18 +45,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.services.live_trading.services import lot_rules
+from backend.services.live_trading.services.broker_client import create_broker
 from backend.services.live_trading.services.qmt_account_sync_task import (
     batch_quantdb_last_close,
 )
-from backend.services.live_trading.services.qmt_exec_client import (
-    QmtExecError,
-    get_qmt_exec_client,
-)
+from backend.services.live_trading.services.qmt_exec_client import QmtExecError
 from backend.services.live_trading.services.trading_session import (
     is_trading_time,
     trade_date_str,
 )
 from backend.shared.live_trading_gate import is_real_trading_enabled
+from backend.shared.real_positions import real_broker_capable
 from backend.shared.simulation_account_keys import (
     canonical_sim_user_suffix,
     resolve_db_account_user,
@@ -94,7 +101,19 @@ ALERT_SUBMIT_FAILED = "submit_failed"
 
 # 账户/行情缓存：避免每笔镜像都打一次 RPC
 _ACCOUNT_CACHE_SECONDS = 10.0
-_account_cache: dict[str, Any] = {"at": 0.0, "data": None}
+_account_cache: dict[str, Any] = {"at": 0.0, "data": None, "broker": ""}
+
+#: 真账户查询用的 user_id。**券商侧多半忽略它**（TDX 桥的账号来自 ``TDX_ACCOUNT``、
+#: 大 QMT 来自 ``QMT_EXEC_ACCOUNT_ID``），此值只为满足 ``query_account(user_id)`` 的
+#: 签名与日志可读性；口径与其余实盘后台任务一致，走 ``resolve_db_account_user``。
+_ACCOUNT_USER_ENV = "MIRROR_ACCOUNT_USER_ID"
+
+#: 券商实例缓存（按券商键）。``create_broker`` 每次新建会带出一个未关闭的
+#: ``httpx.AsyncClient``（``TdxBroker._client`` 无 close），而本函数每 10s 就被
+#: 调用一次 ⇒ 不缓存就是每 10s 泄漏一个连接池。与 ``TradingEngine._broker_cache``
+#: 同一先例。**运行期改桥地址/SDK 配置仍需 respawn**——与既有行为一致（那些参数
+#: 来自进程 env，本来就不是热更面）。
+_broker_cache: dict[str, Any] = {}
 
 # 原子限额预留：KEYS=[日金额, 日笔数, 日标的集合]
 # ARGV=[本次金额, symbol, 单笔上限, 单日金额上限, 单日笔数上限, 单日标的上限, TTL]
@@ -499,7 +518,7 @@ def env_enabled() -> bool:
 
 
 def real_trading_ready(redis: Any, market: str = "CN") -> tuple[bool, str]:
-    """公开包装：实盘通道是否就绪（``ENABLE_REAL_TRADING`` + 市场选定 qmt_exec）。"""
+    """公开包装：实盘通道是否就绪（``ENABLE_REAL_TRADING`` + 市场选定有真单能力的券商）。"""
     return _real_trading_ready(redis, market)
 
 
@@ -642,7 +661,8 @@ def status_snapshot(redis: Any) -> dict[str, Any]:
         "broker_selected": selected,
         "real_trading_ready": ready,
         # ``blocked_reason`` 只回答「镜像为什么没开」；通道就绪是另一个问题，
-        # 且**镜像开着也可能不就绪**（ENABLE_REAL_TRADING 未开 / 券商不是 qmt_exec）。
+        # 且**镜像开着也可能不就绪**（ENABLE_REAL_TRADING 未开 / 未选券商 /
+        # 所选券商无真单能力）。
         # 分开报：推送确认面板要并列展示这两态，合成一个字段会让「就绪=false 但 reason 为空」
         # 变成一句没法行动的空话。``blocked_reason`` 语义保持不变（存量消费方在用）。
         "not_ready_reason": "" if ready else (reason or "unknown"),
@@ -655,41 +675,109 @@ def status_snapshot(redis: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # 账户/行情
 # --------------------------------------------------------------------------
-async def _account_snapshot(force: bool = False) -> dict[str, Any]:
-    """QMT 账户（资金 + 持仓），10s 进程内缓存。"""
+def _selected_real_broker(redis: Any, market: str = "CN") -> str:
+    """当前选定券商键（Redis ``broker:selected:{market}`` → ``REAL_BROKER_TYPE``）。
+
+    读不到返回空串。与 :func:`_real_trading_ready` **同一解析顺序**（就绪判的是它、
+    账户闸门取的也必须是它——两处取不同值就会出现「判就绪用 A 券商的资金闸门配
+    B 券商的账户」）。
+
+    非 CN 市场（HK/US/FUTURES）当前没有镜像面（``MirrorConfig.markets`` 默认仅 CN），
+    这里的 ``market`` 只保证键口径与 :func:`_real_trading_ready` 的入参一致。
+    """
+    key = f"broker:selected:{str(market or 'CN').upper() or 'CN'}"
+    try:
+        selected = _redis_get(redis, key).strip().lower()
+    except Exception:  # noqa: BLE001 - 读不到回落 env 默认
+        selected = ""
+    if selected:
+        return selected
+    try:
+        from backend.services.trade_shared.trade_config import settings
+
+        return str(getattr(settings, "REAL_BROKER_TYPE", "") or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _get_real_broker(broker_type: str) -> Any:
+    """按券商键取（并缓存）真单券商实例。构造失败**抛出**，由调用方 fail-closed。"""
+    cached = _broker_cache.get(broker_type)
+    if cached is not None:
+        return cached
+    broker = create_broker(enable_real=True, broker_type=broker_type)
+    _broker_cache[broker_type] = broker
+    return broker
+
+
+async def _account_snapshot(redis: Any, force: bool = False) -> dict[str, Any]:
+    """真账户（资金 + 可用持仓），按**当前选定券商**取数，10s 进程内缓存。
+
+    出口统一：``{"cash", "total_asset", "available_volume": {后缀式: 数量}, "broker"}``。
+    查不到账户返回 ``{}`` —— 调用方按 ``account_unavailable:empty`` 拒单（fail-closed），
+    **绝不**回落成「0 元 / 0 持仓」放行。
+
+    两条券商实现的字段口径（2026-10-13 实测）：
+
+    * ``TdxBroker``：``available_cash`` / ``total_asset``，持仓行只有 ``stock_code`` 与
+      ``available_volume``（**没有** ``symbol``、**没有** ``can_use_volume``）；
+    * ``QmtExecBroker``：``available_cash`` / ``total_asset``，持仓行含 ``symbol`` +
+      ``available_volume``（由 ``can_use_volume`` 归一而来）。
+
+    故此处两个键名都要认：``symbol or stock_code``、``available_volume or can_use_volume``。
+    只认一套的后果是**静默**的——卖出闸门恒读「可用持仓 0」而全数跳过，界面上只看到
+    「镜像没反应」。
+    """
+    broker_type = _selected_real_broker(redis) or "unset"
     now = asyncio.get_running_loop().time()
     cached = _account_cache.get("data")
     if (
         not force
         and cached is not None
+        and _account_cache.get("broker") == broker_type  # 运维切券商 → 旧缓存必须失效
         and now - float(_account_cache.get("at") or 0) < _ACCOUNT_CACHE_SECONDS
     ):
         return cached
-    client = get_qmt_exec_client()
-    asset = await client.get_asset()
-    positions = await client.get_positions()
+    broker = _get_real_broker(broker_type)
+    account = await broker.query_account(
+        resolve_db_account_user(_ACCOUNT_USER_ENV), tenant_id="default"
+    )
+    if not isinstance(account, dict) or not account:
+        logger.warning("[Mirror] 真账户查询无数据 broker=%s", broker_type)
+        _account_cache.update({"data": None, "at": 0.0, "broker": ""})
+        return {}
     available: dict[str, float] = {}
-    for item in positions:
-        # 桥返回的 symbol 是前缀式（SH600371），而限额闸门/Signal 链路一律用
-        # 后缀式（600371.SH）查；不归一化会让卖出恒判「可用持仓 0」被跳过。
+    for item in account.get("positions") or []:
+        if not isinstance(item, dict):
+            continue
+        # 桥返回的是前缀式（SH600371）/裸码，而限额闸门与 Signal 链路一律用后缀式
+        # （600371.SH）查；不归一化会让卖出恒判「可用持仓 0」被跳过。
         symbol = StockCodeUtil.to_suffix(
             str(item.get("symbol") or item.get("stock_code") or "")
         )
         if symbol:
-            available[symbol] = float(item.get("can_use_volume") or 0)
+            available[symbol] = float(
+                item.get("available_volume") or item.get("can_use_volume") or 0
+            )
+    # 资金字段：``available_cash`` 优先（两条实现都发它），``cash`` 兜底（部分旧形态）。
+    cash = account.get("available_cash")
+    if cash is None:
+        cash = account.get("cash")
+    total = account.get("total_asset")
+    if total is None:
+        total = account.get("balance")
     data = {
-        "cash": float(asset.get("cash") or 0),
-        "total_asset": float(asset.get("total_asset") or 0),
+        "cash": float(cash or 0),
+        "total_asset": float(total or 0),
         "available_volume": available,
+        "broker": str(account.get("broker") or broker_type),
     }
-    _account_cache["data"] = data
-    _account_cache["at"] = now
+    _account_cache.update({"data": data, "at": now, "broker": broker_type})
     return data
 
 
 def _invalidate_account_cache() -> None:
-    _account_cache["data"] = None
-    _account_cache["at"] = 0.0
+    _account_cache.update({"data": None, "at": 0.0, "broker": ""})
 
 
 async def _reference_price(symbol: str) -> float:
@@ -991,27 +1079,24 @@ def build_mirror_client_order_id(
 
 
 def _real_trading_ready(redis: Any, market: str) -> tuple[bool, str]:
-    """实盘通道就绪：ENABLE_REAL_TRADING 且该市场选定 qmt_exec。"""
+    """实盘通道就绪：``ENABLE_REAL_TRADING`` 且该市场选定了**有真单能力的券商**。
+
+    「有真单能力」= 该券商键能承载真实资金账户（见
+    ``shared.real_positions.real_broker_capable``，当前 = qmt_exec / tdx）。原实现写死
+    ``selected != "qmt_exec"``，把选定 TDX 桥的部署判成「未就绪」：同一账户的直单路径
+    正常下单、镜像却永远 skipped，且**没有任何异常**——正是本次要修的静默空转。
+    """
     # 走共享闸门读 env（**调用时读**，不是 import 时冻结），与中间件、
     # 与 `/real-trading/preflight`、与 `mirror_enabled` 的判定同一处。
     # 原来这里读 `trade_config.settings`，那份是 import 期快照——运维改了
     # env 重启后两份开关会在运行期分叉。
     if not is_real_trading_enabled():
         return False, "real_trading_disabled"
-    selected = ""
-    try:
-        selected = _redis_get(redis, f"broker:selected:{market}").strip().lower()
-    except Exception:  # noqa: BLE001
-        selected = ""
+    selected = _selected_real_broker(redis, market)
     if not selected:
-        try:
-            from backend.services.trade_shared.trade_config import settings
-
-            selected = str(getattr(settings, "REAL_BROKER_TYPE", "") or "").lower()
-        except Exception:  # noqa: BLE001
-            selected = ""
-    if selected != "qmt_exec":
-        return False, f"broker_not_qmt_exec:{selected or 'unset'}"
+        return False, "broker_unset"
+    if not real_broker_capable(selected):
+        return False, f"broker_not_real_capable:{selected}"
     return True, ""
 
 
@@ -1346,12 +1431,27 @@ async def _submit_payload(
     if order_value <= 0:
         return _skip("invalid_order_value")
 
-    # 资金 / 持仓闸门（真实账户口径）
+    # 资金 / 持仓闸门（真实账户口径，按当前选定券商取数）
     try:
-        account = await _account_snapshot()
-    except QmtExecError as exc:
+        account = await _account_snapshot(redis)
+    except QmtExecError as exc:  # 大 QMT 侧仍会以该异常形态上报
         logger.warning("[Mirror] 账户查询失败 code=%s: %s", exc.code, exc)
         return _skip(f"account_unavailable:{exc.code}")
+    except Exception as exc:  # noqa: BLE001 - 券商构造失败（未知类型/桥配置缺失）
+        # 未知 broker_type 时 ``create_broker`` 抛 ValueError；TDX 桥地址缺失时
+        # 构造本身不抛、查询失败返回 {}（走下面那条 empty 分支）。两者都不能让
+        # 异常穿出去——本函数的上层是成交回报路径，抛异常会打断模拟腿记账。
+        logger.warning(
+            "[Mirror] 账户不可用 broker=%s: %s: %s",
+            _selected_real_broker(redis) or "unset",
+            type(exc).__name__,
+            exc,
+        )
+        return _skip(f"account_unavailable:{type(exc).__name__}")
+    if not account:
+        # 查得到但不给数据（桥未连接 / 账户未登录）：**绝不当 0 元放行**，
+        # 否则买入闸门恒真——真钱路径上「读不到」必须等同「不下单」。
+        return _skip("account_unavailable:empty")
     if side == "BUY":
         need = order_value * 1.002  # 预留手续费
         if float(account.get("cash") or 0) < need:

@@ -185,6 +185,7 @@ async def probe_open(rc: Any, *, symbol: str, quantity: float, price: float) -> 
         return
 
     from backend.shared.live_trading_gate import is_real_trading_enabled
+    from backend.shared.real_positions import real_broker_capable
     from backend.services.live_trading.services.real_mirror_service import (
         kill_switch_on,
         whitelist_allows,
@@ -199,12 +200,13 @@ async def probe_open(rc: Any, *, symbol: str, quantity: float, price: float) -> 
         )
         return
     selected = str(_raw(rc, _SELECTED_KEY) or "").strip().lower()
-    if selected != "qmt_exec":
+    if not real_broker_capable(selected):
         _record(
             "B 开态（queued）",
             False,
-            f"broker:selected:CN={selected or 'unset'}，非 qmt_exec",
-            "先切券商（界面「券商接入」或 PUT /api/v1/broker-config/selected/CN）",
+            f"broker:selected:CN={selected or 'unset'}，非真单能力券商",
+            "先切券商（界面「券商接入」或 PUT /api/v1/broker-config/selected/CN；"
+            "A 股可选 qmt_exec / tdx）",
         )
         return
     if kill_switch_on(rc):

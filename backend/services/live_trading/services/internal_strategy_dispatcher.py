@@ -123,6 +123,10 @@ def _mirror_reason_cn(reason: str) -> str:
         return "真账户查询失败"
     if key.startswith("market_not_supported"):
         return f"镜像未支持该市场（{key.split(':', 1)[-1]}）"
+    if key.startswith("broker_not_real_capable") or key == "broker_unset":
+        # 通道未就绪的两条现代码。**同时兼容历史串** ``broker_not_qmt_exec:<x>``——
+        # 队列（mirror:queue）里的载荷可能来自上一版进程，补交时仍会带旧原因。
+        return f"实盘券商通道未就绪（{key.split(':', 1)[-1] or '未选择'}）"
     return key or "未知原因"
 
 

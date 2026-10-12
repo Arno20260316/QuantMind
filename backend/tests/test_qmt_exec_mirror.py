@@ -601,6 +601,142 @@ class TestSubmit:
             )
         assert result["reason"] == "account_unavailable:NOT_CONNECTED"
 
+    def test_empty_account_is_rejected_not_treated_as_zero_cash(self) -> None:
+        """账户**查得到但不给数据**（桥未连接 / 未登录）→ 拒单，绝不按「0 元」放行。
+
+        ``{}`` 与「0 元」在闸门里的区别就是真钱区别：把前者当后者，买入闸门
+        ``cash >= need`` 恒假也得先过 ``need>0``；反过来若实现回落成 0 元再放行，
+        就成了**不看钱的无限下单**。
+        """
+        redis = self._open_redis()
+        with (
+            patch.object(m, "_reference_price", AsyncMock(return_value=10.0)),
+            patch.object(m, "_account_snapshot", AsyncMock(return_value={})),
+        ):
+            result = asyncio.run(
+                m._submit_payload(
+                    db=object(), redis=redis, cfg=_cfg(), payload=_payload()
+                )
+            )
+        assert result["status"] == "skipped"
+        assert result["reason"] == "account_unavailable:empty"
+
+    def test_tdx_shaped_account_lets_the_sell_gate_through(self) -> None:
+        """TDX 账户形态（只有 ``stock_code`` / ``available_volume``）走**真**归一化路径。
+
+        ``TdxBroker.query_account`` 的持仓行**没有** ``symbol``、**没有**
+        ``can_use_volume``——只认 QMT 那套键名的实现会把每一行都读成空标的，
+        卖出恒判「可用持仓 0」而全数跳过，界面上只看到「镜像没反应」。
+
+        这条不 patch ``_account_snapshot``（patch 掉就绕过了要测的归一化），而是把
+        券商替身塞在 ``_get_real_broker`` 后面，让**真实现**去解析 TDX 形状的载荷。
+        """
+        redis = self._open_redis()
+        tdx_account = {
+            "broker": "tdx",
+            "available_cash": 500_000.0,
+            "total_asset": 800_000.0,
+            "positions": [
+                # 前缀式 + 只有 stock_code / available_volume（TDX 真实形状）
+                {
+                    "stock_code": "SH600519",
+                    "available_volume": 1000.0,
+                    "cost_price": 9.5,
+                }
+            ],
+        }
+        broker = SimpleNamespace(query_account=AsyncMock(return_value=tdx_account))
+        dispatch = AsyncMock(return_value={"status": "success", "order_id": "1002"})
+        m._invalidate_account_cache()
+        try:
+            with (
+                patch.object(m, "_reference_price", AsyncMock(return_value=10.0)),
+                patch.object(m, "_selected_real_broker", return_value="tdx"),
+                patch.object(m, "_get_real_broker", return_value=broker),
+                patch(
+                    "backend.services.live_trading.services.internal_strategy_dispatcher"
+                    ".dispatch_internal_strategy_order",
+                    dispatch,
+                ),
+                patch.object(m, "notify", side_effect=lambda **kw: None),
+            ):
+                result = asyncio.run(
+                    m._submit_payload(
+                        db=object(),
+                        redis=redis,
+                        cfg=_cfg(),
+                        payload=_payload(side="SELL", quantity=100.0),
+                    )
+                )
+        finally:
+            m._invalidate_account_cache()
+        assert result["status"] == "submitted", result
+        assert result["order_id"] == "1002"
+
+    def test_account_snapshot_normalizes_both_broker_shapes(self) -> None:
+        """两条券商实现的字段口径都必须归一化到同一出口（后缀式 + 同一组键名）。
+
+        TDX：``stock_code`` / ``available_volume``；QMT：``symbol`` / ``can_use_volume``。
+        归一化写错一侧的后果是**静默**的（卖出闸门恒读 0），所以正反两面都钉住。
+        """
+        cases = [
+            (
+                "tdx",
+                {
+                    "broker": "tdx",
+                    "available_cash": 1234.0,
+                    "total_asset": 5678.0,
+                    "positions": [
+                        {"stock_code": "SH600519", "available_volume": 300.0}
+                    ],
+                },
+            ),
+            (
+                "qmt_exec",
+                {
+                    "broker": "qmt_exec",
+                    "available_cash": 1234.0,
+                    "total_asset": 5678.0,
+                    "positions": [
+                        {
+                            "symbol": "SH600519",
+                            "can_use_volume": 300.0,
+                            "available_volume": 300.0,
+                        }
+                    ],
+                },
+            ),
+        ]
+        for broker_type, payload in cases:
+            broker = SimpleNamespace(query_account=AsyncMock(return_value=payload))
+            m._invalidate_account_cache()
+            try:
+                with (
+                    patch.object(m, "_selected_real_broker", return_value=broker_type),
+                    patch.object(m, "_get_real_broker", return_value=broker),
+                ):
+                    snap = asyncio.run(m._account_snapshot(_redis()))
+            finally:
+                m._invalidate_account_cache()
+            assert snap["cash"] == 1234.0, broker_type
+            assert snap["total_asset"] == 5678.0, broker_type
+            assert snap["available_volume"] == {"600519.SH": 300.0}, broker_type
+            assert snap["broker"] == broker_type
+
+    def test_account_snapshot_empty_payload_stays_empty(self) -> None:
+        """桥未连接/未登录时查得到「空账户」→ 返回 ``{}``，绝不当成 0 元账户。"""
+        broker = SimpleNamespace(query_account=AsyncMock(return_value={}))
+        m._invalidate_account_cache()
+        try:
+            with (
+                patch.object(m, "_selected_real_broker", return_value="tdx"),
+                patch.object(m, "_get_real_broker", return_value=broker),
+            ):
+                snap = asyncio.run(m._account_snapshot(_redis()))
+        finally:
+            m._invalidate_account_cache()
+        assert snap == {}
+
     def test_quota_reject(self) -> None:
         redis = self._open_redis()
         with patch.object(
@@ -1133,18 +1269,50 @@ class TestRealTradingGate:
         assert ready is False
         assert reason == "real_trading_disabled"
 
-    def test_requires_qmt_exec_selected(self, monkeypatch) -> None:
+    def test_ready_when_tdx_selected(self, monkeypatch) -> None:
+        """选定 TDX 桥 = 就绪。
+
+        原实现写死 ``selected != "qmt_exec"`` → 把 TDX 部署判成「未就绪」，同账户的
+        **直单路径照常下单、镜像却永远 skipped**，且不抛任何东西（静默空转）。
+        线上实测 ``broker:selected:CN = tdx``：本条断言就是这个故障的回归锁。
+        """
         monkeypatch.setenv(ENV_KEY, "true")
         redis = _redis(strings={"broker:selected:CN": "tdx"})
         ready, reason = m._real_trading_ready(redis, "CN")
-        assert ready is False
-        assert reason == "broker_not_qmt_exec:tdx"
+        assert ready is True
+        assert reason == ""
 
     def test_ready_when_enabled_and_selected(self, monkeypatch) -> None:
         monkeypatch.setenv(ENV_KEY, "true")
         redis = _redis(strings={"broker:selected:CN": "qmt_exec"})
         ready, reason = m._real_trading_ready(redis, "CN")
         assert ready is True and reason == ""
+
+    def test_ready_when_tdx_bridge_prefix(self, monkeypatch) -> None:
+        """``tdx_bridge`` 这类同前缀写法同样算真单能力（映射在 shared 一侧）。"""
+        monkeypatch.setenv(ENV_KEY, "true")
+        redis = _redis(strings={"broker:selected:CN": "tdx_bridge"})
+        ready, reason = m._real_trading_ready(redis, "CN")
+        assert ready is True and reason == ""
+
+    def test_unset_broker(self, monkeypatch) -> None:
+        """没选券商 → ``broker_unset``（**不是** ``broker_not_real_capable``）。"""
+        monkeypatch.setenv(ENV_KEY, "true")
+        monkeypatch.setattr(m, "_selected_real_broker", lambda *_a, **_k: "")
+        ready, reason = m._real_trading_ready(_redis(), "CN")
+        assert ready is False
+        assert reason == "broker_unset"
+
+    def test_unsupported_broker(self, monkeypatch) -> None:
+        """选了没有真单能力的通道（如纸面/海外通道）→ 拒绝原因**带上具体券商键**。
+
+        指名的原因才能让值班一眼看出「选错券商了」，而不是去查 env 开关。
+        """
+        monkeypatch.setenv(ENV_KEY, "true")
+        redis = _redis(strings={"broker:selected:CN": "paper"})
+        ready, reason = m._real_trading_ready(redis, "CN")
+        assert ready is False
+        assert reason == "broker_not_real_capable:paper"
 
 
 class TestWhitelistKeyFormNormalization:

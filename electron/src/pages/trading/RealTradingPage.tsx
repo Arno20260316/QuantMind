@@ -631,7 +631,7 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
     // `utils/consoleTabs.ts`——实盘与模拟共用同一张表，改一处两边同时生效。
     const tabs = useMemo(() => composeConsoleTabs(extraTabs), [extraTabs]);
 
-    // 切市场后原页签可能已不存在（如停在美股下没有的「大 QMT 真单镜像」）→ 回落默认页，
+    // 切市场后原页签可能已不存在（如停在美股下没有的「真单镜像」）→ 回落默认页，
     // 否则内容区渲染成整块空白。公开树无追加页签时 id 集合恒定，该分支恒不触发。
     useEffect(() => {
         const next = resolveConsoleTab(activeTab, tabs, DEFAULT_ACTIVE_TAB);

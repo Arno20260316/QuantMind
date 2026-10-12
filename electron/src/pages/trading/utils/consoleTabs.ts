@@ -99,7 +99,7 @@ export function composeConsoleTabs(extra?: readonly ConsoleTab[]): ConsoleTab[] 
 /**
  * 当前页签在不在表里；不在就回落 `fallback`。
  *
- * 用途：切市场后原来那一栏可能已不存在（如停在美股下没有的「大 QMT 真单镜像」），
+ * 用途：切市场后原来那一栏可能已不存在（如停在美股下没有的「真单镜像」），
  * 不回落会渲染成整块空白。调用方按返回值决定要不要 setState。
  */
 export function resolveConsoleTab(

@@ -57,7 +57,7 @@ interface SettingsCenterProps {
   userId: string;
   isActive: boolean;
   /**
-   * 是否允许出现实盘配置面板（券商实盘接入 / 大 QMT 真单镜像）。缺省允许。
+   * 是否允许出现实盘配置面板（券商实盘接入 / 真单镜像）。缺省允许。
    *
    * 由调用方按**本栏口径**给：定死模拟盘的「模拟交易」栏目传 false——两栏各管一边
    * 之后，实盘配置留在模拟栏里就等于把实盘又搬回来了（改完凭证下一步就是下单）。
@@ -71,7 +71,7 @@ interface SettingsCenterProps {
    */
   tradingMode?: 'real' | 'simulation';
   /**
-   * 追加面板（排在「大 QMT 真单镜像」之后）。缺省不追加 —— 见 `SettingsExtraPanel`。
+   * 追加面板（排在「真单镜像」之后）。缺省不追加 —— 见 `SettingsExtraPanel`。
    * 与内置栏同规矩：**条件挂载**（只有选中时才渲染），切走即卸载，不留后台轮询。
    */
   extraPanels?: readonly SettingsExtraPanel[];
@@ -97,7 +97,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({ userId, isActive, liveC
   const liveEnabled = isLiveTradingEnabled() && liveConfigVisible;
   const [activeTab, setActiveTab] = useState<string>('credentials');
 
-  // 大 QMT 真单镜像仅 A 股；切换市场后回到凭证页，避免停在无入口的面板上
+  // 真单镜像仅 A 股；切换市场后回到凭证页，避免停在无入口的面板上
   useEffect(() => {
     if (currentMarket !== 'CN' && activeTab === 'mirror') {
       setActiveTab('credentials');
@@ -185,7 +185,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({ userId, isActive, liveC
         </h3>
         <p className="text-xs text-gray-500 mt-1">
           {liveEnabled
-            ? '管理接入凭证、券商实盘通道与大 QMT 真单镜像。'
+            ? '管理接入凭证、券商实盘通道与真单镜像。'
             : '管理接入凭证与 API 密钥。'}
         </p>
       </div>
@@ -226,7 +226,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({ userId, isActive, liveC
           }`}
         >
           <ShieldAlert size={13} className="inline mr-1.5 -mt-0.5" />
-          大 QMT 真单镜像
+          真单镜像
         </button>
         )}
         {/* 追加面板（本机实盘栏：总控 / 数据）。不跟实盘开关联动——内容由调用方负责 */}
@@ -362,7 +362,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({ userId, isActive, liveC
         </div>
         )}
 
-        {/* 大 QMT 真单镜像（仅 A 股） */}
+        {/* 真单镜像（仅 A 股；券商可为大 QMT 执行端或通达信 TDX 桥） */}
         {liveEnabled && (
         <div
           className={`h-full bg-white rounded-3xl border border-gray-200 shadow-sm overflow-y-auto custom-scrollbar ${

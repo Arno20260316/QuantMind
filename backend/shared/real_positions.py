@@ -213,6 +213,22 @@ def broker_for_snapshot_source(source: str | None) -> str | None:
     return _CN_SOURCE_TO_BROKER.get(str(source or "").strip().lower())
 
 
+def real_broker_capable(broker_type: str | None) -> bool:
+    """该券商键能否承载**真单**（= 能查真账户 → 能过资金/持仓闸门）。
+
+    判据复用 :func:`snapshot_source_for_broker` 的既有映射：一个券商类型若在
+    ``real_account_snapshots`` 里有对应 source，就说明它是一条**真实资金账户**的
+    接入面，而不是纸面/海外通道。该表与 ``broker_config.MARKET_BROKERS["CN"]``
+    的互逆性由 ``test_trade_trading_precheck`` 锁定，故此处不必再抄一份清单
+    （抄一份就是第二个漂移点：加了新 CN 券商、改了路由表，这里忘改 → 镜像
+    对新券商静默不生效，与本次要修的故障同族）。
+
+    当前 ``True`` 的取值：``qmt_exec`` / ``tdx``（含 ``tdx_bridge`` 这类同前缀写法）。
+    ``tiger`` / ``futu`` / ``ib`` / ``None`` / 空串 → ``False``。
+    """
+    return snapshot_source_for_broker(broker_type) is not None
+
+
 def merge_real_sources(
     rows: list[tuple[str, object, object]],
     *,

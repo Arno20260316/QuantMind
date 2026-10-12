@@ -56,6 +56,7 @@ from backend.services.engine.rd_agent.mining_datasets import (
     SUPPORTED_DATASETS,
     resolve_datasets,
 )
+from backend.shared.safe_pickle import load_pickle
 from backend.shared.utc_datetime import UTC, to_utc_iso
 
 logger = logging.getLogger(__name__)
@@ -2059,11 +2060,9 @@ class AlphaAgentLauncher:
 
     @staticmethod
     def _load_pkl(path: Path) -> Any:
+        """pkl 读取（受限反序列化，机制见 ``shared.safe_pickle``）；失败一律 None。"""
         try:
-            import pickle
-
-            with open(path, "rb") as f:
-                return pickle.load(f)
+            return load_pickle(path)
         except Exception:
             return None
 
@@ -2231,10 +2230,7 @@ class AlphaAgentLauncher:
 
         for pkl_path in log_dir.glob("**/token_cost/**/*.pkl"):
             try:
-                import pickle
-
-                with open(pkl_path, "rb") as f:
-                    data = pickle.load(f)
+                data = load_pickle(pkl_path)
                 if isinstance(data, dict):
                     total_prompt += data.get("prompt_tokens", 0) or 0
                     total_completion += data.get("completion_tokens", 0) or 0

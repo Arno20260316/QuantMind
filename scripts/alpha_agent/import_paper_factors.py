@@ -24,6 +24,12 @@
   报告是冻结的验证产物（110 条命名集合），解析错误只可能是报告损坏——
   静默跳过坏行会把「半份导入」伪装成成功；坏整单、响亮报错、重跑幂等，
   才是这份一次性历史导入的正确语义（T-FM-03 评审 MEDIUM-2 的取舍记录）；
+- **存量刷新 ``--refresh-existing``**（2026-10-12，NW 口径刷新）：同窗口
+  重跑（T-FE-04 后 ``rank_ic_t``=Newey-West）产出的新报告，把**既有行**的
+  统计口径换新——选择面 = 全部 110 条（**跌出 FDR 的历史行也必须刷新**，
+  绝不能把 naive-t 旧值永远留在库里），写出面 = 只命中既有 factor_id：
+  库中缺失的行只报告、不落库（不静默新增），也不删除任何行；``tier`` 保留
+  首次导入值；FDR 标志翻转的行写入 ``fdr_pass_prev`` 并在摘要列出；
 - 默认 **dry-run**（打印逐条身份/翻译状态），``--apply`` 才真写。
 
 用法（宿主或容器；容器里 qlib 数据路径固定 /data）：
@@ -31,6 +37,8 @@
     python scripts/alpha_agent/import_paper_factors.py            # dry-run, tier=fdr
     python scripts/alpha_agent/import_paper_factors.py --tier selected
     python scripts/alpha_agent/import_paper_factors.py --apply
+    python scripts/alpha_agent/import_paper_factors.py --refresh-existing
+    python scripts/alpha_agent/import_paper_factors.py --refresh-existing --apply
 """
 
 from __future__ import annotations
@@ -170,6 +178,18 @@ def _build_metadata(
         "rank_ic_win_rate": factor.get("rank_ic_win_rate"),
         "t_stat": factor.get("t_stat"),
         "p_value": factor.get("p_value"),
+        # t 口径自证：T-FE-04 后的报告逐 horizon 带 rank_ic_t_naive /
+        # rank_ic_t_lags 审计列 ⇒ 主 t = Newey-West；旧报告无从分辨，标 naive
+        # （--refresh-existing 换新报告后此键随之转「newey_west」）。
+        "t_correction": (
+            "newey_west"
+            if any(
+                "rank_ic_t_naive" in h
+                for h in (factor.get("horizons") or [])
+                if isinstance(h, dict)
+            )
+            else "naive"
+        ),
         "icir": factor.get("icir"),
         "rank_icir": factor.get("icir"),
         "fdr_pass": bool(factor.get("fdr_horizons")),
@@ -324,6 +344,110 @@ def _default_persistence():
     return RDAgentFactorPersistence()
 
 
+async def _load_existing_rows(
+    persistence,
+    *,
+    user_id: str,
+    market: str,
+    universe: str,
+) -> dict[str, dict]:
+    """本任务既有行（factor_id → 行；metadata 已解码）。"""
+    rows = await persistence.list_factors(
+        user_id=user_id,
+        market=market,
+        universe=universe,
+        task_id=TASK_ID,
+        limit=1000,
+    )
+    return {r["factor_id"]: r for r in rows}
+
+
+def _run_refresh(args, report: dict, report_path: Path) -> int:
+    """``--refresh-existing`` 同步入口：单事件循环完成整个刷新。"""
+    return asyncio.run(_refresh_flow(args, report, report_path))
+
+
+async def _refresh_flow(args, report: dict, report_path: Path) -> int:
+    """NW 口径刷新既有行（不新增、不删除、记翻转）。
+
+    选择面 = 全部 110 条——跌出 FDR 的历史行也必须换到新口径，否则库里
+    永久残留 naive-t 旧值（这正是本次刷新的起因）。写出面只命中既有
+    factor_id：库中缺失的行只报告、不落库（这是刷新，不是导入），也不
+    删除任何行。``tier`` 保留首次导入值；FDR / 入选标志翻转的行分别写
+    ``fdr_pass_prev`` 并进摘要。读库失败即放弃（读不到既有行时写库无意义）。
+
+    **单循环约束**：读既有行与写回必须同一次 ``asyncio.run``——分两次会
+    让 asyncpg 连接池跨事件循环（2026-10-12 真跑实测：写回时
+    ``Future attached to a different loop``）。
+    """
+    persistence = _default_persistence()
+    try:
+        existing = await _load_existing_rows(
+            persistence,
+            user_id=args.user_id,
+            market=args.market,
+            universe=args.universe,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 读不到既有行就绝不能写
+        print(f"读取既有行失败，放弃刷新：{exc}")
+        return 1
+    rejected: list[dict] = []
+    plan: list[dict] = []
+    missing: list[str] = []
+    fdr_flips: list[tuple[str, bool, bool]] = []
+    sel_flips: list[tuple[str, bool, bool]] = []
+    for row in build_rows(
+        report,
+        tier="all",
+        report_path=report_path,
+        user_id=args.user_id,
+        market=args.market,
+        universe=args.universe,
+        rejected=rejected,
+    ):
+        old = existing.get(row["factor_id"])
+        if old is None:
+            missing.append(row["key"])
+            continue
+        meta = row["metadata"]
+        old_meta = old.get("metadata") or {}
+        meta["tier"] = old_meta.get("tier") or args.tier  # 保留首次导入语义
+        prev_fdr = old_meta.get("fdr_pass")
+        if prev_fdr is not None and bool(prev_fdr) != bool(meta.get("fdr_pass")):
+            meta["fdr_pass_prev"] = bool(prev_fdr)
+            fdr_flips.append((row["key"], bool(prev_fdr), bool(meta.get("fdr_pass"))))
+        prev_sel = old_meta.get("selected")
+        if prev_sel is not None and bool(prev_sel) != bool(meta.get("selected")):
+            sel_flips.append((row["key"], bool(prev_sel), bool(meta.get("selected"))))
+        plan.append(row)
+    flip_keys = {k for k, _, _ in fdr_flips} | {k for k, _, _ in sel_flips}
+    for row in plan:
+        marker = " ★" if row["key"] in flip_keys else ""
+        print(
+            f"{row['key']:>6}  id={row['factor_id'][:12]}  "
+            f"rank_ic={_fmt_ic(row['rank_ic'])}  "
+            f"fdr_pass={row['metadata'].get('fdr_pass')}{marker}"
+        )
+    for key in missing:
+        print(f"{key:>6}  跳过：库中无此身份行（刷新只报告，不落库）")
+    for key, prev, new in fdr_flips:
+        print(f"{key:>6}  ★ FDR 翻转：{prev} → {new}")
+    for key, prev, new in sel_flips:
+        print(f"{key:>6}  ★ 入选翻转：{prev} → {new}")
+    print(
+        f"共 {len(plan)} 条待刷新（既有任务行 {len(existing)}；"
+        f"缺失跳过 {len(missing)}；FDR 翻转 {len(fdr_flips)}；"
+        f"入选翻转 {len(sel_flips)}）；"
+        + ("--apply 已给，开始写库" if args.apply else "dry-run（--apply 才写库）")
+    )
+    if not args.apply:
+        return 0
+
+    summary = await apply_rows(plan, persistence=persistence)
+    print(f"刷新落库完成：{summary}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="T-FM-01 论文因子落库（默认 dry-run，--apply 才写库）"
@@ -333,6 +457,12 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--apply", action="store_true", help="真写 rd_agent_factors（默认只打印）"
     )
+    parser.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="NW 口径刷新既有行：选择面=全 110，只更新既有 factor_id"
+        "（库中缺失只报告不落库、不删行；tier 保留首次导入值；默认 dry-run）",
+    )
     parser.add_argument("--user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--market", default="a_share")
     parser.add_argument("--universe", default="csi300")
@@ -340,6 +470,8 @@ def main(argv=None) -> int:
 
     report_path = Path(args.report)
     report = load_report(report_path)
+    if args.refresh_existing:
+        return _run_refresh(args, report, report_path)
     rejected: list[dict] = []
     rows = build_rows(
         report,

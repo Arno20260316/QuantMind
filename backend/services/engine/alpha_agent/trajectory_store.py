@@ -22,13 +22,15 @@
   ``direct_exp_gen`` 一步内含假设 + 实验两个子环节、共用该步 time_info，
   两节点区间相同（同一步的官方计时，不做拆分猜测）。
 - **上限即如实**：loops 超过 ``MAX_LOOPS`` 保**尾部**（深轮更近失败点），
-  ``truncated=true`` + ``dropped_loops`` 计数；单文件超 ``MAX_PICKLE_BYTES``
-  或单环节超过 ``MAX_LOAD_FILES_PER_PHASE`` 个待解析文件 → 按归因失败降级；
+  ``truncated=true`` + ``dropped_loops`` 计数；单文件超
+  ``shared.safe_pickle.MAX_PICKLE_BYTES`` 或单环节超过
+  ``MAX_LOAD_FILES_PER_PHASE`` 个待解析文件 → 按归因失败降级；
   单 glob 模式枚举上限 ``MAX_GLOB_FILES``（病态目录不拖垮请求）。
 - **白名单反序列化 + 有界读取**（评审 2026-10-12，security-F1/F4）：pkl 出自
   挖掘子进程工作区（该子进程按设计执行 LLM 生成代码），主进程绝不整权反序列化
-  ——``_RestrictedUnpickler`` 按模块根白名单拦截（白名单按真样本实测钉死），
-  读取走 ``read(MAX_PICKLE_BYTES+1)`` 单次有界读（无 stat→open TOCTOU）；
+  ——机制单源在 ``backend.shared.safe_pickle``（``RestrictedUnpickler`` 按模块根
+  白名单拦截，白名单按真样本实测钉死；读取走单次有界读，无 stat→open TOCTOU），
+  本模块的 ``default_load_pickle`` 只叠加「告警 + None」降级策略；
   扫描经 ``asyncio.to_thread`` 移出事件循环。全部失败按证据缺失降级，不抛穿。
 - ``HypothesisFeedback`` 等 vendor 对象的 ``bool()`` 可能为 False（实测），
   一律以 ``is None`` 判空，禁用真值判断。
@@ -38,10 +40,8 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
-import pickle
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Callable
 
+from backend.shared.safe_pickle import PayloadTooLargeError, load_pickle
 from backend.shared.utc_datetime import to_utc_iso, utc_now
 
 logger = logging.getLogger(__name__)
@@ -117,43 +118,12 @@ PARTIAL_TASK_STATUSES = frozenset({"pending", "running"})
 
 #: 单任务返回循环数上限（保尾部）；超出置 truncated + dropped_loops
 MAX_LOOPS = 100
-#: 单个 pkl 大小上限（超限不解析，按归因证据缺失处理）
-MAX_PICKLE_BYTES = 32 * 1024 * 1024
 #: 单环节最多解析的文件数（超限按归因失败降级，绝不静默丢名）
 MAX_LOAD_FILES_PER_PHASE = 50
 #: 单环节最多解析的 time_info 文件数（时间证据，超出不降级）
 MAX_TIME_INFO_FILES = 20
 #: 单 glob 模式枚举上限（病态目录兜底：截断即告警；解析侧 >50 已先降级）
 MAX_GLOB_FILES = 200
-
-#: 反序列化白名单 · 模块根：只认展示所需的数据类。真样本实测（2026-10-12，
-#: 任务 d9a6e6a16a0445de）引用集 = rdagent 五类 + datetime 三型 +
-#: pathlib.PosixPath；collections 为惰性容器兜底。其余模块一律拒绝。
-_ALLOWED_PICKLE_MODULE_ROOTS = frozenset(
-    {"rdagent", "datetime", "pathlib", "collections"}
-)
-
-#: 反序列化白名单 · builtins：数据容器与标量（eval/exec 等一切可执行名拒绝）
-_ALLOWED_PICKLE_BUILTINS = frozenset(
-    {
-        "NoneType",
-        "bool",
-        "bytearray",
-        "bytes",
-        "complex",
-        "dict",
-        "float",
-        "frozenset",
-        "int",
-        "list",
-        "object",
-        "range",
-        "set",
-        "slice",
-        "str",
-        "tuple",
-    }
-)
 
 #: task_id 形状（launcher 生成；终点防目录穿越的第二道闸）
 _SAFE_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -313,49 +283,21 @@ def _parse_dt(raw: Any) -> datetime | None:
     return dt
 
 
-def _is_allowed_pickle_class(module: str, name: str) -> bool:
-    """反序列化白名单判定（纯函数）：模块根 + builtins 名双层收口。"""
-    root = str(module).split(".", 1)[0]
-    if root == "builtins":
-        return name in _ALLOWED_PICKLE_BUILTINS
-    return root in _ALLOWED_PICKLE_MODULE_ROOTS
-
-
-class _RestrictedUnpickler(pickle.Unpickler):
-    """白名单反序列化器：``find_class`` 级拦截，白名单外直接拒绝。
-
-    载荷 pkl 由挖掘子进程写入（该子进程按设计执行 LLM 生成代码）——主进程
-    只反序列化展示所需的数据类（评审 2026-10-12，security-F1），绝不让
-    载荷里的 ``__reduce__`` 类路径在 engine 进程触发任意调用。
-    """
-
-    def find_class(self, module: str, name: str) -> Any:
-        if not _is_allowed_pickle_class(module, name):
-            raise pickle.UnpicklingError(f"轨迹读取白名单拒绝：{module}.{name}")
-        return super().find_class(module, name)
-
-
 def default_load_pickle(path: Path) -> Any:
-    """默认 pkl 读取：白名单反序列化 + 单次有界读取；超限/损坏一律 None。
+    """默认 pkl 读取：受限反序列化（``shared.safe_pickle``）+ 告警降级策略。
 
-    有界读取 = ``read(MAX_PICKLE_BYTES + 1)``（先 stat 再 open 的 TOCTOU 已
-    消除；写入侧持续增长也只读上限 +1 字节）。调用方按证据缺失处理。
+    机制（白名单拦截 / 单次有界读取）单源在 ``backend.shared.safe_pickle``
+    （评审 2026-10-12，security-F1/F4）；本函数只叠加展示链路的策略：
+    读写失败 / 超限 / 白名单拒绝 / 损坏一律 None，调用方按证据缺失处理。
     """
     try:
-        with path.open("rb") as fh:
-            raw = fh.read(MAX_PICKLE_BYTES + 1)
+        return load_pickle(path)
     except OSError as exc:
         logger.warning("[trajectory] pkl 读取失败：%s（%s）", path, exc)
         return None
-    if len(raw) > MAX_PICKLE_BYTES:
-        logger.warning(
-            "[trajectory] pkl 超上限（>%d 字节），跳过解析：%s",
-            MAX_PICKLE_BYTES,
-            path,
-        )
+    except PayloadTooLargeError as exc:
+        logger.warning("[trajectory] %s", exc)
         return None
-    try:
-        return _RestrictedUnpickler(io.BytesIO(raw)).load()
     except Exception as exc:  # noqa: BLE001 —— 归因失败降级，绝不抛穿
         logger.warning("[trajectory] pkl 解析失败（按证据缺失）：%s（%s）", path, exc)
         return None

@@ -12,7 +12,12 @@
   的判决进 ``metadata["structure_screen"]``（只标注不裁决——对库克隆的
   历史导入走值级闸豁免，拒只发生在同一批内）；FM 原式解析失败带 fid
   上下文响亮抛错；
-- 真报告文件在本机时补一组整报告计数钉子（110/102/20、31/79）。
+- 存量刷新 ``--refresh-existing``（NW 口径刷新）：选择面=全量、只写既有
+  factor_id（库中缺失只报告不落库）、tier 保留首导值、FDR 翻转写
+  ``fdr_pass_prev``，dry-run 读库不写库、读库失败放弃；``t_correction``
+  口径标记（newey_west/naive）随 horizon 审计列派生；
+- 真报告文件在本机时补一组整报告计数钉子（110/94/20、31/79；NW 口径，
+  2026-10-12 同窗口重跑替换 naive 报告、旧版备份 `_naive_t.json`）。
 """
 
 from __future__ import annotations
@@ -137,6 +142,8 @@ class _FakePersistence:
         self.ensured = False
         self.saved: list[dict] = []
         self.metrics: list[dict] = []
+        self.listing: list[dict] = []
+        self.listed_with: dict = {}
 
     async def ensure_tables(self):
         self.ensured = True
@@ -146,6 +153,10 @@ class _FakePersistence:
 
     async def update_factor_metrics(self, **kwargs):
         self.metrics.append(kwargs)
+
+    async def list_factors(self, **kwargs):
+        self.listed_with = kwargs
+        return list(self.listing)
 
 
 REPORT_PATH = Path("/tmp/_mini_paper_report.json")
@@ -269,6 +280,144 @@ class TestApply:
         rows, persistence = calls[0]
         assert [r["key"] for r in rows] == ["fm001", "fm002"]
         assert persistence is sentinel
+
+
+class TestRefreshExisting:
+    """``--refresh-existing``（NW 口径刷新，2026-10-12）：只更新既有行、
+    不增不删；tier 保留首导值；FDR 翻转写 ``fdr_pass_prev`` 并进摘要；
+    dry-run 读库不写库；读库失败放弃写。"""
+
+    def _existing(self, imp, key, *, tier="fdr", fdr_pass=None, selected=None):
+        """从 build_rows 产物伪造一条既有行（身份与真导入逐位同源）。"""
+        row = next(
+            r
+            for r in imp.build_rows(_mini_report(), tier="all", report_path=REPORT_PATH)
+            if r["key"] == key
+        )
+        meta = dict(row["metadata"])
+        meta["tier"] = tier
+        if fdr_pass is not None:
+            meta["fdr_pass"] = fdr_pass
+        if selected is not None:
+            meta["selected"] = selected
+        return {"factor_id": row["factor_id"], "metadata": meta}
+
+    def test_only_existing_rows_written_and_tier_preserved(
+        self, imp, monkeypatch, capsys
+    ):
+        REPORT_PATH.write_text(json.dumps(_mini_report()), encoding="utf-8")
+        fake = _FakePersistence()
+        # fm001 既有（tier=fdr）；fm003 既有但首导 tier=selected（须保留）；
+        # fm002 库中缺失（只报告、不落库）
+        fake.listing = [
+            self._existing(imp, "fm001"),
+            self._existing(imp, "fm003", tier="selected"),
+        ]
+        monkeypatch.setattr(imp, "_default_persistence", lambda: fake)
+
+        # --tier fdr 故意给错：刷新选择面恒为全量，tier 参数不参与
+        assert (
+            imp.main(
+                ["--report", str(REPORT_PATH), "--refresh-existing", "--apply", "--tier", "fdr"]
+            )
+            == 0
+        )
+
+        out = capsys.readouterr().out
+        assert [s["factor_id"] for s in fake.saved] == [
+            e["factor_id"] for e in fake.listing
+        ]
+        metas = {s["metadata"]["candidate_key"]: s["metadata"] for s in fake.saved}
+        assert metas["fm001"]["tier"] == "fdr"
+        assert metas["fm003"]["tier"] == "selected"
+        assert metas["fm001"]["t_correction"] == "naive"  # 迷你报告无审计列
+        assert "fm002" not in metas, "缺失行只报告不落库"
+        assert "fm002" in out and "跳过" in out
+        assert "共 2 条待刷新" in out and "缺失跳过 1" in out
+        assert fake.listed_with.get("task_id") == imp.TASK_ID
+
+    def test_fdr_flip_recorded_and_selected_flip_reported(
+        self, imp, monkeypatch, capsys
+    ):
+        report = _mini_report()
+        # 新报告：fm001 跌出 FDR（同时失去入选）；fm002 跌出 FDR（入选不变）
+        report["paper"]["factors"][0] = _factor(
+            "001", "Mean($close, 5)", fdr=False, selected=False
+        )
+        report["paper"]["factors"][1] = _factor(
+            "002", "Neg(CsRank($returns))", fdr=False, selected=False
+        )
+        REPORT_PATH.write_text(json.dumps(report), encoding="utf-8")
+        fake = _FakePersistence()
+        fake.listing = [
+            self._existing(imp, "fm001", fdr_pass=True, selected=True),
+            self._existing(imp, "fm002", fdr_pass=True, selected=False),
+        ]
+        monkeypatch.setattr(imp, "_default_persistence", lambda: fake)
+
+        assert (
+            imp.main(["--report", str(REPORT_PATH), "--refresh-existing", "--apply"]) == 0
+        )
+
+        out = capsys.readouterr().out
+        metas = {s["metadata"]["candidate_key"]: s["metadata"] for s in fake.saved}
+        assert metas["fm001"]["fdr_pass"] is False
+        assert metas["fm001"]["fdr_pass_prev"] is True
+        assert metas["fm001"]["selected"] is False
+        assert metas["fm002"]["fdr_pass_prev"] is True
+        assert "FDR 翻转 2" in out
+        assert "入选翻转 1" in out
+        assert "★ 入选翻转：True → False" in out
+
+    def test_dry_run_reads_existing_but_never_writes(self, imp, monkeypatch, capsys):
+        REPORT_PATH.write_text(json.dumps(_mini_report()), encoding="utf-8")
+        fake = _FakePersistence()
+        fake.listing = [self._existing(imp, "fm001")]
+
+        async def _explode(*a, **k):
+            raise AssertionError("dry-run 不得写库")
+
+        monkeypatch.setattr(imp, "apply_rows", _explode)
+        monkeypatch.setattr(imp, "_default_persistence", lambda: fake)
+
+        assert imp.main(["--report", str(REPORT_PATH), "--refresh-existing"]) == 0
+        out = capsys.readouterr().out
+        assert "dry-run" in out
+        assert not fake.saved
+        assert fake.listed_with.get("task_id") == imp.TASK_ID
+
+    def test_read_failure_aborts_before_write(self, imp, monkeypatch, capsys):
+        REPORT_PATH.write_text(json.dumps(_mini_report()), encoding="utf-8")
+        fake = _FakePersistence()
+
+        async def _raise(**kwargs):
+            raise RuntimeError("db down")
+
+        fake.list_factors = _raise
+
+        async def _explode(*a, **k):
+            raise AssertionError("读失败不得写库")
+
+        monkeypatch.setattr(imp, "apply_rows", _explode)
+        monkeypatch.setattr(imp, "_default_persistence", lambda: fake)
+
+        assert (
+            imp.main(["--report", str(REPORT_PATH), "--refresh-existing", "--apply"]) == 1
+        )
+        assert "读取既有行失败" in capsys.readouterr().out
+
+    def test_t_correction_marker_follows_audit_columns(self, imp):
+        report = _mini_report()
+        # 旧报告口径（无审计列）→ naive
+        rows = imp.build_rows(report, tier="all", report_path=REPORT_PATH)
+        assert all(r["metadata"]["t_correction"] == "naive" for r in rows)
+        # T-FE-04 后报告带 rank_ic_t_naive/lags 审计列 → newey_west
+        report["paper"]["factors"][0]["horizons"][0]["rank_ic_t_naive"] = 1.9
+        report["paper"]["factors"][0]["horizons"][0]["rank_ic_t_lags"] = 6
+        rows = imp.build_rows(report, tier="all", report_path=REPORT_PATH)
+        by_key = {r["key"]: r for r in rows}
+        assert by_key["fm001"]["metadata"]["t_correction"] == "newey_west"
+        assert by_key["fm002"]["metadata"]["t_correction"] == "naive"
 
 
 class TestStructureScreen:
@@ -396,7 +545,9 @@ class TestRealReport:
         fdr = imp.select_factors(report, "fdr")
         selected = imp.select_factors(report, "selected")
         all_factors = imp.select_factors(report, "all")
-        assert len(fdr) == 102
+        # NW 口径（2026-10-12 同窗口重跑替换；naive 版备份 `_naive_t.json`）：
+        # 过 BH-FDR 102→94（8 条 t 膨胀被校正掉）；去重入选保持 20
+        assert len(fdr) == 94
         assert len(selected) == 20
         assert len(all_factors) == 110
 

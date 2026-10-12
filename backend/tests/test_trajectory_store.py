@@ -26,21 +26,23 @@ from pathlib import Path
 import pytest
 
 from backend.services.engine.alpha_agent import trajectory_store as ts
+from backend.shared import safe_pickle as sp
 
 
 @pytest.fixture(autouse=True)
 def _allow_test_module_pickle_root(monkeypatch):
     """本文件合成类（``__module__`` = 本测试模块）放行进白名单。
 
-    生产白名单按真样本钉死为 ``rdagent/datetime/pathlib/collections``
-    （评审 security-F1）；这里的合成类扮演真实轨迹里 ``rdagent.*`` 数据
-    类的角色——放行其模块根模拟同一路径，白名单策略本身由
+    生产白名单按真样本钉死为 ``rdagent/datetime/pathlib/collections/
+    target_task``（评审 security-F1；机制单源在 ``shared.safe_pickle``，
+    2026-10-12 五站点改造后本文件改打共享常量）；这里的合成类扮演真实轨迹里
+    ``rdagent.*`` 数据类的角色——放行其模块根模拟同一路径，白名单策略本身由
     :class:`TestDefaultLoaderGuard` 的表驱动单测钉死。
     """
     monkeypatch.setattr(
-        ts,
-        "_ALLOWED_PICKLE_MODULE_ROOTS",
-        ts._ALLOWED_PICKLE_MODULE_ROOTS | {__name__.split(".")[0]},
+        sp,
+        "ALLOWED_PICKLE_MODULE_ROOTS",
+        sp.ALLOWED_PICKLE_MODULE_ROOTS | {__name__.split(".")[0]},
     )
 
 
@@ -272,7 +274,10 @@ class TestLoadAndExtract:
 
 @pytest.mark.unit
 class TestDefaultLoaderGuard:
-    """默认读取器的白名单反序列化 + 有界读（评审 security-F1/F4，2026-10-12）。
+    """默认读取器的告警降级策略（机制 = 白名单反序列化 + 有界读，评审
+    security-F1/F4，2026-10-12；机制单源已迁至 ``shared.safe_pickle``——
+    本类钉「策略层不抛穿 + 拒绝即不执行」的端到端行为，白名单表驱动单测见
+    ``test_safe_pickle.py``）。
 
     载荷 pkl 由挖掘子进程写入（该子进程按设计执行 LLM 生成代码）——主进程
     反序列化必须只放行展示所需的数据类；白名单外的 ``__reduce__`` 类路径
@@ -280,7 +285,7 @@ class TestDefaultLoaderGuard:
     """
 
     def test_policy_table_module_roots_and_builtins(self):
-        allow = ts._is_allowed_pickle_class
+        allow = sp.is_allowed_pickle_class
         # 真样本实测引用集（任务 d9a6e6a16a0445de，2026-10-12）
         assert allow("rdagent.core.proposal", "Hypothesis") is True
         assert (
@@ -313,11 +318,11 @@ class TestDefaultLoaderGuard:
         assert loaded.factor_name == "f_a"
 
     def test_unlisted_root_rejected(self, tmp_path, monkeypatch):
-        # 把白名单还原为生产四根：本模块合成类应被拒（机制真的在把关）
+        # 把白名单还原为生产五根：本模块合成类应被拒（机制真的在把关）
         monkeypatch.setattr(
-            ts,
-            "_ALLOWED_PICKLE_MODULE_ROOTS",
-            frozenset({"rdagent", "datetime", "pathlib", "collections"}),
+            sp,
+            "ALLOWED_PICKLE_MODULE_ROOTS",
+            frozenset({"rdagent", "datetime", "pathlib", "collections", "target_task"}),
         )
         p = tmp_path / "sneaky.pkl"
         _write_pkl(p, FakeFactorTask("f_a"))
@@ -349,7 +354,7 @@ class TestDefaultLoaderGuard:
         assert ts.default_load_pickle(p) is None
 
     def test_oversize_bytes_skipped_without_parsing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ts, "MAX_PICKLE_BYTES", 64)
+        monkeypatch.setattr(sp, "MAX_PICKLE_BYTES", 64)
         p = tmp_path / "big.pkl"
         _write_pkl(p, [FakeFactorTask(f"f{i}") for i in range(200)])
         assert ts.default_load_pickle(p) is None, "超上限单次有界读后即弃（不再解析）"

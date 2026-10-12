@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import pickle
 import re
 import shutil
 import time
@@ -26,6 +25,7 @@ import pandas as pd
 # 运行时导入（不止注解用）：``quantdb_coverage_from_dir`` 要构造 Window。
 # mining_config 只依赖 mining_datasets（纯表），不反向依赖本模块，无环。
 from backend.services.engine.alpha_agent.mining_config import Window
+from backend.shared.safe_pickle import load_pickle
 
 from .market_adapters import get_adapter, list_markets
 from .market_adapters.base import MarketAdapter
@@ -1758,8 +1758,7 @@ class RDLoopWrapper:
         factor_meta: dict[str, dict] = {}
         for pkl_path in sorted(log_path.glob("**/experiment generation/**/*.pkl")):
             try:
-                with open(pkl_path, "rb") as f:
-                    tasks = pickle.load(f)
+                tasks = load_pickle(pkl_path)
                 if not isinstance(tasks, list):
                     tasks = [tasks]
                 for t in tasks:
@@ -1780,8 +1779,7 @@ class RDLoopWrapper:
         factor_code: dict[str, str] = {}
         for pkl_path in sorted(log_path.glob("**/coder result/**/*.pkl")):
             try:
-                with open(pkl_path, "rb") as f:
-                    workspaces = pickle.load(f)
+                workspaces = load_pickle(pkl_path)
                 if not isinstance(workspaces, list):
                     workspaces = [workspaces]
                 for ws in workspaces:
@@ -1817,8 +1815,7 @@ class RDLoopWrapper:
         feedback_text = ""
         for pkl_path in sorted(log_path.glob("**/feedback/**/*.pkl")):
             try:
-                with open(pkl_path, "rb") as f:
-                    fb = pickle.load(f)
+                fb = load_pickle(pkl_path)
                 if isinstance(fb, str):
                     feedback_text += fb + "\n"
                 elif isinstance(fb, (list, tuple)):

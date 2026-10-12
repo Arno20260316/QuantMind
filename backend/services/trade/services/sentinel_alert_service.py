@@ -143,6 +143,8 @@ class SentinelAlertService:
             "throttled_rate": 0,
             "below_level": 0,
             "stale": 0,
+            # QQ 面范围过滤拦下（2026-10-12：非实盘持仓/非选定券商不推 QQ）
+            "qq_scope_skipped": 0,
             "malformed": 0,
             "record_errors": 0,
             "errors": 0,
@@ -387,17 +389,29 @@ class SentinelAlertService:
         # 解耦——手机 QQ 才是真正的告警面」，站内投递失败（库故障/无管理员）
         # 不该让告警在 QQ 面整条消失（2026-10-09 code review HIGH-1）。
         try:
+            from backend.shared.admin_identity import ADMIN_USER_ID
             from backend.shared.market_labels import market_label
+            from backend.shared.push_scope import (
+                live_symbols_for_push,
+                symbol_allowed_for_push,
+            )
             from backend.shared.qq_digest import enqueue as _digest_enqueue
 
             market = str(row.get("market") or "CN")
             label = market_label(market) or market
-            _digest_enqueue(
-                digest_key=f"sentinel:{market}",
-                header=f"实时情报 · {label}",
-                line=format_sentinel_digest_line(row),
-                footer="详情见交易台 · 实时情报。",
-            )
+            # QQ 推送面范围（2026-10-12 用户指令）：只推「实盘有的股票」且跟随
+            # 券商选定（切 TDX 推 TDX 的仓、切 QMT 推 QMT 的仓）。站内卡片/留痕
+            # 照旧逐条全量；收件面是 admin（与 _default_notify fanout 同口径）。
+            scope = live_symbols_for_push("default", ADMIN_USER_ID)
+            if symbol_allowed_for_push(row.get("symbol"), scope):
+                _digest_enqueue(
+                    digest_key=f"sentinel:{market}",
+                    header=f"实时情报 · {label}",
+                    line=format_sentinel_digest_line(row),
+                    footer="详情见交易台 · 实时情报。",
+                )
+            else:
+                self._bump("qq_scope_skipped")
         except Exception as exc:  # noqa: BLE001 - 摘要失败不影响站内投递（两边独立）
             self._note_error(f"digest: {exc}")
         ok = False

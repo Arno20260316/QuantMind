@@ -626,3 +626,17 @@ class TestQqDigestWiring:
         assert idx_notify < idx_digest < idx_enqueue
         # 旧形态 `... and self._notify(alert, cfg):` 会在这条断言上失败
         assert "and self._notify(" not in src
+
+    def test_persist_gates_qq_lines_by_live_scope(self):
+        """源码守卫（2026-10-12 用户指令）：QQ 摘要行入队前必须先过推送面范围
+        过滤——只推当前选定券商的实盘持仓；模拟盘/自选/另一家券商的票站内照旧、
+        QQ 不推。_persist 依赖真库会话，用源码顺序钉住（范围语义见
+        test_push_scope.py）。"""
+        import inspect
+
+        src = inspect.getsource(HoldingSentinel._persist)
+        idx_scope = src.index("live_symbols_for_push(")
+        idx_digest = src.index("format_holding_digest_line(")
+        idx_enqueue = src.index("self._enqueue_qq_digest(")
+        assert idx_scope < idx_digest < idx_enqueue
+        assert "symbol_allowed_for_push(" in src

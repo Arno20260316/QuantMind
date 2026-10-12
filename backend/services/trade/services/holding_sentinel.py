@@ -805,6 +805,10 @@ class HoldingSentinel:
         from sqlalchemy import text
 
         from backend.shared.holding_alert_contract import TABLE
+        from backend.shared.push_scope import (
+            live_symbols_for_push,
+            symbol_allowed_for_push,
+        )
         from backend.shared.sync_db import sync_session
 
         insert_sql = text(
@@ -820,6 +824,10 @@ class HoldingSentinel:
         recorded = notified = duplicates = 0
         for (tenant, user_id), group in by_user.items():
             cfg = parse_alert_config(self._config_raw(tenant, user_id))
+            # QQ 推送面范围（2026-10-12 用户指令）：QQ 只推「当前选定券商的实盘
+            # 持仓」——模拟盘/手工自选/另一家券商的票，站内卡片与留痕照旧，
+            # QQ 不推。None=不设闸（无实盘快照/读取失败时告警面不静默吞）。
+            qq_scope = live_symbols_for_push(tenant, user_id)
             digest_lines: list[str] = []
             for alert in dedupe_alert_rows(group)[:MAX_ALERTS_PER_SCAN]:
                 try:
@@ -848,7 +856,8 @@ class HoldingSentinel:
                     # QQ 面与站内投递解耦：库写/投递失败也入摘要（手机 QQ 是
                     # 最终告警面——沿用 notification_publisher 旁路先行纪律；
                     # 投递成功与否只影响 notified 计数，不拦摘要，HIGH-1）
-                    digest_lines.append(format_holding_digest_line(alert))
+                    if symbol_allowed_for_push(alert.get("symbol"), qq_scope):
+                        digest_lines.append(format_holding_digest_line(alert))
             if digest_lines:
                 self._enqueue_qq_digest(tenant, user_id, digest_lines)
         return {"recorded": recorded, "notified": notified, "duplicates": duplicates}

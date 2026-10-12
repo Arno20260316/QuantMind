@@ -19,6 +19,20 @@ def _silence_qq_digest(monkeypatch):
     monkeypatch.setattr(qq_digest, "enqueue", lambda **kw: None)
 
 
+@pytest.fixture(autouse=True)
+def _stub_push_scope(monkeypatch):
+    """QQ 推送面范围闸默认不设闸（2026-10-12 实现在 _decide_push 内读真库）。
+
+    范围语义独测于 test_push_scope.py；本文件的用例只验接线，必须密闭
+    ——不隔离的话判定会跟随真实持仓漂移（今天 SH600503 恰好不在 TDX 4 只里）。
+    """
+    import backend.shared.push_scope as push_scope
+
+    monkeypatch.setattr(
+        push_scope, "live_symbols_for_push", lambda tenant, user_id: None
+    )
+
+
 # ── 口径纯函数 ──────────────────────────────────────────────────────
 
 
@@ -410,3 +424,43 @@ def test_default_notify_disables_per_event_qq(monkeypatch):
     assert svc._default_notify(title="t", content="c", level="warning") is True
     assert captured["qq_alert"] is False
     assert captured["type"] == "sentinel"
+
+
+# ── QQ 推送面范围（2026-10-12：实盘有的股票才推送、跟随券商选定）────
+
+
+def test_out_of_scope_symbol_skips_qq_but_keeps_inapp(monkeypatch):
+    """非实盘持仓的票（SH600503 不在选定券商的仓里）：站内卡片/留痕照旧，
+    QQ 摘要不入队，计数留痕 qq_scope_skipped。"""
+    import backend.shared.push_scope as push_scope
+    import backend.shared.qq_digest as qq_digest
+    from backend.services.trade.services.sentinel_alert_service import SentinelConfig
+
+    calls: list[dict] = []
+    monkeypatch.setattr(qq_digest, "enqueue", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(
+        push_scope, "live_symbols_for_push", lambda tenant, user_id: {"SZ002074"}
+    )
+    svc, notes, holder = _service(cfg=SentinelConfig(enabled=True))
+
+    assert svc._decide_push(holder["cfg"], _FakeRedis(), _storm_row()) == "pushed"
+    assert len(notes) == 1  # 站内照旧
+    assert calls == []  # QQ 面不推
+    assert svc.counters["qq_scope_skipped"] == 1
+
+
+def test_in_scope_symbol_feeds_digest(monkeypatch):
+    """放行集里的票照常进摘要（600503.SH 归一为 SH600503 后命中）。"""
+    import backend.shared.push_scope as push_scope
+    import backend.shared.qq_digest as qq_digest
+    from backend.services.trade.services.sentinel_alert_service import SentinelConfig
+
+    calls: list[dict] = []
+    monkeypatch.setattr(qq_digest, "enqueue", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(
+        push_scope, "live_symbols_for_push", lambda tenant, user_id: {"SH600503"}
+    )
+    svc, notes, holder = _service(cfg=SentinelConfig(enabled=True))
+
+    assert svc._decide_push(holder["cfg"], _FakeRedis(), _storm_row()) == "pushed"
+    assert [c["digest_key"] for c in calls] == ["sentinel:CN"]

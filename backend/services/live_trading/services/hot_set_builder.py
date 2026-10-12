@@ -1,14 +1,24 @@
-"""热集构建服务（T-P6-06）：全用户持仓并集 ∪ 候选池 ∪ 异动池 → Redis 热集集合。
+"""热集构建服务（T-P6-06）：全用户持仓并集 ∪ 当日池 ∪ 候选 ∪ 异动池 → Redis 热集集合。
 
 - **持仓**：模拟账户（交易 Redis ``simulation:account:*``，与对账同一先例）∪ **桥实盘/QMT
   真实持仓**（``real_positions.load_real_positions``，多券商并集）——量化实时推理必须覆盖
   真实持仓，否则「自己盘的票」只有恰好进了候选才被推理到（2026-10-08 实测：桥 4 只持仓
   仅 1 只在集）；
+- **当日池**（2026-10-13 补）：``data/reports/stock_picks/{目标交易日}_picks.json`` ——
+  **决策轮读的就是这份**（``decision_context_source.load_pool_doc``），而候选源是
+  PG ``engine_signal_scores`` 的分数 TopN：两份名单**不相交**。池票不在热集 ⇒ 没有
+  行情快照 ⇒ ``l3.stale_quote``（5s，fail-closed）全数拒单，当天那一批买单 22/22 全拒
+  （实测 20261012：池 30 只，15 只不在热集 562）。池是全局产物、**不随租户过滤**。
+  池文件缺席（北京 ~03:00/04:00 才产出）不是错误：记 ``pool_file=""``、``pool=0``，
+  每轮（默认 60s）重读，文件出现即自动纳入；
 - **候选**：``engine_signal_scores`` 最新交易日、CN 口径、按 fusion_score 降序 TopN；
 - **异动**：T-P6-14 识别引擎接口占位（现返回空，接口已留）；
 - **输出**：远端行情 Redis 集合 ``qm:hot_set:symbols``（与 T-P6-02 订阅 worker 同源同键）+
-  ``:meta`` 构建元数据（built_at/统计，运维可查）；**原子替换**（tmp 键 + RENAME，
+  ``:meta`` 构建元数据（built_at/统计/分片压力，运维可查）；**原子替换**（tmp 键 + RENAME，
   避免订阅侧读到半量集合）；空源 → 空集替换（过期标的退订）。
+- **分片压力**：订阅侧 ``collector._shard_desired`` 按**字典序**硬截断到
+  ``SDK_SUBSCRIBE_MAX``（100），排序与合成侧的优先级无关 ⇒ 热集逼近上限时被截掉的可能
+  正是池票。此处如实算出每片应订数与余量并写进报告/meta，逼近上限时 WARNING。
 - 失败隔离：任一源失败如实记录在 report（不阻断其余源）；循环 worker 心跳入调度注册表。
 """
 
@@ -20,16 +30,22 @@ import logging
 import os
 import time
 import uuid
+import zlib
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
 from backend.shared import hot_set as hot_set_pure
+from backend.shared.env_flags import env_flag
 from backend.shared.tdx_aidata import config as tdx_config
+from backend.shared.tdx_aidata.collector import SDK_SUBSCRIBE_MAX
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CANDIDATE_TOP_N = 500
+
+#: 当日池并入开关（默认开：这是决策轮真的会下单的那份名单）。
+POOL_FEATURE_ENV = "QM_HOT_SET_POOL"
 
 
 class HotSetBuilder:
@@ -182,6 +198,65 @@ class HotSetBuilder:
         except Exception as exc:  # noqa: BLE001 - 异动源失败不阻断构建
             return [], f"异动池采集失败: {exc}"
 
+    def _collect_pool(
+        self, day: str | None = None
+    ) -> tuple[list[str], str | None, str]:
+        """当日候选池（**决策轮同源** ``load_pool_doc``）→ 标的清单。
+
+        返回 ``(symbols, error, pool_file)``。三类结果必须可区分：
+
+        * 池文件不在（凌晨未产出、周末/节假日）→ ``([], None, "")``——**不是错误**：
+          每轮 60s 重读，文件出现即自动纳入；
+        * 文件在但读不动/结构异常 → ``([], "候选池采集失败: …", path)`` 如实告警；
+        * 正常 → ``(symbols, None, path)``。
+
+        池是**全局产物**（全市场选股结果），不随 ``tenant_filter`` 过滤：过滤会让
+        测试租户的构建看不到池票，而订阅是全局的、只认 ``qm:hot_set:symbols``。
+        出口已是后缀式（``load_pool_doc`` 内部统一走 ``_to_suffix``），与
+        ``compose_hot_set`` 的归一口径一致。
+        """
+        if not env_flag(POOL_FEATURE_ENV, default=True):
+            return [], None, ""
+        try:
+            from backend.shared.decision_context_source import load_pool_doc, now_cn
+        except Exception as exc:  # noqa: BLE001 - 依赖不可得时静默降级会掩盖问题
+            return [], f"候选池模块不可用: {exc}", ""
+        day_str = str(day or "").strip() or now_cn().strftime("%Y%m%d")
+        try:
+            doc = load_pool_doc(day_str)
+        except Exception as exc:  # noqa: BLE001 - 池读失败不阻断其余源
+            return [], f"候选池采集失败: {exc}", ""
+        if doc is None:
+            return [], None, ""
+        symbols: list[str] = []
+        for row in doc.rows:
+            code = str(getattr(row, "code", "") or "").strip()
+            if code:
+                symbols.append(code)
+        return symbols, None, str(doc.source or "")
+
+    @staticmethod
+    def _shard_pressure(symbols: list[str], shard_count: int) -> dict[str, Any]:
+        """热集按订阅分片算法的压力画像（余量 = ``SDK_SUBSCRIBE_MAX - 最大片）。
+
+        订阅侧 ``collector._shard_desired`` 对**每片**独立做 ``desired[:100]`` 硬截断，
+        而分片函数是 ``crc32(symbol) % shard_count``（与 compose 的优先级无关）。
+        也就是说：热集总量没超、但有某一**片**超过 100 时，静默被截掉的是该片字典序
+        靠后的标的——可能是池票。合成侧无法改变订阅侧的削发顺序，只能**如实暴露**。
+        """
+        n = max(1, int(shard_count or 1))
+        counts = [0] * n
+        for sym in symbols:
+            counts[zlib.crc32(str(sym).encode("utf-8")) % n] += 1
+        shard_max = max(counts) if counts else 0
+        return {
+            "shard_count": n,
+            "shard_max": shard_max,
+            "sdk_cap": SDK_SUBSCRIBE_MAX,
+            "headroom": SDK_SUBSCRIBE_MAX - shard_max,
+            "shards": counts,
+        }
+
     # ── 构建与写入 ──────────────────────────────────────────────────
 
     async def build_once(self, *, tenant_filter: str | None = None) -> dict[str, Any]:
@@ -189,16 +264,25 @@ class HotSetBuilder:
             self._collect_positions, tenant_filter
         )
         real_positions, real_err = await self._collect_real_positions(tenant_filter)
+        pool, pool_err, pool_file = await asyncio.to_thread(self._collect_pool)
         candidates, cand_err = await self._collect_candidates(tenant_filter)
         anomalies, anom_err = self._collect_anomalies()
 
         composed = hot_set_pure.compose_hot_set(
             positions=[*positions, *real_positions],
+            # 池次之：池票是「今天真的要下单」的，不能先被候选挤掉（见模块 docstring）
+            pool=pool,
             anomalies=anomalies,
             candidates=candidates,
             indexes=hot_set_pure.REGIME_INDEXES,  # T-P6-13：regime 常驻指数（不占 cap）
             cap=self.cap,
         )
+        shard_count = 1
+        try:
+            shard_count = int(tdx_config.shard_count())
+        except Exception as exc:  # noqa: BLE001 - 配置读不到按单片算（余量只会更保守）
+            logger.warning("读取订阅分片数失败，按单片估算压力: %s", exc)
+        pressure = self._shard_pressure(composed["symbols"], shard_count)
         report: dict[str, Any] = {
             **composed["stats"],
             "built_at": datetime.now(timezone.utc).isoformat(),
@@ -206,21 +290,40 @@ class HotSetBuilder:
                 "positions": len(positions) + len(real_positions),
                 "positions_sim": len(positions),
                 "positions_real": len(real_positions),
+                "pool": len(pool),
                 "candidates": len(candidates),
                 "anomalies": len(anomalies),
                 "indexes": len(hot_set_pure.REGIME_INDEXES),
             },
-            "errors": [e for e in (pos_err, real_err, cand_err, anom_err) if e],
+            # 池的**出处**（文件路径）如实带上：``pool=0`` 有两种含义——「今天还没有池」
+            # 与「池读失败」，只有文件名能把它们分开（另一条区分在 errors 里）。
+            "pool_file": pool_file,
+            "shard_pressure": pressure,
+            "errors": [
+                e for e in (pos_err, real_err, pool_err, cand_err, anom_err) if e
+            ],
         }
         await asyncio.to_thread(self._write, composed["symbols"], report)
         if report["errors"]:
             logger.warning("hot_set 构建部分源失败: %s", report["errors"])
+        if pressure["headroom"] <= 0:
+            # 逼近 SDK 单订阅上限 ⇒ 该片会被字典序硬截断（可能正好截掉池票）。
+            # 这是**运维动作**问题（上调 QM_SUB_SHARDS），不是构建能自愈的。
+            logger.warning(
+                "hot_set 分片压力逼近上限：最大片 %s/%s（cap %s），可能截断池票，"
+                "请上调订阅分片数（QM_SUB_SHARDS）",
+                pressure["shard_max"],
+                pressure["shard_count"],
+                pressure["sdk_cap"],
+            )
         logger.info(
-            "hot_set built kept=%s total=%s truncated=%s skipped=%s",
+            "hot_set built kept=%s total=%s truncated=%s skipped=%s pool=%s shard_max=%s",
             report["kept"],
             report["total"],
             report["truncated"],
             report["skipped"],
+            len(pool),
+            pressure["shard_max"],
         )
         return report
 
@@ -247,6 +350,10 @@ class HotSetBuilder:
                     "skipped": str(report.get("skipped")),
                     "sources": json.dumps(
                         report.get("sources") or {}, ensure_ascii=False
+                    ),
+                    "pool_file": str(report.get("pool_file") or ""),
+                    "shard_pressure": json.dumps(
+                        report.get("shard_pressure") or {}, ensure_ascii=False
                     ),
                 },
             )

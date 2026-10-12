@@ -218,6 +218,9 @@ async def test_build_once_multi_user_union_real_env():
         assert {"600036.SH", "000001.SZ"} <= members, f"持仓并集缺失: {members}"
         assert {"300750.SZ", "601318.SH"} <= members, f"候选缺失: {members}"
         assert report["kept"] >= 4 and report["kept"] == len(members)
+        # 当日池源必须出现在报告里（即便今天还没产出池文件，也必须是 ``pool=0`` 而不是缺字段）
+        assert "pool" in report["sources"]
+        assert "pool_file" in report
         meta = hs.hgetall(f"{hot_key}:meta")
         assert meta.get("kept") and meta.get("built_at")
     finally:
@@ -292,6 +295,9 @@ async def test_build_once_empty_sources_replaces_empty_real_env():
         # 异动池读共享真 Redis（识别引擎上线后有真实异动，与租户无关）：注入空池
         # 隔离环境漂移，保住本用例「空股票源」的语义
         builder._collect_anomalies = lambda: ([], None)
+        # 当日池读的是磁盘上的真产物（`data/reports/stock_picks/`），池文件在不在
+        # 取决于跑测试的机时；同样注入空池，否则「空源」语义会被当天池票破坏
+        builder._collect_pool = lambda *a, **k: ([], None, "")
         report = await builder.build_once(tenant_filter=tenant)
         # T-P6-13 起：空股票源 → 仅常驻指数（regime 源）；旧集合被**替换**（过期订阅退订）
         assert report["kept"] == 2

@@ -1,7 +1,11 @@
-"""热集合成（T-P6-06 纯函数）：持仓 ∪ 异动 ∪ 候选 ∪ 常驻指数 → 去重/优先级/截断。
+"""热集合成（T-P6-06 纯函数）：持仓 ∪ 池 ∪ 异动 ∪ 候选 ∪ 常驻指数 → 去重/优先级/截断。
 
 规则：
-- **优先级**：持仓 > 异动 > 候选（截断只吃低优先级尾部）；组内保序（调用方给定序）；
+- **优先级**：持仓 > 池 > 异动 > 候选（截断只吃低优先级尾部）；组内保序（调用方给定序）；
+- **池（T-P6-06 补）**：当日候选池（决策轮读的那份 ``stock_picks/{日}_picks.json``）——
+  池票是**当天真的会下单**的标的，必须在截断中先于「按分数取的候选」活下来；池不在
+  热集里的后果是那几只票**没有行情**，5s 陈旧价闸门（``l3.stale_quote``）全数拒单
+  （2026-10-13 实测 20261012 池 30 只中 15 只不在热集）；
 - **常驻指数（T-P6-13）**：``indexes`` 组不占 cap 配额、永不截断（regime 服务依赖其行情），
   与股票池去重后追加尾部；指数采用指数代码口径（如 ``000300.SH``）；
 - **归一**：一律规范为 Qlib 后缀式（``600036.SH``）；非沪深北（如港股/美股/非法码）跳过并计数
@@ -36,10 +40,14 @@ def compose_hot_set(
     positions: Iterable[object],
     anomalies: Iterable[object],
     candidates: Iterable[object],
+    pool: Iterable[object] = (),
     indexes: Iterable[object] = (),
     cap: int = DEFAULT_CAP,
 ) -> dict[str, Any]:
     """合成热集：返回 ``{"symbols": [...], "stats": {...}}``。
+
+    ``pool``：当日候选池（决策轮同源），优先级**仅次于持仓**——池票当天要下单，
+    截断不得先吃它。默认空元组 ⇒ 既有调用点统计不变。
 
     ``indexes``（T-P6-13）：常驻指数源——**不占 cap、永不截断**，去重后追加在股票池尾部。
     """
@@ -47,7 +55,7 @@ def compose_hot_set(
     seen: set[str] = set()
     ordered: list[str] = []
     total = skipped = 0
-    for group in (positions, anomalies, candidates):
+    for group in (positions, pool, anomalies, candidates):
         for item in group:
             total += 1
             norm = normalize_hot_symbol(item)

@@ -12,11 +12,14 @@ Token 物理落点 = `<安装目录>/TdxAiData.ini` 的 `[Token] token=`（原�
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DIR = "/opt/tdx-aidata"
 REDIS_CONFIG_KEY = "qm:market:tdx_aidata:config"
@@ -126,9 +129,17 @@ def ini_path(directory: str | None = None) -> str:
 
 
 def dir_ready(directory: str) -> bool:
-    """安装目录就绪判据：动态库 + tqServer.py 均在。"""
+    """安装目录就绪判据：动态库 + 新版 tdxaidata/ 包（或旧版 tqServer.py）均在。
+
+    2026-10 起通达信改以 PyPI 包 ``tdxaidata``（自带多平台动态库 + ini 模板）发行，
+    安装目录不再必然含 ``tqServer.py``。新形态 = ``libTdxAiData.so`` + ``tdxaidata/`` 包；
+    存量目录向后兼容旧形态（.so + tqServer.py）。
+    """
     base = Path(directory)
-    return (base / "libTdxAiData.so").is_file() and (base / "tqServer.py").is_file()
+    has_lib = (base / "libTdxAiData.so").is_file() or (base / "TdxAiData.dll").is_file()
+    new_pkg = (base / "tdxaidata").is_dir() or (base / "tdxaidata.py").is_file()
+    old_mod = (base / "tqServer.py").is_file()
+    return has_lib and (new_pkg or old_mod)
 
 
 # ── ini Token 外科手术 ──────────────────────────────────────────────
@@ -137,8 +148,23 @@ _TOKEN_LINE_RE = re.compile(r"^(\s*token\s*=\s*)(.*)$", re.IGNORECASE)
 
 
 def write_token(ini_file: str, token: str) -> None:
-    """把 token 写入 ini 的 [Token] 段（只动该行；无段则追加；原子落盘）。"""
-    path = Path(ini_file)
+    """把 token 写入 ini 的 [Token] 段（只动该行；无段则追加；原子落盘）。
+
+    新发行方式（PyPI 包 tdxaidata≥1.2.1）下动态库**订阅会话**只读它自身所在目录的
+    ``lib/TdxAiData.ini``——写入顶层 ini 不够，必须一并写包内 lib 那份（2026-10-13 实测：
+    只写顶层时快照正常但订阅静默 Need Token；双写后订阅才收帧）。
+    """
+    _write_token_to(str(ini_file), token)
+    # 包内 lib ini（新包形态：tdxaidata/lib/TdxAiData.ini；旧包无 lib 目录则跳过）
+    dir_path = Path(str(ini_file)).parent
+    pkg_ini = dir_path / "tdxaidata" / "lib" / "TdxAiData.ini"
+    if pkg_ini.is_file():
+        _write_token_to(str(pkg_ini), token)
+
+
+def _write_token_to(path_str: str, token: str) -> None:
+    """单文件原子写入实现（顶层与包内 lib 共用）。"""
+    path = Path(path_str)
     text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     lines = text.splitlines()
 
@@ -188,6 +214,7 @@ def write_token(ini_file: str, token: str) -> None:
         except OSError:
             pass
         raise
+    logger.info("tdx ini token 已更新: %s", path)
 
 
 def token_status(ini_file: str) -> dict[str, Any]:

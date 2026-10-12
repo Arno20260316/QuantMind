@@ -127,9 +127,11 @@ class TdxAiDataClient:
             log_file = open(log_dir / "tdx_aidata_worker.log", "ab")
             env = dict(os.environ)
             env["PYTHONPATH"] = _PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
-            if self.shard_total > 1:
-                env["QM_SUB_SHARD_ID"] = str(self.shard_id)
-                env["QM_SUB_SHARDS"] = str(self.shard_total)
+            # 恒注入构造期分片语义（2026-10-13 修）：旧实现 `shard_total > 1` 才注入，
+            # 单客户端（shard_total=1）不注入 → worker 回落共享 Redis 配置
+            # shard_count=7 → 以 (0,7) 分片对单测符号取 shard_symbols 空集 → 永不重订。
+            env["QM_SUB_SHARD_ID"] = str(self.shard_id)
+            env["QM_SUB_SHARDS"] = str(self.shard_total)
             subprocess.Popen(
                 [
                     sys.executable,

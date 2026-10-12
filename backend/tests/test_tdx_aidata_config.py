@@ -4,7 +4,7 @@
 1. 配置解析优先级：Redis 配置（前端保存）> 环境变量 > 默认 /opt/tdx-aidata；
 2. ini Token 外科手术式读写：只动 [Token] 段、其余字节级保留、原子落盘；
 3. 状态脱敏：token 只回传掩码（不入日志、不进 API 响应明文）；
-4. 源守卫：全仓只有 worker.py 一处 import tqServer（唯一适配器纪律）。
+4. 源守卫：全仓只有 worker.py 一处引入 SDK（新 tdxaidata 包 / 旧 tqServer 回退）。
 """
 
 from __future__ import annotations
@@ -68,14 +68,10 @@ def test_enabled_flag_precedence(monkeypatch):
     monkeypatch.setenv("TDX_AIDATA_DISABLED", "true")
     assert config.is_enabled() is False
 
-    monkeypatch.setattr(
-        config, "_read_redis_config_sync", lambda: {"enabled": "false"}
-    )
+    monkeypatch.setattr(config, "_read_redis_config_sync", lambda: {"enabled": "false"})
     assert config.is_enabled() is False
 
-    monkeypatch.setattr(
-        config, "_read_redis_config_sync", lambda: {"enabled": "true"}
-    )
+    monkeypatch.setattr(config, "_read_redis_config_sync", lambda: {"enabled": "true"})
     assert config.is_enabled() is True
 
 
@@ -126,6 +122,32 @@ def test_write_token_appends_section_when_missing(tmp_path):
 
 
 @pytest.mark.unit
+def test_write_token_dual_writes_pkg_ini(tmp_path):
+    """新发行方式双写：顶层 ini + 包内 lib ini 一并写（订阅会话只读包内 lib 那份）。"""
+    from backend.shared.tdx_aidata import config
+
+    top = tmp_path / "TdxAiData.ini"
+    top.write_text(_SAMPLE_INI, encoding="utf-8")
+    pkg = tmp_path / "tdxaidata" / "lib" / "TdxAiData.ini"
+    pkg.parent.mkdir(parents=True)
+    pkg.write_text(_SAMPLE_INI.replace("OLD_TOKEN_VALUE", "PKG_OLD"), encoding="utf-8")
+
+    config.write_token(str(top), "DUAL_TOKEN")
+
+    assert "token=DUAL_TOKEN" in top.read_text(encoding="utf-8")
+    pkg_text = pkg.read_text(encoding="utf-8")
+    assert "token=DUAL_TOKEN" in pkg_text
+    assert "PKG_OLD" not in pkg_text
+    # 无 lib 目录的旧形态：顶层照写、不炸
+    old_dir = tmp_path / "old"
+    old_dir.mkdir()
+    old_ini = old_dir / "TdxAiData.ini"
+    old_ini.write_text("[Token]\ntoken=OLD\n", encoding="utf-8")
+    config.write_token(str(old_ini), "NEW2")
+    assert "token=NEW2" in old_ini.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
 def test_read_token_status_masked(tmp_path):
     from backend.shared.tdx_aidata import config
 
@@ -150,7 +172,31 @@ def test_dir_ready_checks_required_files(tmp_path):
 
     assert config.dir_ready(str(tmp_path)) is False
     (tmp_path / "libTdxAiData.so").write_bytes(b"x")
-    assert config.dir_ready(str(tmp_path)) is False  # 还缺 tqServer.py
+    assert config.dir_ready(str(tmp_path)) is False  # 还缺包或旧模块
+    (tmp_path / "tqServer.py").write_text("", encoding="utf-8")
+    assert config.dir_ready(str(tmp_path)) is True  # 旧形态（存量目录）
+
+
+@pytest.mark.unit
+def test_dir_ready_accepts_new_pkg_layout(tmp_path):
+    """新发行方式：.so + tdxaidata/ 包目录（PyPI 包自带动态库，无 tqServer.py）。"""
+    from backend.shared.tdx_aidata import config
+
+    (tmp_path / "libTdxAiData.so").write_bytes(b"x")
+    assert config.dir_ready(str(tmp_path)) is False
+    pkg = tmp_path / "tdxaidata"
+    pkg.mkdir()
+    (pkg / "tdxaidata.py").write_text("", encoding="utf-8")
+    assert config.dir_ready(str(tmp_path)) is True
+
+
+@pytest.mark.unit
+def test_dir_ready_windows_dll_layout(tmp_path):
+    """Windows 安装目录判据：TdxAiData.dll + tqServer.py。"""
+    from backend.shared.tdx_aidata import config
+
+    (tmp_path / "TdxAiData.dll").write_bytes(b"x")
+    assert config.dir_ready(str(tmp_path)) is False
     (tmp_path / "tqServer.py").write_text("", encoding="utf-8")
     assert config.dir_ready(str(tmp_path)) is True
 
@@ -159,12 +205,19 @@ def test_dir_ready_checks_required_files(tmp_path):
 
 
 @pytest.mark.unit
-def test_only_worker_imports_tqserver():
+def test_only_worker_imports_sdk():
+    """源守卫：新 tdxaidata 与旧 tqServer 都只能由 worker.py 引入。"""
+    sdk_imports = (
+        "from tdxaidata import",
+        "import tdxaidata",
+        "from tqServer import",
+        "import tqServer",
+    )
     hits = []
     for path in _BACKEND.rglob("*.py"):
         if "/tests/" in str(path) or str(path).endswith("__init__.py"):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if "from tqServer import" in text or "import tqServer" in text:
+        if any(marker in text for marker in sdk_imports):
             hits.append(path.name)
-    assert hits == ["worker.py"], f"tqServer 只能由 worker.py 引入，命中 {hits}"
+    assert hits == ["worker.py"], f"SDK 只能由 worker.py 引入，命中 {hits}"

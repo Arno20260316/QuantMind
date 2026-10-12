@@ -423,7 +423,7 @@ services:
       - QM_TDX_DIR=${QM_TDX_DIR:-/data/third_party/tdx}
       - QM_INVESTMENT_DATA_DIR=${QM_INVESTMENT_DATA_DIR:-/data/third_party/investment_data}
       - QM_SIMONLIN_A_DIR=${QM_SIMONLIN_A_DIR:-/data/third_party/simonlin_a_stock}
-      # TdxAiData 实时数据通道（P6）：安装目录含 libTdxAiData.so + tqServer.py + TdxAiData.ini（Token）
+      # TdxAiData 实时数据通道（P6）：安装目录含 libTdxAiData.so + tdxaidata/ 包（PyPI 新发行，≥2026-10；旧存量兼容 tqServer.py）+ TdxAiData.ini（Token）
       - TDX_AIDATA_DIR=${TDX_AIDATA_DIR:-/opt/tdx-aidata}
     # 让容器能用 host.docker.internal 指回宿主机（Linux 上 daemon 不默认给这个名字）。
     # 用途：本地 ollama 向量化——因子挖掘子进程在容器里跑，填 127.0.0.1 会指到容器自己。

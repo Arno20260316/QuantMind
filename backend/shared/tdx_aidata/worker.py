@@ -32,7 +32,9 @@ from backend.shared.tdx_aidata import config, protocol
 
 logger = logging.getLogger("tdx_aidata.worker")
 
-_SDK_ERROR_RE = re.compile(r"错误码\s*(\d+)|code=(\d+)|Token\s*Insufficient", re.IGNORECASE)
+_SDK_ERROR_RE = re.compile(
+    r"错误码\s*(\d+)|code=(\d+)|Token\s*Insufficient", re.IGNORECASE
+)
 
 
 class _BudgetGate:
@@ -229,7 +231,10 @@ class AidataWorker:
 
         archiver = None
         if str(os.getenv("QM_L05_ENABLED", "true")).strip().lower() not in {
-            "0", "false", "no", "off",
+            "0",
+            "false",
+            "no",
+            "off",
         }:
             from backend.shared.l05_store import DEFAULT_BASE_DIR, SnapshotArchiver
 
@@ -238,14 +243,19 @@ class AidataWorker:
                 flush_rows=int(os.getenv("QM_L05_FLUSH_ROWS", "50000")),
                 flush_seconds=float(os.getenv("QM_L05_FLUSH_S", "30")),
                 keep_days=int(os.getenv("QM_L05_KEEP_DAYS", "90")),
-                tag=f"s{shard_id}" if shard_count > 1 else "",  # 多 worker 写同日目录防文件名撞车
+                tag=f"s{shard_id}"
+                if shard_count > 1
+                else "",  # 多 worker 写同日目录防文件名撞车
             )
             logger.info("l05 archiver enabled dir=%s", archiver.base_dir)
         self.archiver = archiver
 
         latency = None
         if str(os.getenv("QM_LATENCY_ENABLED", "true")).strip().lower() not in {
-            "0", "false", "no", "off",
+            "0",
+            "false",
+            "no",
+            "off",
         }:
             from backend.shared.latency_metrics import LatencyRecorder
 
@@ -277,7 +287,9 @@ class AidataWorker:
         )
         logger.info(
             "subscription engine enabled hot_set=%s shard=%d/%d",
-            _cfg.hot_set_key(), engine.shard_id, engine.shard_count,
+            _cfg.hot_set_key(),
+            engine.shard_id,
+            engine.shard_count,
         )
 
     # ── SDK 引入（唯一处） ──────────────────────────────────────────
@@ -286,15 +298,31 @@ class AidataWorker:
         if not config.dir_ready(self.directory):
             self.sdk_error = f"安装目录不完整: {self.directory}"
             return
-        os.chdir(self.directory)  # .so 依赖同目录 NewTc.dat；本进程专用于此，无副作用顾虑
+        os.chdir(
+            self.directory
+        )  # .so 依赖同目录 NewTc.dat；本进程专用于此，无副作用顾虑
         if self.directory not in sys.path:
             sys.path.insert(0, self.directory)
         try:
-            from tqServer import tqs  # type: ignore  # 唯一合规引入点（源守卫）
+            # 新发行方式（2026-10 起 PyPI 包 tdxaidata≥1.2.1，随包带多平台动态库）：
+            #   from tdxaidata import tqs
+            # 关键坑（2026-10-13 实测）：DLL 的**订阅会话**只读「它自己文件所在目录」的
+            # TdxAiData.ini——用 TDX_AI_DATA_LIB 指回顶层 .so 时快照正常但订阅静默无帧
+            # （Need Token）。因此走包内 lib 默认路径（tdxaidata/lib/），token 由
+            # config.ini_path() 写顶层 + 保存面双写包内 ini（见 tdx_aidata.py 保存逻辑）。
+            from tdxaidata import tqs  # type: ignore  # 唯一合规引入点（源守卫）
 
-            self.tqs = tqs
-        except Exception as exc:  # noqa: BLE001
-            self.sdk_error = f"SDK 加载失败: {exc}"
+            self.sdk_error = None
+        except Exception:  # noqa: BLE001 - 新包缺失再试旧式
+            try:
+                from tqServer import tqs  # type: ignore  # 旧版回退（存量目录兼容）
+
+                self.sdk_error = None
+            except Exception as exc:  # noqa: BLE001
+                self.tqs = None
+                self.sdk_error = f"SDK 加载失败: {exc}"
+                return
+        self.tqs = tqs
 
     # ── 请求分发 ────────────────────────────────────────────────────
 
@@ -307,7 +335,11 @@ class AidataWorker:
         retry_after_s: float | None = None,
     ) -> dict[str, Any]:
         self.counters["errors"][code] = self.counters["errors"].get(code, 0) + 1
-        self.counters["last_error"] = {"code": code, "message": message, "ts": time.time()}
+        self.counters["last_error"] = {
+            "code": code,
+            "message": message,
+            "ts": time.time(),
+        }
         return {
             "code": code,
             "message": message,
@@ -315,7 +347,9 @@ class AidataWorker:
             "retry_after_s": retry_after_s,
         }
 
-    async def dispatch(self, method: str, params: dict) -> tuple[Any, dict | None, dict]:
+    async def dispatch(
+        self, method: str, params: dict
+    ) -> tuple[Any, dict | None, dict]:
         """返回 (result, error, meta)。"""
         t0 = time.monotonic()
         meta: dict[str, Any] = {"duration_ms": 0.0, "attempts": 1}
@@ -414,7 +448,9 @@ class AidataWorker:
         self.counters["last_ok_ts"] = time.time()
         self.gate.note_success()
         meta["duration_ms"] = round((time.monotonic() - t0) * 1000, 2)
-        meta["budget_left"] = max(0, self.gate.max_requests - self.gate.snapshot()["window_requests"])
+        meta["budget_left"] = max(
+            0, self.gate.max_requests - self.gate.snapshot()["window_requests"]
+        )
         return result, None, meta
 
     def _invoke(self, method: str, params: dict) -> Any:
@@ -442,7 +478,11 @@ class AidataWorker:
                 if not symbols[0]:
                     raise ValueError("symbol 必填")
             else:
-                symbols = [str(s).strip() for s in (params.get("symbols") or []) if str(s).strip()]
+                symbols = [
+                    str(s).strip()
+                    for s in (params.get("symbols") or [])
+                    if str(s).strip()
+                ]
                 if not symbols:
                     raise ValueError("symbols 必填")
             data, out = _capture_fd_call(
@@ -518,16 +558,31 @@ class AidataWorker:
                         "id": -1,
                         "ok": False,
                         "result": None,
-                        "error": {"code": "protocol", "message": str(exc), "raw_code": None, "retry_after_s": None},
+                        "error": {
+                            "code": "protocol",
+                            "message": str(exc),
+                            "raw_code": None,
+                            "retry_after_s": None,
+                        },
                         "meta": {},
                     }
                     writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
                     await writer.drain()
                     continue
                 self.counters["requests"] += 1
-                result, err, meta = await self.dispatch(req["method"], req.get("params") or {})
-                resp = {"id": req["id"], "ok": err is None, "result": result, "error": err, "meta": meta}
-                writer.write((json.dumps(resp, ensure_ascii=False, default=str) + "\n").encode())
+                result, err, meta = await self.dispatch(
+                    req["method"], req.get("params") or {}
+                )
+                resp = {
+                    "id": req["id"],
+                    "ok": err is None,
+                    "result": result,
+                    "error": err,
+                    "meta": meta,
+                }
+                writer.write(
+                    (json.dumps(resp, ensure_ascii=False, default=str) + "\n").encode()
+                )
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             return

@@ -31,14 +31,18 @@ _SELFCHECK_SYMBOL = "600036.SH"
 
 class TdxAiDataConfigRequest(BaseModel):
     dir: str | None = Field(
-        None, description="安装目录（含 libTdxAiData.so + tqServer.py + TdxAiData.ini）"
+        None,
+        description="安装目录（含 libTdxAiData.so + tdxaidata/ 包或 tqServer.py + TdxAiData.ini）",
     )
     enabled: bool | None = Field(None, description="启用开关")
     token: str | None = Field(
         None, description="通达信 Token（写入 TdxAiData.ini 的 [Token] 段；不回显）"
     )
     shard_count: int | None = Field(
-        None, ge=1, le=32, description="订阅分片数（SDK 单进程上限 100 只/片；保存后重启全分片生效）"
+        None,
+        ge=1,
+        le=32,
+        description="订阅分片数（SDK 单进程上限 100 只/片；保存后重启全分片生效）",
     )
 
 

@@ -6,5 +6,6 @@
 - ``worker``   子进程单实例（chdir 隔离 + SDK 唯一引入口 + 冷却窗口管理）
 - ``client``   父进程异步客户端（按需拉起 worker / 超时 / 错误映射）
 
-纪律：全仓只有 ``worker.py`` 一处 import tqServer（源守卫测试约束）。
+纪律：全仓只有 ``worker.py`` 一处引入 SDK（源守卫测试约束）——新发行方式为
+``from tdxaidata import tqs``（PyPI 包），旧 ``from tqServer import tqs`` 仅作存量回退。
 """

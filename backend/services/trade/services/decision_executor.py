@@ -907,6 +907,23 @@ async def execute_batch(
             agent=agent,
         )
 
+    if env_flag("QM_DECISION_ROUND_QUOTE_REFRESH", default=True):
+        # 派发前把本轮腿的行情**现查现写**标准键（2026-10-12 决策轮 22/22 拒
+        # ``l3.stale_quote`` 的修复面）：热集轮转 ~100s 才轮到同一只票一圈，而
+        # 风控时效门 max_age_s=5——不刷新则池票快照在提交时刻必然判「陈旧」。
+        # **这不违反模块头纪律 1（执行段不重读行情）**：plan_orders 用的仍是
+        # 轮次开始的那份快照（本刷新不喂计划）；更新的只是风控在提交时刻读到的
+        # 行情新鲜度。best-effort：刷新内部自带超时护栏且绝不抛出，桥不可达时
+        # 照常提交、闸门按老数据自行裁定（fail-closed 语义不动）。
+        try:
+            from backend.services.live_trading.services.tdx_quote_feed import (
+                refresh_symbols_now,
+            )
+
+            await refresh_symbols_now([leg.symbol for leg in plan.legs])
+        except Exception as exc:  # noqa: BLE001 刷新失败不挡派发
+            logger.warning("[DecisionExec] 派发前行情刷新失败（继续提交）: %s", exc)
+
     submit = submitter
     if submit is None:
         submit = _make_default_submitter(

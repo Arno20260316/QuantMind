@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -72,6 +73,12 @@ feed_status: dict = {
     "last_error": None,
     "rate_limited": False,  # 桥限流避让中（60次/分钟）
     "member_gate": {"enabled": True, "allowed": True, "checked_at": None},
+    # 派发前 on-demand 刷新（2026-10-12 决策轮 stale_quote 修复）：观察面——
+    # 「刷新到底跑了没有、成了几只」在 /tdx/quote-feed/status 一眼可见。
+    "on_demand_calls": 0,
+    "on_demand_ok": 0,
+    "on_demand_last_at": None,
+    "on_demand_last_error": None,
 }
 
 
@@ -346,6 +353,98 @@ async def _write_snapshot(prefix: str, snap: dict) -> bool:
             return False
 
     return await asyncio.to_thread(_do)
+
+
+#: 派发前 on-demand 刷新的单次上限与节流：桥 rate_limit 600/min 与持仓馈送
+#: （~40/min）/热集轮转/账户同步共用——决策轮腿数通常 <30，逐只直查（2026-10-12
+#: 实测 21–56ms/只）+ 0.05s 间隔，22 腿整批 ≈1.8s，突发不挤爆预算。
+ON_DEMAND_MAX_SYMBOLS = 50
+ON_DEMAND_PACING_S = 0.05
+#: 时延护栏：httpx 默认 10s/请求且无重试——桥活着但通达信客户端挂起时，
+#: 没有这两道闸就是 50 只 × 10s = 500s 把派发卡死。单只 2s、整批 8s 封顶，
+#: 超了跳过剩余（best-effort 语义：刷不到就按老数据走闸门）。
+ON_DEMAND_CALL_TIMEOUT_S = 2.0
+ON_DEMAND_TOTAL_BUDGET_S = 8.0
+
+
+async def refresh_symbols_now(symbols: Iterable[str]) -> dict[str, bool]:
+    """按需直取桥快照并写标准键（派发前调用）——**best-effort，绝不抛出**。
+
+    为什么存在（2026-10-12 决策轮 22/22 拒 ``l3.stale_quote`` 的修复面）：热集
+    轮转 ~0.18s/只 × 500+ 只 ≈ **100s 才刷新同一只票一次**，而风控时效门
+    ``max_age_s=5``——池票在派发时刻的快照年龄期望 ≈50s，``risk_gate_service.
+    _quote_snapshot`` 读到即拒（「陈旧」=有数据但老的变体）。持仓票没这个问题：
+    持仓馈送按 ~3s 周期直查（手动单因此总能成交）。本函数把同一份直查搬到
+    **决策腿提交前**：对这批标的现查现写 ``market:snapshot/series`` 标准键，
+    让风控读到的就是真实新鲜行情，而不是等缓存轮转到。
+
+    边界（与「谁负责什么」的分工一致）：
+
+    * **只刷新数据，不改判定**——桥不可达/字段缺失/限流时**原样放行后续提交**，
+      闸门照旧按已有快照裁定（l3.stale_quote 的 fail-closed 语义不动）；
+    * **不喂执行计划**——``plan_orders`` 用的仍是轮次开始读的那份快照
+      （``decision_executor`` 模块头纪律 1：执行段不重读行情）；本函数影响的
+      只是风控在**提交时刻**读到的行情新鲜度；
+    * 队列去重（同票多腿只查一次）、上限 ``ON_DEMAND_MAX_SYMBOLS`` 截断；
+    * 逐只失败静默计数——一只查不到不该挡整批派发。
+
+    返回 ``{suffix 式代码: 是否写入成功}``（供调用方留痕/测试断言）。
+    """
+    if not tdx_pusher.enabled:
+        # OSS 默认无桥：这里一次日志都不该刷（每轮双腿数条 warning = 纯噪声），
+        # 且立即返回——桥都没配，闸门本来就有既有快照的裁定口径。
+        feed_status["on_demand_last_error"] = "桥未配置（TDX_BRIDGE_URL/TOKEN）"
+        return {}
+
+    wanted: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols or ():
+        code = str(raw or "").strip()
+        if not code:
+            continue
+        suffix = StockCodeUtil.to_suffix(code) or code
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        wanted.append(suffix)
+        if len(wanted) >= ON_DEMAND_MAX_SYMBOLS:
+            break
+
+    result: dict[str, bool] = {}
+    last_idx = len(wanted) - 1
+    deadline = time.monotonic() + ON_DEMAND_TOTAL_BUDGET_S
+    for idx, suffix in enumerate(wanted):
+        if time.monotonic() >= deadline:
+            feed_status["on_demand_last_error"] = (
+                f"总预算 {ON_DEMAND_TOTAL_BUDGET_S:.0f}s 用尽，跳过剩余 {last_idx - idx + 1} 只"
+            )
+            break
+        ok = False
+        try:
+            raw_snap = await asyncio.wait_for(
+                tdx_pusher.tdx_call("get_market_snapshot", {"stock_code": suffix}),
+                timeout=ON_DEMAND_CALL_TIMEOUT_S,
+            )
+            snap = map_snapshot(raw_snap if isinstance(raw_snap, dict) else {})
+            if snap is not None:
+                prefix = StockCodeUtil.to_prefix(suffix) or suffix
+                ok = await _write_snapshot(prefix, snap)
+            else:
+                feed_status["on_demand_last_error"] = (
+                    f"{suffix}: 桥快照映射失败（空载荷/字段缺失）"
+                )
+        except Exception as exc:  # noqa: BLE001 单只失败静默（闸门照旧裁定）
+            logger.warning("[TdxFeed] 派发前快照刷新失败 %s: %s", suffix, exc)
+            feed_status["on_demand_last_error"] = f"{suffix}: {str(exc)[:120]}"
+        result[suffix] = ok
+        feed_status["on_demand_calls"] += 1
+        if ok:
+            feed_status["on_demand_ok"] += 1
+        if ON_DEMAND_PACING_S > 0 and idx < last_idx:
+            await asyncio.sleep(ON_DEMAND_PACING_S)
+    if wanted:
+        feed_status["on_demand_last_at"] = _now_sh().isoformat(timespec="seconds")
+    return result
 
 
 def reconcile_sessions(

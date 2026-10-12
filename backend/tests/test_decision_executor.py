@@ -1641,3 +1641,125 @@ def test_mirror_segment_keeps_status_unknown_for_an_empty_receipt() -> None:
         "status": "unknown",
         "intent": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# 7. 派发前行情刷新（2026-10-12 决策轮 22/22 拒 l3.stale_quote 的修复接线）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def quote_refresh_spy(monkeypatch):
+    """把派发前刷新换成记录替身（**模块级 autouse**，既有用例零改动）。
+
+    宿主/容器 env 里 ``TDX_BRIDGE_URL`` 都是配好的——不替换的话，本文件每个
+    ``execute_batch``/``run_round`` 用例都会真打 Windows 桥并写真 Redis db3
+    （桥不可达时还要逐腿等 ``wait_for`` 超时）。「在提交前、按腿的代码调了」
+    由本节专项用例断言；其余用例只要求它**不出网、不拖慢**。
+    """
+    from backend.services.live_trading.services import tdx_quote_feed as feed
+
+    calls: list[list[str]] = []
+
+    async def _spy(symbols):
+        calls.append(list(symbols))
+        return dict.fromkeys(symbols, True)
+
+    monkeypatch.setattr(feed, "refresh_symbols_now", _spy)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_refreshes_every_leg_quote_before_any_submit(
+    monkeypatch,
+) -> None:
+    """刷新一次、覆盖全部腿的代码、且**先于任何提交**（风控在提交时刻读新鲜度）。"""
+    from backend.services.live_trading.services import tdx_quote_feed as feed
+
+    events: list[tuple] = []
+
+    async def _spy(symbols):
+        events.append(("refresh", tuple(symbols)))
+        return {}
+
+    monkeypatch.setattr(feed, "refresh_symbols_now", _spy)
+
+    class _OrderedSubmitter(_FakeSubmitter):
+        async def __call__(self, leg, client_order_id, real):
+            events.append(("submit", leg.symbol))
+            return await super().__call__(leg, client_order_id, real)
+
+    caller = _OrderedSubmitter()
+    outcome = await dx.execute_batch(
+        _batch(_sell("600036.SH", 1.0), _sell("000001.SZ", 1.0)),
+        round_id="rnd-fresh",
+        holdings=dict([_held("600036.SH"), _held("000001.SZ")]),
+        quotes={
+            "600036.SH": Quote(symbol="600036.SH", price=10.0),
+            "000001.SZ": Quote(symbol="000001.SZ", price=10.0),
+        },
+        real=False,
+        submitter=caller,
+    )
+
+    assert events and events[0][0] == "refresh"  # 任何提交之前先刷新
+    assert sorted(events[0][1]) == ["000001.SZ", "600036.SH"]
+    submit_symbols = [sym for tag, sym in events if tag == "submit"]
+    assert sorted(submit_symbols) == ["000001.SZ", "600036.SH"]
+    assert len(outcome.receipts) == 2
+
+
+@pytest.mark.asyncio
+async def test_quote_refresh_disabled_by_env_flag(
+    monkeypatch, quote_refresh_spy
+) -> None:
+    """``QM_DECISION_ROUND_QUOTE_REFRESH=false`` → 一次都不刷，提交照走。"""
+    monkeypatch.setenv("QM_DECISION_ROUND_QUOTE_REFRESH", "false")
+    submitter = _FakeSubmitter()
+    outcome = await dx.execute_batch(
+        _batch(_sell("600036.SH", 1.0)),
+        round_id="rnd-1",
+        holdings=dict([_held("600036.SH")]),
+        quotes={"600036.SH": Quote(symbol="600036.SH", price=10.0)},
+        real=False,
+        submitter=submitter,
+    )
+    assert quote_refresh_spy == []
+    assert len(submitter.calls) == 1
+    assert len(outcome.receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_never_blocks_submission(monkeypatch) -> None:
+    """刷新炸了（哪怕 Contract 外的异常）→ 记 warning 后照常提交（best-effort）。"""
+    from backend.services.live_trading.services import tdx_quote_feed as feed
+
+    async def _boom(symbols):
+        raise RuntimeError("桥 500")
+
+    monkeypatch.setattr(feed, "refresh_symbols_now", _boom)
+    submitter = _FakeSubmitter()
+    outcome = await dx.execute_batch(
+        _batch(_sell("600036.SH", 1.0)),
+        round_id="rnd-1",
+        holdings=dict([_held("600036.SH")]),
+        quotes={"600036.SH": Quote(symbol="600036.SH", price=10.0)},
+        real=False,
+        submitter=submitter,
+    )
+    assert outcome.summary()["submitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_no_legs_never_triggers_refresh(quote_refresh_spy) -> None:
+    """空计划（全 HOLD）在刷新之前就返回：没腿可发，不查行情。"""
+    submitter = _FakeSubmitter()
+    outcome = await dx.execute_batch(
+        _batch(_hold("600036.SH")),
+        round_id="rnd-1",
+        holdings={},
+        quotes={},
+        submitter=submitter,
+    )
+    assert outcome.receipts == ()
+    assert quote_refresh_spy == []

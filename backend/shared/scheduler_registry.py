@@ -206,6 +206,21 @@ JOBS: tuple[JobSpec, ...] = (
         "收盘报表/池/轮次/精确否决/镜像/跳发/实时信号七段盘点 → QQ；读不到的段如实标"
         "「不可读」，绝不渲染成 0",
     ),
+    # 2026-10-12 用户拍板重规划：非持仓/大盘情报不再碎片化即时推，聚合到
+    # 08:35 盘前 / 11:35 午间 / 15:15 盘后 三档卡片式速览。
+    JobSpec(
+        "intel_briefing",
+        "QQ 情报速览（3 档）",
+        "worker",
+        "trade",
+        "每交易日 08:35/11:35/15:15（60s 轮询）",
+        "QM_QQ_BRIEFING_ENABLED",
+        True,
+        345600,
+        "python backend/scripts/schedule_ctl.py run intel_briefing",
+        "非持仓情报 Redis 缓冲 → 卡片式速览合集（利空/风险优先，15 行折叠）；"
+        "只认最近一档（错过的档不补发），读失败不落 done 键下周期重试",
+    ),
     # P2-5 值班死手检查：**住 celery（跨进程树）**——trade 整体死亡时它还得能响。
     # 核对当日四类回执（报表/摘要/停滞检查/实时信号），缺失集收缩语义告警。
     JobSpec(
@@ -403,7 +418,7 @@ def heartbeat(job_key: str, *, redis_client=None, ttl: int | None = None) -> boo
 
 
 def read_heartbeats(
-    job_keys: "tuple[str, ...] | list[str]",
+    job_keys: tuple[str, ...] | list[str],
     *,
     now_ts: float | None = None,
     redis_client: Any = None,

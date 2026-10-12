@@ -43,11 +43,14 @@ def test_burst_folds_into_one_message(_isolate):
         _enqueue(line=f"▼ 票{i}(SZ00000{i}) 大幅下行 -5.0%")
     qd.flush_all()
 
-    # Assert：一条消息，标题带条数，正文逐行 + 尾句
+    # Assert：一条消息，标题带条数；卡片式正文 = 分隔线 + 6 行明细 + 分隔线 + 尾句
     assert len(_isolate) == 1
     title, body = _isolate[0]
     assert title == "持仓预警 · 6 条"
-    assert len(body.splitlines()) == 8  # 6 行明细 + 空行 + 尾句
+    lines = body.splitlines()
+    assert len(lines) == 9
+    assert lines[0] == qd.SEPARATOR
+    assert lines[7] == qd.SEPARATOR
     assert "票3(SZ000003)" in body
     assert body.rstrip().endswith("详情见交易台。")
 
@@ -61,7 +64,7 @@ def test_lines_beyond_cap_are_folded(_isolate):
     title, body = _isolate[0]
     assert title == "持仓预警 · 20 条"
     assert "行14" in body and "行15" not in body
-    assert "另有 5 条" in body
+    assert "另有 5 条 · 详情见交易台。" in body
 
 
 def test_buffer_overflow_counts_but_keeps_memory_bounded(_isolate):

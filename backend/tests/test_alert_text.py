@@ -253,3 +253,36 @@ def test_digest_line_truncates_long_news_titles():
     assert line.startswith("▼ 据《日经亚洲》")
     assert line.endswith("…")
     assert len(line) <= 45  # 摘要行不允许长成一篇文章
+
+
+def test_digest_line_appends_news_category_and_risk_diamond():
+    """新闻类行带类别尾标、风险事件箭头覆写为 ◆（2026-10-12 用户选定卡片样张）。"""
+    from backend.shared.alert_text import format_sentinel_digest_line
+
+    negative = {
+        "alert_type": "news:negative",
+        "symbol": "600519.SH",
+        "direction": "down",
+        "title": "批价下调传闻",
+        "detail": {"payload": {}},
+    }
+    line = format_sentinel_digest_line(negative, name_resolver=lambda _s: "贵州茅台")
+    assert line == "▼ 贵州茅台(SH600519) 批价下调传闻 · 利空"
+
+    risk = {
+        **negative,
+        "alert_type": "news:risk_event",
+        "symbol": "*",
+        "title": "出口管制新规落地",
+    }
+    line = format_sentinel_digest_line(risk, name_resolver=lambda _s: "")
+    assert line == "◆ 出口管制新规落地 · 风险"
+
+    positive = {
+        **negative,
+        "alert_type": "news:positive",
+        "direction": "up",
+        "title": "海外储能大单",
+    }
+    line = format_sentinel_digest_line(positive, name_resolver=lambda _s: "宁德时代")
+    assert line == "▲ 宁德时代(SH600519) 海外储能大单 · 利好"

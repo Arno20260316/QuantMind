@@ -76,6 +76,7 @@ async def lifespan(app: FastAPI):
     close_audit_task = None
     daily_pnl_report_task = None
     duty_summary_task = None
+    intel_briefing_task = None
     tdx_quote_feed_task = None
     tdx_l2_capture_task = None
     tdx_l2_realtime_task = None
@@ -532,6 +533,16 @@ async def lifespan(app: FastAPI):
             run_duty_summary_task(),
             name="duty-summary",
         )
+        # QQ 情报速览（2026-10-12 用户拍板）：非持仓/大盘情报 3 档卡片合集
+        # （08:35/11:35/15:15），与隔壁值班摘要同款起停（开关在循环体里判）
+        from backend.services.trade.services.intel_briefing_task import (
+            run_intel_briefing_task,
+        )
+
+        intel_briefing_task = asyncio.create_task(
+            run_intel_briefing_task(),
+            name="intel-briefing",
+        )
         from backend.services.live_trading.services.tdx_quote_feed import (
             run_tdx_quote_feed_task,
         )
@@ -888,6 +899,7 @@ async def lifespan(app: FastAPI):
         close_audit_task,
         daily_pnl_report_task,
         duty_summary_task,
+        intel_briefing_task,
         tdx_quote_feed_task,
         tdx_l2_capture_task,
         tdx_l2_realtime_task,

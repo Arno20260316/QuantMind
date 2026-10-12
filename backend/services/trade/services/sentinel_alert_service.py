@@ -105,6 +105,20 @@ def _main_redis():
     )
 
 
+def _briefing_redis():
+    """速览缓冲 Redis（写侧）——**必须与冲刷侧同库**，否则冲刷永远读不到。
+
+    哨兵自身的 client 走 ``REDIS_DB_GENERAL``（冷却/配额/状态键，db0）；速览
+    冲刷任务（``intel_briefing_task``）读的是 ``trade_shared.deps.get_redis``
+    （``REDIS_DB_TRADE``，db2）。2026-10-12 接线核对：若用哨兵 client 写缓冲，
+    冲刷侧永远读不到——「结构性空转」，卡片不发且全链无报错。语义与
+    ``daily_pnl_report_task._redis_client`` 同款（wrapper → 裸 client）。
+    """
+    from backend.services.trade_shared.deps import get_redis
+
+    return getattr(get_redis(), "client", None)
+
+
 def _load_config_sync() -> SentinelConfig:
     try:
         client = _main_redis()
@@ -143,8 +157,9 @@ class SentinelAlertService:
             "throttled_rate": 0,
             "below_level": 0,
             "stale": 0,
-            # QQ 面范围过滤拦下（2026-10-12：非实盘持仓/非选定券商不推 QQ）
-            "qq_scope_skipped": 0,
+            # 非持仓情报进速览缓冲（2026-10-12 拍板：非持仓/大盘情报不即时推，
+            # 聚合到 3 档卡片速览；见 shared/qq_briefing）
+            "qq_briefed": 0,
             "malformed": 0,
             "record_errors": 0,
             "errors": 0,
@@ -370,48 +385,76 @@ class SentinelAlertService:
                 return "throttled_cooldown"
         except Exception as exc:  # noqa: BLE001
             self._note_error(f"cooldown: {exc}")
-        rate_key = f"{RATE_KEY_PREFIX}{datetime.now(_SH_TZ).strftime('%Y%m%d%H')}"
-        try:
-            used = int(client.incr(rate_key))
-            client.expire(rate_key, 3700)
-            if used > cfg.hourly_cap:
-                self._bump("throttled_rate")
-                return "throttled_rate"
-        except Exception as exc:  # noqa: BLE001
-            self._note_error(f"rate: {exc}")
+        # QQ 面路由判定（2026-10-12 用户拍板重规划）：**持仓相关**（选定券商实盘
+        # 仓）→ 即时窗口摘要（qq_digest，📌 持仓情报）；**非持仓/大盘情报** → 只进
+        # 速览档期缓冲（qq_briefing，08:35/11:35/15:15 卡片合集），即时面不再出现。
+        # 市场级事件（无标的）没有「持仓」语义 → 速览面。范围判定故障回退**即时
+        # 面**（宁多勿丢——情报迟一档送达好过静默消失）。
+        market = str(row.get("market") or "CN")
+        symbol = str(row.get("symbol") or "").strip()
+        to_briefing = symbol in ("", "*")
+        if not to_briefing:
+            try:
+                from backend.shared.admin_identity import ADMIN_USER_ID
+                from backend.shared.push_scope import (
+                    live_symbols_for_push,
+                    symbol_allowed_for_push,
+                )
+
+                # 范围闸跟随券商选定（切 TDX 推 TDX 的仓、切 QMT 推 QMT 的仓）；
+                # 读不到范围集 = 不设闸（None → 全部即时面）。收件面是 admin
+                # （与 _default_notify fanout 同口径）。
+                scope = live_symbols_for_push("default", ADMIN_USER_ID)
+                to_briefing = not symbol_allowed_for_push(symbol, scope)
+            except Exception as exc:  # noqa: BLE001 - 判定故障回退即时面
+                self._note_error(f"scope: {exc}")
+        # 小时配额只拦**即时面**：速览条目不当场到手机（档期合集自带 15 行折叠
+        # 与 500 条缓冲上限），若也吃即时配额，行情风暴会把真急的即时告警挤掉。
+        if not to_briefing:
+            rate_key = f"{RATE_KEY_PREFIX}{datetime.now(_SH_TZ).strftime('%Y%m%d%H')}"
+            try:
+                used = int(client.incr(rate_key))
+                client.expire(rate_key, 3700)
+                if used > cfg.hourly_cap:
+                    self._bump("throttled_rate")
+                    return "throttled_rate"
+            except Exception as exc:  # noqa: BLE001
+                self._note_error(f"rate: {exc}")
         # 正文给人读（中文名 + 中文说明），**不再把告警信封 json.dumps 端给用户**：
         # 用户收到的曾是一串 {"alert_type": "anomaly:price_surge", ...} 加浮点原值
         # （2026-09-24 实测），标的是裸代码。信封照旧留在 sentinel_alerts.detail 里
         # 给机器读；要下钻原始字段去交易台 → 实时情报。文案构造见 shared/alert_text。
         title, content = format_sentinel_alert(row)
-        # QQ 面：并入窗口摘要（站内卡片/留痕表照旧逐条——摘要只压缩推送面）。
-        # 入队在投递**之前**：notification_publisher 的旁路纪律是「与库/流成败
-        # 解耦——手机 QQ 才是真正的告警面」，站内投递失败（库故障/无管理员）
+        # QQ 面入队在投递**之前**：notification_publisher 的旁路纪律是「与库/流
+        # 成败解耦——手机 QQ 才是真正的告警面」，站内投递失败（库故障/无管理员）
         # 不该让告警在 QQ 面整条消失（2026-10-09 code review HIGH-1）。
+        # 站内卡片/留痕表照旧逐条全量——QQ 面路由只压缩推送面。
         try:
-            from backend.shared.admin_identity import ADMIN_USER_ID
             from backend.shared.market_labels import market_label
-            from backend.shared.push_scope import (
-                live_symbols_for_push,
-                symbol_allowed_for_push,
-            )
-            from backend.shared.qq_digest import enqueue as _digest_enqueue
 
-            market = str(row.get("market") or "CN")
             label = market_label(market) or market
-            # QQ 推送面范围（2026-10-12 用户指令）：只推「实盘有的股票」且跟随
-            # 券商选定（切 TDX 推 TDX 的仓、切 QMT 推 QMT 的仓）。站内卡片/留痕
-            # 照旧逐条全量；收件面是 admin（与 _default_notify fanout 同口径）。
-            scope = live_symbols_for_push("default", ADMIN_USER_ID)
-            if symbol_allowed_for_push(row.get("symbol"), scope):
+            if to_briefing:
+                from backend.shared.qq_briefing import enqueue_briefing
+
+                briefing_client = _briefing_redis()
+                if briefing_client is not None and enqueue_briefing(
+                    briefing_client,
+                    market,
+                    line=format_sentinel_digest_line(row),
+                    alert_type=str(row.get("alert_type") or ""),
+                    direction=str(row.get("direction") or ""),
+                    ts=float(row.get("ts") or 0) or None,
+                ):
+                    self._bump("qq_briefed")
+            else:
+                from backend.shared.qq_digest import enqueue as _digest_enqueue
+
                 _digest_enqueue(
                     digest_key=f"sentinel:{market}",
-                    header=f"实时情报 · {label}",
+                    header=f"📌 持仓情报 · {label}",
                     line=format_sentinel_digest_line(row),
-                    footer="详情见交易台 · 实时情报。",
+                    footer="交易台 › 实时情报",
                 )
-            else:
-                self._bump("qq_scope_skipped")
         except Exception as exc:  # noqa: BLE001 - 摘要失败不影响站内投递（两边独立）
             self._note_error(f"digest: {exc}")
         ok = False

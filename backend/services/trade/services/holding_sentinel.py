@@ -871,9 +871,9 @@ class HoldingSentinel:
             for line in lines:
                 enqueue(
                     digest_key=f"holding:{tenant}:{user_id}",
-                    header="持仓预警",
+                    header="🔔 持仓预警",
                     line=line,
-                    footer="详情见交易台 · 持仓监控。",
+                    footer="交易台 › 持仓监控",
                 )
         except Exception as exc:  # noqa: BLE001 - 摘要失败不影响留痕与站内卡片
             logger.warning("[holding_sentinel] QQ 摘要入队失败: %s", exc)

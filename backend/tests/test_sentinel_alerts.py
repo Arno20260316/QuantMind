@@ -9,14 +9,19 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _silence_qq_digest(monkeypatch):
-    """默认不触真实摘要缓冲（要断言的测试自设捕获覆盖本桩）。
+    """默认不触真实摘要/速览缓冲（要断言的测试自设捕获覆盖本桩）。
 
     _decide_push 放行即入队——不隔离的话单测会留下真实缓冲与 120s 定时器，
-    且会把跨测试残留冲进 test_qq_digest 的断言（2026-10-09 排序暴露）。
+    且会把跨测试残留冲进 test_qq_digest 的断言（2026-10-09 排序暴露）；
+    速览面同理（2026-10-12：非持仓情报走 qq_briefing，会写真 Redis 交易库）。
     """
+    import backend.services.trade.services.sentinel_alert_service as svc_mod
+    import backend.shared.qq_briefing as qq_briefing
     import backend.shared.qq_digest as qq_digest
 
     monkeypatch.setattr(qq_digest, "enqueue", lambda **kw: None)
+    monkeypatch.setattr(qq_briefing, "enqueue_briefing", lambda *a, **kw: None)
+    monkeypatch.setattr(svc_mod, "_briefing_redis", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -351,7 +356,7 @@ def test_pushed_event_feeds_digest_and_keeps_inapp_per_event(monkeypatch):
     assert len(notes) == 1  # 站内通知照旧逐条（卡片/留痕表全量可查）
     assert len(calls) == 1
     assert calls[0]["digest_key"] == "sentinel:CN"
-    assert "实时情报" in calls[0]["header"]
+    assert "持仓情报" in calls[0]["header"]
     line = calls[0]["line"]
     assert line.startswith("▼") and "SH600503" in line and "-9.86%" in line
 
@@ -426,18 +431,27 @@ def test_default_notify_disables_per_event_qq(monkeypatch):
     assert captured["type"] == "sentinel"
 
 
-# ── QQ 推送面范围（2026-10-12：实盘有的股票才推送、跟随券商选定）────
+# ── QQ 面路由（2026-10-12 拍板：持仓即时 / 非持仓进速览；范围闸跟随券商选定）──
 
 
-def test_out_of_scope_symbol_skips_qq_but_keeps_inapp(monkeypatch):
+def test_out_of_scope_symbol_routes_to_briefing(monkeypatch):
     """非实盘持仓的票（SH600503 不在选定券商的仓里）：站内卡片/留痕照旧，
-    QQ 摘要不入队，计数留痕 qq_scope_skipped。"""
+    QQ 面**不即时推**、改入速览档期缓冲，计数留痕 qq_briefed。"""
+    import backend.services.trade.services.sentinel_alert_service as svc_mod
     import backend.shared.push_scope as push_scope
+    import backend.shared.qq_briefing as qq_briefing
     import backend.shared.qq_digest as qq_digest
     from backend.services.trade.services.sentinel_alert_service import SentinelConfig
 
     calls: list[dict] = []
+    briefed: list[dict] = []
     monkeypatch.setattr(qq_digest, "enqueue", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(svc_mod, "_briefing_redis", lambda: object())
+    monkeypatch.setattr(
+        qq_briefing,
+        "enqueue_briefing",
+        lambda client, market, **kw: briefed.append({"market": market, **kw}) or True,
+    )
     monkeypatch.setattr(
         push_scope, "live_symbols_for_push", lambda tenant, user_id: {"SZ002074"}
     )
@@ -445,8 +459,39 @@ def test_out_of_scope_symbol_skips_qq_but_keeps_inapp(monkeypatch):
 
     assert svc._decide_push(holder["cfg"], _FakeRedis(), _storm_row()) == "pushed"
     assert len(notes) == 1  # 站内照旧
-    assert calls == []  # QQ 面不推
-    assert svc.counters["qq_scope_skipped"] == 1
+    assert calls == []  # 即时摘要不推
+    assert len(briefed) == 1  # 进速览缓冲
+    assert briefed[0]["market"] == "CN"
+    assert briefed[0]["alert_type"] == "anomaly:price_surge"
+    assert briefed[0]["direction"] == "down"
+    assert "SH600503" in briefed[0]["line"]
+    assert svc.counters["qq_briefed"] == 1
+
+
+def test_market_level_row_goes_to_briefing_without_scope_lookup(monkeypatch):
+    """无标的的市场级事件没有「持仓」语义 → 直接走速览面（不查范围集）。"""
+    import backend.services.trade.services.sentinel_alert_service as svc_mod
+    import backend.shared.push_scope as push_scope
+    import backend.shared.qq_briefing as qq_briefing
+    from backend.services.trade.services.sentinel_alert_service import SentinelConfig
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("市场级事件不应查范围集")
+
+    briefed: list[dict] = []
+    monkeypatch.setattr(push_scope, "live_symbols_for_push", _boom)
+    monkeypatch.setattr(svc_mod, "_briefing_redis", lambda: object())
+    monkeypatch.setattr(
+        qq_briefing,
+        "enqueue_briefing",
+        lambda client, market, **kw: briefed.append({"market": market, **kw}) or True,
+    )
+    svc, notes, holder = _service(cfg=SentinelConfig(enabled=True))
+
+    row = _storm_row(symbol="*", alert_type="news:risk_event", direction="down")
+    assert svc._decide_push(holder["cfg"], _FakeRedis(), row) == "pushed"
+    assert len(briefed) == 1
+    assert svc.counters["qq_briefed"] == 1
 
 
 def test_in_scope_symbol_feeds_digest(monkeypatch):

@@ -68,6 +68,9 @@ _HEARTBEAT_WIRED = {
     # P2-5 值班摘要（trade 常驻，15:40）：心跳写在常驻循环里；它同时是死手
     # 核对的回执生产者（「摘要到底有没有人在跑」的唯一信号）。
     "duty_summary": "services/trade/services/duty_summary.py",
+    # 2026-10-12 QQ 情报速览（trade 常驻，08:35/11:35/15:15 三档）：心跳写在
+    # 常驻循环里——「速览到底有没有人在冲刷」的唯一观测面。
+    "intel_briefing": "services/trade/services/intel_briefing_task.py",
     # P2-5 值班死手（celery beat，16:00~23:30）：心跳写在核对函数里——它是
     # 「该响没响」的裁判位，自身停摆没有任何下游能发现，心跳是唯一观测面。
     "duty_deadman": "services/engine/tasks/duty_deadman.py",
@@ -220,6 +223,8 @@ def test_all_jobs_heartbeat_wired_in_source():
         "factor_board_reselect",
         # 资金流延续证据（市场分析 · 资金流全景 v2）
         "flow_evidence",
+        # 2026-10-12 QQ 情报速览（心跳在 trade 常驻循环，见 _HEARTBEAT_WIRED）
+        "intel_briefing",
     }
     registry = {j.key for j in JOBS if j.heartbeat_ttl is not None}
     assert registry == wired, f"注册表与接线不一致: {registry ^ wired}"
@@ -279,6 +284,8 @@ def test_schedule_ctl_dispatch_covers_rerun_declared_jobs():
         "duty_summary",
         # P2-5 值班死手（重跑 = 核对一遍；--force 跳过非交易日闸门与封账键）
         "duty_deadman",
+        # 2026-10-12 QQ 情报速览（重跑 = 立刻冲刷一轮；done 键挡住已发档期）
+        "intel_briefing",
     }
 
     # 未知任务 → 退出码 2（纯函数路径，不触发真实执行）

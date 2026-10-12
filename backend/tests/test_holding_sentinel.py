@@ -610,8 +610,8 @@ class TestQqDigestWiring:
 
         assert [c["line"] for c in calls] == ["行1", "行2"]
         assert {c["digest_key"] for c in calls} == {"holding:default:10000001"}
-        assert all(c["header"] == "持仓预警" for c in calls)
-        assert all("持仓监控" in c["footer"] for c in calls)
+        assert all(c["header"] == "🔔 持仓预警" for c in calls)
+        assert all(c["footer"] == "交易台 › 持仓监控" for c in calls)
 
     def test_persist_source_guards_digest_after_notify(self):
         """源码守卫：先尝试站内通知、再收集摘要行、最后逐用户入队；且摘要

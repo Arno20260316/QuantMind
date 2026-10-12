@@ -604,6 +604,26 @@ def _run_duty_summary(date_str: str | None, force: bool) -> int:
     return 0 if result.get("sent") else 1
 
 
+def _run_intel_briefing(date_str: str | None, force: bool) -> int:
+    """QQ 速览「重跑」= 立刻跑一轮冲刷周期（到档且未发过的市场**真的再推一条 QQ 卡片**）。
+
+    ``--force`` 无特殊语义（与值班摘要同款）；当日已发过的档期由 done 键挡住，
+    不会重复推。非交易日闸门按「手动触发=认定该跑」跳过（与 duty_deadman 同）。
+    """
+    import asyncio
+    from datetime import datetime
+
+    from backend.services.live_trading.services.trading_session import TZ
+    from backend.services.trade.services.intel_briefing_task import (
+        run_intel_briefing_cycle,
+    )
+
+    now = datetime.now(TZ)
+    flushed = asyncio.run(run_intel_briefing_cycle(now, True))
+    print(f"intel_briefing {now:%Y-%m-%d %H:%M}: flushed={flushed} market(s)")
+    return 0
+
+
 def _run_duty_deadman(date_str: str | None, force: bool) -> int:
     """值班死手「重跑」= 核对一遍；``--force`` 跳过非交易日闸门与当日封账键。
 
@@ -695,6 +715,9 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # P2-5 值班死手：重跑 = 核对一遍（--force 跳过非交易日闸门与当日封账键；
     # 告警按缺失集收缩语义去重，不重复响）。
     "duty_deadman": _run_duty_deadman,
+    # 2026-10-12 QQ 速览：重跑 = 立刻冲刷一轮（做的是当天最近一档；已发过
+    # 的由 done 键挡住，不会重复推）。
+    "intel_briefing": _run_intel_briefing,
 }
 
 
@@ -740,6 +763,11 @@ def _force_notice(job_key: str) -> str:
         return (
             "提示：--force = 跳过非交易日闸门与当日封账键，强制重核一遍；"
             "告警仍按缺失集收缩语义去重（集合与已告警台账相同则不重复响）"
+        )
+    if job_key == "intel_briefing":
+        return (
+            "提示：--force 对该任务无额外语义；重跑 = 立刻冲刷一轮速览缓冲"
+            "（到档且当日未发过的市场会**真的再推一条 QQ 卡片**；done 键挡住重复）"
         )
     return f"提示：--force 已传给 {job_key}；该任务的重跑本身不看这个参数"
 

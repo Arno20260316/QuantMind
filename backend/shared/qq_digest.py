@@ -44,6 +44,8 @@ DEFAULT_WINDOW_S = 120.0
 MAX_LINES = 15
 #: 缓冲行上限（防极端风暴下无界占内存；超出的只计数不存文本）
 MAX_BUFFERED_LINES = 60
+#: 卡片分隔线（纯文本，14 个全角横——与速览卡片同款；QQ 平台不收 markdown）
+SEPARATOR = "━" * 14
 
 
 @dataclass
@@ -124,17 +126,28 @@ def _flush_entry(key: str, entry: _Digest) -> None:
 
 
 def _compose(entry: _Digest) -> tuple[str, str]:
-    """（标题, 正文）。折叠计数 = 展示上限之外的 + 缓冲上限之外的。"""
+    """（标题, 正文）。折叠计数 = 展示上限之外的 + 缓冲上限之外的。
+
+    卡片式排版（2026-10-12 用户拍板）：标题｜分隔线｜明细行｜分隔线｜尾注。
+    尾注 = 「另有 N 条 · {footer}」；footer 为空则尾注与第二条分隔线都省。
+    """
     total = len(entry.lines) + entry.folded
     title = f"{entry.header} · {total} 条"
     shown = entry.lines[:MAX_LINES]
     hidden = total - len(shown)
-    body = "\n".join(shown)
+    body_lines = [SEPARATOR, *shown]
+    tail = ""
     if hidden > 0:
-        body += f"\n另有 {hidden} 条"
-    if entry.footer:
-        body += f"\n\n{entry.footer}"
-    return title, body
+        tail = (
+            f"另有 {hidden} 条 · {entry.footer}"
+            if entry.footer
+            else f"另有 {hidden} 条"
+        )
+    elif entry.footer:
+        tail = entry.footer
+    if tail:
+        body_lines += [SEPARATOR, tail]
+    return title, "\n".join(body_lines)
 
 
 def _send(entry: _Digest) -> None:

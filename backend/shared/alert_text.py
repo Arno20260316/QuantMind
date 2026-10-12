@@ -68,6 +68,15 @@ DIRECTION_LABELS: dict[str, str] = {"down": "利空", "up": "利多"}
 #: 方向 → 摘要行箭头（未知方向用「•」，不编造涨跌）
 DIRECTION_ARROWS: dict[str, str] = {"down": "▼", "up": "▲"}
 
+#: 新闻类告警 → 摘要行类别尾标（用户选定卡片样张的 `… · 利空` 形态）。
+#: 只标新闻类：行情/持仓类告警的身份+事实已自明，不加类别词。
+_CATEGORY_LABELS: dict[str, str] = {
+    "news:risk_event": "风险",
+    "news:negative": "利空",
+    "news:positive": "利好",
+    "news:sentiment_spike": "情绪",
+}
+
 #: `metrics` 键 → (中文标签, 格式化函数)。**只登记会进正文的键**；
 #: 其余键（orders/cancelled/date/top_symbol…）留在 detail 里，正文不出现。
 METRIC_LABELS: dict[str, tuple[str, Callable[[Any], str]]] = {
@@ -215,6 +224,11 @@ def format_sentinel_digest_line(
             fact = fact.replace(symbol, ident, 1)
             ident = ""
     arrow = DIRECTION_ARROWS.get(str(row.get("direction") or "").strip(), "•")
+    alert_type = str(row.get("alert_type") or "").strip()
+    if alert_type == "news:risk_event":
+        # 风险事件覆写为 ◆（用户选定样张的规则类字形；仅摘要面——站内
+        # format_sentinel_alert 的标题/正文口径不动）
+        arrow = "◆"
     if len(fact) > 42:  # 新闻标题可能是一整句话；摘要行只留一眼可读的开头
         fact = fact[:41] + "…"
     pct = ""
@@ -226,7 +240,9 @@ def format_sentinel_digest_line(
             pct = f" {float(metrics['pct_chg']) * 100:+.2f}%"
         except (TypeError, ValueError):
             pct = ""
-    return " ".join(part for part in (arrow, ident, fact) if part) + pct
+    category = _CATEGORY_LABELS.get(alert_type, "")
+    suffix = f" · {category}" if category else ""
+    return " ".join(part for part in (arrow, ident, fact) if part) + pct + suffix
 
 
 def format_sentinel_alert(

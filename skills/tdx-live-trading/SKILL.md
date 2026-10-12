@@ -33,6 +33,7 @@ QuantMind 交易执行链路的**操作 + 监控手册**：从模型推理信号
 | **股票代码用后缀格式** | 桥下单/持仓/拉委托一律 `600206.SH`（后缀）；`SH600206`（前缀）会 `codestr error` 被拒 |
 | **T+1 冻结** | 当日买入 `available_volume=0`，卖出会 `可用持仓不足: 0 < 100` —— 不是 bug |
 | **盘后委托=废单** | 收盘后挂单交易所会拒（终态 rejected, filled=0）；对废单撤单返回"撤单提交失败"——正常，无单可撤 |
+| **撤单报失败 ≠ 没撤成** | 撤单异步落定（实测 ≤2s）且直连账号成功码为 `2`——2026-10-12 前桥只认 `1`，把已生效的撤单报成失败。现已**桥 + 后端双层终态复核**：握手失败/超时按当日委托终态判（`side=cancel`=已撤 / filled=撤销前已成交 / 仍在途才是真失败）。撤单失败也必须 pull 复核，以终态为准 |
 | **桥是成交权威** | 委托状态以桥 `pull_orders` 为准（30s 同步 UPSERT 到 PG）；本地超时扫描器**已排除**桥委托（remarks 含「通达信桥委托」），不会误标过期 |
 | **桥当日委托列表有上限** | 太旧的委托会滚出桥列表→sync 看不到→PG 里费用/状态不再刷新；已成交旧单费用需一次性回填（见 §9） |
 | **RedisClient 静默 no-op** | `get/set` 在 client 为 None 时静默返回 —— 独立脚本必须先 `r.connect()`，否则配置"保存成功"实际没写 |
@@ -131,11 +132,12 @@ docker exec -i -w /app quantmind python - < skills/tdx-live-trading/scripts/tdx_
 | 操作 | 路径 | 要点 |
 |---|---|---|
 | 下单/挂单 | `POST /api/v1/plans/execute` | 代码后缀格式；限价单=挂单；`order_price` 需在涨跌停内 |
-| 撤单 | `POST /api/v1/orders/cancel` | 对已废单会失败（正常）；成功后必须 pull 复核终态 |
+| 撤单 | `POST /api/v1/orders/cancel` | 对已废单会失败（正常）；握手失败时桥自动按委托终态复核（≤2s），响应带 `verified:true` 即"报失败系误报、实际已撤"；成功后仍须 pull 复核终态 |
 | 复核 | `POST /api/v1/orders/query` | 返回当日委托+状态；桥是权威 |
 | 持仓 | `POST /api/v1/account/query` | 过滤 total_volume=0 残留 |
 
 桥状态码：`0=REJECTED 1=SUBMITTED 2=PARTIAL_FILL 3=FILLED 4=PARTIAL_CANCELLED 5=CANCELLED`。
+RPC 返回码 `Value`：`1`=已受理（下单=待客户端人工确认）；`2`=直连接管已提交（免确认）。**撤单把 `1`/`2` 都判成功**（2026-10-12 修复；修复前只认 `1`）。
 桥字符串 → PG：`filled→filled, partial_fill/partially_filled→partially_filled, partial_cancelled/cancelled→cancelled, rejected→rejected`，其余→submitted。
 
 **正确下单姿势（API 层）**：先 `pull_positions` 确认可用 > 0（T+1）→ 下单 → `pull_order_status(wtbh)` 轮询 → 终态后 `pull_today_orders` 复核。
@@ -147,7 +149,8 @@ docker exec -i -w /app quantmind python - < skills/tdx-live-trading/scripts/tdx_
 - 同步：桥当日委托每 30s UPSERT 进 PG orders 表（remarks=`通达信桥委托`，exchange_order_id 为桥委托号）
 - **手续费估算**（桥无费用字段，按标准费率写入 `orders.commission`）：
   `佣金 万2.5（最低 5 元/笔，双边） + 印花税 万5（仅卖出） + 过户费 万0.1（双边）`
-  实现：`backend/services/trade/services/tdx_push_service.py::estimate_order_fee`
+  实现：`backend/services/live_trading/services/tdx_push_service.py::estimate_order_fee`
+- **撤单终态复核**（唯一实现 `backend/services/live_trading/services/tdx_cancel_verify.py`）：握手失败/异常时按当日委托终态分类——`cancelled`（已撤）/ `filled`（撤销前已成交）/ `dead`（废单已终结）/ `active`（真失败仍在途）/ `unknown`（结果未知）；`TdxPushService.cancel_order` 与 `TdxBroker.cancel_order_verbose`（TradingEngine 优先消费 verbose 版本）都走它
 - **旧单回填**（桥列表滚出后 sync 刷不到时）：
   ```bash
   docker exec quantmind python -c "
@@ -196,7 +199,8 @@ print(r.get('trade:tdx_config:runtime'))   # 真实生效的 bridge_url/token
 
 ### 测试（不实盘也能验链路）
 
-- 单元：`backend/services/tests/test_tdx_push_service.py`（UPSERT/状态映射/费用）、`test_tdx_rolling_trade.py`（桥交互回归，直接测真实方法）、`test_order_timeout_scanner.py`
+- 单元：`backend/services/tests/test_tdx_push_service.py`（UPSERT/状态映射/费用）、`test_tdx_cancel_verify.py`（撤单假失败复核：终态分类/双客户端消费）、`test_tdx_rolling_trade.py`（桥交互回归，直接测真实方法）、`test_order_timeout_scanner.py`
+- 桥自带 e2e（`tools/bridge-windows/tests/test_e2e.py`，mock 通达信 + 真桥 HTTP）已覆盖撤单三形态：Value=2 判成功 / 握手失败但终态已撤 → `verified` 成功 / 仍在途 → 如实失败
 - 实测（盘后安全做法）：`0.01` 价格下单 → 交易所 `价格错误[code,0.010(现价)]` 拒单 = 链路通；挂有效价限价单 → 盘后变废单（rejected, filled=0）→ 验证撤单接口返回"提交失败"（无单可撤，正常）
 - **撤单完整闭环**（撤真在途单）只能在交易时段验证
 
@@ -207,7 +211,7 @@ print(r.get('trade:tdx_config:runtime'))   # 真实生效的 bridge_url/token
 | 交易记录全 rejected/expired | 旧版本 sync 只 INSERT 不 UPDATE + 超时扫描误标 | 已修复（UPSERT+排除桥委托）；确认版本含 `ab48fbb2` |
 | 持仓数偏大 | 桥清仓残留未过滤 | 已修复（volume>0 过滤）；版本含 `ab48fbb2` |
 | 下单报 `codestr error` | 用了前缀格式 | 改用后缀 `600206.SH` |
-| 撤单失败 | 单已废/已成交 | pull 复核终态，以桥为准 |
+| 撤单报失败 | 单已废/已成交（多数）；或修复前的 Value=2 假失败（2026-10-12） | pull 复核终态；响应含 `verified:true` 即已生效；确实仍在途才按真失败处置 |
 | 配置保存了但没生效 | RedisClient 未 connect | 独立脚本先 `r.connect()` |
 
 ## 相关技能

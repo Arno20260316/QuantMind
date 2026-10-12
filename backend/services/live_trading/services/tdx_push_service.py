@@ -13,6 +13,9 @@ import os
 import uuid
 from typing import Any, Optional
 
+from backend.services.live_trading.services.tdx_cancel_verify import (
+    verify_cancel_terminal,
+)
 from backend.services.live_trading.services.trading_session import (
     real_order_session_refusal,
 )
@@ -283,11 +286,56 @@ class TdxPushService:
 
         返回 {"success": bool, "message": str}；撤单成功不代表原委托一定未成交,
         调用方应随后 query 一次当日委托确认最终状态。
+
+        桥握手指失败/异常时按当日委托终态复核（2026-10-12 实测桥撤单只认
+        Value=="1"，直连账号成功码为 "2"，实际已撤却报 success=false）——
+        复核确认已撤则纠正为 success=True + verified=True。
         """
-        return await self._post("/api/v1/orders/cancel", {
-            "stock_code": stock_code,
-            "order_id": order_id,
-        })
+        payload = {"stock_code": stock_code, "order_id": order_id}
+        try:
+            resp = await self._post("/api/v1/orders/cancel", payload)
+        except Exception:
+            # 桥不可达/HTTP 错 = 撤单结果未知；复核确认已撤则如实上报，否则原样重抛
+            state, _ = await verify_cancel_terminal(
+                lambda: self.pull_order_status(order_id))
+            if state == "cancelled":
+                logger.warning(
+                    "[TdxPush] 撤单握手异常但终态复核确认已撤: %s %s",
+                    stock_code, order_id,
+                )
+                return {
+                    "success": True,
+                    "verified": True,
+                    "message": "撤单已生效（桥握手异常，经委托终态复核确认）",
+                }
+            raise
+        if resp.get("success"):
+            return resp
+        state, _order = await verify_cancel_terminal(
+            lambda: self.pull_order_status(order_id))
+        if state == "cancelled":
+            logger.info("[TdxPush] 撤单假失败纠正: %s %s", stock_code, order_id)
+            return {
+                "success": True,
+                "verified": True,
+                "message": "撤单已生效（桥握手报失败系误报，经委托终态复核确认）",
+                "bridge_message": resp.get("message", ""),
+            }
+        if state == "filled":
+            return {
+                "success": False,
+                "verified": True,
+                "message": "撤销前已成交，无法撤单",
+                "bridge_message": resp.get("message", ""),
+            }
+        if state == "dead":
+            return {
+                "success": False,
+                "verified": True,
+                "message": "该委托已终结（废单/已拒绝），无需撤销",
+                "bridge_message": resp.get("message", ""),
+            }
+        return resp
 
     async def tdx_call(self, method: str, params: dict | None = None) -> dict:
         """通用 JSON-RPC 透传（桥 /api/v1/tdx/call，白名单方法）。

@@ -45,9 +45,7 @@ class _FakeDb:
 
     async def execute(self, stmt, params=None):
         if isinstance(stmt, Select):
-            return _RowsResult(
-                [(eid, oid) for eid, oid in self.existing.items()]
-            )
+            return _RowsResult([(eid, oid) for eid, oid in self.existing.items()])
         if not isinstance(stmt, TextClause):
             return _RowsResult([])
         sql = str(stmt).strip().upper()
@@ -226,6 +224,7 @@ async def test_sync_skips_order_without_exchange_id_and_symbol():
 
 # ============ 真单时段闸门（咽喉点） ============
 
+
 class TestRealOrderSessionGate:
     """``place_order`` 是滚动单 / L2 主单 / L2 在途重挂三条路的汇合点。闸门放这一
     层而不是各调用点：调用点漂移一次就是一次真钱事故——A 股委托在盘外要么被柜台
@@ -248,18 +247,25 @@ class TestRealOrderSessionGate:
 
         # 注入打在**谓词所在模块**上：闸门（`real_order_session_refusal`）在调用时
         # 才查这个全局名，所以它跟着一起被接管；也免得用例去认闸门函数的名字。
-        monkeypatch.setattr(trading_session, "is_trading_time", lambda now=None: in_session)
+        monkeypatch.setattr(
+            trading_session, "is_trading_time", lambda now=None: in_session
+        )
         sent: list[tuple[str, dict]] = []
 
         async def _fake_post(path: str, payload: dict) -> dict:
             sent.append((path, payload))
+            if path.endswith("/api/v1/orders/cancel"):
+                # 与真实桥同形：撤单成功路径不该再触发终态复核查询
+                return {"success": True, "message": "撤单成功"}
             return {"status": "executed", "orders": []}
 
         monkeypatch.setattr(push_mod.tdx_pusher, "_post", _fake_post)
         return sent
 
     @pytest.mark.asyncio
-    async def test_out_of_session_real_order_never_reaches_the_bridge(self, monkeypatch):
+    async def test_out_of_session_real_order_never_reaches_the_bridge(
+        self, monkeypatch
+    ):
         from backend.services.live_trading.services.tdx_push_service import tdx_pusher
 
         sent = self._wire(monkeypatch, in_session=False)
@@ -316,9 +322,9 @@ class TestRealOrderSessionGate:
             Path(__file__).resolve().parents[1]
             / "live_trading/services/tdx_push_service.py"
         ).read_text(encoding="utf-8")
-        assert "from backend.services.live_trading.services.trading_session import" in src, (
-            "place_order 的时段闸门没走 trading_session 唯一口径"
-        )
+        assert (
+            "from backend.services.live_trading.services.trading_session import" in src
+        ), "place_order 的时段闸门没走 trading_session 唯一口径"
         # 闸门走的是**共用拒因函数**（各写一份文案 → 用户在委托备注里看到的原因
         # 会取决于他从哪条路进来）。该函数本身在 trading_session 里读 is_trading_time，
         # 窗口口径仍然只有一份。

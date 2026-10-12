@@ -19,9 +19,14 @@ TOKEN = "a" * 64
 # ---- mock TDX (独立线程, 标准库) ----
 
 class MockTdx:
-    def __init__(self, price=11.00, sell_value="1"):
+    def __init__(self, price=11.00, sell_value="1", cancel_value="1",
+                 cancel_msg="撤单成功"):
         self.price = price
         self.sell_value = sell_value
+        self.cancel_value = cancel_value
+        self.cancel_msg = cancel_msg
+        self.orders_list = []  # query_stock_orders 返回的当日委托
+        self.cancels = []      # cancel_order_stock 收到的参数
         self.orders_placed = []
         self.port = None
         self._httpd = None
@@ -69,7 +74,7 @@ class _MockHandler(BaseHTTPRequestHandler):
                                {"Code": "600519.SH", "Cbj": "10.00", "TotalVol": "100",
                                 "CanUseVol": "100"}]
         elif method == "query_stock_orders":
-            result["Value"] = []
+            result["Value"] = list(self.mock.orders_list)
         elif method == "order_stock":
             params = body.get("params", {})
             side = "sell" if params.get("order_type") == 1 else "buy"
@@ -78,7 +83,8 @@ class _MockHandler(BaseHTTPRequestHandler):
             result.update({"Value": self.mock.sell_value, "Wtbh": f"W{int(time.time())}",
                            "Msg": "已发送信号至客户端，待用户确认！"})
         elif method == "cancel_order_stock":
-            result.update({"Value": "1", "Msg": "撤单成功"})
+            self.mock.cancels.append(body.get("params", {}))
+            result.update({"Value": self.mock.cancel_value, "Msg": self.mock.cancel_msg})
         elif method == "get_market_snapshot":
             result.update({"Now": f"{self.mock.price}", "Max": "12.00", "Min": "10.00"})
         elif method == "get_market_data":
@@ -176,6 +182,38 @@ async def run_tests():
         status, placed = await api("/api/v1/plans/execute", http_plan.to_dict())
         assert status == 200 and placed["status"] == "executed", f"{status} {placed}"
         print(f"[PASS] HTTP 桥下单: {placed['status']}")
+
+        # 6.5 撤单: 直连成功码 Value=2 不得误报失败
+        # (2026-10-12 实盘假失败根因: 撤单路由只认 "1", 而直连账号成功码为 "2"——
+        #  下单路径 plan_executor 早已把 "2" 当成功, 撤单路径漏了)
+        mock.cancel_value, mock.cancel_msg = "2", "撤单成功"
+        status, can2 = await api("/api/v1/orders/cancel",
+                                 {"stock_code": "600519.SH", "order_id": "W9001"})
+        assert status == 200 and can2["success"] is True, f"Value=2 被误判失败: {status} {can2}"
+        assert mock.cancels[-1]["order_id"] == "W9001", "order_id 未透传到通达信"
+        print("[PASS] 撤单 Value=2(直连成功码) 判定为成功")
+
+        # 6.6 撤单: 握手报失败但当日委托终态已是撤单(BSFlag=-1) → 复核纠正为成功
+        mock.cancel_value, mock.cancel_msg = "0", "撤单提交失败"
+        mock.orders_list = [{"Wtbh": "W9002", "Code": "600519.SH", "BSFlag": "-1",
+                             "Status": "0", "WtPrice": "1650.00", "CjPrice": "0",
+                             "CjVol": "0", "WtVol": "100"}]
+        status, can3 = await api("/api/v1/orders/cancel",
+                                 {"stock_code": "600519.SH", "order_id": "W9002"})
+        assert status == 200 and can3["success"] is True, f"{status} {can3}"
+        assert can3.get("verified") is True, f"未标记为终态复核确认: {can3}"
+        print("[PASS] 握手失败但终态已撤 → 复核纠正为成功 (verified)")
+
+        # 6.7 撤单: 握手失败且委托仍在途 → 如实报失败 (不搞"永远成功")
+        mock.cancel_value, mock.cancel_msg = "0", "撤单提交失败"
+        mock.orders_list = [{"Wtbh": "W9003", "Code": "600519.SH", "BSFlag": "0",
+                             "Status": "1", "WtPrice": "1650.00", "CjPrice": "0",
+                             "CjVol": "0", "WtVol": "100"}]
+        status, can4 = await api("/api/v1/orders/cancel",
+                                 {"stock_code": "600519.SH", "order_id": "W9003"})
+        assert status == 200 and can4["success"] is False, f"在途委托被误报撤单成功: {status} {can4}"
+        print("[PASS] 握手失败且委托仍在途 → 如实报失败")
+        mock.orders_list = []
 
         # 7. 止损守护 (高价不触发)
         sltp = StopLossDaemon(tdx, os.path.join(tmp, "stop_loss_state.json"), poll_interval=0.1)

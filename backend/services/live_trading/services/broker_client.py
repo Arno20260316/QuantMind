@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 from sqlalchemy import text
 
+from backend.services.live_trading.services.tdx_cancel_verify import (
+    verify_cancel_terminal,
+)
 from backend.services.live_trading.services.trading_session import (
     real_order_session_refusal,
 )
@@ -1267,9 +1270,25 @@ class TdxBroker(BaseBroker):
             return {}
 
     async def cancel_order(self, exchange_order_id: str, **kwargs) -> bool:
-        if not self.bridge_url:
-            return False
+        ok, _reason = await self.cancel_order_verbose(exchange_order_id, **kwargs)
+        return ok
+
+    async def cancel_order_verbose(
+        self, exchange_order_id: str, **kwargs
+    ) -> tuple[bool, str]:
+        """撤单（如实上报）：返回 ``(是否受理, 原因码)``。
+
+        桥握手指失败/结果未知时按当日委托终态复核（side=cancel 即已撤；
+        2026-10-12 实测桥只认 Value=="1"，直连账号成功码为 "2"，实际已撤
+        却报 success=false）。原因码: ``submitted`` 受理/复核确认已撤;
+        ``counter_rejected`` 撤销前已成交或委托已终结; ``rejected`` 真未
+        撤掉仍在途; ``timeout`` 复核不可用、结果未知; ``error`` 通道未配置。
+        """
+        if not self.bridge_url or not self.bridge_token:
+            return False, "error"
         symbol = self._std_symbol(kwargs.get("symbol", ""))
+        order_ref = str(exchange_order_id)
+        data: dict | None = None
         try:
             client = await self._get_client()
             resp = await client.post(
@@ -1278,7 +1297,7 @@ class TdxBroker(BaseBroker):
                     "account": self.account,
                     "account_type": self.account_type,
                     "stock_code": symbol,
-                    "order_id": str(exchange_order_id),
+                    "order_id": order_ref,
                 },
                 headers=self._headers(),
             )
@@ -1286,12 +1305,47 @@ class TdxBroker(BaseBroker):
                 logger.warning(
                     "[TdxBroker] cancel_order HTTP %s: %s", resp.status_code, resp.text
                 )
-                return False
-            data = resp.json() or {}
-            return bool(data.get("success"))
+            else:
+                data = resp.json() or {}
         except Exception as e:
             logger.error("[TdxBroker] cancel_order failed: %s", e)
-            return False
+
+        if data is not None and data.get("success"):
+            return True, "submitted"
+
+        # 握手失败或结果未知 → 终态复核（失败也不代表没撤掉）
+        state, _order = await verify_cancel_terminal(
+            lambda: self._query_order_state(symbol, order_ref)
+        )
+        if state == "cancelled":
+            logger.info("[TdxBroker] 撤单复核确认已撤 order_id=%s", order_ref)
+            return True, "submitted"
+        if state == "filled":
+            return False, "counter_rejected"
+        if state == "dead":
+            return False, "counter_rejected"
+        if state == "active":
+            return False, "rejected"
+        return False, "timeout"
+
+    async def _query_order_state(self, symbol: str, exchange_order_id: str) -> dict:
+        """查单笔委托终态（/orders/query 扫描），找不到返回 {}。"""
+        client = await self._get_client()
+        resp = await client.post(
+            f"{self.bridge_url}/api/v1/orders/query",
+            json={
+                "account": self.account,
+                "account_type": self.account_type,
+                "stock_code": symbol,
+            },
+            headers=self._headers(),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"orders/query HTTP {resp.status_code}")
+        for o in (resp.json() or {}).get("orders") or []:
+            if str(o.get("order_id", "")) == str(exchange_order_id):
+                return o
+        return {}
 
     async def query_quote(self, symbol: str) -> dict[str, Any]:
         """用通达信快照接口取最新价."""

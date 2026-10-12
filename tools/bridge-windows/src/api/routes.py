@@ -255,19 +255,56 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         except TdxError as e:
             return json_error(502, "TDX_UNAVAILABLE", str(e))
 
+    async def _verify_cancel_effective(account_id, stock_code: str, order_id: str,
+                                       attempts: int = 3, delay: float = 0.6) -> bool:
+        """撤单握手报失败后, 按当日委托终态复核撤单是否实际已生效.
+
+        通达信撤单异步落定 (2026-10-12 实测 ≤2s): 握手 Value 只代表受理瞬时结果,
+        报失败≠没撤成. 委托记录 BSFlag=-1 (parser 归一为 side="cancel") 或状态
+        已成/部成撤 即已撤; 查询失败视作"未确认", 不改变原结论 (不搞"永远成功").
+        """
+        for _ in range(attempts):
+            await asyncio.sleep(delay)
+            try:
+                orders = await _call_tdx(
+                    lambda: [parser.parse_order(o) for o in tdx.query_stock_orders(
+                        account_id, stock_code, False)])
+            except Exception:
+                continue
+            for o in orders or []:
+                if str(o.get("order_id", "")) != str(order_id):
+                    continue
+                return o.get("side") == "cancel" or o.get("status") in (
+                    "cancelled", "partial_cancelled")
+        return False
+
     async def cancel_order(request: web.Request):
         data = await request.json()
+        stock_code = data.get("stock_code", "")
+        order_id = data.get("order_id", "")
         account_id = await _call_tdx(executor.resolve_account_id,
                                      data.get("account", ""), data.get("account_type", "stock"))
         try:
             res = await _call_tdx(tdx.cancel_order_stock, account_id,
-                                  data.get("stock_code", ""), data.get("order_id", ""))
-            ok = str(res.get("Value", "0")) == "1"
-            executor.log_trade({"event": "cancel_order", "stock_code": data.get("stock_code"),
-                                "order_id": data.get("order_id"), "ok": ok,
+                                  stock_code, order_id)
+            # 直连账号成功码为 "2" (下单路径 plan_executor 同样把 "2" 当成功),
+            # 撤单只认 "1" 会把已受理的撤单报成失败 (2026-10-12 实盘假失败根因)
+            ok = str(res.get("Value", "0")) in ("1", "2")
+            verified = False
+            if not ok:
+                # 握手失败不等于没撤成: 按当日委托终态复核 (撤单是减风险动作,
+                # 假失败会被上层当"未撤"重试或放弃, 两头都是通道风险)
+                verified = await _verify_cancel_effective(account_id, stock_code, order_id)
+                ok = verified
+            executor.log_trade({"event": "cancel_order", "stock_code": stock_code,
+                                "order_id": order_id, "ok": ok, "verified": verified,
                                 "msg": res.get("Msg", "")})
-            return web.json_response({"success": ok, "message": res.get("Msg", ""),
-                                      "channel_used": "http"})
+            resp = {"success": ok, "message": res.get("Msg", ""),
+                    "channel_used": "http"}
+            if verified:
+                resp["verified"] = True
+                resp["message"] = "撤单已生效（握手报失败系误报, 经委托终态复核确认）"
+            return web.json_response(resp)
         except TdxError as e:
             return json_error(502, "TDX_UNAVAILABLE", str(e))
 

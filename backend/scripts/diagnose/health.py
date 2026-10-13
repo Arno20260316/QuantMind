@@ -17,6 +17,8 @@
   C11 runner 只读 DB 账号                 C12 本地行情数据可用性
   C13 真日历覆盖年限（决策轮 fail-closed 的硬期限）
   C14 分账账本一致性（LLM 腿成交 ↔ 分账流水 ↔ 成交唯一键）
+  C15 模型产物一致（注册表 ready 行 ↔ 磁盘目录）
+  C16 投影孤儿（simulation_orders 无对应 sim_orders 的幽灵投影）
 
 用法（容器内）:
     python backend/scripts/diagnose/health.py                # 全量
@@ -58,6 +60,18 @@ AGENT_LEDGER_WINDOW_DAYS = 30
 #: （日期）滤，两者由同一个成交瞬时推出来但落点不同——窗口卡死会在边界日把一对合法
 #: 记录判成「漏记 + 孤儿」。
 AGENT_LEDGER_WINDOW_SLACK_DAYS = 1
+
+#: C16 投影终态集合：这些状态的孤儿是历史残留（pending worker 只扫 pending，不会
+#: 再触碰终态行）；集合**之外**的（pending/submitted/…）是「活的」缺陷——pending 会被
+#: worker 每轮按 "legacy order missing" 拒单刷屏，submitted 则永久滞留（投影在册、
+#: 台账无据的幽灵单，再没有被解析的路径）。
+TERMINAL_PROJECTION_STATUSES = frozenset({"rejected", "filled", "cancelled", "expired"})
+
+#: C16 活跃孤儿的「新鲜窗口」（天）。与 C05 的近 7 日覆盖同口径：窗口内的活跃孤儿是
+#: **正在发生**的写路径缺陷（fail）；窗口外的活跃孤儿（本批卸载时 2026-09-16 那 10 行
+#: submitted 即此类）是历史残留，只 warn。没有这条窗口，一个永远清不掉的红灯就会被
+#: 忽略——正是本检查想避免的形态（见 C13 注释）。
+PROJECTION_ORPHAN_ACTIVE_WINDOW_DAYS = 7
 
 LEVEL_ORDER = {"ok": 0, "warn": 1, "fail": 2}
 
@@ -1330,6 +1344,118 @@ async def check_c15_model_artifact_consistency(ctx: HealthContext) -> CheckResul
     return classify_model_artifact_drift(rows, os.path.isdir)
 
 
+def classify_projection_orphans(
+    *,
+    terminal: int,
+    active_recent: int,
+    active_historical: int,
+    sample_rows: list | None = None,
+) -> CheckResult:
+    """C16 判定（纯函数）：V2 投影孤儿巡检（``simulation_orders`` 无对应 ``sim_orders``）。
+
+    背景（2026-10-13 模拟盘审计实锤）：双栈订单模型里 ``simulation_orders`` 是
+    ``sim_orders`` 的投影/幂等载体，但**两表之间没有外键**——投影行能不能被解析，
+    全靠写入方自觉成对落库。集成测试的 finally 只删了 ``sim_orders``（``cop-*`` /
+    ``sim-e2e-*``），投影行便成了永久的孤儿：pending_order_worker 每轮扫到它们，
+    按 "legacy order missing" 拒单，日刷噪声，且没有任何一道闸能看见它。
+
+    定级按**两维**分层（状态 × 年龄），而不是「有多少孤儿」一刀切：
+
+    - **近窗活跃孤儿**（status 非终态 且 ``created_at`` 在 ``PROJECTION_ORPHAN_ACTIVE_
+      WINDOW_DAYS`` 内）= fail。正在发生的写路径缺陷：pending 会被 worker 每轮拒单，
+      submitted 更是投影在册、台账无据的幽灵单。
+    - **其它孤儿**（终态任意年龄 + 非终态但超窗）= warn。历史测试残留的特征（本批卸载
+      时 2026-09-16 那 10 行 submitted 属此类——worker 早已不再触碰），属可清理脏数据，
+      不阻断体检。这条窗口是**必须**的：一个永远清不掉的 fail 会让整条检查失明。
+    - 无孤儿 = ok。
+    """
+    terminal = max(0, int(terminal or 0))
+    active_recent = max(0, int(active_recent or 0))
+    active_historical = max(0, int(active_historical or 0))
+    total = terminal + active_recent + active_historical
+    metrics = {
+        "orphans": total,
+        "terminal_orphans": terminal,
+        "active_recent_orphans": active_recent,
+        "active_historical_orphans": active_historical,
+    }
+    if total == 0:
+        return CheckResult(
+            "C16", "投影孤儿", "ok", "无孤儿投影（投影与台账一一对应）", "", metrics
+        )
+    sample = "，".join(
+        f"{r.get('client_order_id') or r.get('order_id')}({r.get('status')})"
+        for r in (sample_rows or [])[:3]
+    )
+    if active_recent:
+        return CheckResult(
+            "C16",
+            "投影孤儿",
+            "fail",
+            f"{active_recent} 行近 {PROJECTION_ORPHAN_ACTIVE_WINDOW_DAYS} 日活跃孤儿投影"
+            f"（共 {total} 行孤儿；样本 {sample}）",
+            "活跃孤儿 = 投影在册、v1 台账无据的幽灵单（pending 被 worker 每轮拒单、"
+            "submitted 永久滞留）：查是哪条写路径只写投影不写台账；双栈之间无外键，"
+            "只有写入方成对落库这条软约束，须在写侧补强而不是靠巡检兜底",
+            metrics,
+        )
+    return CheckResult(
+        "C16",
+        "投影孤儿",
+        "warn",
+        f"{total} 行历史孤儿投影（终态 {terminal} / 超窗活跃 {active_historical}；"
+        f"样本 {sample}）",
+        "历史测试残留特征（集成测试 finally 曾只删 sim_orders）：worker 不再触碰，"
+        "属可清理脏数据；写侧已补成对删除，如近窗活跃数复现则是新泄漏",
+        metrics,
+    )
+
+
+async def check_c16_projection_orphans(ctx: HealthContext) -> CheckResult:
+    """巡检 ``simulation_orders`` 中无对应 ``sim_orders`` 的行（投影孤儿）。
+
+    单条聚合查询同时给出三个计数（终态 / 近窗活跃 / 超窗活跃），并另取一组样本行
+    供报警点名。样本与计数共用同一 ``NOT EXISTS`` 口径，且窗口边界由调用方按
+    ``ctx.today`` 算出（与 FakeCtx 的 today 一致，测试可注入历史日期）。
+    """
+    not_exists = (
+        "FROM simulation_orders p "
+        "WHERE NOT EXISTS (SELECT 1 FROM sim_orders s WHERE s.order_id = p.order_id)"
+    )
+    # 终态集合是模块内代码常量（非用户输入），内联成字面量，避免 ``ALL(:param)``
+    # 列表绑定在不同驱动下的方言差异（同一份文本喂 FakeCtx 与 asyncpg）。
+    terminal_sql = (
+        "(" + ", ".join(f"'{s}'" for s in sorted(TERMINAL_PROJECTION_STATUSES)) + ")"
+    )
+    cutoff = ctx.today - timedelta(days=PROJECTION_ORPHAN_ACTIVE_WINDOW_DAYS)
+    counts_sql = (
+        "SELECT "
+        f"count(*) FILTER (WHERE lower(p.status) IN {terminal_sql}) AS terminal, "
+        f"count(*) FILTER (WHERE lower(p.status) NOT IN {terminal_sql} "
+        "  AND p.created_at >= :cutoff) AS active_recent, "
+        f"count(*) FILTER (WHERE lower(p.status) NOT IN {terminal_sql} "
+        "  AND p.created_at < :cutoff) AS active_historical "
+        f"{not_exists}"
+    )
+    sample_sql = (
+        "SELECT p.order_id::text AS order_id, p.status, p.client_order_id "
+        f"{not_exists} "
+        "ORDER BY p.created_at DESC LIMIT 20"
+    )
+    try:
+        rows = ctx.query(counts_sql, cutoff=cutoff)
+        sample_rows = ctx.query(sample_sql)
+    except Exception as exc:  # noqa: BLE001 - 表缺失等不阻断（旧库）
+        return CheckResult("C16", "投影孤儿", "warn", f"投影孤儿查询失败: {exc}")
+    row = rows[0] if rows else {}
+    return classify_projection_orphans(
+        terminal=int(row.get("terminal") or 0),
+        active_recent=int(row.get("active_recent") or 0),
+        active_historical=int(row.get("active_historical") or 0),
+        sample_rows=sample_rows,
+    )
+
+
 def _crypto_market_enabled() -> bool:
     """加密市场是否启用（委托 quantbc_hub，避免 ENABLE_CRYPTO 解析两处口径分叉）。"""
     from backend.services.engine.data_platform.quantbc_hub import _crypto_enabled
@@ -1353,6 +1479,7 @@ CHECKS: list[tuple[str, str, Callable]] = [
     ("C13", "真日历覆盖年限", check_c13_trading_calendar_coverage),
     ("C14", "分账账本一致性", check_c14_agent_ledger_parity),
     ("C15", "模型产物一致", check_c15_model_artifact_consistency),
+    ("C16", "投影孤儿", check_c16_projection_orphans),
 ]
 
 

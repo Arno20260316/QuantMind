@@ -292,10 +292,18 @@ class SimOrderService:
             from backend.services.simulation.services.market_rules import (
                 infer_market,
             )
+            from backend.shared.order_contract import SOURCE_MANUAL
             from backend.shared.simulation_account_keys import ledger_account_id
 
             status = getattr(order, "status", None)
             status_str = getattr(status, "value", status)
+            # 来源分类（审计：投影 trigger_source 此前恒为模型默认 'manual'，807 行
+            # 投影来源全丢——cop-*/sim-e2e-*/rebalance 与手工单在投影侧不可区分）。
+            # v1 台账的 source 是权威（create_order 已按 trigger_source 写入）；
+            # 缺失时回落 SOURCE_MANUAL，与模型默认一致。
+            resolved_source = (
+                str(getattr(order, "source", None) or "").strip() or SOURCE_MANUAL
+            )[:32]
             resolved_client_order_id = (
                 str(
                     client_order_id
@@ -343,6 +351,7 @@ class SimOrderService:
                         ),
                         quantity=float(getattr(order, "quantity", 0) or 0),
                         price=getattr(order, "price", None),
+                        trigger_source=resolved_source,
                         status=str(status_str or "pending"),
                         rejected_reason=rejected_reason,
                         client_order_id=resolved_client_order_id,
@@ -364,6 +373,15 @@ class SimOrderService:
                     existing.rejected_reason = rejected_reason
                 if resolved_client_order_id and not existing.client_order_id:
                     existing.client_order_id = resolved_client_order_id
+                # 历史行自愈：存量投影的 trigger_source 恒为模型默认 'manual'（旧
+                # 实现从不写该列）。仅在「当前值仍是默认值、且 v1 台账给出更具体的
+                # 来源」时回填——不覆盖 legacy_replay（migration_service 显式写入的
+                # 另一套来源）与任何已具名来源，避免把已正确的行改坏。
+                if (
+                    str(existing.trigger_source or "") == SOURCE_MANUAL
+                    and resolved_source != SOURCE_MANUAL
+                ):
+                    existing.trigger_source = resolved_source
                 await self.db.commit()
                 return existing
         except Exception:

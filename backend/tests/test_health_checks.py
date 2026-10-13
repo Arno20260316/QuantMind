@@ -20,6 +20,7 @@ from backend.scripts.diagnose.health import (
     classify_ledger_writes,
     classify_local_market_data,
     classify_model_artifact_drift,
+    classify_projection_orphans,
     classify_signal_distribution,
     classify_snapshot_consistency,
     check_c01_signal_distribution,
@@ -31,6 +32,7 @@ from backend.scripts.diagnose.health import (
     check_c13_trading_calendar_coverage,
     check_c14_agent_ledger_parity,
     check_c15_model_artifact_consistency,
+    check_c16_projection_orphans,
     exit_code,
     ledger_parity,
     summarize,
@@ -943,3 +945,144 @@ def test_c15_sql_joins_settings_for_enabled_dimension():
     src = _HEALTH_PY.read_text(encoding="utf-8")
     assert "qm_model_inference_settings" in src
     assert '("C15", "模型产物一致", check_c15_model_artifact_consistency)' in src
+
+
+# --- C16 投影孤儿（simulation_orders 无对应 sim_orders）----------------------
+
+
+def test_c16_no_orphans_is_ok():
+    r = classify_projection_orphans(terminal=0, active_recent=0, active_historical=0)
+
+    assert r.level == "ok"
+    assert r.metrics["orphans"] == 0
+
+
+def test_c16_recent_active_orphan_is_fail():
+    """正在发生的写路径缺陷：投影在册、台账无据的幽灵单。"""
+    r = classify_projection_orphans(
+        terminal=200, active_recent=1, active_historical=0, sample_rows=[]
+    )
+
+    assert r.level == "fail"
+    assert "近" in r.detail and "活跃孤儿" in r.detail
+    assert r.metrics == {
+        "orphans": 201,
+        "terminal_orphans": 200,
+        "active_recent_orphans": 1,
+        "active_historical_orphans": 0,
+    }
+    # 终态存量不得因一行活跃孤儿被算成「活跃」
+    assert "200" not in r.detail.split("行孤儿")[1]  # 细节只点活跃数
+
+
+def test_c16_historical_only_is_warn_not_fail():
+    """本批卸载时的形态：2026-09-16 那 10 行 submitted 早已超窗——
+    若判 fail，这个红灯永远清不掉（worker 不再触碰），整条检查随之失明。"""
+    r = classify_projection_orphans(
+        terminal=218, active_recent=0, active_historical=10, sample_rows=[]
+    )
+
+    assert r.level == "warn"
+    assert "历史孤儿投影" in r.detail
+    assert r.metrics["terminal_orphans"] == 218
+    assert r.metrics["active_historical_orphans"] == 10
+
+
+def test_c16_sample_names_the_offending_rows():
+    """报警文案必须点名样本——没有点名的话运维拿到「有孤儿」也无从下手。"""
+    rows = [
+        {"client_order_id": "cop-abc-600036.SH-buy", "status": "submitted"},
+        {"client_order_id": None, "status": "rejected", "order_id": "u-1"},
+    ]
+    r = classify_projection_orphans(
+        terminal=0, active_recent=1, active_historical=1, sample_rows=rows
+    )
+
+    assert r.level == "fail"
+    assert "cop-abc-600036.SH-buy" in r.detail
+
+
+@pytest.mark.asyncio
+async def test_c16_check_reads_counts_and_sample():
+    """端到端形状：抓聚合计数行 + 样本行，判定按计数、文案按样本。"""
+    ctx = FakeCtx(
+        {
+            "count(*) FILTER (WHERE lower(p.status) IN": [
+                {"terminal": 218, "active_recent": 0, "active_historical": 10}
+            ],
+            "ORDER BY p.created_at DESC LIMIT 20": [
+                {"order_id": "u-1", "status": "submitted", "client_order_id": "sim-e2e-1"}
+            ],
+        }
+    )
+    r = await check_c16_projection_orphans(ctx)
+
+    assert r.level == "warn"  # 计数活跃均为 0（历史档），哪怕样本里躺着 submitted 行
+    assert "sim-e2e-1" in r.detail
+    assert r.metrics["orphans"] == 228
+
+
+@pytest.mark.asyncio
+async def test_c16_check_fails_when_recent_active_counted():
+    ctx = FakeCtx(
+        {
+            "count(*) FILTER (WHERE lower(p.status) IN": [
+                {"terminal": 218, "active_recent": 2, "active_historical": 8}
+            ],
+            "ORDER BY p.created_at DESC LIMIT 20": [],
+        }
+    )
+    r = await check_c16_projection_orphans(ctx)
+
+    assert r.level == "fail"
+    assert "2 行" in r.detail
+
+
+@pytest.mark.asyncio
+async def test_c16_check_missing_table_is_warn_not_crash():
+    """旧库缺表不能把体检整体炸掉（异常→warn，not fail）。"""
+
+    class _BoomCtx(FakeCtx):
+        def query(self, sql, **params):
+            raise RuntimeError("relation \"simulation_orders\" does not exist")
+
+    r = await check_c16_projection_orphans(_BoomCtx())
+
+    assert r.level == "warn"
+    assert "查询失败" in r.detail
+
+
+def test_c16_registered_in_checks():
+    """必须在 CHECKS 里，否则体检根本不会跑它（接线与判定一起钉）。"""
+    ids = [cid for cid, _name, _fn in CHECKS]
+    assert "C16" in ids
+
+
+def test_c16_windows_and_terminal_set_are_pinned():
+    """数值与状态集是**判定口径**：改窗口/改终态集 = 改判级，须由人复核。
+
+    尤其终态集——若把 'submitted' 误加进去，活跃孤儿会被静默降级成 warn，
+    「投影在册、台账无据」这类真缺陷就再也报不出来。
+    """
+    from backend.scripts.diagnose.health import (
+        PROJECTION_ORPHAN_ACTIVE_WINDOW_DAYS,
+        TERMINAL_PROJECTION_STATUSES,
+    )
+
+    assert PROJECTION_ORPHAN_ACTIVE_WINDOW_DAYS == 7
+    assert TERMINAL_PROJECTION_STATUSES == frozenset(
+        {"rejected", "filled", "cancelled", "expired"}
+    )
+    assert "submitted" not in TERMINAL_PROJECTION_STATUSES
+    assert "pending" not in TERMINAL_PROJECTION_STATUSES
+
+
+def test_c16_sql_pairs_only_against_sim_orders_with_no_fk_assumption():
+    """源断言：判定必须落在「simulation_orders 无对应 sim_orders」上。
+
+    双栈之间没有外键——若未来有人改成只查 simulation_orders 自身（如 status 统计），
+    「投影在册、台账无据」这个定义就丢了，检查会变成一条永远绿的装饰。
+    """
+    src = _HEALTH_PY.read_text(encoding="utf-8")
+    assert "NOT EXISTS (SELECT 1 FROM sim_orders s WHERE s.order_id = p.order_id)" in src
+    assert '("C16", "投影孤儿", check_c16_projection_orphans)' in src

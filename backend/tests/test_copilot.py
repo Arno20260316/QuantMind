@@ -262,11 +262,24 @@ def test_advice_execute_via_router_with_audit_and_cleanup():
     try:
         asyncio.run(_flow())
     finally:
-        # 清理：委托/成交（cop- 前缀 + 测试建议）/ 建议卡
+        # 清理：V2 投影 / 委托 / 成交（cop- 前缀 + 测试建议）/ 建议卡。
+        # 顺序敏感：投影必须先删——`simulation_orders.order_id` 无外键，靠
+        # `sim_orders` 子查询定位；先删 `sim_orders` 会让子查询空手，投影行
+        # 永留为孤儿（pending_order_worker 每轮按 "legacy order missing" 拒单，
+        # 每天 8 条噪声）。cid 直删是第二道网：跨轮重跑时 `sim_orders` 已被
+        # 上轮清掉，子查询仍能靠投影自身的 client_order_id 收干净。
         try:
             with sync_session() as session:
                 for aid in created_advice:
                     cid = f"cop-{aid.replace('-', '')[:8]}-"
+                    session.execute(
+                        sql_text(
+                            "DELETE FROM simulation_orders WHERE client_order_id LIKE :c "
+                            "OR order_id IN (SELECT order_id FROM sim_orders "
+                            "WHERE client_order_id LIKE :c)"
+                        ),
+                        {"c": f"{cid}%"},
+                    )
                     session.execute(
                         sql_text("DELETE FROM sim_trades WHERE order_id IN "
                                  "(SELECT order_id FROM sim_orders WHERE client_order_id LIKE :c)"),

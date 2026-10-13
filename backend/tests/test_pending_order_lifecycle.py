@@ -158,6 +158,25 @@ async def _cleanup_tenant(tenant: str):
             except Exception:  # noqa: BLE001 - 表不存在则跳过
                 continue
         await session.commit()
+    # Redis 账户缓存同清：撮合路径会把账户写进 trade 库（db2）
+    # ``simulation:account:{tenant}:{user}[:MARKET]``，只删 PG 会留下无主账户键
+    # （实测残留 `simulation:account:t-pending-life-fill-e2cb5a:32`，永久占位且
+    # 体检 C03/C04 会把它当活跃账户扫）。按 tenant 前缀精确收窄，不碰其它租户。
+    try:
+        from backend.services.trade_shared.redis_client import redis_client
+
+        if redis_client.client is None:
+            redis_client.connect()
+        if redis_client.client is not None:
+            stale = list(
+                redis_client.client.scan_iter(
+                    match=f"simulation:account:{tenant}:*", count=200
+                )
+            )
+            if stale:
+                redis_client.client.delete(*stale)
+    except Exception:  # noqa: BLE001 - Redis 不可用不阻断清理收尾
+        pass
 
 
 async def _create_order(tenant: str, user: str, *, symbol: str = "600036.SH"):
@@ -373,6 +392,84 @@ async def test_cancel_mirrors_projection_and_worker_skips(monkeypatch):
         v1, v2 = await _read_both(order_id)
         assert v1.status == OrderStatus.CANCELLED
         assert v2.status == "cancelled"
+    finally:
+        await _cleanup_tenant(tenant)
+        await close_database()
+
+
+# ── 真库：投影来源（trigger_source）随 v1 台账来源落库 ───────────────
+
+
+@pytest.mark.asyncio
+async def test_projection_trigger_source_follows_v1_order_source():
+    """审计实锤：``sync_order_projection`` 此前从不写 ``trigger_source``，
+    807 行投影的该列恒为模型默认 'manual'——cop-*/内部/调仓单在投影侧不可区分。
+
+    两方向都钉：
+    - 新建（insert 分支）：v1 台账 source=co_pilot → 投影 trigger_source=co_pilot；
+    - 历史行自愈（existing 分支）：投影仍是默认 'manual'、v1 已具名 → 回填；
+      而投影已是 ``legacy_replay``（迁移显式写入的另一套来源）→ **不覆盖**。
+    """
+    await _ensure_db_pool()
+    from sqlalchemy import select
+
+    from backend.services.simulation.models.order import (
+        OrderSide,
+        OrderType,
+        SimOrder,
+    )
+    from backend.services.simulation.models.order_v2 import SimulationOrderV2
+    from backend.services.simulation.schemas.order import SimOrderCreate
+    from backend.services.simulation.services.order_service import SimOrderService
+    from backend.shared.database_manager_v2 import close_database, get_session
+
+    tenant = f"{_TEST_TENANT_PREFIX}-src-{uuid.uuid4().hex[:6]}"
+    try:
+        async with get_session(read_only=False) as session:
+            svc = SimOrderService(session)
+            order = await svc.create_order(
+                tenant,
+                "34",
+                SimOrderCreate(
+                    symbol="600036.SH",
+                    side=OrderSide.BUY,
+                    order_type=OrderType.MARKET,
+                    quantity=100.0,
+                ),
+                trigger_source="co_pilot",
+            )
+            await session.commit()
+            order_id = order.order_id
+
+        async with get_session(read_only=False) as session:
+            svc = SimOrderService(session)
+            proj = (
+                await session.execute(
+                    select(SimulationOrderV2).where(
+                        SimulationOrderV2.order_id == order_id
+                    )
+                )
+            ).scalar_one()
+            assert proj.trigger_source == "co_pilot"  # 修复前：恒为 'manual'
+
+            # 历史行自愈：人为改回默认值 → 再 sync 应回填具名来源
+            proj.trigger_source = "manual"
+            await session.commit()
+            order = (
+                await session.execute(
+                    select(SimOrder).where(SimOrder.order_id == order_id)
+                )
+            ).scalar_one()
+            await svc.sync_order_projection(order)
+            await session.commit()
+            assert proj.trigger_source == "co_pilot"
+
+            # legacy_replay（迁移显式写入）不得被 v1 的 'manual' 覆盖
+            proj.trigger_source = "legacy_replay"
+            await session.commit()
+            await svc.sync_order_projection(order)
+            await session.commit()
+            assert proj.trigger_source == "legacy_replay"
     finally:
         await _cleanup_tenant(tenant)
         await close_database()

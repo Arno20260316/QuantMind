@@ -515,12 +515,25 @@ async def test_unique_index_real_db_and_duplicate_create_e2e():
         assert int(n) == 1
     finally:
         async with get_session(read_only=False) as session:
+            # 顺序敏感：投影先删（`simulation_orders.order_id` 无外键，靠 sim_orders
+            # 子查询定位）——旧实现只删 sim_orders，留下 sim-e2e-* 孤儿投影
+            # （pending_order_worker 每轮按 "legacy order missing" 拒单）。cid 直删
+            # 兼顾跨轮重跑：上轮已清 sim_orders 时子查询空手，投影仍靠自身 cid 收净。
+            await session.execute(
+                sa_text(
+                    "DELETE FROM simulation_orders WHERE client_order_id=:c "
+                    "OR order_id IN (SELECT order_id FROM sim_orders "
+                    "WHERE tenant_id='default' AND client_order_id=:c)"
+                ),
+                {"c": cid},
+            )
             await session.execute(
                 sa_text(
                     "DELETE FROM sim_orders WHERE tenant_id='default' AND client_order_id=:c"
                 ),
                 {"c": cid},
             )
+            await session.commit()
         await close_database()
 
 

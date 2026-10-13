@@ -19,6 +19,7 @@ import { QuantDBCatalogPanel } from './quantdb/QuantDBCatalogPanel';
 import { QuantDBPreviewDrawer } from './quantdb/QuantDBPreviewDrawer';
 import { describeError, httpStatusOf } from './quantdb/utils';
 import { SyncSchedulePanel } from './data-management/SyncSchedulePanel';
+import { PoolReadinessCard } from './data-management/PoolReadinessCard';
 import { TdxAiDataPanel } from './data-management/TdxAiDataPanel';
 
 const { Text } = Typography;
@@ -280,6 +281,11 @@ export const AdminQuantDBPanel: React.FC = () => {
                     前往「个人中心 - 数据平台」绑定或更新密钥 →
                 </Button>
             </div>
+
+            {/* 补池链就绪状态卡（日K → alpha 库 → 自定义因子集 → 当日推理 → 候选池）：
+                回答「今天的候选池为什么没有」，卡在哪一段一眼可见。判据与宿主盘前告警
+                脚本同源（backend/shared/pool_readiness.py）。 */}
+            <PoolReadinessCard />
 
             {/* 定时同步调度面板（建议次日 00:00 以后按需错峰，具体时间以前端设置为准） */}
             <SyncSchedulePanel market="A" defaultDays={5} />

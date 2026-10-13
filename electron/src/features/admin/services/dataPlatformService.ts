@@ -366,6 +366,38 @@ export interface QuantDBDiffResult {
     timestamp: string;
 }
 
+// ---- 补池链就绪（候选池为什么没有） ----
+/** 补池链五段之一。`detail` 是后端实测原话（含日期），前端不加工。 */
+export interface PoolReadinessStage {
+    key: 'kline' | 'alpha_library' | 'custom_dataset' | 'inference' | 'pool';
+    label: string;
+    ok: boolean;
+    detail: string;
+    /** 方向闸按设计清空池（复盘判看空）——不是故障。 */
+    by_design: boolean;
+    value?: string | null;
+}
+
+/**
+ * 补池链就绪报告。
+ *
+ * `blocked_stage` 是**第一个**不就绪的段，回答「今天池没有，卡在哪」。
+ * `target_degraded` 为真表示交易日历读不到、按工作日启发式推的目标日（长假会判错），
+ * 界面必须把来源显示出来，人才知道该不该信这一次判定。
+ */
+export interface PoolReadiness {
+    target: string;
+    target_source: string;
+    target_degraded: boolean;
+    kline_dt: string | null;
+    ok: boolean;
+    by_design: boolean;
+    blocked_stage: string | null;
+    blocked_label: string;
+    stages: PoolReadinessStage[];
+    timestamp: string;
+}
+
 // ---- Qlib 数据管理 ----
 export interface QlibStatus {
     enabled?: boolean;
@@ -703,6 +735,20 @@ class DataPlatformService {
             '/admin/data-platform/quantdb/sync-datasets',
             payload,
         );
+        return this.unwrap(resp);
+    }
+
+    // ---- 补池链就绪 ----
+    /**
+     * 候选池就绪状态（五段串联）。**判据唯一出处是后端**
+     * `backend/shared/pool_readiness.py`——宿主盘前告警脚本读的是同一份，
+     * 前端不重算，避免两边漂移。
+     */
+    async getPoolReadiness(market = 'A', target?: string): Promise<PoolReadiness> {
+        const resp = await this.axiosInstance.get('/admin/data-platform/pool-readiness', {
+            params: { market, ...(target ? { target } : {}) },
+            timeout: 30000,
+        });
         return this.unwrap(resp);
     }
 

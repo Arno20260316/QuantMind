@@ -18,7 +18,7 @@ import logging
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -95,7 +95,9 @@ def _market_local_stats(market: str) -> dict | None:
             "symbols": int(row["symbols"]),
             "start_date": str(row["start_date"])[:10],
             "end_date": str(row["end_date"])[:10],
-            "file_size_mb": round(sum(p.stat().st_size for p in fwd.rglob("*.parquet")) / 1024 / 1024, 1),
+            "file_size_mb": round(
+                sum(p.stat().st_size for p in fwd.rglob("*.parquet")) / 1024 / 1024, 1
+            ),
         }
     except Exception:
         return None
@@ -104,20 +106,24 @@ def _market_local_stats(market: str) -> dict | None:
 def _get_routing():
     """延迟引入 data_platform，避免 API 启动时强依赖 engine 模块。"""
     from backend.services.engine.data_platform.aggregator import FieldRoutingTable
+
     return FieldRoutingTable()
 
 
 def _get_registry():
     from backend.services.engine.data_platform.adapters import register_all
     from backend.services.engine.data_platform.registry import get_registry
+
     register_all()
     return get_registry()
 
 
 def _get_monitor():
     from backend.services.engine.data_platform.monitor import get_monitor
+
     try:
         import redis  # type: ignore
+
         url = os.getenv("REDIS_URL", "redis://quantmind-redis:6379/0")
         client = redis.from_url(url, socket_timeout=2)
         return get_monitor(redis_client=client)
@@ -143,7 +149,12 @@ _FIELD_LOCAL_PARTITION: dict[str, str] = {
 
 def _market_hub(market: str):
     """按市场解析本地量化数据枢纽（读其 data_dir）。"""
-    from backend.services.engine.data_platform import quantdb_hub, quanthk_hub, quantus_hub
+    from backend.services.engine.data_platform import (
+        quantdb_hub,
+        quanthk_hub,
+        quantus_hub,
+    )
+
     cls = {
         "A": quantdb_hub.QuantDBDataHub,
         "HK": quanthk_hub.QuantHKDataHub,
@@ -158,6 +169,7 @@ def _market_hub(market: str):
 def _expected_trade_date():
     """预期最新交易日：今天；周六回退到周五，周日回退到上周五。"""
     from datetime import timedelta
+
     d = date.today()
     wd = d.weekday()  # 周一=0 ... 周日=6
     if wd == 5:
@@ -172,14 +184,14 @@ def _latest_partition_date_str(root, rel_dir: str):
     d = Path(root) / rel_dir
     if not d.is_dir():
         return None
-    dates = [p.name[3:] for p in d.iterdir()
-             if p.is_dir() and p.name.startswith("dt=")]
+    dates = [p.name[3:] for p in d.iterdir() if p.is_dir() and p.name.startswith("dt=")]
     return max(dates) if dates else None
 
 
 def _db_engine():
     from sqlalchemy import create_engine
     from urllib.parse import quote_plus as _q
+
     db_url = os.getenv("DATABASE_URL", "").strip()
     if not db_url:
         host = os.getenv("DB_MASTER_HOST", "quantmind-db")
@@ -229,20 +241,22 @@ async def list_sources(current_user: dict = Depends(require_admin)):
                         covered_fields.add(f)
             # 用 daily_kline 作为代表抓 health 摘要
             health = monitor.get_health(name, "daily_kline")
-            out.append({
-                "name": name,
-                "class": adapter.__class__.__name__,
-                "markets": adapter.markets,
-                "field_count": len(adapter.fields),
-                "covered_field_count": len(covered_fields),
-                "health_summary": {
-                    "last_success_at": health.get("last_success_at"),
-                    "last_error_at": health.get("last_error_at"),
-                    "last_error_msg": health.get("last_error_msg"),
-                    "error_rate_1h": health.get("error_rate_1h"),
-                    "avg_latency_ms": health.get("avg_latency_ms"),
-                },
-            })
+            out.append(
+                {
+                    "name": name,
+                    "class": adapter.__class__.__name__,
+                    "markets": adapter.markets,
+                    "field_count": len(adapter.fields),
+                    "covered_field_count": len(covered_fields),
+                    "health_summary": {
+                        "last_success_at": health.get("last_success_at"),
+                        "last_error_at": health.get("last_error_at"),
+                        "last_error_msg": health.get("last_error_msg"),
+                        "error_rate_1h": health.get("error_rate_1h"),
+                        "avg_latency_ms": health.get("avg_latency_ms"),
+                    },
+                }
+            )
         return {"success": True, "data": {"sources": out, "timestamp": _now_iso()}}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"failed: {exc}")
@@ -297,17 +311,21 @@ async def health_matrix(
                 sources_seen.add(src)
                 health = monitor.get_health(src, f)
                 registered = src in reg.list_sources()
-                cells.append({
-                    "field": f,
-                    "source": src,
-                    "is_primary": src == route.primary,
-                    "registered": registered,
-                    "last_success_at": health.get("last_success_at"),
-                    "last_error_at": health.get("last_error_at"),
-                    "error_rate_1h": float(health.get("error_rate_1h", 0) or 0),
-                    "avg_latency_ms": float(health.get("avg_latency_ms", 0) or 0),
-                    "fallback_triggered_count": int(health.get("fallback_triggered_count", 0) or 0),
-                })
+                cells.append(
+                    {
+                        "field": f,
+                        "source": src,
+                        "is_primary": src == route.primary,
+                        "registered": registered,
+                        "last_success_at": health.get("last_success_at"),
+                        "last_error_at": health.get("last_error_at"),
+                        "error_rate_1h": float(health.get("error_rate_1h", 0) or 0),
+                        "avg_latency_ms": float(health.get("avg_latency_ms", 0) or 0),
+                        "fallback_triggered_count": int(
+                            health.get("fallback_triggered_count", 0) or 0
+                        ),
+                    }
+                )
         return {
             "success": True,
             "data": {
@@ -333,14 +351,16 @@ async def field_coverage(current_user: dict = Depends(require_admin)):
             rows = []
             for f in rt.list_fields(m):
                 r = rt.get_route(m, f)
-                rows.append({
-                    "field": f,
-                    "tier": r.tier,
-                    "primary": r.primary,
-                    "fallbacks": r.fallbacks,
-                    "consensus": r.consensus,
-                    "cleanup": r.cleanup,
-                })
+                rows.append(
+                    {
+                        "field": f,
+                        "tier": r.tier,
+                        "primary": r.primary,
+                        "fallbacks": r.fallbacks,
+                        "consensus": r.consensus,
+                        "cleanup": r.cleanup,
+                    }
+                )
             out[m] = rows
         return {"success": True, "data": {"coverage": out, "timestamp": _now_iso()}}
     except Exception as exc:  # noqa: BLE001
@@ -365,6 +385,7 @@ async def list_quality_alerts(
     current_user: dict = Depends(require_admin),
 ):
     from sqlalchemy import text as sql_text
+
     try:
         engine = _db_engine()
         clauses = []
@@ -383,10 +404,13 @@ async def list_quality_alerts(
             params["ack"] = bool(acknowledged)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         with engine.begin() as conn:
-            total = conn.execute(
-                sql_text(f"SELECT COUNT(*) FROM data_quality_alerts {where}"),
-                params,
-            ).scalar() or 0
+            total = (
+                conn.execute(
+                    sql_text(f"SELECT COUNT(*) FROM data_quality_alerts {where}"),
+                    params,
+                ).scalar()
+                or 0
+            )
             rows = conn.execute(
                 sql_text(
                     f"""
@@ -403,10 +427,16 @@ async def list_quality_alerts(
             ).fetchall()
         items = [
             {
-                "id": r[0], "alert_type": r[1], "severity": r[2],
-                "market": r[3], "field": r[4], "source": r[5], "symbol": r[6],
+                "id": r[0],
+                "alert_type": r[1],
+                "severity": r[2],
+                "market": r[3],
+                "field": r[4],
+                "source": r[5],
+                "symbol": r[6],
                 "trade_date": r[7].isoformat() if r[7] else None,
-                "message": r[8], "details": r[9],
+                "message": r[8],
+                "details": r[9],
                 "acknowledged": bool(r[10]),
                 "acknowledged_by": r[11],
                 "acknowledged_at": r[12].isoformat() if r[12] else None,
@@ -430,6 +460,7 @@ async def ack_quality_alert(
     current_user: dict = Depends(require_admin),
 ):
     from sqlalchemy import text as sql_text
+
     try:
         user_id = str(current_user.get("user_id") or current_user.get("id") or "admin")
         engine = _db_engine()
@@ -448,7 +479,10 @@ async def ack_quality_alert(
             ).rowcount
         if not updated:
             raise HTTPException(status_code=404, detail=f"alert {alert_id} not found")
-        return {"success": True, "data": {"alert_id": alert_id, "acknowledged_by": user_id}}
+        return {
+            "success": True,
+            "data": {"alert_id": alert_id, "acknowledged_by": user_id},
+        }
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -488,21 +522,31 @@ async def trigger_sync(
 
         from backend.services.engine.data_platform.aggregator import FieldAggregator
         from backend.services.engine.data_platform.cleaner import DataCleaner
+
         agg = FieldAggregator(
-            registry=reg, routing=rt, monitor=_get_monitor(), cleaner=DataCleaner(),
+            registry=reg,
+            routing=rt,
+            monitor=_get_monitor(),
+            cleaner=DataCleaner(),
         )
 
         results: list[dict[str, Any]] = []
         for sym in payload.symbols[:50]:  # 限制 batch
             try:
                 res = agg.fetch(
-                    market=payload.market, field=payload.field, symbol=sym,
+                    market=payload.market,
+                    field=payload.field,
+                    symbol=sym,
                 )
-                results.append({
-                    "symbol": sym, "ok": True,
-                    "source_used": res.source_used, "rows": len(res.data),
-                    "cleaning": res.cleaning_report,
-                })
+                results.append(
+                    {
+                        "symbol": sym,
+                        "ok": True,
+                        "source_used": res.source_used,
+                        "rows": len(res.data),
+                        "cleaning": res.cleaning_report,
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
                 results.append({"symbol": sym, "ok": False, "error": str(exc)})
         return {"success": True, "data": {"source": name, "results": results}}
@@ -557,7 +601,10 @@ async def sweep_market(
 
         monitor = _get_monitor()
         agg = FieldAggregator(
-            registry=reg, routing=rt, monitor=monitor, cleaner=DataCleaner(),
+            registry=reg,
+            routing=rt,
+            monitor=monitor,
+            cleaner=DataCleaner(),
         )
 
         symbols = [s.strip() for s in payload.symbols if s and s.strip()][:20]
@@ -580,13 +627,19 @@ async def sweep_market(
                     if hasattr(adapter, "fetch_field"):
                         try:
                             df = adapter.fetch_field(
-                                payload.field, sym, start=start, end=end,
+                                payload.field,
+                                sym,
+                                start=start,
+                                end=end,
                             )
                         except (NotImplementedError, Exception) as field_exc:
                             # fetch_field 未实现该字段，回退到 fetch_daily
                             msg = str(field_exc).lower()
-                            if ("not implemented" in msg or "未实现" in msg
-                                    or isinstance(field_exc, NotImplementedError)):
+                            if (
+                                "not implemented" in msg
+                                or "未实现" in msg
+                                or isinstance(field_exc, NotImplementedError)
+                            ):
                                 df = None
                             else:
                                 raise
@@ -594,11 +647,20 @@ async def sweep_market(
                         df = adapter.fetch_daily(sym, start, end)
                     rows = 0 if df is None else len(df)
                     monitor.record_success(src, payload.field, latency_ms=0.0)
-                    sym_results.append({"symbol": sym, "ok": True, "rows": rows, "started": t0})
+                    sym_results.append(
+                        {"symbol": sym, "ok": True, "rows": rows, "started": t0}
+                    )
                     ok_total += 1
                 except Exception as exc:  # noqa: BLE001
                     monitor.record_error(src, payload.field, error=str(exc))
-                    sym_results.append({"symbol": sym, "ok": False, "error": str(exc)[:200], "started": t0})
+                    sym_results.append(
+                        {
+                            "symbol": sym,
+                            "ok": False,
+                            "error": str(exc)[:200],
+                            "started": t0,
+                        }
+                    )
                     fail_total += 1
             per_source.append({"source": src, "results": sym_results})
 
@@ -607,17 +669,25 @@ async def sweep_market(
         for sym in symbols:
             try:
                 res = agg.fetch(
-                    market=payload.market, field=payload.field, symbol=sym,
-                    start=start, end=end,
+                    market=payload.market,
+                    field=payload.field,
+                    symbol=sym,
+                    start=start,
+                    end=end,
                 )
-                agg_results.append({
-                    "symbol": sym, "ok": True,
-                    "source_used": res.source_used,
-                    "consensus_sources": res.consensus_sources,
-                    "rows": len(res.data),
-                })
+                agg_results.append(
+                    {
+                        "symbol": sym,
+                        "ok": True,
+                        "source_used": res.source_used,
+                        "consensus_sources": res.consensus_sources,
+                        "rows": len(res.data),
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
-                agg_results.append({"symbol": sym, "ok": False, "error": str(exc)[:200]})
+                agg_results.append(
+                    {"symbol": sym, "ok": False, "error": str(exc)[:200]}
+                )
 
         return {
             "success": True,
@@ -729,6 +799,7 @@ async def get_sync_progress(current_user: dict = Depends(require_admin)):
     """获取当前同步执行进度（步骤级）。"""
     try:
         from backend.scripts.daily_data_sync import get_sync_progress
+
         progress = get_sync_progress()
         return {"success": True, "data": progress}
     except Exception as exc:  # noqa: BLE001
@@ -796,7 +867,9 @@ async def get_freshness(
 
         for f in rt.list_fields(m):
             route = rt.get_route(m, f)
-            all_sources = [route.primary] + [s for s in (route.fallbacks or []) if s != route.primary]
+            all_sources = [route.primary] + [
+                s for s in (route.fallbacks or []) if s != route.primary
+            ]
             # 可映射字段：同一 field 的所有源共享同一份本地数据日期
             data_date_str = None
             rel_dir = _FIELD_LOCAL_PARTITION.get(f)
@@ -814,8 +887,11 @@ async def get_freshness(
                     try:
                         dd = _dt.strptime(data_date_str, "%Y%m%d").date()
                         days_stale = (expected_td - dd).days
-                        freshness = "fresh" if days_stale <= 0 else (
-                            "stale" if days_stale <= 3 else "outdated")
+                        freshness = (
+                            "fresh"
+                            if days_stale <= 0
+                            else ("stale" if days_stale <= 3 else "outdated")
+                        )
                     except Exception:
                         pass
                 # 2) 无法确定数据日期时，退回最近一次成功拉取
@@ -823,21 +899,26 @@ async def get_freshness(
                     try:
                         last_dt = _dt.fromisoformat(last_ok.replace("Z", "+00:00"))
                         days_stale = (now - last_dt).days
-                        freshness = "fresh" if days_stale == 0 else (
-                            "stale" if days_stale <= 3 else "outdated")
+                        freshness = (
+                            "fresh"
+                            if days_stale == 0
+                            else ("stale" if days_stale <= 3 else "outdated")
+                        )
                     except Exception:
                         pass
-                items.append({
-                    "field": f,
-                    "source": src,
-                    "is_primary": src == route.primary,
-                    "last_success_at": last_ok,
-                    "last_error_at": health.get("last_error_at"),
-                    "days_stale": days_stale,
-                    "freshness": freshness,
-                    "avg_latency_ms": float(health.get("avg_latency_ms", 0) or 0),
-                    "error_rate_1h": float(health.get("error_rate_1h", 0) or 0),
-                })
+                items.append(
+                    {
+                        "field": f,
+                        "source": src,
+                        "is_primary": src == route.primary,
+                        "last_success_at": last_ok,
+                        "last_error_at": health.get("last_error_at"),
+                        "days_stale": days_stale,
+                        "freshness": freshness,
+                        "avg_latency_ms": float(health.get("avg_latency_ms", 0) or 0),
+                        "error_rate_1h": float(health.get("error_rate_1h", 0) or 0),
+                    }
+                )
 
         return {
             "success": True,
@@ -893,26 +974,43 @@ async def get_online_status(current_user: dict = Depends(require_admin)):
                 # 真实连通性 / 依赖缺失异常 → 判离线或异常，不再误报在线
                 latency_ms = round((_time.monotonic() - t0) * 1000, 1)
                 msg = str(exc).lower()
-                if any(k in msg for k in (
-                    "not installed", "未安装", "未配置", "未找到", "not found",
-                    "404", "timeout", "timed out", "time out", "refused", "连接",
-                    "connection", "resolve", "dns", "unreachable",
-                )):
+                if any(
+                    k in msg
+                    for k in (
+                        "not installed",
+                        "未安装",
+                        "未配置",
+                        "未找到",
+                        "not found",
+                        "404",
+                        "timeout",
+                        "timed out",
+                        "time out",
+                        "refused",
+                        "连接",
+                        "connection",
+                        "resolve",
+                        "dns",
+                        "unreachable",
+                    )
+                ):
                     status = "unavailable"
                 else:
                     status = "error"
                 error_msg = str(exc)[:200]
 
-            items.append({
-                "name": name,
-                "class": adapter.__class__.__name__,
-                "markets": adapter.markets,
-                "fields": sorted(adapter.fields),
-                "status": status,
-                "latency_ms": latency_ms,
-                "error": error_msg,
-                "checked_at": _now_iso(),
-            })
+            items.append(
+                {
+                    "name": name,
+                    "class": adapter.__class__.__name__,
+                    "markets": adapter.markets,
+                    "fields": sorted(adapter.fields),
+                    "status": status,
+                    "latency_ms": latency_ms,
+                    "error": error_msg,
+                    "checked_at": _now_iso(),
+                }
+            )
 
         return {
             "success": True,
@@ -920,7 +1018,9 @@ async def get_online_status(current_user: dict = Depends(require_admin)):
                 "items": items,
                 "total": len(items),
                 "online": sum(1 for i in items if i["status"] == "online"),
-                "offline": sum(1 for i in items if i["status"] in ("error", "unavailable")),
+                "offline": sum(
+                    1 for i in items if i["status"] in ("error", "unavailable")
+                ),
                 "timestamp": _now_iso(),
             },
         }
@@ -937,7 +1037,10 @@ async def list_alpha_agent_markets(current_user: dict = Depends(require_admin)):
     """列出 Alpha Agent 支持的市场及数据就绪状态。"""
     try:
         from pathlib import Path
-        from backend.services.engine.rd_agent.market_adapters import list_markets, get_adapter
+        from backend.services.engine.rd_agent.market_adapters import (
+            list_markets,
+            get_adapter,
+        )
 
         # 市场 → H5 数据文件路径（仅 crypto 5min 用）
         h5_map = _ALPHA_AGENT_H5_MAP
@@ -962,6 +1065,7 @@ async def list_alpha_agent_markets(current_user: dict = Depends(require_admin)):
                 if h5_path and Path(h5_path).exists():
                     try:
                         import pandas as pd
+
                         df = pd.read_hdf(h5_path, key="data")
                         dates = df.index.get_level_values("datetime")
                         instruments = df.index.get_level_values("instrument")
@@ -970,7 +1074,9 @@ async def list_alpha_agent_markets(current_user: dict = Depends(require_admin)):
                             "symbols": int(instruments.nunique()),
                             "start_date": str(dates.min().date()),
                             "end_date": str(dates.max().date()),
-                            "file_size_mb": round(Path(h5_path).stat().st_size / 1024 / 1024, 1),
+                            "file_size_mb": round(
+                                Path(h5_path).stat().st_size / 1024 / 1024, 1
+                            ),
                         }
                         m["data_source"] = "h5"
                     except Exception:
@@ -988,8 +1094,16 @@ async def list_alpha_agent_markets(current_user: dict = Depends(require_admin)):
             if qlib_dir and Path(qlib_dir).is_dir():
                 try:
                     p = Path(qlib_dir)
-                    cal_files = list((p / "calendars").iterdir()) if (p / "calendars").is_dir() else []
-                    feat_count = len(list((p / "features").iterdir())) if (p / "features").is_dir() else 0
+                    cal_files = (
+                        list((p / "calendars").iterdir())
+                        if (p / "calendars").is_dir()
+                        else []
+                    )
+                    feat_count = (
+                        len(list((p / "features").iterdir()))
+                        if (p / "features").is_dir()
+                        else 0
+                    )
                     m["qlib_info"] = {
                         "qlib_dir": str(qlib_dir),
                         "calendar_files": [f.name for f in cal_files],
@@ -1034,12 +1148,18 @@ async def sync_fundamentals(
                     None, lambda _m=m: sync_market_fundamentals(_m, payload.dry_run)
                 )
                 results[m] = result
-            return {"success": True, "data": {"results": results, "dry_run": payload.dry_run}}
+            return {
+                "success": True,
+                "data": {"results": results, "dry_run": payload.dry_run},
+            }
         else:
             result = await loop.run_in_executor(
                 None, lambda: sync_market_fundamentals(market, payload.dry_run)
             )
-            return {"success": True, "data": {"result": result, "dry_run": payload.dry_run}}
+            return {
+                "success": True,
+                "data": {"result": result, "dry_run": payload.dry_run},
+            }
     except Exception as exc:  # noqa: BLE001
         logger.error("sync_fundamentals failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"failed: {exc}")
@@ -1047,7 +1167,9 @@ async def sync_fundamentals(
 
 @router.post("/sync-alpha-agent-market")
 async def sync_alpha_agent_market(
-    market: str = Query(..., description="市场 ID: a_share, crypto, hong_kong, us_stock"),
+    market: str = Query(
+        ..., description="市场 ID: a_share, crypto, hong_kong, us_stock"
+    ),
     force: bool = Query(False, description="强制重新下载"),
     current_user: dict = Depends(require_admin),
 ):
@@ -1094,19 +1216,31 @@ async def sync_alpha_agent_market(
             feature_msg = ""
             try:
                 import subprocess
-                script_path = Path(__file__).resolve().parents[3] / "scripts" / "update_market_features.py"
+
+                script_path = (
+                    Path(__file__).resolve().parents[3]
+                    / "scripts"
+                    / "update_market_features.py"
+                )
                 if not script_path.exists():
                     script_path = Path("/app/backend/scripts/update_market_features.py")
                 if script_path.exists():
                     proc = subprocess.run(
                         ["python", str(script_path), "--market", market],
-                        capture_output=True, text=True, timeout=600, check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        check=False,
                     )
                     if proc.returncode == 0:
                         feature_msg = "，特征快照已更新"
                     else:
                         feature_msg = "，特征计算失败"
-                        logger.warning("Feature computation failed for %s: %s", market, proc.stderr[-500:])
+                        logger.warning(
+                            "Feature computation failed for %s: %s",
+                            market,
+                            proc.stderr[-500:],
+                        )
             except Exception as e:
                 feature_msg = "，特征计算异常"
                 logger.warning("Feature computation error for %s: %s", market, e)
@@ -1134,4 +1268,80 @@ async def sync_alpha_agent_market(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         logger.error("sync_alpha_agent_market failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# 补池链就绪状态（候选池为什么没有）
+# ---------------------------------------------------------------------------
+def _pool_target_day(d: date | None = None) -> str:
+    """今天该有哪个交易日的池（**展示/排障用**）。
+
+    真正的判定唯一出处在 ``backend.shared.pool_readiness.target_trade_day``（含来源
+    与降级标记）——这里只是转发，供运维手动查一个日期时用，别在别处再写一套。
+    """
+    from backend.shared.pool_readiness import target_trade_day  # noqa: PLC0415
+
+    return target_trade_day(d).day
+
+
+def _pool_readiness(market: str, target: str | None = None) -> Any:
+    """共享判据的取数入口（供路由与测试注入）。
+
+    故意**不**自己判断「有没有池」：五段串联的判据唯一出处在
+    ``backend/shared/pool_readiness.py``，宿主盘前告警脚本读的是同一份——两处各写
+    一套必然会漂移（本仓反复出事的形态）。
+    """
+    from backend.shared.pool_readiness import collect, pg_inference_probe  # noqa: PLC0415
+
+    if market.upper() != "A":
+        raise ValueError(f"补池链目前只覆盖 A 股（收到 {market}）")
+    return collect(target=target, inference_probe=pg_inference_probe())
+
+
+def _readiness_payload(report: Any) -> dict[str, Any]:
+    return {
+        "target": report.target,
+        "target_source": getattr(report, "target_source", ""),
+        "target_degraded": bool(getattr(report, "target_degraded", False)),
+        "kline_dt": report.kline_dt,
+        "ok": report.ok,
+        "by_design": report.by_design,
+        "blocked_stage": report.blocked_stage,
+        "blocked_label": report.blocked_label,
+        "stages": [
+            {
+                "key": s.key,
+                "label": s.label,
+                "ok": s.ok,
+                "detail": s.detail,
+                "by_design": s.by_design,
+                "value": s.value,
+            }
+            for s in report.stages
+        ],
+        "timestamp": _now_iso(),
+    }
+
+
+@router.get("/pool-readiness")
+async def get_pool_readiness(
+    market: str = Query("A", description="目前仅 A 股"),
+    target: str | None = Query(None, description="目标交易日 YYYYMMDD，缺省按日历推"),
+    current_user: dict = Depends(require_admin),
+):
+    """候选池就绪状态：五段串联（日K → alpha 库 → 自定义因子集 → 推理批 → 池）。
+
+    ``blocked_stage`` 是**第一个**不就绪的段——回答「今天没有池，卡在哪」。
+    方向闸按设计清空池（复盘判看空）时 ``by_design=true`` 且不算断链。
+    """
+    try:
+        return {
+            "success": True,
+            "data": _readiness_payload(_pool_readiness(market, target)),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get_pool_readiness failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"failed: {exc}")

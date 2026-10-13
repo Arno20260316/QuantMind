@@ -10,6 +10,11 @@
 本任务节奏 `TDX_HOTSET_PACING_S`（默认 0.18s/只 ≈ 333/min），留 >200/min 余量；撞
 RATE_LIMITED → 指数退避（30s→300s 封顶），不当作故障。
 
+**配额三处口径必须一致**（2026-10-13 治 429 刷屏）：① 桥仓库 `config.yaml`
+`security.rate_limit_per_minute`（2026-10-13 由 60 改 600——旧默认会让自带配置起的桥
+立刻自锁：热集一轮就打满）；② 部署端 Windows 侧同一项；③ 本模块 `TDX_HOTSET_PACING_S`
+推出来的轮转速率。三处任一处小一档，表现都是盘中 429 刷屏 + 快照落地率塌方。
+
 **交易时段门**：与持仓馈送同源（`is_trading_time`，含集合竞价，午休停拉）。
 
 **写侧**：复用 `tdx_quote_feed.map_snapshot` / `_write_snapshot`（同源契约：小写前缀

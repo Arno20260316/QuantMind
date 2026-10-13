@@ -30,7 +30,7 @@ from backend.services.api.user_app.middleware.auth import get_current_user
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.logging_config import get_logger
 from backend.shared.quantdb_flow_units import normalize_l2_flow_money_to_yuan
-from backend.shared.signal_scores import score_freq_of
+from backend.shared.signal_scores import normalize_a_share_symbol, score_freq_of
 
 logger = get_logger(__name__)
 
@@ -110,6 +110,22 @@ def _exchange_of(symbol: str) -> str:
     if symbol.endswith(".BJ"):
         return "BJ"
     return ""
+
+
+def _bare_symbol(raw: Any) -> str | None:
+    """任意键形（``600036`` / ``SH600036`` / ``600036.SH``）→ A 股裸六位码；非 A 股返回 ``None``。
+
+    归一化只此一处。``engine_signal_scores.symbol`` 同日可并存三种写法：prefix
+    （``SH600000``，日频 batch 推理）、suffix（``600000.SH``，盘中 realtime）、
+    bare（``600000``）。本模块所有消费端（``df["Symbol"].str.split(".")[0]``、
+    ``score_info.get(code)``、``trend_map.get(code)``）都是**裸码**口径，
+    写侧若非裸码建键就全 miss（2026-10-13 候选信号列表整页空的根因）。
+
+    复用 ``signal_scores.normalize_a_share_symbol``（它已处理三种写法并返回 prefix
+    规范形），本函数只做最后一步「prefix → 去前缀」。
+    """
+    prefix = normalize_a_share_symbol(raw)
+    return prefix[2:] if prefix else None
 
 
 def _latest_partition(base: Path) -> Path | None:
@@ -1509,16 +1525,22 @@ async def _trend_map(model: str | None, before=None) -> dict[str, str]:
         stmt = _txt(
             "SELECT symbol, trade_date, fusion_score, created_at FROM engine_signal_scores "
             "WHERE tenant_id='default' AND trade_date IN :ds "
-            f"{mwhere} {bwhere} ORDER BY created_at"
+            f"{mwhere} {bwhere} ORDER BY created_at DESC, id DESC"
         ).bindparams(_bindparam("ds", expanding=True))
         rows = (
             await session.execute(stmt, {**params, "ds": tuple(dates)})
         ).fetchall()
-    # 每 (symbol, date) 取 created_at 最新一条
+    # 每 (标的归一键, date) 取 created_at 最新一条。
+    # 键必须归一到裸六位：同一只股跨日可能换写法（今天批量裸码、明天实时后缀、
+    # 自定义市场地块是前缀），按字面 symbol 建键会让 s1/s0 查不到 → 整只被跳过。
+    # 行序已是 created_at DESC，故首次即锁（first-wins），不靠 DB 返回序的偶然。
     per: dict[tuple[str, str], float] = {}
     for sym, d, fusion, _created in rows:
-        if fusion is not None:
-            per[(str(sym), str(d))] = float(fusion)
+        if fusion is None:
+            continue
+        key = (_bare_symbol(sym) or str(sym), str(d))
+        if key not in per:
+            per[key] = float(fusion)
     out: dict[str, str] = {}
     for (sym, d), fusion in per.items():
         idx = next((i for i, dt in enumerate(dates) if str(dt) == d), -1)
@@ -2013,7 +2035,15 @@ async def list_stocks(
             latest = _d0
             _signal_date = str(_d0)[:10] if _d0 else None
         if latest is not None:
-            where = "tenant_id = 'default' AND trade_date = :d"
+            # 市场口径与 signal_scores 同一常量（可空列 + 自定义市场别名）：
+            # 2026-10-13 全市场带 BUY/SELL 的行**只**存在于 market='CUSTOM' 桶，
+            # 漏掉它候选信号列表整片为空（前端默认 side=BUY）。
+            from backend.shared.signal_scores import A_SHARE_MARKET_SQL as _market_sql
+            from backend.shared.signal_scores import SYMBOL_FOLD_KEY as _fold_key
+
+            where = (
+                f"tenant_id = 'default' AND trade_date = :d AND {_market_sql}"
+            )
             params: dict = {"d": latest}
             if model:
                 # model_version 列恒为 'inference_script'（历史遗留），真实模型标识
@@ -2029,29 +2059,34 @@ async def list_stocks(
             if only_signaled:
                 where += " AND signal_side IN ('BUY','SELL')"
             sql = (
-                # 同一天可能跑了多个 run（同一批数据的多次打分），必须去重后取一条，
-                # 否则下面的 score_info[sym] = ... 是「按 DB 返回顺序后写覆盖」= 任意挑一个。
-                # 实测同日不同 run 的 fusion_score 量纲互不相同（相关系数可为 −0.03），
-                # 混着取会让列表分数不确定。约定同 _trend_map：按 created_at 取最新。
+                # 同一天同一只股可能有多行（多个 run / 批次行 + 盘中实时行），且
+                # symbol 有三种写法（裸 600000 / 后缀 600000.SH / 前缀 SH600000）。
+                # 按**字面** symbol 去重只能合并同形态的行：前缀形排序恒在数字形之后，
+                # 循环里「后写覆盖」等价于「前缀形恒胜」，与 created_at 无关——
+                # 实测 2026-10-09 有 3235 只被喂了 00:00 的旧行而不是 19:00 的新行。
+                # 故 DISTINCT ON 的键必须先折到裸六位（与 signal_scores 同一表达式）。
                 # source 必须一起取：同一天既有日频批次行、又有盘中实时行，
                 # 列表得如实标出这一行的分是「实时」还是「日频」（frontend 打分频徽章）
-                "SELECT DISTINCT ON (symbol) "
+                f"SELECT DISTINCT ON ({_fold_key}) "
                 "symbol, fusion_score, signal_side, model_version, quality, source "
                 f"FROM engine_signal_scores WHERE {where} "
-                "ORDER BY symbol, created_at DESC, id DESC"
+                f"ORDER BY {_fold_key}, created_at DESC, id DESC"
             )
             async with get_session() as session:
                 from sqlalchemy import text as _txt
 
                 rows = (await session.execute(_txt(sql), params)).fetchall()
             for r in rows:
-                sym = str(r[0])
-                # engine_signal_scores.symbol 为纯数字 600519（不带市场后缀）
-                sfx = sym if "." in sym else sym
+                # engine_signal_scores.symbol 同日可出现三种写法（prefix SH600000 /
+                # suffix 600000.SH / bare 600000），而下游一律按裸六位码取值，
+                # 所以这里必须归一后建键，否则整页全 miss。
+                bare = _bare_symbol(str(r[0]))
+                if not bare:
+                    continue
                 pos = None
                 if isinstance(r[4], dict):
                     pos = r[4].get("position")
-                score_info[sfx] = {
+                score_info[bare] = {
                     "fusion": float(r[1]) if r[1] is not None else None,
                     "side": str(r[2] or "HOLD"),
                     "date": str(latest)[:10],
@@ -2154,34 +2189,36 @@ async def list_stocks(
                         n = int((codes.map(trend_map) == optv).sum())
                     counts[optv] = n
                 option_counts[dim] = counts
-            if not model:
-                # 推理模型命中数：各模型在最近信号日涉及的股票数
-                model_counts: dict[str, int] = {}
-                try:
-                    async with get_session() as _s2:
-                        from sqlalchemy import text as _txt
+            # 推理模型命中数：各模型在最近信号日涉及的股票数。
+            # 该统计只依赖全局最新信号日，与当前筛选条件无关，故**不**随 model 参数收敛
+            # （原先被 `if not model:` 包住，导致带模型刷新的请求连命中数一起消失，
+            # 前端看起来「越筛越少」）。
+            model_counts: dict[str, int] = {}
+            try:
+                async with get_session() as _s2:
+                    from sqlalchemy import text as _txt
 
-                        _d1 = (
+                    _d1 = (
+                        await _s2.execute(
+                            _txt("SELECT MAX(trade_date) FROM engine_signal_scores WHERE tenant_id='default'")
+                        )
+                    ).scalar_one_or_none()
+                    if _d1 is not None:
+                        _mr = (
                             await _s2.execute(
-                                _txt("SELECT MAX(trade_date) FROM engine_signal_scores WHERE tenant_id='default'")
+                                _txt(
+                                    "SELECT r.model_id, COUNT(*) c FROM engine_signal_scores e "
+                                    "JOIN qm_model_inference_runs r ON r.run_id = e.run_id "
+                                    "WHERE e.tenant_id='default' AND e.trade_date = :d "
+                                    "GROUP BY r.model_id"
+                                ),
+                                {"d": _d1},
                             )
-                        ).scalar_one_or_none()
-                        if _d1 is not None:
-                            _mr = (
-                                await _s2.execute(
-                                    _txt(
-                                        "SELECT r.model_id, COUNT(*) c FROM engine_signal_scores e "
-                                        "JOIN qm_model_inference_runs r ON r.run_id = e.run_id "
-                                        "WHERE e.tenant_id='default' AND e.trade_date = :d "
-                                        "GROUP BY r.model_id"
-                                    ),
-                                    {"d": _d1},
-                                )
-                            ).fetchall()
-                            model_counts = {str(m): int(c) for m, c in _mr}
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("model counts failed: %s", exc)
-                option_counts["model"] = model_counts
+                        ).fetchall()
+                        model_counts = {str(m): int(c) for m, c in _mr}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("model counts failed: %s", exc)
+            option_counts["model"] = model_counts
         except Exception as exc:  # noqa: BLE001
             logger.warning("option counts failed: %s", exc)
 
@@ -2204,12 +2241,14 @@ async def list_stocks(
     # 推理模型选项（供筛选下拉）：最近 90 天内有信号的全部模型（真实 model_id + display_name）。
     # engine_signal_scores.model_version 恒为 'inference_script'（历史遗留无意义），
     # 真实模型标识在 qm_model_inference_runs.model_id（同 model_training history 逻辑）。
-    # JOIN+GROUP BY 全表 2.3s/次，结果按日频更新——缓存 _UNIVERSE_TTL 消除重复开销
+    # JOIN+GROUP BY 全表 2.3s/次，结果按日频更新——缓存 _UNIVERSE_TTL 消除重复开销。
+    # **任何请求都回选项**（原先只在无 model 参数时计算，导致选完模型刷新后
+    # `models` 变空、下拉看起来「越筛越少」；选项集是全局口径，本就与筛选无关）。
     model_options: list[dict[str, Any]] = []
     _now = time.time()
-    if not model and _model_options_cache["v"] is not None and _now - _model_options_cache["ts"] < _UNIVERSE_TTL:
+    if _model_options_cache["v"] is not None and _now - _model_options_cache["ts"] < _UNIVERSE_TTL:
         model_options = _model_options_cache["v"]
-    elif not model:
+    else:
         try:
             async with get_session() as _s:
                 from sqlalchemy import text as _txt
@@ -2221,6 +2260,9 @@ async def list_stocks(
                 _latest_date = (await _s.execute(_txt(_date_sql))).scalar_one_or_none()
                 if _latest_date is not None:
                     _from = _latest_date - _timedelta(days=90)
+                    # 30 天新鲜度：上游批量推理失败时某些模型会静默停更，
+                    # 把事实带到下拉框，用户才分得清「这款没信号」和「界面漏了」
+                    _recent_cut = _latest_date - _timedelta(days=30)
                     _mrows = (
                         await _s.execute(
                             _txt(
@@ -2258,6 +2300,9 @@ async def list_stocks(
                         model_options.append({
                             "model_id": str(_mid),
                             "display_name": _meta_map.get(str(_mid), ""),
+                            "has_signals_30d": bool(
+                                _latest is not None and _latest >= _recent_cut
+                            ),
                         })
                 _model_options_cache.update({"v": model_options, "ts": time.time()})
         except Exception as exc:  # noqa: BLE001
@@ -2337,6 +2382,10 @@ async def list_stocks(
             "page_size": page_size,
             "trade_date": trade_date,
             "signal_date": _signal_date,
+            # 锚定信号日在该模型口径下实际有多少只有分（**过滤前**）。
+            # 前端据此区分三种空态：无信号日 / 该模型当日无分 / 筛选条件命中 0。
+            # 不能拿 total 反推——total 是筛完之后的结果，三种原因都归零。
+            "signal_rows": len(score_info),
             # 当日分数里有多少只是盘中实时分（列表头部据此标「实时/日频」；
             # 0 = 实时推理未开启或本轮未产出行 → 整页都是日频降级分）
             "realtime_rows": sum(

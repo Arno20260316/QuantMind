@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { Search, RefreshCw, Star, ChevronDown, ChevronLeft, ChevronRight, ChevronsUp, ChevronsDown, ShieldCheck, AlertTriangle, Send, X } from 'lucide-react';
 import { Checkbox, Input, Spin, message, Dropdown, Segmented } from 'antd';
-import { StockListItem, StockListResponse, StockRisk, ExclusionMeta, PushChannel, PushSide } from '../types';
+import { StockListItem, StockListResponse, StockRisk, ExclusionMeta, PushChannel, PushSide, StockModelOption } from '../types';
 import { EXCLUDE_ON, riskChips, channelText } from '../riskModel';
 import { channelOptions, MAX_PICK } from '../pushModel';
 import { scoreFreqView, tableFreqView } from '../scoreFreq';
@@ -13,6 +13,7 @@ import { PushConfirmPanel } from './PushConfirmPanel';
 import { EvalScoreBadge } from '../../../components/shared/EvalScoreBadge';
 // 展示面口径：signal_side 只译成「靠前/靠后/居中」（见 features/shared/signalVocabulary.ts）
 import { signalPositionLabel } from '../../shared/signalVocabulary';
+import { emptyListHint } from '../emptyListHint';
 
 interface Props {
   selected: string | null;
@@ -35,9 +36,9 @@ interface Props {
   /** 筛选条件（页面持有，看板面板在左侧列表上方） */
   filters: ListFilters;
   onFiltersChange: (f: ListFilters) => void;
-  onModels?: (models: { model_id: string; display_name?: string }[]) => void;
+  onModels?: (models: StockModelOption[]) => void;
   /** 全部模型列表（页面持有，用于筛选面板下拉选项） */
-  models?: { model_id: string; display_name?: string }[];
+  models?: StockModelOption[];
   /** 列表数量回传（供筛选面板计数） */
   onTotals?: (filtered: number) => void;
   /** 当前列表基准信号日回传（日历高亮 + 面板日期 chip） */
@@ -247,8 +248,9 @@ export function StockSidebar({ selected, onSelect, watchlistSymbols, watchFilter
     setLoading(true);
     try {
       const resp = await stockTerminalService.getStockList(buildParams(page, !append));
-      const models = resp.models ?? [];
-      if (models.length) onModels?.(models);
+      // 无条件回传选项（含空数组）——「只在非空时覆盖」会把上一次的陈旧列表无限留着，
+      // 用户看到的就是「模型只有几款、永远不变」。老后端不带 models（undefined）→ 不覆盖。
+      if (resp.models) onModels?.(resp.models);
       if (!append) {
         pageOffsetRef.current = (page - 1) * PAGE_SIZE;
         setOptionCounts(resp.option_counts ?? {});
@@ -940,9 +942,44 @@ export function StockSidebar({ selected, onSelect, watchlistSymbols, watchFilter
                 </button>
               </div>
             ) : (
-              <div className="text-center py-8 text-[11px] text-slate-400">
-                {searching ? `全市场没有匹配「${q.trim()}」的股票代码或名称` : '无匹配股票'}
-              </div>
+              (() => {
+                // 空列表的空因**不是一种**：后端 `signal_rows` = 本请求**过滤前**的分数行数
+                // （选中模型时已按该模型 run 收窄）。分类与文案在 `../../emptyListHint`
+                // （纯函数，单测覆盖）：当日全市场没分 / 这款模型没分 / 被条件滤掉 / 老后端兜底。
+                const sideApplied = !searching && !onlyWatchlist && !!filters.side;
+                const hint = emptyListHint({
+                  searching,
+                  query: q,
+                  signalRows: data?.signal_rows,
+                  model: filters.model,
+                  signalDate: data?.signal_date,
+                  filteredTotal: data?.total ?? 0,
+                  narrowingLabels: activeNarrowing.map(([, label]) => label),
+                  side: filters.side,
+                  sideApplied,
+                  onlyWatchlist,
+                });
+                return (
+                  <div className="text-center py-8 px-3">
+                    <div className="text-[11px] text-slate-500">{hint.title}</div>
+                    {hint.detail && (
+                      <div className="mt-1 text-[10px] text-slate-400 leading-relaxed">{hint.detail}</div>
+                    )}
+                    {hint.labels.length > 0 && (
+                      <div className="mt-1 text-[10px] text-slate-400">{hint.labels.join(' · ')}</div>
+                    )}
+                    {hint.canClear && (
+                      <button
+                        type="button"
+                        onClick={clearNarrowing}
+                        className="mt-2 rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1 text-[11px] font-bold text-blue-600 hover:bg-blue-100 transition-colors"
+                      >
+                        清除这些条件
+                      </button>
+                    )}
+                  </div>
+                );
+              })()
             )
           )}
       </div>

@@ -10,11 +10,18 @@
    ``trade_date``（计数把后缀身份折叠到裸 6 位——实时行 ``600036.SH`` 与批量行
    ``600036`` 是同一只，同股只算一次；T4-1 审计 M2）；当日覆盖不足（推理刚跑到
    一半/降级日）时回退到最近一天，并把回退事实交给调用方（``meta.fallback=True``）。
-2. 该日每标的取**最新一条**（``DISTINCT ON (symbol) ORDER BY created_at DESC, id DESC``）：
-   同一天可能既有日频批次行、又有盘中实时行（``source='realtime'``），
-   混着取会让分数不确定。
-3. 市场口径 ``market IS NULL OR market = 'CN'``——该列可空（老库未回填），
-   裸等号会把 CN 行查空。
+2. 该日每标的取**最新一条**（``DISTINCT ON <裸码归一键> ORDER BY <同键>, created_at
+   DESC, id DESC``）：同一天同一只股会有多行——日频批次行 / 盘中实时行
+   （``source='realtime'``）/ 不同 run 的重复打分，且 **symbol 有三种写法**
+   （裸 ``600036`` / 后缀 ``600036.SH`` / 前缀 ``SH600036``）。按**字面** symbol
+   去重只能合并同形态的行：裸码留多行，Python 侧「后写覆盖」实际是按字面序挑
+   一条（前缀形排序恒在后 → 恒胜），与 ``created_at`` 最新无关。故去重键必须先
+   折到裸 6 位（:data:`SYMBOL_FOLD_KEY`）。
+3. 市场口径 = :data:`A_SHARE_MARKET_SQL`——``market`` 列可空（老库未回填，裸等号
+   会把这些行整片查空）；``'CUSTOM'``（自定义市场）按 A 股适配器/日历/基准构造
+   （``getMarketConfig('CUSTOM')`` = a_share + SSE + SH000300），落库 symbol
+   100% 是 A 股形态，必须与 ``'CN'`` 同等对待——2026-10-13 全市场带 BUY/SELL
+   的行**只**存在于 ``CUSTOM`` 桶，漏掉它候选信号列表整片为空。
 4. 标的键形归一为 prefix（``SH600036``）：表里是裸 6 位，持仓/自选侧是 prefix。
 5. **按桶过滤（P2-0 信号桶隔离）**：表里同日多模型按
    ``feature_version='script_v1_<模型桶>'`` 并存，旧口径混读会把观察期挑战者
@@ -58,9 +65,23 @@ SYMBOL_COUNT_KEY = (
     "CASE WHEN symbol ~ '^[0-9]{6}[.](SH|SZ|BJ)$' THEN left(symbol, 6) ELSE symbol END"
 )
 
+#: 打分去重用的标的归一表达式：在 :data:`SYMBOL_COUNT_KEY` 之上再折「前缀形」
+#: （``SH600036`` → ``600036``）。覆盖计数与打分去重必须用**同一个归一键**，否则
+#: 「覆盖充分」的判据与「取哪一行」的口径不一致。前缀形自 2026-10-09 起进入本表
+#: （自定义市场/CUSTOM 桶走 prefix），不折就会与裸码行并成两只、且去重时按字面序
+#: 挑行。**跨模块共享**（stock_terminal 同一表达式内联在 4 条 SQL 里）。
+SYMBOL_FOLD_KEY = (
+    "CASE WHEN symbol ~ '^[0-9]{6}[.](SH|SZ|BJ)$' THEN left(symbol, 6) "
+    "WHEN symbol ~ '^(SH|SZ|BJ)[0-9]{6}$' THEN substr(symbol, 3, 6) "
+    "ELSE symbol END"
+)
+
+#: A 股市场口径谓词（**唯一出处**）：可空列 + 自定义市场别名。见模块 docstring 第 3 条。
+A_SHARE_MARKET_SQL = "(market IS NULL OR market IN ('CN','CUSTOM'))"
+
 SQL_LATEST_COVERED_DATE_TMPL = (
     "SELECT trade_date FROM engine_signal_scores "
-    "WHERE tenant_id = :tid AND (market IS NULL OR market = 'CN') {bucket}"
+    f"WHERE tenant_id = :tid AND {A_SHARE_MARKET_SQL} {{bucket}}"
     "GROUP BY trade_date HAVING COUNT(DISTINCT {sym_key}) >= :min_cov "
     "ORDER BY trade_date DESC LIMIT 1"
 )
@@ -68,21 +89,21 @@ SQL_LATEST_COVERED_DATE_TMPL = (
 _CN_PREFIX_RE = re.compile(r"^(SH|SZ|BJ)\d{6}$")
 
 #: 三条 SQL 的模板：``{bucket}`` 占位在 ``_BUCKET_SQL`` 渲染时带上「前导 AND +
-#: 尾随空格」。仅覆盖日模板的 DISTINCT 计数带市场段折叠（T4-1 审计 M2，见
-#: ``SYMBOL_COUNT_KEY``——该表达式含正则量词 ``{6}``，必须经 ``{sym_key}``
-#: 占位传入：str.format 不重扫替换值，内联进模板则会被当替换字段报错）；
-#: 其余两条与旧口径逐字节相同。
+#: 尾随空格」。``{sym_key}`` 是**标的归一键**（覆盖日模板用 :data:`SYMBOL_COUNT_KEY`、
+#: 打分模板用 :data:`SYMBOL_FOLD_KEY`）——该表达式含正则量词 ``{6}``，必须经
+#: ``{sym_key}`` 占位传入：str.format 不重扫替换值，内联进模板则会被当替换字段报错。
+#: 市场口径统一走 :data:`A_SHARE_MARKET_SQL`（f-string 内联，非 format 占位）。
 SQL_LATEST_ANY_DATE_TMPL = (
     "SELECT trade_date FROM engine_signal_scores "
-    "WHERE tenant_id = :tid AND (market IS NULL OR market = 'CN') {bucket}"
+    f"WHERE tenant_id = :tid AND {A_SHARE_MARKET_SQL} {{bucket}}"
     "GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1"
 )
 
 SQL_SCORES_BY_DATE_TMPL = (
-    "SELECT DISTINCT ON (symbol) symbol, fusion_score, signal_side, source, trade_date "
+    "SELECT DISTINCT ON ({sym_key}) symbol, fusion_score, signal_side, source, trade_date "
     "FROM engine_signal_scores "
-    "WHERE tenant_id = :tid AND trade_date = :d AND (market IS NULL OR market = 'CN') {bucket}"
-    "ORDER BY symbol, created_at DESC, id DESC"
+    f"WHERE tenant_id = :tid AND trade_date = :d AND {A_SHARE_MARKET_SQL} {{bucket}}"
+    "ORDER BY {sym_key}, created_at DESC, id DESC"
 )
 
 #: 桶过滤子句（enforce/shadow 按桶取数用；前导 AND + 尾随空格由这里携带）
@@ -93,7 +114,7 @@ SQL_LATEST_COVERED_DATE = SQL_LATEST_COVERED_DATE_TMPL.format(
     bucket="", sym_key=SYMBOL_COUNT_KEY
 )
 SQL_LATEST_ANY_DATE = SQL_LATEST_ANY_DATE_TMPL.format(bucket="")
-SQL_SCORES_BY_DATE = SQL_SCORES_BY_DATE_TMPL.format(bucket="")
+SQL_SCORES_BY_DATE = SQL_SCORES_BY_DATE_TMPL.format(bucket="", sym_key=SYMBOL_FOLD_KEY)
 
 
 def score_freq_of(source: Any) -> str:
@@ -191,7 +212,9 @@ async def _fetch_snapshot(
         return None, [], fallback
     rows = (
         await session.execute(
-            text(SQL_SCORES_BY_DATE_TMPL.format(bucket=clause)),
+            text(
+                SQL_SCORES_BY_DATE_TMPL.format(bucket=clause, sym_key=SYMBOL_FOLD_KEY)
+            ),
             {"tid": tenant_id, "d": d0, **({"bucket": bucket} if bucket else {})},
         )
     ).fetchall()

@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 from backend.shared.signal_scores import (
+    A_SHARE_MARKET_SQL,
     MIN_SIGNAL_COVERAGE,
     SQL_LATEST_ANY_DATE,
     SQL_LATEST_COVERED_DATE,
     SQL_SCORES_BY_DATE,
+    SYMBOL_FOLD_KEY,
     build_score_map,
     normalize_a_share_symbol,
     score_freq_of,
@@ -130,9 +132,13 @@ class TestScoreFreqOf:
 
 class TestSqlConstants:
     def test_market_predicate_tolerates_null_market(self):
-        # 老库 market 列未回填；裸 `market = 'CN'` 会把 CN 行整片查空（静默）
+        # 老库 market 列未回填；裸 `market = 'CN'` 会把 CN 行整片查空（静默）。
+        # 且 `'CUSTOM'`（自定义市场，a_share 适配器 + SSE 日历 + SH000300 基准构建，
+        # 落库 symbol 100% A 股形态）必须与 'CN' 同等对待 —— 2026-10-13 全市场带
+        # BUY/SELL 的行**只**存在于 CUSTOM 桶，漏掉它候选信号列表整片为空。
         for sql in (SQL_LATEST_COVERED_DATE, SQL_LATEST_ANY_DATE, SQL_SCORES_BY_DATE):
-            assert "market IS NULL OR market = 'CN'" in sql
+            assert A_SHARE_MARKET_SQL in sql
+            assert "'CUSTOM'" in sql
 
     def test_coverage_threshold_is_bound_not_inlined(self):
         assert ":min_cov" in SQL_LATEST_COVERED_DATE
@@ -147,5 +153,13 @@ class TestSqlConstants:
         assert "left(symbol, 6)" in SQL_LATEST_COVERED_DATE
 
     def test_scores_query_picks_latest_row_per_symbol(self):
-        assert "DISTINCT ON (symbol)" in SQL_SCORES_BY_DATE
+        # 去重键必须折到裸六位（SYMBOL_FOLD_KEY），不能按字面 symbol：前缀形排序恒在
+        # 数字形之后，Python 侧「后写覆盖」会等价于「前缀形恒胜」，与 created_at 无关。
+        assert SYMBOL_FOLD_KEY in SQL_SCORES_BY_DATE
+        assert "DISTINCT ON (symbol)" not in SQL_SCORES_BY_DATE
         assert "created_at DESC" in SQL_SCORES_BY_DATE
+
+    def test_scores_query_folds_prefix_form_too(self):
+        # 前缀形（'SH600036'）也要折——它是自定义市场桶的唯一写法
+        assert "substr(symbol, 3, 6)" in SYMBOL_FOLD_KEY
+        assert "^(SH|SZ|BJ)[0-9]{6}$" in SYMBOL_FOLD_KEY

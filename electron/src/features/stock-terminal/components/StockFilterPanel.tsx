@@ -6,6 +6,7 @@ import { Select } from 'antd';
 
 // 概念板块限宽 200px（网格列约束）+ 选中项省略号，避免长概念名把后面控件挤在一起
 import { stockTerminalService } from '../services/stockTerminalService';
+import type { StockModelOption } from '../types';
 import { MarketCalendarFilter } from './MarketCalendarFilter';
 import { EXCLUDE_ON } from '../riskModel';
 // 展示面口径：signal_side 只说「靠前/靠后/居中」（见 features/shared/signalVocabulary.ts）
@@ -71,7 +72,7 @@ interface Props {
   onChange: (f: ListFilters) => void;
   total: number;        // 筛选后数量（已选条件的命中数）
   fullTotal: number;    // 全市场数量
-  models?: { model_id: string; display_name?: string }[];  // 真实模型（值用 model_id，标签用显示名）
+  models?: StockModelOption[];  // 真实模型（值用 model_id，标签用显示名；has_signals_30d 用于弱化标注）
   /** 左侧列内嵌模式：筛选网格 2 列紧凑排布 */
   compact?: boolean;
   /** 各条件下拉选项命中数（由父级统计），如 { board: {沪市主板: 1500}, capTier: {中盘: 800} } */
@@ -226,7 +227,12 @@ export function StockFilterPanel({ filters, onChange, total, fullTotal, models: 
         )}
         <Select allowClear showSearch size="small" placeholder="推理模型" value={filters.model || undefined}
           optionFilterProp="label" onChange={v => set({ model: v })}
-          options={modelOptions.map(m => ({ label: m.display_name || m.model_id, value: m.model_id }))} />
+          options={modelOptions.map(m => ({
+            // `has_signals_30d=false`（上游推理近 30 天没产出该模型的分）只在文案上加弱化后缀，
+            // 让它仍然可选 —— 用户要能一眼分清「这款没信号」和「界面漏了」。老后端无此字段 → 不加。
+            label: `${m.display_name || m.model_id}${m.has_signals_30d === false ? ' · 近 30 天无信号' : ''}`,
+            value: m.model_id,
+          }))} />
         {extraRight && <div className="flex items-center justify-end min-w-0">{extraRight}</div>}
       </div>
 

@@ -113,6 +113,18 @@ export interface KlineSplitsEvent {
   ratio: number | null;
 }
 
+/** 推理模型下拉选项（`/stock-terminal/list` 的 `models`，值用 model_id、标签用 display_name） */
+export interface StockModelOption {
+  model_id: string;
+  display_name?: string;
+  /**
+   * 近 30 天是否有打分行（后端按 `MAX(e.trade_date) >= 最新分日 − 30d` 判定）。
+   * 上游批量推理失败时某些模型会静默停更——把事实带到下拉框，用户才分得清
+   * 「这款没信号」和「界面漏了」。老后端无此字段 → undefined，按「未知」渲染。
+   */
+  has_signals_30d?: boolean;
+}
+
 export interface StockListResponse {
   total: number;
   page: number;
@@ -121,11 +133,18 @@ export interface StockListResponse {
   signal_date?: string;
   /** 本日分数里有多少只是盘中实时分（0 = 整页都是日频降级分；老后端无此字段） */
   realtime_rows?: number | null;
+  /**
+   * 基准信号日**过滤前**的分数行数（`engine_signal_scores` 当日命中只数）。
+   * 与 `total` 的分工：「当日无信号」= signal_rows 为 0（上游推理没产出）；
+   * 「筛选命中 0」= signal_rows > 0 且 total 为 0（是筛选条件把行滤没了）。
+   * 老后端无此字段 → 空态只能退化为「当前条件下没有股票」。
+   */
+  signal_rows?: number;
   items: StockListItem[];
   /** 定位股票在当前排序中的名次（find_symbol 参数时返回，1-based；无分数为 null） */
   find_rank?: number | null;
   /** 推理模型选项（真实 model_id + display_name，供筛选下拉） */
-  models?: { model_id: string; display_name?: string }[];
+  models?: StockModelOption[];
   /** 筛选下拉选项命中数（with_counts=true 时返回），如 { board: {沪市主板: 1500}, model: {...} } */
   option_counts?: Record<string, Record<string, number>>;
   /** 列表内各列的取值集合（表头筛选选项），如 { board: [...], industry: [...], cap_tier: [...], trend: [...], side: [...] } */

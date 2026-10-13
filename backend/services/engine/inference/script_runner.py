@@ -2617,23 +2617,32 @@ class InferenceScriptRunner:
         # 而批次记录已写成 completed —— 表现为「推理成功但排名永远是空的」。
         from backend.shared.remote_quote_config import resolve_remote_quote_redis
 
+        # ⚠️ `db` 必须从解析结果取（`resolve_remote_quote_redis()` 第 4 元 =
+        # FREE_FEED_DB = 3）。此前解包成 `_db` 就丢弃、构造 client 时不传 `db=`，
+        # 于是 **连到错误的库**（默认 db0，实测空集）。写侧（tdx_aidata collector /
+        # worker / 席位 / 桥）全部落 db3，读 db0 恒查空 —— 表现为「键名 100% 正确，
+        # 命中数恒为 0，expected_price 全 NULL」的静默失败。
+        # 同族消费方（remote_redis_source / manual_execution_service /
+        # real_trading_utils / simulation.redis_series_quote）均已正确透传 db。
         resolved = resolve_remote_quote_redis()
         redis_host = os.getenv("REMOTE_QUOTE_REDIS_HOST", "redis")
         redis_port = 6379
         redis_password = None
+        redis_db = int(os.getenv("REDIS_DB_MARKET") or "3")
         if resolved is not None:
-            redis_host, redis_port, redis_password, _db = resolved
+            redis_host, redis_port, redis_password, redis_db = resolved
         try:
             quote_redis = redis_lib.Redis(
                 host=redis_host,
                 port=redis_port,
                 password=redis_password,
+                db=redis_db,
                 decode_responses=True,
                 socket_timeout=2,
             )
             quote_redis.ping()
             logger.info(
-                f"[InferenceScriptRunner] 已连接行情 Redis: {redis_host}:{redis_port}"
+                f"[InferenceScriptRunner] 已连接行情 Redis: {redis_host}:{redis_port} db={redis_db}"
             )
         except Exception as redis_err:
             logger.warning(
@@ -2645,12 +2654,13 @@ class InferenceScriptRunner:
         #
         # 原实现是**两处逐行** `hget`：每只股票一次跨公网往返（实测 46 ms），
         # 3206 只 × 2 遍 ≈ 296 s —— 单任务 5 分 09 秒的 96% 耗在这里。
-        # 更糟的是键名 `stock:{code}.SH` 属**已退役命名空间**（远端 `stock:*` n=0，
-        # 写侧契约是 `market:snapshot:{prefix.lower()}`），所以这两遍查询
-        # 历史上从未取到过任何值（expected_price 全库 100% NULL）。
+        # 更糟的是键名 `stock:{code}.SH` 属**已退役命名空间**（写侧契约是
+        # `market:snapshot:{prefix.lower()}`），加上连接未透传 db（连到 db0，
+        # 写侧全落 db3）——两条错叠加，这两遍查询**历史上从未取到过任何值**
+        # （expected_price 全库 100% NULL）。
         #
-        # 现在：键构造统一走 `snapshot_key()`（唯一契约实现），
-        # 分片 pipeline 一次往返（实测 3206 键 ≈ 1.6 s，本地 ≈ 0.17 s），
+        # 现在：键构造统一走 `snapshot_key()`（唯一契约实现）+ 连接透传解析出的
+        # db=3，分片 pipeline 一次往返（实测 3206 键 ≈ 1.6 s，本地 ≈ 0.17 s），
         # 结果在 Step 2/Step 3 之间复用，不再重查。
         price_map = self._fetch_expected_prices(
             quote_redis,

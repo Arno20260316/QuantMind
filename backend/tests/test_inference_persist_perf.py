@@ -8,8 +8,9 @@
 3. 失效锁 `_INFER_PERSIST_LOCK` 已移除（进程内锁在 prefork 下无跨进程语义）。
 
 实测背景（容器内取证，见 docs/推理落库慢_与_成交台账双写_修复细案.md）：
-远端 `hget` 46 ms × 3206 只 × 2 遍 ≈ 296 s；`stock:*` 远端 n=0 而
-`market:snapshot:*` n=6553，故两遍查询历史上从未取到任何值。
+远端 `hget` 46 ms × 3206 只 × 2 遍 ≈ 296 s；键名错（`stock:*` 远端 n=0）**叠加**
+连接漏传 db（连到 db0，写侧全落 db3），故两遍查询历史上从未取到任何值。两条
+都必须钉住——只修键名仍会因 db 错而恒查空（2026-10-13 补测证实）。
 """
 
 from __future__ import annotations
@@ -133,6 +134,36 @@ def test_fetch_expected_prices_skips_unrecognizable_symbols():
     # snapshot_key("00700.HK") → market:snapshot:0700.hk（大写后缀式，非 A 股契约）；
     # 该形态不在候选内，键面必须仍是 market:snapshot:*，且不含 stock:
     assert all(k.startswith("market:snapshot:") for k in redis.issued_keys)
+
+
+@pytest.mark.unit
+def test_quote_redis_connection_passes_resolved_db(monkeypatch):
+    """行情连接必须透传解析出的 ``db``。
+
+    写侧（tdx_aidata collector/worker、能力席位、桥）全部落 db3；连接漏传
+    ``db=`` 会连到默认 db0（实测空集）→ 键名再对也恒查空。这是与「错键名」
+    并列的第二条静默失败根因，必须有测试钉住。
+    """
+    from backend.shared import regime_daily_store, remote_quote_config
+
+    monkeypatch.setattr(regime_daily_store, "load_day_state", lambda *a, **k: None)
+    monkeypatch.setattr(
+        remote_quote_config,
+        "resolve_remote_quote_redis",
+        lambda: ("quote-host", 6379, "pw", 3),
+    )
+    captured: dict = {}
+
+    class _CapturingRedis:
+        def __init__(self, *a, **k):
+            captured.update(k)
+            raise RuntimeError("captured — stop before ping")
+
+    monkeypatch.setattr("redis.Redis", _CapturingRedis)
+    _persist(_RecordingSession(probe_rows=[]))
+
+    assert captured.get("host") == "quote-host"
+    assert captured.get("db") == 3, "行情连接必须落写侧同一个 db（漏传 → db0 恒查空）"
 
 
 # ── 2. 保留期：存在性探针短路 ────────────────────────────────────────

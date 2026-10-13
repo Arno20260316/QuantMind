@@ -217,8 +217,21 @@ class CnExchange(Exchange):
             order, trade_account=trade_account, position=position, dealt_order_amount=dealt_order_amount
         )
 
-        # Log trade if it was executed and backtest_id is provided
-        if self.redis_client and trade_val > 0:
+        # 只记**真实成交**：`trade_account` 非空才写台账流水。
+        #
+        # 为什么必须区分（2026-10-13 复现证实）：`deal_order` 在一步回测里会被
+        # 调多次，其中**只有一次是真实成交**——
+        #   1) `TopkDropoutStrategy.generate_trade_decision`（signal_strategy.py:258）
+        #      对每个**卖单**调 `deal_order(sell_order, position=current_temp)`，
+        #      用 deepcopy 的持仓估算「可动用现金」——这不是成交；
+        #   2) `SimulatorExecutor._collect_data`（executor.py:604）才用
+        #      `trade_account=self.trade_account` 真正撮合。
+        # 买入腿不调 `deal_order`（只 get_deal_price/get_factor），所以旧实现在
+        # 线上只把**卖单**写了两遍（52 键 8.1 万行里 2.5 万重复，方向分布
+        # {'sell': 24940}，买组 0，两份仅 timestamp 差 ~8 ms）。
+        # 下游 `RiskAnalyzer._deduplicate_trades` 一直在替它擦屁股——
+        # 那是兜底，不该是主防线。
+        if self.redis_client and trade_val > 0 and trade_account is not None:
             try:
                 action = "buy" if order.direction == OrderDir.BUY else "sell"
                 trade_record = {

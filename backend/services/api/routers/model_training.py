@@ -1554,8 +1554,12 @@ async def trigger_backfill(
         appended = 0
         failed = 0
         logs: list[str] = []
-        # runner 成功日的真实分数，循环结束后一次性合并进 pred.parquet
-        pred_signals: list[tuple[str, list[dict]]] = []
+        # runner 成功日的真实分数：**逐日**合并进 pred.parquet（同日幂等 upsert）。
+        #
+        # 原实现把各日分数累积在内存、循环结束后才一次性合并——中途重启/杀进程
+        # 则已算完的天数全部丢失（pred.parquet 不动，coverage 缺口仍在，前端表现
+        # 为「跑了很久，缺口没变」）。逐日落盘后，重跑只补剩余缺口。
+        merged_days = 0
         try:
             storage_path = str(model.get("storage_path") or "")
             parquet_file = next(
@@ -1563,15 +1567,24 @@ async def trigger_backfill(
             )
             if not parquet_file:
                 parquet_file = Path(storage_path) / "pred.parquet"
+
+            def _merge_day(day: str, signals: list[dict]) -> int:
+                """把单日真实分数合并进 pred.parquet（线程池内同步执行）。"""
+                if parquet_file is None or not signals:
+                    return 0
+                return _merge_runner_signals_into_pred(parquet_file, [(day, signals)])
+
             for idx, d in enumerate(gaps):
                 try:
                     _backfill_tasks[task_id]["progress"] = int(
                         (idx + 1) / len(gaps) * 100
                     )
                     _backfill_tasks[task_id]["logs"] = "\n".join(logs[-50:])
-                    # 优先通过 InferenceScriptRunner 真实推理（Ubuntu /data/quantdb）
-                    # 若 runner 不可用或失败则回退到模板复制
-                    executed = False
+                    # 只走 InferenceScriptRunner 真实推理（Ubuntu /data/quantdb）。
+                    # 曾经的「runner 失败 → 复制上一日 parquet 行、只改 trade_date
+                    # 重标」兜底已删除：那是拿旧分数冒充新日分数，属数据完整性问题，
+                    # 且会让 coverage 缺口假性消除。失败日如实记 failed。
+                    result = None
                     try:
                         runner = InferenceScriptRunner(
                             primary_model_dir=str(Path(storage_path)),
@@ -1596,18 +1609,34 @@ async def trigger_backfill(
                             result = await loop.run_in_executor(pool, _sync_run)
                         if getattr(result, "success", False):
                             appended += 1
-                            logs.append(
-                                f"{d} 推理完成（runner {result.signals_count} 行）"
-                            )
-                            executed = True
-                            pred_signals.append(
-                                (d, list(getattr(result, "signals", None) or []))
-                            )
+                            _day_signals = list(getattr(result, "signals", None) or [])
+                            try:
+                                with concurrent.futures.ThreadPoolExecutor(
+                                    max_workers=1
+                                ) as pool:
+                                    merged_rows = await loop.run_in_executor(
+                                        pool, _merge_day, d, _day_signals
+                                    )
+                                merged_days += 1
+                                logs.append(
+                                    f"{d} 推理完成（runner {result.signals_count} 行，"
+                                    f"已合并 pred {merged_rows} 行）"
+                                )
+                            except Exception as merge_exc:  # noqa: BLE001
+                                logs.append(f"{d} 推理完成但 pred 合并失败: {merge_exc}")
+                                logger.warning(
+                                    "backfill %s %s merge pred failed: %s",
+                                    model_id,
+                                    d,
+                                    merge_exc,
+                                )
                         else:
+                            failed += 1
                             logs.append(
                                 f"{d} runner 失败: {getattr(result, 'error', '')}"
                             )
                     except Exception as exc:
+                        failed += 1
                         logs.append(f"{d} runner 异常: {exc}")
                         result = None
                     # runner 失败时落 run 终态，避免 run 记录悬空（此前失败日
@@ -1645,48 +1674,6 @@ async def trigger_backfill(
                                 )
                         except Exception:
                             pass
-                    if not executed:
-                        import duckdb
-                        import pandas as pd
-
-                        con = duckdb.connect()
-                        try:
-                            last_date = (
-                                _read_pred_dates(parquet_file)[-1]
-                                if parquet_file.is_file()
-                                else None
-                            )
-                            if last_date:
-                                df = con.execute(
-                                    f"SELECT * FROM read_parquet('{str(parquet_file)}') WHERE CAST(trade_date AS VARCHAR) = '{last_date}'"
-                                ).df()
-                                if not df.empty:
-                                    df["trade_date"] = pd.Timestamp(d)
-                                    existing = con.execute(
-                                        f"SELECT * FROM read_parquet('{str(parquet_file)}')"
-                                    ).df()
-                                    combined = pd.concat(
-                                        [existing, df], ignore_index=True
-                                    )
-                                    combined = combined.drop_duplicates(
-                                        subset=["symbol", "trade_date"], keep="last"
-                                    )
-                                    combined.to_parquet(str(parquet_file), index=False)
-                                    appended += 1
-                                    logs.append(
-                                        f"{d} 推理完成（模板复制 {len(df)} 行）"
-                                    )
-                                else:
-                                    failed += 1
-                                    logs.append(f"{d} 跳过：模板日无数据")
-                            else:
-                                failed += 1
-                                logs.append(f"{d} 失败：无模板日且 runner 未成功")
-                        finally:
-                            try:
-                                con.close()
-                            except Exception:
-                                pass
                     await asyncio.sleep(0.05)
                 except Exception as exc:
                     failed += 1
@@ -1700,20 +1687,6 @@ async def trigger_backfill(
                         "failed": failed,
                     }
                 )
-            # 循环结束后一次性把 runner 真实分数合并进 pred.parquet：
-            # coverage 缺口判定与个股分数曲线均读 pred.parquet，不回写则
-            # 补全"成功"后前端缺口永远不消除
-            if pred_signals and parquet_file is not None:
-                try:
-                    merged = _merge_runner_signals_into_pred(parquet_file, pred_signals)
-                    logs.append(
-                        f"pred.parquet 已合并 {merged} 行（{len(pred_signals)} 日）"
-                    )
-                except Exception as exc:
-                    logs.append(f"pred.parquet 合并失败: {exc}")
-                    logger.warning(
-                        "backfill %s merge pred.parquet failed: %s", model_id, exc
-                    )
             if failed:
                 # 部分成功标 partial（非笼统 failed）：成功日已可用，
                 # 失败明细（多为数据未产出）附在 error 供前端展示
@@ -1723,6 +1696,7 @@ async def trigger_backfill(
                         "progress": 100,
                         "logs": "\n".join(logs[-200:]),
                         "appended": appended,
+                        "merged_days": merged_days,
                         "failed": failed,
                         "error": (
                             f"{appended}/{len(gaps)} 日补全成功，{failed} 日失败："
@@ -1739,6 +1713,7 @@ async def trigger_backfill(
                         "progress": 100,
                         "logs": "\n".join(logs[-200:]),
                         "appended": appended,
+                        "merged_days": merged_days,
                         "failed": 0,
                     }
                 )

@@ -85,11 +85,14 @@ from backend.shared.training_runtime import rebase_container_path, repo_root_dir
 
 logger = logging.getLogger(__name__)
 
-# 并发推理时，多个 worker 会同时执行 _persist_and_publish 写 engine_signal_scores
-# （DELETE 历史 + DELETE 当日 + INSERT 大量行）。并发写同一张表会触发 PostgreSQL
-# 锁竞争，导致 worker 卡死。用模块级锁把写库串行化：推理子进程仍并发执行，
-# 只有最终写库串行，既保留加速又避免锁冲突。
-_INFER_PERSIST_LOCK = __import__("threading").Lock()
+# 写库并发控制：**不在本模块做**。
+#
+# 曾有一个模块级 ``threading.Lock()``（`_INFER_PERSIST_LOCK`）号称「把写库串行化」。
+# 它是**进程内**锁，而 Celery 是 ``--concurrency=4`` prefork（多个 fork 各持一把），
+# 对「多 worker 并发写同一张表」零保护；且写库内是纯 asyncpg 同步会话，
+# 单进程内本就无并发。真正防同日同模型重复推理的是 Redis 锁
+# （``backend.shared.inference_lock``，见 ``execute()``），跨进程有效。
+# 保留此说明以防有人再加一把无效锁。
 
 
 def _resolve_quantdb_data_dir() -> str:
@@ -2089,29 +2092,28 @@ class InferenceScriptRunner:
 
         db = SessionLocal()
         try:
-            with _INFER_PERSIST_LOCK:
-                self._persist_locked(
-                    db=db,
-                    run_id=run_id,
-                    prediction_trade_date=prediction_trade_date,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    signals=signals,
-                    symbols=symbols,
-                    scores=scores,
-                    consensus_list=consensus_list,
-                    zfusion_list=zfusion_list,
-                    detail_list=detail_list,
-                    confidence_list=confidence_list,
-                    feature_dim=feature_dim,
-                    model_name=model_name,
-                    feature_version=feature_version,
-                    inference_date=inference_date,
-                    signal_sides=signal_sides,
-                    raw_symbols=raw_symbols,
-                    partial=partial,
-                    market=market,
-                )
+            self._persist_locked(
+                db=db,
+                run_id=run_id,
+                prediction_trade_date=prediction_trade_date,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                signals=signals,
+                symbols=symbols,
+                scores=scores,
+                consensus_list=consensus_list,
+                zfusion_list=zfusion_list,
+                detail_list=detail_list,
+                confidence_list=confidence_list,
+                feature_dim=feature_dim,
+                model_name=model_name,
+                feature_version=feature_version,
+                inference_date=inference_date,
+                signal_sides=signal_sides,
+                raw_symbols=raw_symbols,
+                partial=partial,
+                market=market,
+            )
             # 信号落库后：按当日截面算 position_score（凯利仓位建议）写回 quality JSONB。
             # 失败不影响主流程（信号已落库），仅告警。
             try:
@@ -2264,6 +2266,89 @@ class InferenceScriptRunner:
 
         return True
 
+    #: 行情取价 pipeline 分片大小（与 realtime_service._default_snapshots 同口径）
+    _QUOTE_CHUNK = 200
+
+    @classmethod
+    def _fetch_expected_prices(
+        cls,
+        quote_redis,
+        symbols: list[str],
+        raw_symbols: list[str] | None = None,
+    ) -> dict[str, float | None]:
+        """一次 pipeline 批量取现价 → ``{归一 symbol: 现价}``（取不到的不入表）。
+
+        - 键构造走 ``decision_context_source.snapshot_key()``（唯一契约实现，
+          ``market:snapshot:{prefix.lower()}``）——**不要**再手拼 ``stock:{code}.SH``，
+          那是已退役命名空间（远端 n=0，静默全空）。
+        - 分片 ``pipeline(transaction=False)``，每片一次往返（不比逐键慢，且避免
+          跨公网时延摊销到每一只）。
+        - 连接不可用 / 取数异常一律 WARNING 留痕并返回空表（诚实缺失，不是 0）；
+          调用方据此把 ``expected_price`` 写成 NULL。
+        """
+        if not quote_redis or not symbols:
+            return {}
+        from backend.shared.decision_context_source import snapshot_key
+
+        # 归一 symbol → 查询键：优先用 raw_symbols（保留原始市场前缀），
+        # raw_symbols 缺失或同形时回落到归一 symbol 本身。
+        key_for: dict[str, str] = {}
+        for idx, sym in enumerate(symbols):
+            raw = raw_symbols[idx] if raw_symbols and idx < len(raw_symbols) else sym
+            key = snapshot_key(raw)
+            if key is None:
+                key = snapshot_key(sym)
+            if key is not None:
+                key_for[sym] = key
+        if not key_for:
+            return {}
+
+        items = list(key_for.items())
+        out: dict[str, float | None] = {}
+        try:
+            for start in range(0, len(items), cls._QUOTE_CHUNK):
+                chunk = items[start : start + cls._QUOTE_CHUNK]
+                pipe = quote_redis.pipeline(transaction=False)
+                for _sym, key in chunk:
+                    pipe.hget(key, "Now")
+                for (sym, _key), raw_price in zip(
+                    chunk, pipe.execute(), strict=False
+                ):
+                    if raw_price is None or raw_price == "":
+                        continue
+                    try:
+                        out[sym] = float(raw_price)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[InferenceScriptRunner] 批量取价失败（expected_price 写 NULL）: %s", exc
+            )
+            return out
+        logger.info(
+            "[InferenceScriptRunner] 批量取价：请求 %d 只，命中 %d 只",
+            len(items),
+            len(out),
+        )
+        return out
+
+    @staticmethod
+    def _retention_rows_exist(db, probe_sql: str, params: dict) -> bool:
+        """保留期 DELETE 的存在性探针。
+
+        探头 SQL 必须形如 ``SELECT 1 ... LIMIT 1`` 且与随后的 DELETE 谓词一致：
+        走唯一索引取一行（实测 ~0.3 ms），未命中即短路，避免为一次注定空转的
+        删除执行全表顺序扫。探针本身失败时**保守返回 True**（宁可白跑一次
+        DELETE，也不能因探针故障跳过本该执行的清理）。
+        """
+        try:
+            return db.execute(text(probe_sql), params).fetchone() is not None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[InferenceScriptRunner] 保留期探针失败，退化为直接 DELETE: %s", exc
+            )
+            return True
+
     def _persist_locked(
         self,
         *,
@@ -2288,50 +2373,95 @@ class InferenceScriptRunner:
         partial: bool = False,
         market: str | None = None,
     ) -> None:
-        """写库逻辑（在 _INFER_PERSIST_LOCK 保护下执行）。
+        """单次推理的写库事务（DELETE 旧 run + INSERT 分数 + 候选池快照）。
 
-        并发推理时多个 worker 会同时写 engine_signal_scores / engine_feature_runs /
-        qm_research_candidate_snapshot。PostgreSQL 对并发 DELETE+INSERT 大量行会
-        发生锁竞争甚至卡死，因此把整个写库串行化。推理子进程仍并发执行，仅写库串行。
+        并发控制：同日同模型的全市场推理由 Redis 锁（``inference_lock``）在
+        ``execute()`` 层互斥，跨进程有效；调用方不再持进程内锁（见文件头说明）。
         """
         prediction_day = date.fromisoformat(prediction_trade_date)
         retention_floor = (
             prediction_day - timedelta(days=max(1, _PREDICTION_RETENTION_DAYS))
         ).isoformat()
 
-        # ── Step 0.1: 清理超出保留期的历史数据（默认 30 天）────────────
-        db.execute(
-            text("""
-                DELETE FROM engine_signal_scores
-                WHERE tenant_id = :tenant_id
-                  AND user_id = :user_id
-                  AND model_version = 'inference_script'
-                  AND feature_version = :feature_version
-                  AND trade_date < :retention_floor
-            """),
+        # ── Step 0.1: 清理超出保留期的历史数据 ────────────────────────────
+        #
+        # 保留期天数见 `_PREDICTION_RETENTION_DAYS`（env `INFERENCE_PREDICTION_RETENTION_DAYS`）。
+        #
+        # 实测（2026-10-13）：这份 DELETE 在默认 730 天下**恒不命中**
+        # （最老数据 2024-08 距今不足 730 天），却每次付一次全表 Parallel Seq Scan
+        # ——`Rows Removed by Filter: 4,805,733`，`shared read=1,159,372`，约 1.15 s/次。
+        # 现有 6 个索引无一覆盖 (tenant_id, user_id, model_version, feature_version,
+        # trade_date) 五元组，规划器只能顺序扫。
+        #
+        # 因此先跑一次索引友好的存在性探针（唯一索引 + LIMIT 1，实测 ~0.3 ms，
+        # Heap Fetches=0），未命中即整体短路——语义与逐条 DELETE 完全一致
+        # （不删任何行），只是不再为一次注定空转的删除付全表扫描。
+        if self._retention_rows_exist(
+            db,
+            """
+            SELECT 1 FROM engine_signal_scores
+            WHERE tenant_id = :tenant_id AND user_id = :user_id
+              AND model_version = 'inference_script'
+              AND feature_version = :feature_version
+              AND trade_date < :retention_floor
+            LIMIT 1
+            """,
             {
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "feature_version": feature_version,
                 "retention_floor": retention_floor,
             },
-        )
-        db.execute(
-            text("""
-                DELETE FROM engine_feature_runs
-                WHERE tenant_id = :tenant_id
-                  AND user_id = :user_id
-                  AND source = 'inference_script'
-                  AND feature_version = :feature_version
-                  AND trade_date < :retention_floor
-            """),
+        ):
+            db.execute(
+                text("""
+                    DELETE FROM engine_signal_scores
+                    WHERE tenant_id = :tenant_id
+                      AND user_id = :user_id
+                      AND model_version = 'inference_script'
+                      AND feature_version = :feature_version
+                      AND trade_date < :retention_floor
+                """),
+                {
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "feature_version": feature_version,
+                    "retention_floor": retention_floor,
+                },
+            )
+        if self._retention_rows_exist(
+            db,
+            """
+            SELECT 1 FROM engine_feature_runs
+            WHERE tenant_id = :tenant_id AND user_id = :user_id
+              AND source = 'inference_script'
+              AND feature_version = :feature_version
+              AND trade_date < :retention_floor
+            LIMIT 1
+            """,
             {
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "feature_version": feature_version,
                 "retention_floor": retention_floor,
             },
-        )
+        ):
+            db.execute(
+                text("""
+                    DELETE FROM engine_feature_runs
+                    WHERE tenant_id = :tenant_id
+                      AND user_id = :user_id
+                      AND source = 'inference_script'
+                      AND feature_version = :feature_version
+                      AND trade_date < :retention_floor
+                """),
+                {
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "feature_version": feature_version,
+                    "retention_floor": retention_floor,
+                },
+            )
 
         # ── Step 0.15: 登记运行记录（run → model 可追溯）───────────────
         #
@@ -2511,6 +2641,28 @@ class InferenceScriptRunner:
             )
             quote_redis = None
 
+        # 一次性批量取价（Step 2 与 Step 3 共用）。
+        #
+        # 原实现是**两处逐行** `hget`：每只股票一次跨公网往返（实测 46 ms），
+        # 3206 只 × 2 遍 ≈ 296 s —— 单任务 5 分 09 秒的 96% 耗在这里。
+        # 更糟的是键名 `stock:{code}.SH` 属**已退役命名空间**（远端 `stock:*` n=0，
+        # 写侧契约是 `market:snapshot:{prefix.lower()}`），所以这两遍查询
+        # 历史上从未取到过任何值（expected_price 全库 100% NULL）。
+        #
+        # 现在：键构造统一走 `snapshot_key()`（唯一契约实现），
+        # 分片 pipeline 一次往返（实测 3206 键 ≈ 1.6 s，本地 ≈ 0.17 s），
+        # 结果在 Step 2/Step 3 之间复用，不再重查。
+        price_map = self._fetch_expected_prices(
+            quote_redis,
+            symbols,
+            raw_symbols,
+        )
+        if quote_redis:
+            try:
+                quote_redis.close()
+            except Exception:
+                pass
+
         # 写入语义同 realtime_contract.mark_signal_ready（审计 M1 / T4-3）：
         # created_at 只在 INSERT 落 = 首次落库；DO UPDATE 只刷 signal_ts（真实最后
         # 写入）。判写侧活跃用 signal_ts，勿用 created_at（见 docs/
@@ -2547,7 +2699,7 @@ class InferenceScriptRunner:
         has_zfusion = zfusion_list is not None and len(zfusion_list) == len(symbols)
         has_detail = detail_list is not None and len(detail_list) == len(symbols)
         for idx, (sym, score) in enumerate(zip(symbols, scores, strict=True)):
-            expected_price = None
+            expected_price = price_map.get(sym)
             signal_side = signal_sides[idx]
             # 构建 quality JSONB
             quality_parts = {"consensus": consensus_list[idx]} if has_consensus else {}
@@ -2558,29 +2710,6 @@ class InferenceScriptRunner:
             if confidence_list is not None and idx < len(confidence_list) and confidence_list[idx] is not None:
                 quality_parts["confidence"] = round(float(confidence_list[idx]), 4)
             quality = json.dumps(quality_parts) if quality_parts else None
-            if quote_redis:
-                try:
-                    # symbols 已归一为纯数字，行情 Redis 查价需要原始
-                    # 市场前缀定位（stock:{code}.SH），raw_symbols 兜底原样
-                    raw_sym0 = raw_symbols[idx] if raw_symbols else sym
-                    raw_sym = (
-                        raw_sym0.replace("SH", "").replace("SZ", "").replace("BJ", "")
-                    )
-                    if raw_sym0.startswith("SH"):
-                        redis_key = f"stock:{raw_sym}.SH"
-                    elif raw_sym0.startswith("SZ"):
-                        redis_key = f"stock:{raw_sym}.SZ"
-                    elif raw_sym0.startswith("BJ") or raw_sym.startswith("920"):
-                        redis_key = f"stock:{raw_sym}.BJ"
-                    else:
-                        redis_key = f"stock:{raw_sym0}"
-                    now_price = quote_redis.hget(redis_key, "Now")
-                    if now_price:
-                        expected_price = float(now_price)
-                except Exception as e:
-                    logger.debug(
-                        f"[InferenceScriptRunner] 获取 {sym} 价格失败: {e}"
-                    )
             db.execute(
                 score_sql,
                 {
@@ -2601,11 +2730,6 @@ class InferenceScriptRunner:
                     "source": SOURCE_BATCH,
                 },
             )
-        if quote_redis:
-            try:
-                quote_redis.close()
-            except Exception:
-                pass
 
         # ── Step 3: 写入投研平台候选池快照 ────────────────────────────────
         db.execute(
@@ -2665,24 +2789,8 @@ class InferenceScriptRunner:
                 confidence_level = "watch"
             else:
                 confidence_level = "medium"
-            # 获取 expected_price（从之前 Redis 查询的结果）
-            expected_price_val = None
-            if quote_redis:
-                try:
-                    raw_sym = sym.replace("SH", "").replace("SZ", "").replace("BJ", "")
-                    if sym.startswith("SH"):
-                        redis_key = f"stock:{raw_sym}.SH"
-                    elif sym.startswith("SZ"):
-                        redis_key = f"stock:{raw_sym}.SZ"
-                    elif sym.startswith("BJ") or sym.startswith("920"):
-                        redis_key = f"stock:{raw_sym}.BJ"
-                    else:
-                        redis_key = f"stock:{sym}"
-                    now_price = quote_redis.hget(redis_key, "Now")
-                    if now_price:
-                        expected_price_val = float(now_price)
-                except Exception:
-                    pass
+            # expected_price 复用 Step 2 的批量取价结果（同一份 price_map，不再重查）
+            expected_price_val = price_map.get(sym)
             db.execute(
                 candidate_sql,
                 {

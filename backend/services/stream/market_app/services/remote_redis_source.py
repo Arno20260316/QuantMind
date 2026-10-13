@@ -43,6 +43,8 @@ class RemoteRedisDataSource(DataSourceAdapter):
         self._password = remote_quote_redis_password()
         self._db = remote_quote_redis_db()
         self._client: aioredis.Redis | None = None
+        # 远端行情 Redis 为上游只读总线；写入被拒时只告警一次，避免刷屏。
+        self._write_warned = False
 
     def _get_client(self) -> aioredis.Redis:
         if self._client is None:
@@ -302,7 +304,13 @@ class RemoteRedisDataSource(DataSourceAdapter):
                 await pipe.execute()
             return True
         except Exception as e:
-            logger.error(f"[RemoteRedis] 写入时序数据失败 {symbol}: {e}")
+            if not self._write_warned:
+                self._write_warned = True
+                logger.warning(
+                    "[RemoteRedis] 写入时序数据被拒（远端行情 Redis 应只读，"
+                    "后续不再重复告警）: %s",
+                    e,
+                )
             return False
 
     async def fetch_symbols(self, market: str | None = None) -> list[dict[str, Any]]:

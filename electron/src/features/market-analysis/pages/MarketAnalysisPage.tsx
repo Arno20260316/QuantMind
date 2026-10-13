@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Sparkles, Activity, Layers, Network, TrendingUp, Clock, RefreshCw, Zap } from 'lucide-react';
+import { Sparkles, Activity, Network, TrendingUp, Clock, RefreshCw, Zap } from 'lucide-react';
 import { DatePicker, message } from 'antd';
 import dayjs from 'dayjs';
 import { BroadMarketHeader, IndexItem } from '../components/BroadMarketHeader';
-import { ShenwanHeatmapChart } from '../components/ShenwanHeatmapChart';
+import { HeatmapDrillCard } from '../components/HeatmapDrillCard';
 import { StockMoneyFlowTable, StockMoneyFlowItem } from '../components/StockMoneyFlowTable';
 import { MarketBreadthCard } from '../components/MarketBreadthCard';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
@@ -393,17 +393,12 @@ export const MarketAnalysisPage: React.FC = () => {
                 </div>
               </div>
 
-              <div className="lg:col-span-7 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 border border-purple-100/80 shadow-md shadow-purple-500/5 flex flex-col min-h-0 justify-between">
-                <div className="flex items-center justify-between border-b border-purple-100/60 pb-2 mb-1 shrink-0">
-                  <h3 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
-                    <Layers className="w-3.5 h-3.5 text-purple-600" />
-                    <span>通达信二级分类热力矩形图谱</span>
-                  </h3>
-                  <span className="text-[10px] text-slate-400 font-mono">市值权重 vs 涨跌幅</span>
-                </div>
-                <div className="flex-1 min-h-0">
-                  <ShenwanHeatmapChart data={heatmapData} height="100%" />
-                </div>
+              <div className="lg:col-span-7 min-h-0">
+                <HeatmapDrillCard
+                  topItems={heatmapData}
+                  date={snapDate}
+                  onStockClick={(symbol, name) => openStockDetail({ symbol, name } as StockMoneyFlowItem)}
+                />
               </div>
             </div>
           )}

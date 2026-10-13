@@ -41,7 +41,24 @@ PERIOD_DAYS = {"1d": 1, "3d": 3, "5d": 5, "10d": 10, "20d": 20}
 # 板块分类 -> sector_concept 中的 SectorType
 # 注意：shenwan 必须用「行业板块(二级)」=通达信二级行业(标准 80 个)，与离线快照/官网一致；
 # 不要用「行业板块(一级)」(申万一级 48 个)，否则实时刷新与快照的板块归口不一致。
-CATEGORY_TYPE = {"shenwan": "行业板块(二级)", "concept": "概念板块"}
+# 键名 shenwan 为历史遗留（语义=通达信二级行业），前端已按此键取值，勿改动；
+# industry1 为一级行业下钻新增（无离线快照，走实时聚合兜底）。
+CATEGORY_TYPE = {
+    "shenwan": "行业板块(二级)",
+    "industry1": "行业板块(一级)",
+    "concept": "概念板块",
+}
+
+# 分类展示名（面包屑/标题文案唯一出处）
+CATEGORY_LABEL = {
+    "shenwan": "通达信二级行业",
+    "industry1": "通达信一级行业",
+    "concept": "概念板块",
+}
+
+# 个股下钻单板块最多渲染的矩形数（概念板块可达 1200+ 只，整图上屏会拖垮渲染）；
+# 超过则按市值降序取前 N，并在 summary.shown/total 中如实披露截断。
+MAX_DRILL_ITEMS = 300
 
 # 缓存 TTL（秒）：日级别分析数据设为 30 分钟，点击「市场分析」按钮时会主动清空
 _QUERY_TTL = 1800  # 资金流与市场指标聚合结果缓存 30 分钟
@@ -152,15 +169,18 @@ def _latest_l2_date() -> str | None:
     return str(int(df.iloc[0]["dt"]))
 
 
-def _market_pct_snapshot() -> tuple[str | None, pd.DataFrame]:
-    """最新交易日的全市场涨跌幅快照。
+def _market_pct_snapshot(
+    anchor: str | None = None,
+) -> tuple[str | None, pd.DataFrame]:
+    """指定交易日（默认最新）的全市场涨跌幅快照。
 
     官方 technical_indicators 常滞后一个分区（最新日可能只有少量行），
     此处用不复权收盘价 close_t / close_{t-1} - 1 自行推算兜底
     （仅除权除息个股有轻微偏差），官方指标可用处仍优先采用。
+    ``anchor`` 传 YYYYMMDD 可锚定历史交易日（下钻回溯用），None=最新交易日。
     返回 (trade_date, DataFrame[symbol, close, amount, pct_change])。
     """
-    latest = _latest_trade_date()
+    latest = str(anchor).zfill(8) if anchor else _latest_trade_date()
     if not latest:
         return None, pd.DataFrame()
     days = _trading_days(latest, 2)
@@ -784,6 +804,205 @@ def get_sector_heatmap(category: str = "shenwan") -> list[dict[str, Any]]:
         return items
 
     return _cached(f"heatmap_{category}", _QUERY_TTL, _load)
+
+
+def _load_valuation_mv(days: list[str]) -> pd.DataFrame:
+    """指定交易日的个股总市值（元）。days 降序，逐日回退取首个可用日。"""
+    if not days:
+        return pd.DataFrame()
+    df = _read_partitioned("5_technical_derived/valuation", days, "symbol, total_mv")
+    if df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["dt"] = df["dt"].astype(str)
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["total_mv"] = pd.to_numeric(df["total_mv"], errors="coerce")
+    df = df[df["total_mv"].notna() & (df["total_mv"] > 0)]
+    # 同一 symbol 多日出现时保留最新日（days 降序 → drop_duplicates 保留首行）
+    return df.drop_duplicates(subset=["symbol"], keep="first")
+
+
+def _clean_flow_rows(flow: pd.DataFrame) -> pd.DataFrame:
+    """剔除 L2 占位污染行（多只股票共享同一常量值=假数据）。
+
+    占位判定与 ``placeholder_symbols_by_dt`` 同判据，但只针对当前单日子集，
+    避免为了一次下钻而把整个窗口读进来。
+    """
+    if flow.empty:
+        return flow
+    bad = placeholder_symbols_by_dt(flow).get(str(flow["dt"].iloc[0]), set())
+    return flow[~flow["symbol"].isin(bad)]
+
+
+def get_sector_drill(
+    category: str = "shenwan",
+    name: str = "",
+    date: str | None = None,
+) -> dict[str, Any] | None:
+    """板块 → 成分个股热力矩形图（下钻）。
+
+    矩形面积=个股总市值（亿，与板块层同口径，父子面积自洽）；
+    颜色可由前端按 ``pct_change``（涨跌幅换挡）或 ``flow_net``（主力净额，元→亿）着色。
+    超过 :data:`MAX_DRILL_ITEMS` 的成分按市值降序截断，并在 ``summary`` 中如实披露。
+
+    找不到板块（名不存在/该体系无此板块）返回 ``None``；无行情数据的成分保留在
+    结果里（``pct_change=0``、``value`` 走成交额兜底），确保「板块有多少票就出多少图块」。
+    """
+    sector_name = str(name or "").strip()
+    if not sector_name or category not in CATEGORY_TYPE:
+        return None
+    target = _normalize_date(date)
+
+    def _load() -> dict[str, Any] | None:
+        if not _available():
+            return None
+
+        members = _sector_members()
+        if members.empty or "sector_type" not in members.columns:
+            return None
+        stype = CATEGORY_TYPE[category]
+        sub = members[
+            (members["sector_type"].astype(str) == stype)
+            & (members["sector_name"].astype(str).str.strip() == sector_name)
+        ]
+        if sub.empty:
+            return None
+        syms = sorted(
+            {str(s).strip() for s in sub["symbol"].astype(str) if str(s).strip()}
+        )
+        if not syms:
+            return None
+
+        trade_date, prices = _market_pct_snapshot(target)
+        if prices.empty:
+            # 涨跌幅快照缺失：仍产出成分（市值/名称可用），颜色退化为 0
+            prices = pd.DataFrame(columns=["symbol", "close", "amount", "pct_change"])
+            trade_date = target or _latest_trade_date()
+
+        ref = str(trade_date or target or _latest_trade_date() or "").zfill(8)
+        days = _trading_days(ref, 8) if ref else []
+
+        # 市值（元→亿）：优先参考日，缺失则向前回退到最近可用分区
+        mv = _load_valuation_mv(days)
+        mv_map: dict[str, float] = {}
+        if not mv.empty:
+            for r in mv.itertuples(index=False):
+                v = float(r.total_mv or 0.0)
+                mv_map[str(r.symbol)] = v if math.isfinite(v) else 0.0
+
+        # L2 主力净额（flow_super_net + flow_large_net，元→亿）：参考日单日
+        flow_map: dict[str, float] = {}
+        if ref:
+            for d in _l2_days(ref, 6):
+                fl = _read_partitioned(
+                    "6_ml_datasets/l2_factors",
+                    [d],
+                    "symbol, amount, flow_net_amount, flow_super_net, flow_large_net",
+                )
+                if fl.empty:
+                    continue
+                fl = _clean_flow_rows(fl)
+                if fl.empty:
+                    continue
+                # 逐日金额档位归一（元），与 flow_panorama/_with_derived 的「主力」口径一致
+                fl = normalize_l2_flow_money_to_yuan(fl)
+                for r in fl.itertuples(index=False):
+                    sym = str(r.symbol).strip()
+                    fv = _f(getattr(r, "flow_super_net", 0.0)) + _f(
+                        getattr(r, "flow_large_net", 0.0)
+                    )
+                    flow_map[sym] = fv
+                if flow_map:
+                    break
+
+        names = _instrument_names()
+        price_map: dict[str, dict[str, float]] = {}
+        for r in prices.itertuples(index=False):
+            price_map[str(r.symbol).strip()] = {
+                "pct_change": _f(getattr(r, "pct_change", 0.0)),
+                "amount": _f(getattr(r, "amount", 0.0)),
+            }
+
+        rows: list[dict[str, Any]] = []
+        for sym in syms:
+            p = price_map.get(sym)
+            pct = p["pct_change"] if p else 0.0
+            amount_wan = p["amount"] if p else 0.0
+            mv_yuan = mv_map.get(sym, 0.0)
+            val_yi = (
+                round(mv_yuan / 1e8, 2) if mv_yuan > 0 else round(amount_wan / 1e4, 2)
+            )
+            net_yuan = flow_map.get(sym, 0.0)
+            rows.append(
+                {
+                    "symbol": _normalize_prefix(sym),
+                    "name": names.get(sym, sym),
+                    "value": max(val_yi, 0.01),
+                    "pct_change": round(pct, 2),
+                    "flow_net": round(net_yuan / 1e8, 4),
+                    "is_leader": False,
+                }
+            )
+
+        total = len(rows)
+        rows.sort(key=lambda x: x["value"], reverse=True)
+        truncated = total > MAX_DRILL_ITEMS
+        if truncated:
+            rows = rows[:MAX_DRILL_ITEMS]
+        if rows:
+            rows[0]["is_leader"] = True
+
+        adv = sum(1 for r in rows if r["pct_change"] > 0)
+        dec = sum(1 for r in rows if r["pct_change"] < 0)
+        flat = len(rows) - adv - dec
+        avg_pct = (
+            round(sum(r["pct_change"] for r in rows) / len(rows), 2) if rows else 0.0
+        )
+        total_flow = round(sum(r["flow_net"] for r in rows), 2)
+
+        return {
+            "trade_date": _dash(ref),
+            "category": category,
+            "category_label": CATEGORY_LABEL.get(category, category),
+            "sector_name": sector_name,
+            "items": rows,
+            "summary": {
+                "total": total,
+                "shown": len(rows),
+                "truncated": truncated,
+                "advance": adv,
+                "decline": dec,
+                "flat": flat,
+                "avg_pct": avg_pct,
+                "total_flow_yi": total_flow,
+                "total_mv_yi": round(sum(r["value"] for r in rows), 1),
+            },
+        }
+
+    key = f"sector_drill_{category}_{sector_name}_{target or 'latest'}"
+    return _cached(key, _QUERY_TTL, _load)
+
+
+def _l2_days(end: str, n: int) -> list[str]:
+    """截至 end 的最近 n 个有 L2 数据的交易日（降序）。"""
+    dates = _get_partition_dates("6_ml_datasets/l2_factors")
+    if dates:
+        return [d for d in dates if d <= end][:n]
+    return []
+
+
+def _normalize_date(date: str | None) -> str | None:
+    """YYYY-MM-DD / YYYYMMDD → YYYYMMDD；非法输入返回 None。"""
+    if not date:
+        return None
+    s = str(date).strip().replace("-", "")
+    return s if len(s) == 8 and s.isdigit() else None
+
+
+def _dash(yyyymmdd: str | None) -> str:
+    """YYYYMMDD → YYYY-MM-DD（None/空 → 空串）。"""
+    s = str(yyyymmdd or "").zfill(8)
+    return f"{s[:4]}-{s[4:6]}-{s[6:]}" if len(s) == 8 and s.isdigit() else ""
 
 
 def get_indices_overview() -> list[dict[str, Any]]:

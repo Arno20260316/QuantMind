@@ -16,6 +16,8 @@ export interface SectorHeatmapItem {
   pct_change: number; // 涨跌幅 %
   leader?: string;
   leader_pct?: number;
+  /** 主力净额（亿）；仅下钻/按净额着色时有值 */
+  flow_net?: number;
 }
 
 interface SectorHeatmapChartProps {
@@ -23,15 +25,46 @@ interface SectorHeatmapChartProps {
   height?: number | string;
   /** 面积权重的量纲名（tooltip 文案），默认「市值权重规模」 */
   valueLabel?: string;
+  /** 点击色块回调（下钻入口）；不传则色块不可点 */
+  onItemClick?: (name: string) => void;
+  /** 逐块取色覆盖（如按主力净额着色）；不传则用内置涨跌幅档位色 */
+  colorOf?: (item: SectorHeatmapItem) => string;
+  /** 逐块标签数值文本覆盖（第二行）；不传则用 `+x.xx%` */
+  labelValueOf?: (item: SectorHeatmapItem) => string;
+  /** tooltip 内追加一行（下钻层显示主力净额）；返回空串则不显示 */
+  tooltipExtraOf?: (item: SectorHeatmapItem) => string;
+  /**
+   * 渲染键：当取色/标签口径变化（如切换「涨跌幅 ↔ 主力净额」）时，
+   * 调用方把该值一并改变即可触发重绘。回调函数一律走 ref 读取最新值，
+   * 因此不必在调用点用 useCallback 包裹，也不会因内联箭头函数导致图表重建。
+   */
+  renderKey?: string | number;
 }
 
 export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
   data,
   height = 460,
   valueLabel = '市值权重规模',
+  onItemClick,
+  colorOf,
+  labelValueOf,
+  tooltipExtraOf,
+  renderKey = '',
 }) => {
   const chartRef = useRef<HTMLDivElement>(null);
   const instanceRef = useRef<echarts.ECharts | null>(null);
+
+  // 回调一律经 ref 透传最新实现：既能避免内联函数触发重建，又保证点击/取色用的是最新闭包。
+  const onItemClickRef = useRef(onItemClick);
+  const colorOfRef = useRef(colorOf);
+  const labelValueOfRef = useRef(labelValueOf);
+  const tooltipExtraOfRef = useRef(tooltipExtraOf);
+  useEffect(() => {
+    onItemClickRef.current = onItemClick;
+    colorOfRef.current = colorOf;
+    labelValueOfRef.current = labelValueOf;
+    tooltipExtraOfRef.current = tooltipExtraOf;
+  });
 
   const sectorItems = data && data.length > 0 ? data : [];
 
@@ -55,9 +88,16 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
       pct_change: item.pct_change,
       leader: item.leader,
       leader_pct: item.leader_pct,
+      flow_net: (item as { flow_net?: number }).flow_net,
+      // 第二行标签文本：默认涨跌幅，下钻层可覆盖为「+x.xx亿」等
+      label_value:
+        labelValueOfRef.current?.(item) ??
+        `${item.pct_change >= 0 ? '+' : ''}${item.pct_change}%`,
       itemStyle: {
+        // 默认按涨跌幅档位着色；下钻层可传 colorOf 覆盖（按主力净额等）
         color:
-          item.pct_change > 2
+          colorOfRef.current?.(item) ??
+          (item.pct_change > 2
             ? '#ef4444'
             : item.pct_change > 0
             ? '#f87171'
@@ -65,7 +105,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
             ? '#94a3b8'
             : item.pct_change > -2
             ? '#34d399'
-            : '#10b981',
+            : '#10b981'),
       },
     }));
 
@@ -81,12 +121,26 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
           const pct = d.pct_change ?? 0;
           const color = pct >= 0 ? '#f87171' : '#34d399';
           const leaderText = d.leader ? `<div style="margin-top: 2px; color: #cbd5e1;">领涨龙头: <b>${d.leader} (${d.leader_pct >= 0 ? '+' : ''}${d.leader_pct}%)</b></div>` : '';
+          const extra = (() => {
+            const fn = tooltipExtraOfRef.current;
+            if (!fn) return '';
+            const raw = fn({
+              name: info.name,
+              value: cap,
+              pct_change: pct,
+              leader: d.leader,
+              leader_pct: d.leader_pct,
+              flow_net: d.flow_net,
+            } as SectorHeatmapItem);
+            return raw ? `<div style="margin-top: 2px;">${raw}</div>` : '';
+          })();
           return `
             <div style="font-family: sans-serif; font-size: 12px; padding: 2px 4px;">
               <div style="font-weight: bold; font-size: 13px; margin-bottom: 4px; border-bottom: 1px solid #475569; padding-bottom: 4px;">${info.name}</div>
               <div>${valueLabel}: <b>${cap} 亿</b></div>
               <div>平均涨跌幅: <span style="color: ${color}; font-weight: bold;">${pct >= 0 ? '+' : ''}${pct}%</span></div>
               ${leaderText}
+              ${extra}
             </div>
           `;
         },
@@ -105,8 +159,9 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
             show: true,
             formatter: (params: any) => {
               const d = params.data || {};
-              const pct = d.pct_change ?? 0;
-              return `{name|${params.name}}\n{pct|${pct >= 0 ? '+' : ''}${pct}%}`;
+              // label_value 由 formattedData 预计算（默认涨跌幅；下钻层可覆盖为净额）
+              const val = d.label_value ?? '';
+              return `{name|${params.name}}\n{pct|${val}}`;
             },
             rich: {
               name: {
@@ -135,6 +190,13 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
 
     // 第一遍渲染：确定每个色块的实际布局（treemap 布局只取决于 value，与 label padding 无关）
     chart.setOption(option);
+
+    // 点击色块 → 下钻（treemap 的 nodeClick 会吃掉原生 click，必须用 echarts 事件）
+    const handleClick = (params: any) => {
+      if (params?.componentType !== 'series' || !params?.name) return;
+      onItemClickRef.current?.(String(params.name));
+    };
+    chart.on('click', handleClick);
 
     // 第二遍渲染：按每个色块自身高度注入上下 padding，实现文字水平+垂直居中；
     // padding 在「盒高=色块高」的文本盒内生效：上下各留 (块高-文字高)/2，两行文本整体上下居中；
@@ -176,7 +238,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
       chart.dispose();
       instanceRef.current = null;
     };
-  }, [sectorItems, valueLabel]);
+  }, [sectorItems, valueLabel, renderKey]);
 
   if (sectorItems.length === 0) {
     return (
@@ -189,7 +251,13 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
     );
   }
 
-  return <div ref={chartRef} style={{ width: '100%', height }} className="w-full" />;
+  return (
+    <div
+      ref={chartRef}
+      style={{ width: '100%', height, cursor: onItemClick ? 'pointer' : 'default' }}
+      className="w-full"
+    />
+  );
 };
 
 // ---- 向后兼容别名（A 股/港股侧的历史命名，勿在新代码中使用） ----

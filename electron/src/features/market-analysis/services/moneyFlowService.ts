@@ -405,6 +405,69 @@ export async function getFlowStock(
   return flowGet<FlowStockDetailResponse>(`/money-flow/stock?${qs.toString()}`);
 }
 
+/** 热力矩形图下钻分类（与后端 /heatmap 的 category 一致；shenwan=通达信二级行业）。 */
+export type HeatmapDrillCategory = 'shenwan' | 'industry1' | 'concept';
+
+export interface HeatmapDrillItem {
+  symbol: string;
+  name: string;
+  /** 矩形面积规模（亿）：优先总市值，无估值时回落成交额 */
+  value: number;
+  pct_change: number;
+  /** 主力净额（亿）：flow_super_net + flow_large_net 当日值 */
+  flow_net: number;
+  is_leader: boolean;
+}
+
+export interface HeatmapDrillResponse {
+  trade_date: string;
+  category: HeatmapDrillCategory;
+  category_label: string;
+  sector_name: string;
+  items: HeatmapDrillItem[];
+  summary: {
+    total: number;
+    shown: number;
+    truncated: boolean;
+    advance: number;
+    decline: number;
+    flat: number;
+    avg_pct: number;
+    total_flow_yi: number;
+    total_mv_yi: number;
+  };
+}
+
+/** 板块 → 成分个股热力矩形图（下钻）；板块不存在时抛 MoneyFlowError(404)。 */
+export async function getHeatmapDrill(
+  params: { category?: HeatmapDrillCategory; name: string; date?: string },
+): Promise<HeatmapDrillResponse> {
+  const qs = new URLSearchParams({ name: params.name });
+  qs.set('category', params.category || 'shenwan');
+  if (params.date) qs.set('date', params.date);
+  return flowGet<HeatmapDrillResponse>(`/heatmap/drill?${qs.toString()}`);
+}
+
+export interface HeatmapTopItem {
+  name: string;
+  value: number;
+  pct_change: number;
+  leader?: string;
+  leader_pct?: number;
+}
+
+/** 板块层热力图（顶层）。realtime=true 跳过快照、直接读 QuantDB 全量
+ *  —— 快照对概念板块只存前 50，会让「概念」分类缺板块，实时全量才有完整 422 个。 */
+export async function getHeatmapTop(
+  params: { category?: HeatmapDrillCategory; date?: string; realtime?: boolean } = {},
+): Promise<HeatmapTopItem[]> {
+  const qs = new URLSearchParams({ category: params.category || 'shenwan' });
+  if (params.date) qs.set('date', params.date);
+  if (params.realtime) qs.set('realtime', '1');
+  const body = await flowGet<{ items?: HeatmapTopItem[] }>(`/heatmap?${qs.toString()}`);
+  return Array.isArray(body.items) ? body.items : [];
+}
+
 /** 证据台：信号档案（过闸条件统计 + 否决清单）+ 命中榜（默认最新，可回溯快照日）。 */
 export async function getFlowEvidence(
   params: { date?: string } = {},

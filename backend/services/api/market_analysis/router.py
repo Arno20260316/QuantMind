@@ -253,6 +253,42 @@ async def get_heatmap(
     return {"trade_date": str(_dt.date.today()), "category": category, "items": []}
 
 
+@router.get("/heatmap/drill")
+async def get_heatmap_drill(
+    category: Literal["shenwan", "industry1", "concept"] = Query(
+        default="shenwan",
+        description="板块分类：shenwan=二级行业 / industry1=一级行业 / concept=概念",
+    ),
+    name: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="板块名（与 /heatmap items[].name 一致）",
+    ),
+    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """板块 → 成分个股热力矩形图下钻（矩形面积=总市值，颜色可按涨跌幅/主力净额）。
+
+    顶层图（/heatmap）任一板块点击后进入本层；板块名或分类不存在返回 404
+    （detail 带 category/name 供前端定位），前端据此回退顶层而不是显示空白图。
+    """
+    _ = current_user
+    data = await asyncio.to_thread(
+        quantdb_feed.get_sector_drill, category=category, name=name, date=date
+    )
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"板块不存在或暂无数据：{category} / {name}",
+                "category": category,
+                "name": name,
+            },
+        )
+    return data
+
+
 # ---- Anomalies ----
 
 @router.get("/anomalies", response_model=list[AnomalyResponse])

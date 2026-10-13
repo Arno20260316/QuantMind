@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -55,6 +57,11 @@ def rig(tmp_path):
     bins = tmp_path / "bin"
     bins.mkdir()
 
+    # 真 `host_env.py` 拷进假仓库（**不写替身**）：脚本调它解析 PG 地址，而它按自己
+    # 所在目录推仓库根 → 拷进来之后读的就是假仓库的 `.env`。这样测到的是真解析器。
+    for name in ("host_env.py",):
+        shutil.copyfile(SCRIPT.parent / name, root / "scripts" / name)
+
     # 假刷新脚本：把「被调用」记进文件，并按 FAKE_ALPHA_WRITE 决定是否补出新分区。
     refresh = root / "scripts" / "alpha_library_refresh.sh"
     refresh.write_text(
@@ -88,13 +95,17 @@ def rig(tmp_path):
     )
     docker.chmod(0o755)
 
-    # 假池脚本：记录调用并照 FAKE_PICKS_RC 退出。
+    # 假池脚本：记录调用、把**当时看到的 POSTGRES_HOST** 也记下来（PG 缺省那条判据
+    # 只能这么验：脚本体里看不见，只有下游进程的环境才是真凭据），并照 FAKE_PICKS_RC 退出。
     picks = root / "scripts" / "postmarket_pipeline.py"
     picks.write_text(
         textwrap.dedent(
             """\
             import os
             open(os.environ["FAKE_PICKS_CALLS"], "a").write("picks-call\\n")
+            open(os.environ["FAKE_PICKS_ENV"], "w").write(
+                "POSTGRES_HOST=" + os.environ.get("POSTGRES_HOST", "<unset>") + "\\n"
+            )
             raise SystemExit(int(os.environ.get("FAKE_PICKS_RC", "0")))
             """
         ),
@@ -119,6 +130,7 @@ def rig(tmp_path):
         "refresh": tmp_path / "refresh.calls",
         "docker": tmp_path / "docker.calls",
         "picks": tmp_path / "picks.calls",
+        "picks_env": tmp_path / "picks.env",
         "notify": tmp_path / "notify.calls",
         "log": root / "logs" / "keepers" / "alpha_refresh_retry.log",
     }
@@ -131,6 +143,7 @@ def rig(tmp_path):
         "FAKE_REFRESH_CALLS": str(calls["refresh"]),
         "FAKE_DOCKER_CALLS": str(calls["docker"]),
         "FAKE_PICKS_CALLS": str(calls["picks"]),
+        "FAKE_PICKS_ENV": str(calls["picks_env"]),
         "FAKE_NOTIFY_OUT": str(calls["notify"]),
     }
     for var in (
@@ -138,8 +151,13 @@ def rig(tmp_path):
         "FAKE_REFRESH_RC",
         "FAKE_DOCKER_RC",
         "FAKE_PICKS_RC",
+        # 宿主环境若有这条，会盖掉「脚本自己补 POSTGRES_HOST」的观察点
+        # （跑测试的人多半就在 cron 同款 shell 里）。那两条用例显式设好的值不受影响。
+        "POSTGRES_HOST",
     ):
         env.pop(var, None)
+    # `.env` 是 PG 缺省那条判据的**唯一事实源**（QM_DB_BIND）：默认给一份「未设」的，
+    # 只有专门验它的用例才写。不写就不存在，脚本走 no-export 分支。
     return {
         "root": root,
         "alpha_root": alpha_root,
@@ -240,6 +258,85 @@ class TestSelfHealHappyPath:
 
         assert proc.returncode == 1
         assert "🟠" in _notifies(rig)[0]
+
+    def test_container_step_uses_container_python_not_host_path(self, rig):
+        """容器内那步不许复用宿主的绝对解释器路径。
+
+        2026-10-13 实跑事故：`quantmind` 镜像只有 `/usr/local/bin/python3`，
+        脚本却把宿主用的 `/usr/bin/python3` 原样传进 `docker exec`（PYTHON_BIN
+        当时是两者共用一个变量），CUSTOM 重建以
+        `rc=127 exec: "/usr/bin/python3": no such file or directory` 失败，
+        整条自愈链停在「alpha 已补但下游未走完」——**此前只跑过 --dry-run，
+        没走过真实 docker 路径**，所以这个 127 一直没被任何测试挡住。
+        """
+        _run(rig, FAKE_ALPHA_WRITE=ALPHA_NEW)
+
+        docker_calls = _calls(rig, "docker")
+        assert len(docker_calls) == 1
+        assert "quantmind python3 -" in docker_calls[0], docker_calls[0]
+        assert "/usr/bin/python3" not in docker_calls[0], (
+            "容器内解释器写成了宿主的绝对路径——镜像里没有它，会 rc=127："
+            f"{docker_calls[0]}"
+        )
+
+
+class TestPostgresHostResolution:
+    """PG 地址缺省：手工调用（无 crontab 头部）时不许连回环 5432。
+
+    2026-10-13 首次手工实跑 `postmarket_pipeline --picks-only` 撞
+    `Connection refused`（127.0.0.1:5432 无监听）——crontab 头部给了 `POSTGRES_HOST`，
+    手工跑没有。脚本因此要自己从 `.env` 的 `QM_DB_BIND` 取（那份就是「DB 发布到哪」的
+    唯一事实源），**且不许把 IP 写死在脚本体里**（写死会在换网段时静默连错地址）。
+    """
+
+    def test_explicit_postgres_host_is_respected(self, rig):
+        """显式设过 → 原封不动传下去（crontab 那条路径的行为不许被改动）。"""
+        _run(
+            rig,
+            FAKE_ALPHA_WRITE=ALPHA_NEW,
+            POSTGRES_HOST="10.9.9.9",
+        )
+
+        assert "POSTGRES_HOST=10.9.9.9" in rig["calls"]["picks_env"].read_text(
+            encoding="utf-8"
+        )
+
+    def test_unset_falls_back_to_env_qm_db_bind(self, rig):
+        """没设 + `.env` 有 QM_DB_BIND → 用它（脚本不该要求人工记得导出）。"""
+        (rig["root"] / ".env").write_text(
+            'DB_HOST=db\nQM_DB_BIND="10.1.2.3"\nQM_OTHER="x"\n', encoding="utf-8"
+        )
+
+        _run(rig, FAKE_ALPHA_WRITE=ALPHA_NEW)
+
+        assert "POSTGRES_HOST=10.1.2.3" in rig["calls"]["picks_env"].read_text(
+            encoding="utf-8"
+        )
+
+    def test_loopback_qm_db_bind_is_not_exported(self, rig):
+        """`.env` 里 QM_DB_BIND 就是回环 → 不 export（现状缺省，不假装知道地址）。"""
+        (rig["root"] / ".env").write_text("QM_DB_BIND=127.0.0.1\n", encoding="utf-8")
+
+        _run(rig, FAKE_ALPHA_WRITE=ALPHA_NEW)
+
+        assert "POSTGRES_HOST=<unset>" in rig["calls"]["picks_env"].read_text(
+            encoding="utf-8"
+        )
+
+    def test_no_env_file_leaves_host_unset(self, rig):
+        """`.env` 也没有 → 不猜，保持缺省（endpoint 变了要人工看日志）。"""
+        _run(rig, FAKE_ALPHA_WRITE=ALPHA_NEW)
+
+        assert "POSTGRES_HOST=<unset>" in rig["calls"]["picks_env"].read_text(
+            encoding="utf-8"
+        )
+
+    def test_no_hardcoded_lan_ip_in_script(self):
+        """脚本体里不许出现写死的 LAN IP（应经 `.env` 的 QM_DB_BIND 解析）。"""
+        body = SCRIPT.read_text(encoding="utf-8")
+        assert not re.search(r"192\.168\.\d+\.\d+", body), (
+            "脚本里写死了 LAN IP——地址属于部署配置，应走 .env 的 QM_DB_BIND"
+        )
 
 
 class TestRefreshStillStale:

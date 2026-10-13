@@ -66,6 +66,26 @@ def _judge():
     return collect, pg_inference_probe
 
 
+def _guarded_probe(probe):
+    """包一层探针，**留住它抛的是什么**（``collect`` 会把异常吞掉只留空集）。
+
+    ``collect`` 的契约是「探不到 ≠ 就绪」：探针抛异常 → 第 ④ 段按空集判不就绪。
+    问题在于报告面看不出「**探不到**」和「真的没有批」——2026-10-13 那次手工跑
+    （宿主没设 ``POSTGRES_HOST``，连回环 5432 被拒）就据此推了一条「候选池未就绪」，
+    而链其实是通的。留住原话，告警里说清楚是**判据没跑全**还是**链真断了**。
+    """
+    state: dict[str, str] = {"error": ""}
+
+    def wrapped(kline_dt):
+        try:
+            return probe(kline_dt)
+        except Exception as exc:  # noqa: BLE001 - 只为留痕，异常照样往上抛
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+
+    return wrapped, state
+
+
 def _fmt_stage_line(stage) -> str:
     mark = "✓" if stage.ok else "✗"
     tail = "（方向闸清空，正常）" if stage.by_design else ""
@@ -120,6 +140,18 @@ def _mark_sent(target: str) -> None:
         log(f"⚠️ 去重标记写不动（下次可能重复推）：{exc}")
 
 
+def _resolve_pg_host() -> str:
+    """宿主手工调用时补 ``POSTGRES_HOST``（crontab 头部才有这条，见 crontab 第 2 行）。
+
+    解析实现不在这里第二份——``scripts/host_env.py`` 是唯一出处（读 ``.env`` 的
+    ``QM_DB_BIND``）。返回实际用到的地址，空串表示没解析出来（保持缺省）。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from host_env import ensure_postgres_host  # noqa: PLC0415
+
+    return ensure_postgres_host() or ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="盘前补池就绪检查")
     ap.add_argument("--target", help="目标交易日 YYYYMMDD（缺省按交易日历推）")
@@ -127,9 +159,11 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="忽略当天已推过去重")
     args = ap.parse_args()
 
+    pg_host = _resolve_pg_host()
     collect, pg_inference_probe = _judge()
+    probe, probe_state = _guarded_probe(pg_inference_probe())
     try:
-        report = collect(target=args.target, inference_probe=pg_inference_probe())
+        report = collect(target=args.target, inference_probe=probe)
     except Exception as exc:  # noqa: BLE001 - 判据本身炸了本身就是事故，得报出来
         log(f"❌ 就绪判据执行失败：{exc}")
         _send(
@@ -139,11 +173,20 @@ def main() -> int:
         )
         return 1
 
-    degraded_note = ""
+    notes: list[str] = []
     if report.target_degraded:
-        degraded_note = (
+        notes.append(
             f"⚠️ 交易日历不可用（来源={report.target_source}），"
             "目标日按工作日启发式推出——周中长假会判错，请人工核对。"
+        )
+    if probe_state["error"]:
+        # 判据没跑全 ≠ 链断了。两者在报告面上长得一样（都是第 ④ 段「无」），
+        # 所以必须显式分开说——否则会像 2026-10-13 那样推一条假的「候选池未就绪」。
+        notes.append(
+            f"⚠️ 推理批次探针**没跑成**：{probe_state['error']}\n"
+            "   → 第 ④ 段是按「探不到」判的，**不一定是链真的断了**；先确认 PG 可达"
+            "（手工调用要 export POSTGRES_HOST，crontab 头部有这条）。"
+            + (f"\n   → 本次用的 PG 地址={pg_host}。" if pg_host else "")
         )
 
     summary = " / ".join(f"{s.label}={'ok' if s.ok else '断'}" for s in report.stages)
@@ -153,11 +196,13 @@ def main() -> int:
             log(f"链通，池按方向闸清空（正常）：{report.target} ｜ {summary}")
         else:
             log(f"链通：{report.target} ｜ {summary}")
+        for n in notes:
+            log(n)
         return 0
 
     log(f"❌ 断链：{report.target} ｜ 卡在 {report.blocked_stage} ｜ {summary}")
-    if degraded_note:
-        log(degraded_note)
+    for n in notes:
+        log(n)
 
     if not args.force and _already_sent(report.target):
         log("当天已推送过，跳过重复推送（--force 可强制）")
@@ -165,7 +210,7 @@ def main() -> int:
 
     _send(
         "🟠 盘前预警：候选池未就绪",
-        _alert_body(report, degraded_note=degraded_note),
+        _alert_body(report, degraded_note="\n".join(notes)),
         dry_run=args.dry_run,
     )
     if not args.dry_run:

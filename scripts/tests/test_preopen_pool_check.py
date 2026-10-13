@@ -57,6 +57,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ppc, "_send", lambda title, body, dry_run=False: sent.append((title, body))
     )
+    # PG 地址解析是**宿主侧环境动作**（会写 os.environ）：测试里一律短路，
+    # 免得跑测试的人的环境反过来影响用例（专测它的用例自己再覆盖）。
+    monkeypatch.setattr(ppc, "_resolve_pg_host", lambda: "")
     return {"sent": sent, "tmp": tmp_path, "monkeypatch": monkeypatch}
 
 
@@ -67,6 +70,74 @@ def _run(env, argv, report):
     )
     env["monkeypatch"].setattr(sys, "argv", ["preopen_pool_check.py", *argv])
     return ppc.main()
+
+
+class TestProbeFailureIsDistinguished:
+    """探针**没跑成** ≠ 链断了——两者在报告面上都是第 ④ 段「无」。
+
+    2026-10-13 手工跑（宿主没设 ``POSTGRES_HOST``）就据此推了一条「候选池未就绪」，
+    而链其实是通的（方向闸按设计清空）。告警必须把这两种情形分开说。
+    """
+
+    def test_probe_error_is_named_in_alert_and_log(self, env, monkeypatch):
+        from backend.shared.pool_readiness import assess
+
+        def boom(_kline_dt):
+            raise RuntimeError("connection refused to 127.0.0.1:5432")
+
+        def collect_with_real_probe(*, target=None, inference_probe=None):
+            # 真 ``collect`` 会把探针异常吞成空集（这正是问题所在）——这里复刻它的
+            # 消费者行为，同时让 ``_guarded_probe`` 真的包一次坏探针。
+            try:
+                inference_probe("20261012")
+            except Exception:  # noqa: BLE001
+                pass
+            return assess(
+                target=TARGET,
+                kline_dt="20261012",
+                alpha_dt="20261012",
+                custom_dt="20261012",
+                inference_dates=frozenset(),
+                pool=PoolSnapshot(False, False, 0, "", ""),
+            )
+
+        monkeypatch.setattr(
+            ppc, "_judge", lambda: (collect_with_real_probe, lambda: boom)
+        )
+        monkeypatch.setattr(sys, "argv", ["preopen_pool_check.py", "--target", TARGET])
+
+        rc = ppc.main()
+
+        assert rc == 2
+        title, body = env["sent"][0]
+        assert "候选池未就绪" in title
+        assert "探针" in body and "没跑成" in body
+        assert "不一定是链真的断了" in body
+        assert "connection refused" in body
+
+    def test_healthy_chain_with_dead_probe_says_so_in_log(
+        self, env, monkeypatch, capsys
+    ):
+        """链按设计清空（ok）但探针是坏的 → rc=0，日志里仍要说清第 ④ 段为何是空的。"""
+
+        def boom(_kline_dt):
+            raise RuntimeError("PG down")
+
+        def collect(*, target=None, inference_probe=None):
+            try:
+                inference_probe("20261012")  # 真 collect 会这么调，异常被它吞掉
+            except Exception:  # noqa: BLE001
+                pass
+            return _report()
+
+        env["monkeypatch"].setattr(ppc, "_judge", lambda: (collect, lambda: boom))
+        env["monkeypatch"].setattr(
+            sys, "argv", ["preopen_pool_check.py", "--target", TARGET]
+        )
+
+        assert ppc.main() == 0
+        out = capsys.readouterr().out
+        assert "探针" in out and "PG down" in out
 
 
 class TestThreeStates:

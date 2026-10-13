@@ -42,7 +42,13 @@
 set -uo pipefail
 
 QM_ROOT="${QM_ROOT:-/home/zbox/projects/quantmind}"
+# 宿主解释器：跑 postmarket_pipeline.py / push_notify.py（宿主确有 /usr/bin/python3）。
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+# 容器内解释器：**必须与上一行分开**。`quantmind` 镜像只有 /usr/local/bin/python3，
+# 没有 /usr/bin/python3 —— 2026-10-13 首次实跑（此前只跑过 --dry-run）时 CUSTOM 重建
+# 一步以 rc=127「exec: /usr/bin/python3: no such file or directory」直接失败，整条
+# 自愈链停在「alpha 已补但下游未走完」。容器内一律靠 PATH 解析，不写绝对路径。
+CONTAINER_PYTHON_BIN="${CONTAINER_PYTHON_BIN:-python3}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 
 SCRIPT="$QM_ROOT/scripts/alpha_library_refresh.sh"
@@ -128,10 +134,28 @@ fi
 
 log_line "✅ alpha 已补齐（alpha=$AL_NEW kline=$KL_DT，刷新 rc=$REFRESH_RC）→ 接下游"
 
+# 2b) PG 地址：`pick_candidates` 的 psycopg2 缺省连回环 5432，而**回环无监听**——
+#     DB 只发布在 LAN 地址上（compose 的 `QM_DB_BIND`）。宿主脚本读 `POSTGRES_HOST`
+#     （`postmarket_pipeline._pg_connect`），crontab 头部有这条变量、**非 cron 手工
+#     调用时没有**：2026-10-13 首次手工实跑就撞 `Connection refused`。
+#     解析逻辑**不在这里写第二份**（同一个键两种读法 = 一个地址两个答案）：
+#     `scripts/host_env.py` 是唯一实现（`QM_DB_BIND` 是「DB 发布到哪」的事实源，
+#     compose 与 boot_guard.sh 同源），bash 只负责把结果 export 出去。
+#     显式设过 `POSTGRES_HOST` 的一律尊重；解析不出则不动（退回脚本自身缺省）。
+if [ -z "${POSTGRES_HOST:-}" ]; then
+    _db_host=$(cd "$QM_ROOT/scripts" && "$PYTHON_BIN" -c \
+        'from host_env import resolve_postgres_host; print(resolve_postgres_host() or "")' \
+        2>/dev/null)
+    if [ -n "$_db_host" ]; then
+        export POSTGRES_HOST="$_db_host"
+        log_line "POSTGRES_HOST 未设 → 用 .env 的 QM_DB_BIND=$_db_host"
+    fi
+fi
+
 # 3) 下游① CUSTOM 数据集重建：容器内跑，复用唯一实现。
 #    调度被用户关掉时尊重用户设置（只补 alpha，不代跑）；enabled=true 才代跑一次
 #    （幂等：已最新则秒退，实测 0.09s）。
-CUSTOM_OUT=$("$DOCKER_BIN" exec -i -w /app -e PYTHONPATH=/app quantmind "$PYTHON_BIN" - <<'PY' 2>&1
+CUSTOM_OUT=$("$DOCKER_BIN" exec -i -w /app -e PYTHONPATH=/app quantmind "$CONTAINER_PYTHON_BIN" - <<'PY' 2>&1
 import json, os, sys
 import redis
 r = redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), socket_timeout=3)

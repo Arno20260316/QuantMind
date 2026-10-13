@@ -270,6 +270,45 @@ def main():
     assert 'cfg.get("sltp_daemon.enabled", True)' not in _main_src, "main.py 仍有 True 默认值"
     print("  ✅ 两处默认值均为「关」")
 
+    # /stats 的缓存计数绝不许在事件循环里同步跑。
+    # `cache_db.get_stats()` = 7 个 COUNT(*)，其一打在 tdx_log（生产 512 万行 /
+    # 6.9GB，实测 3-52s）。它会连 `/api/v1/health` 一起按住 ⇒ Windows 看门狗
+    # `-TimeoutSec 5` 连续 2 次失败即杀桥重启 ⇒ 桥 ui.auto_open 再开一个控制台标签
+    # ⇒ 标签每 15s 又打一次 /stats。2026-10-13 单日重启 378 次，每次 kill 之前
+    # 3s 内都有一次桥内耗时 8-52s 的 /stats（bridge.log 无崩溃 traceback）。
+    print("\n=== /stats 不得在事件循环里跑 COUNT(*) ===")
+    import ast
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _routes_src = open(os.path.join(_root, "src", "api", "routes.py"), encoding="utf-8").read()
+    _tree = ast.parse(_routes_src)
+    _stats_fn = next(
+        n for n in ast.walk(_tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "stats"
+    )
+    _sync_calls = [
+        n for n in ast.walk(_stats_fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in ("get_stats", "get_cache_disk")
+    ]
+    assert not _sync_calls, (
+        "stats 处理器里仍有同步的 cache_db.get_stats()/get_cache_disk() 调用——"
+        "COUNT(*) 会按住事件循环 3-52s，连 /health 一起停摆，触发看门狗杀桥的"
+        "自毁循环。必须经 asyncio.to_thread(_cache_stats_sync, ...) 出循环。"
+    )
+    assert "asyncio.to_thread(\n                _cache_stats_sync" in _routes_src or \
+        "asyncio.to_thread(_cache_stats_sync" in _routes_src, \
+        "stats 必须把缓存计数丢进线程（_cache_stats_sync）"
+    assert "CACHE_STATS_TTL_S = 60.0" in _routes_src, \
+        "_cache_stats_sync 的 TTL 缓存（60s）也一并守着——计数本身就该廉价，别每 15s 重算一遍"
+    print("  ✅ 缓存计数走线程 + 60s TTL 缓存")
+
+    # 控制台自动打开必须节流：每重启一次开一个标签 = 每重启一次多一份 /stats 负载。
+    print("\n=== 控制台自动打开去重（每重启一次不再多开一个标签）===")
+    assert ".ui_opened_at" in _main_src, "main.py 的 _auto_open_ui 缺少去重节流时间戳"
+    assert "min_interval_sec" in _main_src, "main.py 的 _auto_open_ui 缺少节流间隔参数"
+    print("  ✅ 自动打开控制台已节流")
+
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")
     return 1 if failed else 0

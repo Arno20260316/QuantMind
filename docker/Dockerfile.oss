@@ -91,11 +91,9 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=quantmind-pip \
 
 # 安装 QuantDB SDK（付费高质量数据源：K线/Tick/财报/估值/315维AI因子）
 # 钉版 ==0.3.3 + 共享 pip 缓存（id=quantmind-pip，与上方 requirements 层同设计）。
-# 2026-10-10 解冲突：cb81f137（并行会话 stash-pop 冲突后带病提交）把
-# `<<<<<<< Updated upstream / >>>>>>> Stashed changes` 留在此处，任何镜像重建
-# （含服务器 update.sh / full-deploy）都会以 dockerfile parse error 失败。保留
-# 本支侧（钉版+缓存挂载）——与在跑镜像实际安装的 0.3.3、d64d1296 的缓存设计一致；
-# stashed 侧（--no-cache-dir + >=0.3.1 范围）是被弃的旧 WIP，不迁回。
+# 2026-10-13 解冲突：本行下方的 stash-pop 冲突标记被清掉——HEAD 侧（钉版+缓存挂载）
+# 与在跑镜像实际安装的 0.3.3 一致；stashed 侧（--no-cache-dir + >=0.3.1 范围）是被
+# 弃的旧 WIP，不迁回。留标记会让任何镜像重建以 dockerfile parse error 失败。
 RUN --mount=type=cache,target=/root/.cache/pip,id=quantmind-pip \
     python -m pip install --root-user-action=ignore "quantdb-sdk==0.3.3"
 

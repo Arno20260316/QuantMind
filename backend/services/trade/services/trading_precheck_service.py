@@ -23,9 +23,7 @@ from backend.shared.trade_redis_keys import (
 )
 
 
-
 def _build_check(key: str, label: str, passed: bool, detail: str) -> dict[str, Any]:
-
 
     return {
         "key": key,
@@ -78,10 +76,13 @@ def _get_stream_series_redis_client():
         _get_env_with_root_fallback("REDIS_HOST", "redis"),
     )
     port = int(_get_env_with_root_fallback("REMOTE_QUOTE_REDIS_PORT", "6379") or "6379")
-    password = _get_env_with_root_fallback(
-        "REMOTE_QUOTE_REDIS_PASSWORD",
-        _get_env_with_root_fallback("REDIS_PASSWORD", ""),
-    ) or None
+    password = (
+        _get_env_with_root_fallback(
+            "REMOTE_QUOTE_REDIS_PASSWORD",
+            _get_env_with_root_fallback("REDIS_PASSWORD", ""),
+        )
+        or None
+    )
     db = int(_get_env_with_root_fallback("REMOTE_QUOTE_REDIS_DB", "3") or "3")
     client = redis_lib.Redis(
         host=host,
@@ -220,28 +221,27 @@ async def _query_market_data_readiness(
 
 def _check_inference_model_exists() -> tuple[bool, str]:
     """检查推理模型文件是否存在，不查询数据库。"""
-    production_dir = Path(
-        os.getenv("MODELS_PRODUCTION", "/app/models/production")
-    )
-    user_models_dir = Path(
-        os.getenv("USER_MODELS_ROOT", "/app/models/users")
-    )
+    production_dir = Path(os.getenv("MODELS_PRODUCTION", "/app/models/production"))
+    user_models_dir = Path(os.getenv("USER_MODELS_ROOT", "/app/models/users"))
     if production_dir.exists() and production_dir.is_dir():
         try:
-            model_files = [f for f in production_dir.rglob("*.lgb") if f.is_file()] + [f for f in production_dir.rglob("*.bin") if f.is_file()]
+            model_files = [f for f in production_dir.rglob("*.lgb") if f.is_file()] + [
+                f for f in production_dir.rglob("*.bin") if f.is_file()
+            ]
             if model_files:
                 return True, f"生产模型已存在 (files={len(model_files)})"
         except Exception:
             pass
     if user_models_dir.exists() and user_models_dir.is_dir():
         try:
-            user_model_files = [f for f in user_models_dir.rglob("*.lgb") if f.is_file()] + [f for f in user_models_dir.rglob("*.bin") if f.is_file()]
+            user_model_files = [
+                f for f in user_models_dir.rglob("*.lgb") if f.is_file()
+            ] + [f for f in user_models_dir.rglob("*.bin") if f.is_file()]
             if user_model_files:
                 return True, f"用户模型已就绪 (files={len(user_model_files)})"
         except Exception:
             pass
     return False, "未检测到可用的生产或用户模型权重文件"
-
 
     pass
 
@@ -420,12 +420,20 @@ async def run_trading_readiness_precheck(
                     candidates = await model_registry_service.list_models(
                         tenant_id=tenant_id, user_id=user_id, include_archived=False
                     )
-                    avail = [m for m in candidates if str(m.get("status") or "").lower() in {"ready", "active"}]
+                    avail = [
+                        m
+                        for m in candidates
+                        if str(m.get("status") or "").lower() in {"ready", "active"}
+                    ]
                     chosen = (avail or candidates[:1] or [None])[0]
                     if chosen and chosen.get("model_id"):
                         try:
-                            default_model = await model_registry_service.set_default_model(
-                                tenant_id=tenant_id, user_id=user_id, model_id=str(chosen.get("model_id"))
+                            default_model = (
+                                await model_registry_service.set_default_model(
+                                    tenant_id=tenant_id,
+                                    user_id=user_id,
+                                    model_id=str(chosen.get("model_id")),
+                                )
                             )
                         except Exception:
                             default_model = chosen
@@ -505,7 +513,10 @@ async def run_trading_readiness_precheck(
             )
 
         try:
-            from backend.services.live_trading.routers.real_trading_utils import check_stream_series_freshness
+            from backend.services.live_trading.routers.real_trading_utils import (
+                check_stream_series_freshness,
+            )
+
             # 同步 Redis + 本地日线探测，放线程里跑，避免阻塞事件循环
             res = await asyncio.to_thread(
                 check_stream_series_freshness,
@@ -520,21 +531,27 @@ async def run_trading_readiness_precheck(
                     "stream_series_freshness",
                     "实时行情服务已就绪",
                     True if is_sim else res["ok"],
-                    res["message"] if res["ok"] else f"[WARNING] {res['message']}（已回退日线开盘价撮合，不阻断模拟盘）" if is_sim else res["message"],
+                    res["message"]
+                    if res["ok"]
+                    else f"[WARNING] {res['message']}（已回退日线开盘价撮合，不阻断模拟盘）"
+                    if is_sim
+                    else res["message"],
                 )
             )
         except Exception as exc:
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            is_trading_hours = (
-                now.weekday() < 5
-                and ((now.hour == 9 and now.minute >= 15) or (now.hour >= 10 and now.hour < 15))
+            is_trading_hours = now.weekday() < 5 and (
+                (now.hour == 9 and now.minute >= 15)
+                or (now.hour >= 10 and now.hour < 15)
             )
             checks.append(
                 _build_check(
                     "stream_series_freshness",
                     "实时行情服务已就绪",
                     not is_trading_hours,
-                    f"[阻断] stream_probe_error={exc}" if is_trading_hours else f"[WARNING] stream_probe_error={exc}",
+                    f"[阻断] stream_probe_error={exc}"
+                    if is_trading_hours
+                    else f"[WARNING] stream_probe_error={exc}",
                 )
             )
         return {
@@ -601,7 +618,10 @@ async def run_trading_readiness_precheck(
             )
         )
 
-    from backend.services.live_trading.routers.real_trading_utils import check_stream_series_freshness
+    from backend.services.live_trading.routers.real_trading_utils import (
+        check_stream_series_freshness,
+    )
+
     # REAL 模式同样回退 QuantDB 日线兜底：TDX 通道无实时行情流时仍可交易
     res = await asyncio.to_thread(
         check_stream_series_freshness,
@@ -630,8 +650,16 @@ async def run_trading_readiness_precheck(
                 check_tdx_bridge_online,
             )
 
-            tdx_online, tdx_detail = check_tdx_bridge_online()
-            if tdx_online:
+            _tdx_online, tdx_detail = check_tdx_bridge_online()
+            # 判据用**账户通道**而不是行情半边的 health：`check_tdx_bridge_online`
+            # 只读桥的 `/api/v1/health`，其中的 `tdx_connected` 来自**行情类**查询
+            # （`get_match_stkinfo`），交易端掉线时它照样判在线——用它决定
+            # 「策略能不能开」是判据错位（隔壁 2026-09-24 的 preflight.json 实录：
+            # account.ok=false 而桥进程活着）。账户通道真查一次才拦得住「假活」。
+            account_ok, account_detail, _account_details = (
+                check_bridge_account_channel()
+            )
+            if account_ok:
                 qmt_ok = True
                 # 标签跟着通道换。判定走的是通达信桥，标题还写「QMT Agent 在线且
                 # 数据已上报」时，界面呈现的是「通过 + 明细写 QMT 未接入」，
@@ -639,18 +667,21 @@ async def run_trading_readiness_precheck(
                 # 标题换成「交易通道（通达信桥）」（real_trading_preflight.py 回退分支），
                 # 这里与它对齐。
                 qmt_label = "交易通道（通达信桥）"
-                qmt_detail = f"{tdx_detail}（QMT Agent 未接入: {qmt_detail}）"
+                qmt_detail = (
+                    f"{account_detail}（QMT Agent 未接入: {qmt_detail}）；{tdx_detail}"
+                )
             else:
-                qmt_detail = f"{qmt_detail}；且 {tdx_detail}"
+                # 账户不通才是真不可用；把 QMT 原因与行情半边的结论都带出来，
+                # 便于分辨「QMT 没接」/「账户断」/「行情断」到底断在哪一半。
+                qmt_detail = (
+                    f"{qmt_detail}；且 {account_detail}；行情半边：{tdx_detail}"
+                )
             # 行情通 ≠ 账户通：上面那条只读桥的 health（`health_check_fast` 发的是
             # 行情类查询），交易端掉线时它照样判在线——而账户查询会超时。隔壁
             # 2026-09-24 09:12 的 preflight.json 就是这种形态（account.ok=false、
             # 桥进程活着）。账户通道必须**真查一次**，单独一行，失败时界面能看出
             # 是哪一半断的。
             # （`_build_check` 只有四个形参、没有 details 段——持仓数已写进 detail。）
-            account_ok, account_detail, _account_details = (
-                check_bridge_account_channel()
-            )
             checks.append(
                 _build_check(
                     "bridge_account_channel",

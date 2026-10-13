@@ -11,6 +11,7 @@ import { useTradingModeSwitch } from '../../features/shared/useTradingModeSwitch
 
 import { SERVICE_URLS } from '../../config/services';
 import { isLiveTradingEnabled } from '../../config/tradingFlags';
+import { fmtBeijingClock, fmtBeijingDateEnShort } from '../../utils/timeBeijing';
 
 export const HeaderBar: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -156,17 +157,20 @@ export const HeaderBar: React.FC = () => {
 
       <div className="flex flex-col items-end justify-center">
         <div className="rounded-[20px] border border-white/70 bg-white/54 backdrop-blur-md px-5 py-2.5 shadow-[0_10px_28px_rgba(15,23,42,0.05)]">
-          <div className="flex items-baseline gap-1 font-mono text-slate-800 justify-center">
+          <div
+            className="flex items-baseline gap-1 font-mono text-slate-800 justify-center"
+            title="北京时间（UTC+8）"
+          >
             <span className="text-[30px] font-black tracking-[-0.05em] leading-none">
-              {currentTime.getHours().toString().padStart(2, '0')}:
-              {currentTime.getMinutes().toString().padStart(2, '0')}
+              {fmtBeijingClock(currentTime, { withSeconds: false })}
             </span>
             <span className="text-xs font-bold opacity-55">
-              {currentTime.getSeconds().toString().padStart(2, '0')}
+              {fmtBeijingClock(currentTime, { withSeconds: true }).split(':')[2] ?? '00'}
             </span>
+            <span className="sr-only">北京时间</span>
           </div>
           <div className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.22em] mt-1 text-center">
-            {currentTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+            {fmtBeijingDateEnShort(currentTime)} · 北京
           </div>
         </div>
       </div>

@@ -5,6 +5,7 @@ import type { RealTradingStatus } from '../../../../../services/realTradingServi
 import type { LatestInferenceRunInfo } from '../../../../../services/modelTrainingService';
 import { RUN_STATE_META } from '../topologyTypes';
 import type { RunState } from '../topologyTypes';
+import { fmtBeijingDateTime } from '../../../../../utils/timeBeijing';
 
 interface RuntimeLayerProps {
     runState: RunState;
@@ -83,11 +84,8 @@ const tierMeta = (mode?: string | null) => TIER_META[String(mode ?? '')] ?? {
     icon: <ShieldAlert size={13} />,
 };
 
-/** ISO 时间戳转本地可读——后端给的是 UTC ISO，直接铺给用户看是工程噪声。 */
-const fmtStamp = (iso: string): string => {
-    const t = new Date(iso);
-    return Number.isNaN(t.getTime()) ? iso : t.toLocaleString();
-};
+/** ISO 时间戳转北京可读——后端给的是 UTC ISO，直接铺给用户看是工程噪声。 */
+const fmtStamp = (iso: string): string => fmtBeijingDateTime(iso, { withSeconds: false });
 
 const Stat: React.FC<{ label: string; value: number; tone: string }> = ({ label, value, tone }) => (
     <span className="flex items-baseline gap-1.5">

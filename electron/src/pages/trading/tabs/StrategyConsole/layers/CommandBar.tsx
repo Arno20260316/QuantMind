@@ -6,6 +6,7 @@ import type { StrategyFile } from '../../../../../types/backtest/strategy';
 import { RUN_STATE_META } from '../topologyTypes';
 import type { RunState } from '../topologyTypes';
 import { modeCopy } from '../../../utils/tradingModeCopy';
+import { fmtBeijingClock } from '../../../../../utils/timeBeijing';
 import type { TradingMode } from '../../../utils/tradingModeCopy';
 import { describeMarketMismatch } from '../../../utils/strategyMarket';
 
@@ -125,7 +126,7 @@ const CommandBar: React.FC<CommandBarProps> = ({
                             <>
                                 <span className="text-slate-200">|</span>
                                 <span className="text-slate-400">
-                                    更新于 {new Date(lastUpdatedAt).toLocaleTimeString()}
+                                    更新于 {fmtBeijingClock(lastUpdatedAt, { withSeconds: false })}
                                 </span>
                             </>
                         )}

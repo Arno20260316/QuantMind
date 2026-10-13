@@ -5,7 +5,7 @@
  * 这是一个用户可见的约定——进页第一眼先看平台能不能用；被改回去时要有测试拦住。
  */
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ACTIVE_TAB, resolveInitialTab } from '../activeTab';
+import { DEFAULT_ACTIVE_TAB, resolveInitialSymbol, resolveInitialTab } from '../activeTab';
 
 describe('resolveInitialTab', () => {
   it('默认落在「系统健康」', () => {
@@ -32,6 +32,8 @@ describe('resolveInitialTab', () => {
   it('持仓预警深链 tab=position 直达持仓监控（哨兵「去持仓」落点）', () => {
     expect(resolveInitialTab('#/trading?tab=position')).toBe('position');
     expect(resolveInitialTab('#/trading?tab=position&symbol=SZ000001')).toBe('position');
+    // 归一后实盘栏深链同样直达（本机实盘栏目存在）
+    expect(resolveInitialTab('#/live?tab=position&symbol=SZ000001')).toBe('position');
   });
 
   it('未列入深链白名单的页签回落默认，不盲信 URL', () => {
@@ -41,5 +43,15 @@ describe('resolveInitialTab', () => {
 
   it('query 里 tab 排在别的参数之后也能取到', () => {
     expect(resolveInitialTab('#/trading?market=CN&tab=signals')).toBe('signals');
+  });
+
+  it('深链 symbol 只在 tab=position 时消费（哨兵「去持仓」带标的）', () => {
+    expect(resolveInitialSymbol('#/trading?tab=position&symbol=SZ000001')).toBe('SZ000001');
+    expect(resolveInitialSymbol('#/live?tab=position&symbol=SH601000')).toBe('SH601000');
+    expect(resolveInitialSymbol('#/trading?tab=position')).toBeNull();
+    expect(resolveInitialSymbol('#/trading?tab=signals&symbol=SZ000001')).toBeNull();
+    expect(resolveInitialSymbol('#/trading?tab=manage&symbol=SZ000001')).toBeNull();
+    expect(resolveInitialSymbol('')).toBeNull();
+    expect(resolveInitialSymbol(null)).toBeNull();
   });
 });

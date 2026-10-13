@@ -71,14 +71,29 @@ if [ -n "$NOWRITABLE" ]; then
     exit 0
 fi
 
-# 4) 内存闸门
-AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
-if [ -z "$AVAIL_GB" ] || [ "$AVAIL_GB" -lt "$MIN_MEM_GB" ]; then
-    log_line "跳过：可用内存 ${AVAIL_GB:-?}GB < ${MIN_MEM_GB}GB（alpha=$AL_DT kline=$KL_DT）"
-    exit 0
-fi
+# 4) 内存闸门：不足先**有界等待**，超时仍不足才跳过。
+#    2026-10-13 事故：02:30 那一刻可用 14GB < 30GB → 直接 exit 0，alpha 停在
+#    dt=20261009 而日K 已 20261012；下游 CUSTOM 重建 fail-closed 拒写 → 模型撞
+#    维度门禁 → 当日无批量信号。整条链的**唯一可动点**就是这里。此前凌晨常有
+#    其它任务（备份/训练残留）短暂吃内存，等一个窗口往往就够——直接放弃太早。
+MEM_WAIT_SECONDS=${MEM_WAIT_SECONDS:-1800}
+MEM_WAIT_SLEEP=120
+waited=0
+while :; do
+    AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+    if [ -n "$AVAIL_GB" ] && [ "$AVAIL_GB" -ge "$MIN_MEM_GB" ]; then
+        break
+    fi
+    if [ "$waited" -ge "$MEM_WAIT_SECONDS" ]; then
+        log_line "跳过：可用内存 ${AVAIL_GB:-?}GB < ${MIN_MEM_GB}GB，已等待 ${waited}s（alpha=$AL_DT kline=$KL_DT）→ 由 alpha_refresh_retry 择机重试"
+        exit 0
+    fi
+    [ "$waited" -eq 0 ] && log_line "内存不足（可用 ${AVAIL_GB:-?}GB < ${MIN_MEM_GB}GB），等待内存释放（上限 ${MEM_WAIT_SECONDS}s）…"
+    sleep "$MEM_WAIT_SLEEP"
+    waited=$((waited + MEM_WAIT_SLEEP))
+done
 
-log_line "开始刷新（alpha=${AL_DT:-无} kline=$KL_DT 可用内存=${AVAIL_GB}GB）"
+log_line "开始刷新（alpha=${AL_DT:-无} kline=$KL_DT 可用内存=${AVAIL_GB}GB 等待=${waited}s）"
 nice -n 10 "$PY" "$SCRIPT" >> "$LOG" 2>&1
 rc=$?
 AL_NEW=$(ls -d "$ALPHA_ROOT"/dt=* 2>/dev/null | grep -oE '[0-9]{8}' | sort | tail -1)

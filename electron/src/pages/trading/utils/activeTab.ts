@@ -39,3 +39,17 @@ export function resolveInitialTab(hash: string | null | undefined): ActiveTab {
   const t = new URLSearchParams(hash.slice(qi + 1)).get('tab');
   return DEEP_LINKABLE.includes(t as ActiveTab) ? (t as ActiveTab) : DEFAULT_ACTIVE_TAB;
 }
+
+/**
+ * 从 `window.location.hash` 解析深链里的 `symbol=` 参数（哨兵「去持仓」带标的）。
+ * 只在 tab=position 时消费；`hash` 传入而非内部读取，便于测试。
+ */
+export function resolveInitialSymbol(hash: string | null | undefined): string | null {
+  if (!hash) return null;
+  const qi = hash.indexOf('?');
+  if (qi < 0) return null;
+  const params = new URLSearchParams(hash.slice(qi + 1));
+  if (params.get('tab') !== 'position') return null;
+  const sym = String(params.get('symbol') || '').trim();
+  return sym || null;
+}

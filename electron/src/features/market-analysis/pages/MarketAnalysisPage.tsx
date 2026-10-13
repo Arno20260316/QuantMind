@@ -11,6 +11,7 @@ import { FactorBoardPanel } from '../components/FactorBoardPanel';
 import { FlowPanoramaPanel } from '../components/FlowPanoramaPanel';
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import { PAGE_LAYOUT } from '../../../config/pageLayout';
+import { fmtBeijingClock } from '../../../utils/timeBeijing';
 
 const MARKET_ANALYSIS_API = `${SERVICE_ENDPOINTS.USER_SERVICE}/market-analysis`;
 
@@ -122,8 +123,7 @@ export const MarketAnalysisPage: React.FC = () => {
         }
       }
 
-      const now = new Date();
-      setUpdateTime(now.toTimeString().split(' ')[0]);
+      setUpdateTime(fmtBeijingClock(Date.now(), { withSeconds: false }));
     } catch (e) {
       console.warn('后端市场接口连接出现异常，保留现有渲染状态', e);
     } finally {
@@ -189,7 +189,7 @@ export const MarketAnalysisPage: React.FC = () => {
           default:
             break;
         }
-        setUpdateTime(new Date().toTimeString().split(' ')[0]);
+        setUpdateTime(fmtBeijingClock(Date.now(), { withSeconds: false }));
       };
 
       while (true) {

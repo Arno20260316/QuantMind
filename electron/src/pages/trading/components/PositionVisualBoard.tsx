@@ -8,7 +8,7 @@
  *      + 行内「卖出」/ 批量「清仓选中」→ 预检确认面板（只预填与转发，不自己下单）
  * - ExecutionStrip：今日执行折叠条（默认一行摘要，点开列单）。
  */
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
 import ReactECharts from 'echarts-for-react';
 import { Activity, ArrowDownUp, ChevronDown, ChevronUp, PieChart, Search } from 'lucide-react';
 import { Checkbox, message } from 'antd';
@@ -60,9 +60,44 @@ export const PositionVisualBoard: React.FC<{
    * 整段徽标不渲染，公开形态与本机制引入前一致。
    */
   quoteFreshness?: Record<string, QuoteFreshness>;
-}> = ({ holdings, summary, defaultChannels = ['sim'], quoteFreshness }) => {
+  /**
+   * 深链带过来的持仓代码（前缀式，如 `SH601000`）：来自哨兵「去持仓」的 `symbol=`
+   * 参数。命中行高亮 + 自动滚动进视野；不命中（已卖出/代码不匹配）静默无效果，
+   * 不清洗 URL、不报错——深链只是入口，页面状态由用户掌控。
+   */
+  highlightSymbol?: string | null;
+}> = ({ holdings, summary, defaultChannels = ['sim'], quoteFreshness, highlightSymbol }) => {
   const [sortKey, setSortKey] = useState<SortKey>('value');
   const [q, setQ] = useState('');
+
+  // 深链高亮：目标行滚动进视野 + 一段时间的醒目描边（提前清掉，避免再次 setState）。
+  const highlightedRef = useRef<string | null>(null);
+  const [highlighted, setHighlighted] = useState<string | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const target = (highlightSymbol || '').trim();
+    if (!target) return;
+    const norm = target.toUpperCase();
+    const held = holdings.some((h) => h.code.toUpperCase() === norm);
+    if (highlightedRef.current === norm) return; // 同标的已高亮过，不重复触发
+    if (!held) return;
+    highlightedRef.current = norm;
+    setHighlighted(norm);
+    const timer = window.setTimeout(() => setHighlighted(null), 6000);
+    // 找到对应行元素滚进视野（列表容器里最近的行）
+    window.requestAnimationFrame(() => {
+      const rows = listRef.current?.querySelectorAll('[data-row]');
+      const row = rows ? Array.from(rows).find((el) => el.getAttribute('data-row') === norm) : null;
+      if (row && listRef.current) {
+        const box = listRef.current.getBoundingClientRect();
+        const rowBox = (row as HTMLElement).getBoundingClientRect();
+        if (rowBox.top < box.top || rowBox.bottom > box.bottom) {
+          row.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    });
+    return () => window.clearTimeout(timer);
+  }, [highlightSymbol, holdings]);
 
   // 断流可见性：KPI 行单列一格「行情陈旧 N 只」——逐行徽标会被滚动埋掉，
   // 这一格保证「有价在过期」在任何滚动位置都一眼可见。
@@ -353,9 +388,10 @@ export const PositionVisualBoard: React.FC<{
       </div>
 
       {/* 明细列表 */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-2 pb-2 pt-0.5 space-y-1">
+      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto px-2 pb-2 pt-0.5 space-y-1">
         {sorted.map((h) => {
           const pct = Math.max(0, Math.min(1, (h.value || 0) / base));
+          const isHighlighted = highlighted === h.code;
           // T6-1：这一行的行情新鲜度（fresh 不渲染任何东西）
           const fresh = quoteFreshness?.[h.code];
           const freshTag = h.priceMissing || !fresh || fresh.kind === 'fresh'
@@ -380,8 +416,13 @@ export const PositionVisualBoard: React.FC<{
           return (
             <div
               key={h.code}
+              data-row={h.code}
               title={`${h.name}（${h.code}） 持仓 ${h.shares} 股 · 市值 ${h.priceMissing ? '—（缺现价）' : fmtMoney(h.value)}`}
-              className="grid grid-cols-[1.1rem_minmax(0,1.3fr)_minmax(0,2.2fr)_minmax(0,1fr)_minmax(0,1.1fr)_3.5rem] items-center gap-3 rounded-xl border border-transparent px-2 py-1.5 transition-colors hover:border-slate-200 hover:bg-slate-50/70"
+              className={`grid grid-cols-[1.1rem_minmax(0,1.3fr)_minmax(0,2.2fr)_minmax(0,1fr)_minmax(0,1.1fr)_3.5rem] items-center gap-3 rounded-xl border px-2 py-1.5 transition-colors hover:border-slate-200 hover:bg-slate-50/70 ${
+                isHighlighted
+                  ? 'border-blue-400 bg-blue-50/60 shadow-[0_0_0_1px_#60a5fa]'
+                  : 'border-transparent'
+              }`}
             >
               <Checkbox checked={picked.has(h.code)} onChange={() => togglePick(h.code)} />
               <div className="min-w-0">

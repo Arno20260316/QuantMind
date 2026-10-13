@@ -11,6 +11,7 @@ import type {
   HoldingAlertSeverity,
   HoldingSentinelStatus,
 } from '../../services/holdingAlertService';
+import { isLocalLiveAvailable } from '../shared/localLive';
 
 export interface ToneMeta {
   tone: 'red' | 'amber' | 'slate' | 'blue';
@@ -205,10 +206,32 @@ export function shouldMarkExecuted(outcome: PushOutcomeLike | null | undefined):
   return outcome.status === 'executed' || outcome.status === 'partial' || outcome.status === undefined;
 }
 
-/** 预警深链：后端给的 action_url 是站内路径；异常的（外链/空）一律退回交易台 */
+/**
+ * 预警深链：后端给的 action_url 是站内路径；异常的（外链/空）一律退回交易台。
+ *
+ * 哨兵在用户**实盘为主**时给的仍是 `/trading?tab=position…`（后端不知道本机有没有
+ * 独立实盘栏目），而本机 `/trading` 路由被 `resolveSimColumnForcedMode` 定死为模拟盘——
+ * 点「去持仓」落在模拟仓，与用户实盘语境不符。这里按构建期常量 `isLocalLiveAvailable`
+ * 把 `tab=position` 的深链归一为 `/live`（实盘栏目）；公开树没有 `/live` 路由，
+ * 归一恒不生效，行为与引入前逐位相同。
+ */
 export function alertActionTarget(actionUrl: string | null | undefined): string {
   const raw = String(actionUrl || '').trim();
-  return raw.startsWith('/') ? raw : '/trading';
+  if (!raw.startsWith('/')) return '/trading';
+  return normalizeAlertActionUrl(raw);
+}
+
+/** 把哨兵 `tab=position` 深链的 `/trading` 前缀归一为 `/live`（仅本机实盘栏目存在时）。 */
+export function normalizeAlertActionUrl(raw: string): string {
+  if (!isLocalLiveAvailable) return raw;
+  const qi = raw.indexOf('?');
+  const path = qi < 0 ? raw : raw.slice(0, qi);
+  const params = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+  if (path.endsWith('/trading') && params.get('tab') === 'position') {
+    const tail = params.toString();
+    return tail ? `/live?${tail}` : '/live';
+  }
+  return raw;
 }
 
 /**

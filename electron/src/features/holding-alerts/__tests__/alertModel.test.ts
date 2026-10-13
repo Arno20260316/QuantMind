@@ -13,6 +13,7 @@ import {
   shouldMarkExecuted,
   SENTINEL_STALE_SECONDS,
   formatScore,
+  normalizeAlertActionUrl,
 } from '../alertModel';
 import { DEFAULT_ALERT_CONFIG } from '../../../services/holdingAlertService';
 import type {
@@ -233,7 +234,14 @@ describe('卖出回执是否够格标「已卖出」', () => {
 
 describe('深链目标', () => {
   test('站内路径直接用', () => {
-    expect(alertActionTarget('/trading?tab=position&symbol=SZ000001')).toBe('/trading?tab=position&symbol=SZ000001');
+    // 本机（isLocalLiveAvailable=true）：哨兵 `tab=position` 深链归一为实盘栏 `/live`
+    expect(alertActionTarget('/trading?tab=position&symbol=SZ000001')).toBe('/live?tab=position&symbol=SZ000001');
+    expect(alertActionTarget('/trading?tab=position')).toBe('/live?tab=position');
+  });
+
+  test('非 position 的站内路径不归一（仍是模拟栏其它页签/系统健康）', () => {
+    expect(alertActionTarget('/trading?tab=desk')).toBe('/trading?tab=desk');
+    expect(alertActionTarget('/backtest')).toBe('/backtest');
   });
 
   test('外链/空值退回交易台（不把外链丢进 router）', () => {

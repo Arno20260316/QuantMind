@@ -118,6 +118,19 @@ export function fmtBeijingClock(
   return idx >= 0 ? full.slice(idx + 1) : full;
 }
 
+const EN_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * 北京墙钟的「Mon D, YYYY」英文短日期（顶栏用，设备时区无关）。
+ * aware 换算北京、naive 原样取字段、不可解析原样返回——与上面两条同纪律。
+ */
+export function fmtBeijingDateEnShort(value: string | number | Date | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  const p = beijingPartsOf(value) ?? naivePartsOf(String(value));
+  if (!p) return String(value).trim() || '—';
+  return `${EN_MONTHS[p.m - 1]} ${p.d}, ${p.y}`;
+}
+
 /**
  * A 股交易时段（含集合竞价尾段与尾盘），按**北京墙钟**判定（设备时区无关）。
  * 用法：行情新鲜度的「已陈旧」徽标只在时段内计时——推送判重只比价格

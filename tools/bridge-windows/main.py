@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -212,11 +213,45 @@ async def _shutdown(tasks):
         t.cancel()
 
 
-async def _auto_open_ui(port: int):
-    """延迟 1.5s 后自动用系统浏览器打开控制台."""
+async def _auto_open_ui(port: int, min_interval_sec: float = 600.0):
+    """延迟 1.5s 后自动用系统浏览器打开控制台（带去重节流）。
+
+    为什么要节流
+    ------------
+    桥每被看门狗重启一次就会开一个浏览器标签，而**标签自己就是负载**：
+    ``ui.html`` 里 ``setInterval(loadStats, 15000)`` 会每 15s 打一次 ``/stats``。
+    2026-10-13 实测到自毁循环——桥被重启 378 次 → 桌面上堆了几百个控制台标签 →
+    ``/stats`` 把事件循环按住（当时 ``get_stats()`` 的 COUNT(*) 3-52s）→ ``/health``
+    一起停摆 → 看门狗 5s 超时判「假活」再杀一次。标签数量与重启次数互为因果。
+
+    （循环的另一半——``/stats`` 不在循环里跑 COUNT(*)——已在 ``src/api/routes.py``
+    的 ``_cache_stats_sync`` 修掉。这条是第二道闸：即便将来又有什么原因导致重启，
+    也不会再靠开标签把负载越堆越高。）
+
+    节流判据落在 ``data/.ui_opened_at`` 时间戳文件（跨进程存活，重启不清零）。
+    超时或读不到就照常打开——节流是为了止血，不是为了挡住正常使用。
+    """
     try:
-        await asyncio.sleep(1.5)
         url = f"http://127.0.0.1:{port}/ui"
+        stamp = os.path.join(BASE_DIR, "data", ".ui_opened_at")
+        now = time.time()
+        try:
+            with open(stamp, "r", encoding="utf-8") as f:
+                last = float(f.read().strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        if last and now - last < min_interval_sec:
+            log.info(
+                f"控制台 {int(now - last)}s 前刚打开过，跳过自动打开（{url} 可直接访问）"
+            )
+            return
+        try:
+            os.makedirs(os.path.dirname(stamp), exist_ok=True)
+            with open(stamp, "w", encoding="utf-8") as f:
+                f.write(str(now))
+        except OSError:
+            pass
+        await asyncio.sleep(1.5)
         log.info(f"自动打开控制台: {url}")
         webbrowser.open(url)
     except Exception as e:

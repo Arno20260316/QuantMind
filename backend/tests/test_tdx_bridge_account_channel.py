@@ -101,6 +101,30 @@ def test_healthy_account_channel_is_ok(monkeypatch):
     assert details["position_count"] == 8
 
 
+def test_health_probe_budget_covers_bridge_call_budget(monkeypatch):
+    """行情探针的客户端超时必须 ≥ 桥自己的 TDX 调用预算，否则忙时必然误报「不可达」。
+
+    回归背景（2026-10-13）：旧值 3.0s < 桥的 ``TDX_CALL_TIMEOUT = 8.0``，实测 10
+    次探测 9 次恰好 3.05s 超时、放宽到 30s 后全部 200——桥是活的，是**我们这边先断**。
+    这条误报把 REAL 闸门里「可回退的 TDX 通道」拼成「双失败」，策略启不动。
+    """
+    _configure(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    def _get(url: str, **kwargs: Any):
+        seen["url"] = url
+        seen["timeout"] = kwargs.get("timeout")
+        return _Resp(200, {"status": "ok", "tdx_connected": True})
+
+    monkeypatch.setattr(rtu.httpx, "get", _get)
+
+    ok, _detail = rtu.check_tdx_bridge_online()
+
+    assert ok is True
+    assert seen["timeout"] == rtu.BRIDGE_HEALTH_TIMEOUT_S
+    assert seen["timeout"] >= 8.0, "客户端预算必须盖过桥的 TDX_CALL_TIMEOUT(8s)"
+
+
 def test_the_documented_failure_is_caught(monkeypatch):
     """**本模块存在的理由**：行情/health 通、而账户查询失败 —— 必须判不通过。
 
@@ -501,10 +525,12 @@ async def test_trading_precheck_fails_when_the_account_channel_is_down(
     row = next(i for i in result["items"] if i["key"] == "bridge_account_channel")
     assert row["passed"] is False
     assert "RDP" in row["detail"]
-    # 正向对照：行情那一行必须是**通过**的——否则「不通过」可能只是桥整个没探到，
-    # 与账户通道无关（那正是改造前唯一能被发现的情形）。
+    # qmt 行现在**由账户通道判**（2026-10-13 改）：账户不通 ⇒ 该行也翻假——这正是
+    # 「策略启动被拦」的正确行为。行情半边的结论仍保留在文案里（`_QUOTE_UP`），
+    # 便于分辨断在哪一半（旧实现拿行情半边当判据，才出现 2026-10-13 的误拦）。
     qmt = next(i for i in result["items"] if i["key"] == "qmt_agent_online")
-    assert qmt["passed"] is True, "行情/进程这一半是通的（旧探针判得出它、判不出账户）"
+    assert qmt["passed"] is False, "账户通道不通 ⇒ 交易通道行必须翻假（真不可用）"
+    assert _QUOTE_UP[1] in qmt["detail"], "行情半边结论要带出来，便于分辨断在哪一半"
     assert result["passed"] is False
 
 
@@ -589,8 +615,11 @@ async def test_preflight_ready_is_false_when_the_account_channel_is_down(monkeyp
     row = next(c for c in result["checks"] if c["key"] == "bridge_account_channel")
     assert row["ok"] is False
     assert row["required"] is True, "REAL 下账户通道坏了必须阻断启动，不能只是提醒"
+    # qmt 行改由账户通道判（2026-10-13）：账户不通 ⇒ 该行也翻假；行情半边结论仍在
+    # 文案里（`_QUOTE_UP`），供分辨断在哪一半。
     qmt = next(c for c in result["checks"] if c["key"] == "qmt_agent_online")
-    assert qmt["ok"] is True, "正向对照：桥进程/行情这一半是通的"
+    assert qmt["ok"] is False, "账户通道不通 ⇒ 交易通道行必须翻假"
+    assert _QUOTE_UP[1] in qmt["message"]
     assert result["ready"] is False
 
 

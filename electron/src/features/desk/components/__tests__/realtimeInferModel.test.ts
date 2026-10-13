@@ -191,8 +191,9 @@ describe('realtimeInferModel · 运行面（心跳/时延/治理/台账）', () 
     expect(v.baselineSource).toContain('quantdb_factors');
   });
 
-  it('镜像时间以本地 hh:mm:ss 展示（面板要能一眼看到"这是几点的状态"）', () => {
-    const v = inferViewState(cfg, { updated_at: new Date(2026, 8, 20, 22, 3, 4).toISOString(), counters: {} }, T0);
+  it('镜像时间以**北京** hh:mm:ss 展示（设备时区无关，面板要能一眼看到"这是几点的状态"）', () => {
+    // 显式 UTC 输入 ⇒ 期望值不随设备时区漂（旧实现读设备本地钟，主机 JST 会多 1 小时）。
+    const v = inferViewState(cfg, { updated_at: '2026-09-20T14:03:04Z', counters: {} }, T0);
     expect(v.mirrorUpdatedText).toBe('22:03:04');
   });
 });

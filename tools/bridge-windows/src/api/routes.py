@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from aiohttp import web
 
@@ -21,6 +22,12 @@ TDX_CALL_TIMEOUT = 8.0
 
 # stats 账户缓存 (避免网页高频轮询压垮通达信)
 _stats_cache = {"ts": 0, "account": None}
+
+# stats 缓存行数缓存。COUNT(*) 必须 **出事件循环**（见 `_cache_stats_sync` 注释），
+# 而它本身又慢（生产库 6.9GB / tdx_log 512 万行，单次 COUNT 3-52s），所以再加一层
+# TTL：控制台每 15s 轮询一次，60s 内复用同一份计数，把每分钟 4 次重算降到 1 次。
+CACHE_STATS_TTL_S = 60.0
+_cache_stats_cache = {"ts": 0.0, "data": None}
 
 # 通达信并发信号量: 延迟初始化 (绑定运行中的 event loop, 避免 loop 冲突)
 _tdx_semaphore = None
@@ -126,6 +133,55 @@ def _record_trade(cache_db, plan_id, event, symbol, side, volume, price,
                            order_id, status, message, detail)
     except Exception:
         log.warning("记录交易日志失败(忽略)", exc_info=True)
+
+
+def _cache_stats_sync(cache_db, memory_cache) -> dict | None:
+    """取缓存计数 —— **同步函数，由调用方丢进线程跑**。
+
+    .. warning::
+       本函数**绝不可**在事件循环里直接调用。`cache_db.get_stats()` 是 7 个
+       ``COUNT(*)``，其中一个打在 ``tdx_log`` 上（生产实测 512 万行 / 6.9 GB
+       SQLite），单次实测 3–52s；一旦在循环里同步执行，整个桥（含免鉴权的
+       ``/api/v1/health``）会被按住同样久。后果不是"页面慢"，是**自毁循环**：
+
+       1. 控制台页面（``ui.html`` 的 ``setInterval(loadStats, 15000)``）每 15s 打一次
+          ``/stats``；桥自身 ``ui.auto_open: true``，每重启一次就**再开一个**标签。
+       2. ``/stats`` 把事件循环按住 3–52s ⇒ ``/health`` 一起停摆。
+       3. Windows 侧 ``watchdog.ps1`` 用 ``Invoke-WebRequest -TimeoutSec 5`` 探
+          ``/health``，连续 2 次失败即**杀掉桥重启**——于是又开一个标签，回到第 1 步。
+
+       2026-10-13 实测：15:00 之后 31 次"桥疑似崩溃/假活，正在重启"，**每一次**都
+       紧跟在一记桥内耗时 8–52s 的 ``/stats`` 之后（bridge.log 无任何进程崩溃
+       traceback，桥是被杀的）。当日重启 378 次。而 QuantMind 侧启动闸门的行情探针
+       同步超时，于是策略启不动。
+
+    另外计数本身不值这个价：控制台只是展示，60s 的陈旧度完全够用（见
+    :data:`CACHE_STATS_TTL_S`），故外层再加 TTL 缓存，命中时<b>连线程都不进</b>。
+    """
+    if not cache_db:
+        return None
+    now = time.monotonic()
+    cached = _cache_stats_cache.get("data")
+    if cached is not None and now - _cache_stats_cache.get("ts", 0.0) < CACHE_STATS_TTL_S:
+        # 浅拷贝：调用方还要往里塞 mem_hit_rate 等键，别污染缓存
+        return dict(cached)
+    try:
+        data = cache_db.get_stats()
+        data["disk_bytes"] = cache_db.get_cache_disk()
+    except Exception:
+        log.warning("缓存统计读取失败(忽略)", exc_info=True)
+        return None
+    _cache_stats_cache["ts"] = now
+    _cache_stats_cache["data"] = dict(data)
+    if memory_cache:
+        try:
+            data["mem_hit_rate"] = memory_cache.hit_rate()
+            stats = memory_cache.stats()
+            data["mem_hits"] = stats["hits"]
+            data["mem_entries"] = stats["cache_entries"]
+        except Exception:
+            pass
+    return data
 
 
 def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
@@ -545,18 +601,15 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 _stats_cache["account"] = stats_data["account"]
             except Exception:
                 stats_data["account"] = None
-        # 缓存统计
+        # 缓存统计：**必须转线程**。这条曾经在事件循环里同步跑 `cache_db.get_stats()`
+        # （7 个 COUNT(*)，其一打在 512 万行 / 6.9GB 的 tdx_log 上，实测 3–52s），
+        # 把 `/health` 一起按住 → Windows 看门狗 5s 超时 → 判「桥假活」杀桥重启 →
+        # 桥自带控制台又开一个标签 → 更多 /stats。2026-10-13 的启动失败即此自毁循环。
+        # 详见 `_cache_stats_sync` 的 docstring。
         if cache_db:
-            try:
-                stats_data["cache"] = cache_db.get_stats()
-                stats_data["cache"]["disk_bytes"] = cache_db.get_cache_disk()
-                # 内存缓存命中率
-                if memory_cache:
-                    stats_data["cache"]["mem_hit_rate"] = memory_cache.hit_rate()
-                    stats_data["cache"]["mem_hits"] = memory_cache.stats()["hits"]
-                    stats_data["cache"]["mem_entries"] = memory_cache.stats()["cache_entries"]
-            except Exception:
-                stats_data["cache"] = None
+            stats_data["cache"] = await asyncio.to_thread(
+                _cache_stats_sync, cache_db, memory_cache
+            )
         # 限流状态
         if rate_limiter:
             try:

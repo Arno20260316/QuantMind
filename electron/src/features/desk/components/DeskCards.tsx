@@ -15,6 +15,7 @@ import { StockLabel } from './StockLabel';
 import { CARD, CardHeader, StatTile } from './cardKit';
 import { formatResearchScore, researchScore } from '../../shared/researchScore';
 import { SERVICE_URLS } from '../../../config/services';
+import { fmtBeijingClock } from '../../../utils/timeBeijing';
 import {
   executionSummary,
   executionUnavailableReason,
@@ -353,7 +354,7 @@ export const HealthCard: React.FC<{ health: HealthBlock | null | undefined; trad
           数据同步
           {captureLast ? (
             <span className={`rounded-full border px-1.5 py-px text-[10px] font-bold ${captureStale ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-emerald-50 text-emerald-600 border-emerald-200'}`}>
-              {new Date(captureLast).toLocaleTimeString('zh-CN', { hour12: false })}
+              {fmtBeijingClock(captureLast, { withSeconds: false })}
               {captureStale ? ' · 陈旧' : ' · 新鲜'}
             </span>
           ) : (

@@ -13,6 +13,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Gauge, RefreshCw } from 'lucide-react';
 import { PAGE_LAYOUT } from '../../config/pageLayout';
+import { fmtBeijingDateTime } from '../../utils/timeBeijing';
 import { useAppSelector } from '../../store';
 import { selectCurrentMarket } from '../../store/slices/uiSlice';
 import { getDeskToday } from './services/deskService';
@@ -87,7 +88,7 @@ const DeskTodayPage: React.FC<{ embedded?: boolean; tradingRunning?: boolean }> 
   );
   const asOfChip = desk?.as_of && (
     <span className="hidden md:inline-flex rounded-full bg-slate-100 border border-slate-200 px-3 py-1 text-[11px] font-bold text-slate-500 font-mono tabular-nums">
-      {new Date(desk.as_of).toLocaleString('zh-CN')}
+      {fmtBeijingDateTime(desk.as_of)}
     </span>
   );
   const refreshBtn = (

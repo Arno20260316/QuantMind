@@ -24,6 +24,7 @@ import type {
   NotificationRouteTarget,
 } from '../types/notification';
 import { normalizeNotificationType } from '../types/notification';
+import { normalizeAlertActionUrl } from '../features/holding-alerts/alertModel';
 
 const NOTIFICATION_ROUTE_MAP: Record<string, NotificationRouteTarget> = {
   '/backtest': 'backtest-history',
@@ -422,6 +423,11 @@ export const resolveNotificationTarget = (
     }
     
     if (rawUrl.startsWith('/')) {
+      // 哨兵/持仓类深链：后端仍给 `/trading?tab=position…`，本机该路由是模拟栏——
+      // 归一为实盘栏 `/live`（仅本机实盘栏目存在时；公开树归一恒不生效）。
+      if (rawUrl.includes('tab=position')) {
+        return { route: normalizeAlertActionUrl(rawUrl) };
+      }
       return { route: rawUrl };
     }
   }

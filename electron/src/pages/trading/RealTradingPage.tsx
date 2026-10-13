@@ -26,7 +26,7 @@ import { selectCurrentMarket } from '../../store/slices/uiSlice';
 import { useTradingModeSwitch } from '../../features/shared/useTradingModeSwitch';
 import { useTradeWebSocket } from '../../hooks/useTradeWebSocket';
 import { buildTradingTopBarAccountInfo, resolveTradingAccountMode } from './utils/accountAdapter';
-import { DEFAULT_ACTIVE_TAB, resolveInitialTab, type ActiveTab } from './utils/activeTab';
+import { DEFAULT_ACTIVE_TAB, resolveInitialSymbol, resolveInitialTab, type ActiveTab } from './utils/activeTab';
 import {
     composeConsoleTabs,
     resolveConsoleTab,
@@ -192,6 +192,10 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
     // 默认「系统健康」，深链 ?tab=eval|signals 直达 —— 规则见 utils/activeTab.ts（有测试锁定）
     const initialTab: ActiveTab = resolveInitialTab(
         typeof window === 'undefined' ? null : window.location.hash,
+    );
+    // 深链带标的（哨兵「去持仓」）：惰性解析一次，落到持仓监控高亮那行
+    const [initialSymbol] = useState<string | null>(() =>
+        typeof window === 'undefined' ? null : resolveInitialSymbol(window.location.hash),
     );
     // 取值域含追加页签 id，故为 string；基础 9 栏的 id 仍由 consoleTabs 钉在 ActiveTab 上
     const [activeTab, setActiveTab] = useState<string>(initialTab);
@@ -790,6 +794,7 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                             isActive={activeTab === 'position'}
                             accountInfo={accountInfo}
                             accountMode={tradingMode}
+                            highlightSymbol={initialSymbol}
                             // 同 manualTaskExtras：回调返回元素，不在这里调 hook
                             railPanels={positionRailExtras?.(tabContext)}
                         />

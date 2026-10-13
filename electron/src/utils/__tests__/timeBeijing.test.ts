@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   beijingPartsOf,
   fmtBeijingClock,
+  fmtBeijingDateEnShort,
   fmtBeijingDateTime,
   isAwareTimestamp,
   isCnTradingHours,
@@ -59,6 +60,19 @@ describe('timeBeijing', () => {
     expect(fmtBeijingClock('2026-10-10T01:30:05Z')).toBe('09:30:05');
     expect(fmtBeijingClock('2026-10-10 09:30:05')).toBe('09:30:05');
     expect(fmtBeijingClock('2026-10-10 09:30:05', { withSeconds: false })).toBe('09:30');
+  });
+
+  it('fmtBeijingDateEnShort：中文文案的英文短日期（aware 换算北京；naive 原样）', () => {
+    // 顶栏日期回归：主机 TZ=JST 时旧 `toLocaleDateString('en-US')` 会跨日出错。
+    // 15:00Z = 北京次日 00:00 —— 跨日边界必须按北京，而不是设备时区。
+    expect(fmtBeijingDateEnShort('2026-09-20T14:03:04Z')).toBe('Sep 20, 2026');
+    expect(fmtBeijingDateEnShort('2026-09-20T16:00:00Z')).toBe('Sep 21, 2026');
+    expect(fmtBeijingDateEnShort(new Date('2026-01-01T00:00:00+08:00'))).toBe('Jan 1, 2026');
+    // naive 原样取字段（不 +8）
+    expect(fmtBeijingDateEnShort('2026-12-31 23:59:00')).toBe('Dec 31, 2026');
+    // 坏值 / 空值兜底
+    expect(fmtBeijingDateEnShort('garbage')).toBe('garbage');
+    expect(fmtBeijingDateEnShort(null)).toBe('—');
   });
 
   it('isCnTradingHours：按北京墙钟判时段（周末 / 午休 / 边界都不放行）', () => {

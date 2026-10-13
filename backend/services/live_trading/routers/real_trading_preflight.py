@@ -326,14 +326,22 @@ async def preflight_check(
             )
 
             tdx_online, tdx_detail = check_tdx_bridge_online()
-            if tdx_online:
+            # 判据取**账户通道**（真查一次）而非行情半边的 health：health 里的
+            # `tdx_connected` 来自行情类查询，交易端掉线时照样为真。账户通道才是
+            # 「行情通 ≠ 账户通」的判据（见 real_trading_utils 该函数 docstring）。
+            account_ok, account_detail, account_details = check_bridge_account_channel()
+            if account_ok:
                 add_check(
                     "qmt_agent_online",
                     "交易通道（通达信桥）",
                     True,
                     bridge_required,
-                    f"{tdx_detail}（QMT Agent 未接入: {qmt_failed_detail}）",
-                    {"channel": "tdx_bridge", "qmt_detail": qmt_failed_detail},
+                    f"{account_detail}（QMT Agent 未接入: {qmt_failed_detail}）；{tdx_detail}",
+                    {
+                        "channel": "tdx_bridge",
+                        "qmt_detail": qmt_failed_detail,
+                        **account_details,
+                    },
                 )
             else:
                 add_check(
@@ -341,15 +349,15 @@ async def preflight_check(
                     "交易通道（QMT/通达信）",
                     False,
                     bridge_required,
-                    f"{qmt_failed_detail}；且 {tdx_detail}",
+                    f"{account_detail}；行情半边：{tdx_detail}",
+                    {"qmt_detail": qmt_failed_detail, **account_details},
                 )
             # 行情通 ≠ 账户通（P0.3 核出的那个 ⚠️）。上面那条只读桥的 health，
             # 而 health 里的 tdx_connected 来自 health_check_fast —— 一个**行情类**
             # 查询；交易端掉线时它照样返回 True，账户查询却超时。隔壁
             # 2026-09-24 09:12 的 preflight.json 正是此形态（account.ok=false 而
             # 桥进程活着），它的判词是「盘中分析/调仓/哨兵条件位会静默停摆」。
-            # 故账户通道单独一行、**真查一次**：分开列才知道断的是哪一半。
-            account_ok, account_detail, account_details = check_bridge_account_channel()
+            # 故账户通道单独一行，失败时界面能看出断的是哪一半。
             add_check(
                 "bridge_account_channel",
                 "账户通道（通达信桥）",
@@ -428,7 +436,9 @@ async def preflight_check(
             )
 
         real_short_required = mode == "REAL"
-        # TDX 桥通道在线时，多空灰度检查自动放行（通达信股票账户无信用数据）
+        # TDX 桥通道在线时，多空灰度检查自动放行（通达信股票账户无信用数据）。
+        # 这里问的是**行情/进程这一半**（通达信账户有无信用数据只看通道类型，
+        # 与账户能否查询无关）——故用轻量的 health 探针，不搬账户通道那记重查。
         tdx_channel_ready = False
         if real_short_required:
             from backend.services.live_trading.routers.real_trading_utils import (

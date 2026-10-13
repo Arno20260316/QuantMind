@@ -5,6 +5,8 @@
  * run_id + 基线取数面）。此前只摆了 4 个计数器，看不出上面任何一条。
  */
 
+import { fmtBeijingClock } from '../../../utils/timeBeijing';
+
 export interface InferConfigView {
   enabled?: string;
   model_dir?: string;
@@ -133,9 +135,8 @@ function _ageText(s: number): string {
 }
 
 function _hms(ms: number): string {
-  const d = new Date(ms);
-  const p = (x: number) => String(x).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  // 北京口径（`timeBeijing`）：该值来自后端 epoch 毫秒，设备时区无关地换算北京墙钟。
+  return fmtBeijingClock(ms, { withSeconds: true });
 }
 
 function _sizeText(bytes: number | null | undefined): string {

@@ -1412,6 +1412,14 @@ def _check_quantdb_latest_daily(market: str = "CN") -> tuple[bool, str]:
 #: 「桥在忙」与「交易端掉线」，桥侧的真实报错（``TDX_UNAVAILABLE``）永远读不到。
 BRIDGE_ACCOUNT_TIMEOUT_S = 12.0
 
+#: 行情/进程健康探针的客户端超时（秒）。**与账户探针同档**，理由同上：
+#: 桥的 ``/api/v1/health`` 要过 ``asyncio.Semaphore(4)`` 再转 tqcenter，实测
+#: 6–35s（2026-10-13 盘后主机侧采样），早已超出桥自身 8s 预算。旧值 3.0 会在
+#: 桥正常但繁忙时**系统性误报「不可达: timed out」**——10 次探测 9 次恰好 3.05s
+#: 超时、放宽到 30s 后全部 200。REAL 闸门曾被这条误报把「可回退的 TDX 通道」
+#: 拼成「双失败」，策略因此启不动（见 precheck/preflight 回退分支）。
+BRIDGE_HEALTH_TIMEOUT_S = 12.0
+
 #: 隔壁那条故障实录里验证过的修法（原文：「需 RDP 重登通达信交易端」）。
 #: 单独成常量：判据文案与测试都引用它，改一处即可。
 BRIDGE_ACCOUNT_REMEDY = "需在 Windows 侧 RDP 重登通达信交易端后重试"
@@ -1443,7 +1451,10 @@ def check_tdx_bridge_online() -> tuple[bool, str]:
     if not bridge_url or not bridge_token:
         return False, "TDX 桥未配置（TDX_BRIDGE_URL/TOKEN 为空）"
     try:
-        resp = httpx.get(f"{bridge_url.rstrip('/')}/api/v1/health", timeout=3.0)
+        resp = httpx.get(
+            f"{bridge_url.rstrip('/')}/api/v1/health",
+            timeout=BRIDGE_HEALTH_TIMEOUT_S,
+        )
         if resp.status_code == 200:
             payload = (
                 resp.json()
@@ -1601,7 +1612,7 @@ def check_bridge_sltp_disarmed() -> tuple[bool, str, bool]:
         resp = httpx.get(
             f"{bridge_url.rstrip('/')}/api/v1/sltp/state",
             headers={"Authorization": f"Bearer {bridge_token}"},
-            timeout=3.0,
+            timeout=BRIDGE_HEALTH_TIMEOUT_S,
         )
         if resp.status_code != 200:
             return (

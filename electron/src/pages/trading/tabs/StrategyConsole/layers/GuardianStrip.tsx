@@ -1,6 +1,7 @@
 import React from 'react';
 import { Activity, HeartPulse, Info, ServerCog } from 'lucide-react';
 import type { RealTradingStatus } from '../../../../../services/realTradingService';
+import { fmtBeijingClock } from '../../../../../utils/timeBeijing';
 
 interface GuardianStripProps {
     status: RealTradingStatus | null;
@@ -99,7 +100,7 @@ const GuardianStrip: React.FC<GuardianStripProps> = ({ status, loading }) => {
 
             <span className="flex items-center gap-1.5">
                 <Activity size={13} className="text-slate-400" />
-                最近周期：{cycle?.at ? new Date(cycle.at).toLocaleTimeString() : '尚无'}
+                最近周期：{cycle?.at ? fmtBeijingClock(cycle.at, { withSeconds: false }) : '尚无'}
             </span>
 
             <span className="ml-auto flex items-center gap-1.5 text-slate-500">

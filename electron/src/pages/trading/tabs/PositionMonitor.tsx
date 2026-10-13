@@ -28,6 +28,11 @@ interface PositionMonitorProps {
      *  看实盘持仓却默认发模拟腿，会因为「模拟账户没有这只票」逐笔被拦。 */
     accountMode?: TradingAccountMode;
     /**
+     * 深链带过来的持仓代码（前缀式）：哨兵「去持仓」的 `symbol=` 参数。
+     * 传到 `PositionVisualBoard` 高亮该标的行；不命中静默无效果。
+     */
+    highlightSymbol?: string | null;
+    /**
      * 追加到右栏（持仓风险与情报）的区块，排在哨兵面板之后、副驾驶之前。缺省不渲染。
      *
      * **公开树不感知调用方是谁** —— 无调用方时这个 prop 为 undefined，追加分支整段
@@ -81,7 +86,7 @@ const mergeLivePrices = (holdings: NormalizedHolding[], live: Record<string, Quo
     });
 };
 
-const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isActive, accountInfo, accountMode = 'simulation', railPanels }) => {
+const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isActive, accountInfo, accountMode = 'simulation', railPanels, highlightSymbol }) => {
     const currentMarket = useAppSelector(selectCurrentMarket);
     const [stockNames, setStockNames] = useState<Record<string, string>>({});
     // 键 = 前缀式代码；值是带元信息的最后一条行情（价 + 服务端新鲜度 + 源 + 行情时刻，T6-1）
@@ -228,6 +233,7 @@ const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isAc
                         holdings={holdings}
                         summary={summary}
                         quoteFreshness={quoteFreshness}
+                        highlightSymbol={highlightSymbol}
                         defaultChannels={
                             // 实盘开关关闭时恒为模拟盘：这里是实盘关闭后最容易漏的一处——
                             // 账户态仍可能是 real（历史数据），默认通道若不跟着收敛，

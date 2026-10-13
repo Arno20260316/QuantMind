@@ -2,6 +2,7 @@ import React from 'react';
 import { Gauge, Clock, Radio } from 'lucide-react';
 import type { RealTradingStatus } from '../../../../../services/realTradingService';
 import { deriveFrequencyTier, describeRhythm, FREQUENCY_TIERS, INTRADAY_TIER } from '../../../utils/frequencyTier';
+import { fmtBeijingDateTime } from '../../../../../utils/timeBeijing';
 
 interface RhythmLayerProps {
     status: RealTradingStatus | null;
@@ -130,7 +131,7 @@ const RhythmLayer: React.FC<RhythmLayerProps> = ({ status, loading }) => {
                     />
                     <Cell
                         label="最近周期"
-                        value={cycle?.at ? new Date(cycle.at).toLocaleString() : '尚无记录'}
+                        value={cycle?.at ? fmtBeijingDateTime(cycle.at, { withSeconds: false }) : '尚无记录'}
                         title={cycle?.last_line}
                         hint="托管调度器最近一次实际执行的时间"
                     />

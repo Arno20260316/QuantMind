@@ -41,14 +41,25 @@ def _get_proxy_client() -> httpx.AsyncClient:
     return _client
 
 
-# 重接口（手动任务预览/创建：账户快照 + 全市场信号计划构建，
-# 信号表被覆盖清空时还要回退读 pred.parquet 截面）的读超时，
-# 避免 10 秒全局超时把慢而正确的请求打成 504。
+# 重接口的读超时，避免 10 秒全局超时把慢而正确的请求打成 504。
+# - `/manual-executions`：手动任务预览/创建（账户快照 + 全市场信号计划构建，
+#   信号表被覆盖清空时还要回退读 pred.parquet 截面）。
+# - `/trading-precheck`、`/preflight`：交易准备度检测。内部要真探通达信桥
+#   （`BRIDGE_ACCOUNT_TIMEOUT_S`/`BRIDGE_HEALTH_TIMEOUT_S` 各 12s）并跑若干带
+#   DB 的检查，实测 18.7s 起；10s 全局超时下日志实测 34 次 `ReadTimeout` 假失败，
+#   前端看到的是「准备度检测超时」而不是真实结论。
+# - `/account`：实盘账户查询，实测 27.2s（104 次 `ReadTimeout` 假失败）。
+_PROXY_SLOW_PATH_MARKERS = (
+    "/manual-executions",
+    "/trading-precheck",
+    "/preflight",
+    "/account",
+)
 _SLOW_PATH_TIMEOUT_SECONDS = float(os.getenv("TRADE_PROXY_SLOW_TIMEOUT_SECONDS", "120"))
 
 
 def _resolve_proxy_timeout(path: str) -> httpx.Timeout:
-    if "/manual-executions" in path:
+    if any(marker in path for marker in _PROXY_SLOW_PATH_MARKERS):
         return httpx.Timeout(_SLOW_PATH_TIMEOUT_SECONDS, connect=3.0)
     return httpx.Timeout(10.0, connect=3.0)
 
@@ -57,9 +68,11 @@ async def _do_proxy(request: Request, user: dict | None = None) -> Response:
     path = request.url.path
 
     # 兼容旧版前端：重写路径到 /api/v1
-    if path.startswith("/internal/strategy") or \
-       path.startswith("/simulation") or \
-       path.startswith("/real-trading"):
+    if (
+        path.startswith("/internal/strategy")
+        or path.startswith("/simulation")
+        or path.startswith("/real-trading")
+    ):
         if not path.startswith("/api/v1"):
             path = f"/api/v1{path}"
 
@@ -101,7 +114,8 @@ async def _do_proxy(request: Request, user: dict | None = None) -> Response:
             resp_headers = {
                 k: v
                 for k, v in resp.headers.items()
-                if k.lower() not in {"content-encoding", "content-length", "transfer-encoding"}
+                if k.lower()
+                not in {"content-encoding", "content-length", "transfer-encoding"}
             }
             return Response(
                 content=resp.content,
@@ -121,84 +135,142 @@ async def _do_proxy(request: Request, user: dict | None = None) -> Response:
             last_exc = exc
             break
 
-    logger.error(f"❌ TRADE PROXY FINAL FAILURE: {request.method} {url} -> {type(last_exc).__name__}: {last_exc}")
-    raise map_upstream_http_error("trade", last_exc or Exception("Unknown trade proxy error"))
+    logger.error(
+        f"❌ TRADE PROXY FINAL FAILURE: {request.method} {url} -> {type(last_exc).__name__}: {last_exc}"
+    )
+    raise map_upstream_http_error(
+        "trade", last_exc or Exception("Unknown trade proxy error")
+    )
 
 
-@router.api_route("/api/v1/simulation", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
 @router.api_route(
-    "/api/v1/simulation/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False
-)
-@router.api_route("/api/v1/real-trading", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route(
-    "/api/v1/real-trading/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], include_in_schema=False
-)
-@router.api_route("/api/v1/replay", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route(
-    "/api/v1/replay/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False
-)
-@router.api_route("/api/v1/orders", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route(
-    "/api/v1/orders/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], include_in_schema=False
-)
-@router.api_route("/api/v1/tdx", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route(
-    "/api/v1/tdx/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], include_in_schema=False
-)
-@router.api_route("/api/v1/broker-config-status", methods=["GET", "OPTIONS"], include_in_schema=False)
-@router.api_route(
-    "/api/v1/broker-config/selected/{market}", methods=["GET", "PUT", "OPTIONS"], include_in_schema=False
+    "/api/v1/simulation", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
 )
 @router.api_route(
-    "/api/v1/broker-config", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], include_in_schema=False
+    "/api/v1/simulation/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/real-trading", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/real-trading/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/replay", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/replay/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/orders", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/orders/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/tdx", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/tdx/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/broker-config-status", methods=["GET", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/broker-config/selected/{market}",
+    methods=["GET", "PUT", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/broker-config",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
 )
 @router.api_route(
     "/api/v1/broker-config/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-@router.api_route("/api/v1/trades", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route("/api/v1/trades/{p:path}", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
-@router.api_route("/api/v1/qmt-mirror", methods=["GET", "POST", "PUT", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/api/v1/trades", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
+@router.api_route(
+    "/api/v1/trades/{p:path}",
+    methods=["GET", "POST", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/qmt-mirror",
+    methods=["GET", "POST", "PUT", "OPTIONS"],
+    include_in_schema=False,
+)
 @router.api_route(
     "/api/v1/qmt-mirror/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-@router.api_route("/api/v1/decision", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/api/v1/decision", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
 @router.api_route(
     "/api/v1/decision/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-@router.api_route("/api/v1/portfolios", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
 @router.api_route(
-    "/api/v1/portfolios/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], include_in_schema=False
+    "/api/v1/portfolios", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
 )
-@router.api_route("/api/v1/internal/strategy", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/api/v1/portfolios/{p:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/api/v1/internal/strategy",
+    methods=["GET", "POST", "OPTIONS"],
+    include_in_schema=False,
+)
 @router.api_route(
     "/api/v1/internal/strategy/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
 # 兼容旧版前端路径（不带 /api/v1 前缀）
-@router.api_route("/internal/strategy", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/internal/strategy", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
 @router.api_route(
     "/internal/strategy/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-@router.api_route("/simulation", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/simulation", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
 @router.api_route(
     "/simulation/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-@router.api_route("/real-trading", methods=["GET", "POST", "OPTIONS"], include_in_schema=False)
+@router.api_route(
+    "/real-trading", methods=["GET", "POST", "OPTIONS"], include_in_schema=False
+)
 @router.api_route(
     "/real-trading/{p:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-async def trade_proxy_handler(request: Request, user: dict | None = Depends(get_optional_user)):
+async def trade_proxy_handler(
+    request: Request, user: dict | None = Depends(get_optional_user)
+):
     return await _do_proxy(request, user)

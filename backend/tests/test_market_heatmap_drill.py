@@ -137,3 +137,19 @@ def test_sector_drill_flow_matches_super_plus_large():
     )
     # 至少存在非零主力净额的成分（否则数据链路可能整体为空）
     assert any(abs(it["flow_net"]) > 0 for it in items)
+
+
+def test_sector_heatmap_layer_exposes_flow_net():
+    """板块层（/heatmap 的实时聚合结果）必须带 flow_net：前端「主力净额」着色
+    套在板块层与下钻层同一份数据上，板块层缺这一列会让切换着色后整图无净额。
+
+    回归点：``_load_l2_main_flow`` 少读 amount/flow_net_amount/flow_net_ratio
+    时，单位判别器静默退回「已是元」，万元分区被当元读 → 板块净额整列 0.00。
+    """
+    items = quantdb_feed.get_sector_heatmap("shenwan")
+    assert items, "板块层无数据"
+    assert all("flow_net" in it for it in items), "板块层缺 flow_net 字段"
+    # 至少有一个板块净额非零——全零即上述单位误判回归
+    assert any(abs(it["flow_net"] or 0.0) > 0 for it in items), (
+        "板块层主力净额整列 0，疑似 L2 单位判别退化为「已是元」"
+    )

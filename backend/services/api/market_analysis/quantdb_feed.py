@@ -63,6 +63,11 @@ MAX_DRILL_ITEMS = 300
 # 缓存 TTL（秒）：日级别分析数据设为 30 分钟，点击「市场分析」按钮时会主动清空
 _QUERY_TTL = 1800  # 资金流与市场指标聚合结果缓存 30 分钟
 
+# L2 单日读取的分区宽度与上探上限：最新交易日的 L2 分区常延后落盘（T+1 追平），
+# 必须向前回溯到最近有数据的交易日，否则板块层「主力净额」整列恒为 0。
+_L2_FLOW_WINDOW = 8
+_L2_FLOW_MAX_LOOKBACK = 40
+
 _cache_lock = threading.Lock()
 _cache: dict[str, tuple[float, Any]] = {}
 _inflight: dict[str, threading.Lock] = {}
@@ -770,6 +775,10 @@ def get_sector_heatmap(category: str = "shenwan") -> list[dict[str, Any]]:
                         tv = 0.0
                     mv_map[sym] = tv
 
+        # 主力净额（主力 = flow_super_net + flow_large_net）：板块层按成分求和，
+        # 与下钻层同口径；取不到时留 None，前端显示「—」而不是伪装成 0。
+        _, flow_map = _load_l2_main_flow(today_s)
+
         items: list[dict[str, Any]] = []
         for sname, syms in groups.items():
             sub = prices[prices["symbol"].isin(syms)]
@@ -792,10 +801,14 @@ def get_sector_heatmap(category: str = "shenwan") -> list[dict[str, Any]]:
                     val_yi = round(tot_amt, 1)
 
             leader_row = sub.sort_values("pct_change", ascending=False).iloc[0]
+            # 主力净额（亿）：全成分求和（含未在行情快照内的成分，只要 L2 有值即计入）
+            flow_yuan = sum(flow_map.get(s, 0.0) for s in syms) if flow_map else None
+            flow_yi = round(flow_yuan / 1e8, 2) if flow_yuan is not None else None
             items.append({
                 "name": sname,
                 "value": max(val_yi, 10.0),
                 "pct_change": avg_pct,
+                "flow_net": flow_yi,
                 "leader": str(leader_row.get("name") or leader_row["symbol"]),
                 "leader_pct": round(float(leader_row["pct_change"] or 0.0), 2),
             })
@@ -832,6 +845,43 @@ def _clean_flow_rows(flow: pd.DataFrame) -> pd.DataFrame:
         return flow
     bad = placeholder_symbols_by_dt(flow).get(str(flow["dt"].iloc[0]), set())
     return flow[~flow["symbol"].isin(bad)]
+
+
+def _load_l2_main_flow(end: str | None) -> tuple[str | None, dict[str, float]]:
+    """截至 ``end`` 的最近一个有 L2 数据的交易日的主力净额（元）。
+
+    主力口径 = flow_super_net + flow_large_net（与 flow_panorama 一致）。
+    L2 分区常滞后于行情分区（最新交易日尚无行），故自 ``end`` 向前回溯；
+    返回 ``(flow_date, {symbol: 元})``；取不到时 ``(None, {})``，调用方须如实留空
+    （而不是把 0 当成「无净额」展示）。
+    """
+    if not end:
+        return None, {}
+    for d in _l2_days(str(end).zfill(8), _L2_FLOW_MAX_LOOKBACK):
+        # 必须带上 amount/flow_net_amount/flow_net_ratio：单位判别器靠
+        # 「flow_net_amount / amount ≈ flow_net_ratio」恒等式分档（分区混存元/万元），
+        # 少了这三列会静默退回「已是元」，万元分区被当元读 → 板块净额整列 0.00。
+        fl = _read_partitioned(
+            "6_ml_datasets/l2_factors",
+            [d],
+            "symbol, amount, flow_net_amount, flow_net_ratio, "
+            "flow_super_net, flow_large_net",
+        )
+        if fl.empty:
+            continue
+        fl = _clean_flow_rows(fl)
+        if fl.empty:
+            continue
+        # 逐日金额档位归一（元），与 flow_panorama 的主力口径一致
+        fl = normalize_l2_flow_money_to_yuan(fl)
+        m: dict[str, float] = {}
+        for r in fl.itertuples(index=False):
+            m[str(r.symbol).strip()] = _f(getattr(r, "flow_super_net", 0.0)) + _f(
+                getattr(r, "flow_large_net", 0.0)
+            )
+        if m:
+            return d, m
+    return None, {}
 
 
 def get_sector_drill(
@@ -890,30 +940,10 @@ def get_sector_drill(
                 v = float(r.total_mv or 0.0)
                 mv_map[str(r.symbol)] = v if math.isfinite(v) else 0.0
 
-        # L2 主力净额（flow_super_net + flow_large_net，元→亿）：参考日单日
+        # L2 主力净额（flow_super_net + flow_large_net，元→亿）：参考日（缺失则前溯）
         flow_map: dict[str, float] = {}
         if ref:
-            for d in _l2_days(ref, 6):
-                fl = _read_partitioned(
-                    "6_ml_datasets/l2_factors",
-                    [d],
-                    "symbol, amount, flow_net_amount, flow_super_net, flow_large_net",
-                )
-                if fl.empty:
-                    continue
-                fl = _clean_flow_rows(fl)
-                if fl.empty:
-                    continue
-                # 逐日金额档位归一（元），与 flow_panorama/_with_derived 的「主力」口径一致
-                fl = normalize_l2_flow_money_to_yuan(fl)
-                for r in fl.itertuples(index=False):
-                    sym = str(r.symbol).strip()
-                    fv = _f(getattr(r, "flow_super_net", 0.0)) + _f(
-                        getattr(r, "flow_large_net", 0.0)
-                    )
-                    flow_map[sym] = fv
-                if flow_map:
-                    break
+            _, flow_map = _load_l2_main_flow(ref)
 
         names = _instrument_names()
         price_map: dict[str, dict[str, float]] = {}
@@ -958,7 +988,11 @@ def get_sector_drill(
         avg_pct = (
             round(sum(r["pct_change"] for r in rows) / len(rows), 2) if rows else 0.0
         )
-        total_flow = round(sum(r["flow_net"] for r in rows), 2)
+        total_flow = (
+            round(sum(r["flow_net"] for r in rows if r["flow_net"] is not None), 2)
+            if any(r["flow_net"] is not None for r in rows)
+            else None
+        )
 
         return {
             "trade_date": _dash(ref),

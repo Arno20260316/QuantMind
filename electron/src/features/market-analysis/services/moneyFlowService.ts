@@ -452,12 +452,14 @@ export interface HeatmapTopItem {
   name: string;
   value: number;
   pct_change: number;
+  /** 主力净额（亿）：flow_super_net + flow_large_net 当日值；快照/无 L2 时为 null */
+  flow_net?: number | null;
   leader?: string;
   leader_pct?: number;
 }
 
 /** 板块层热力图（顶层）。realtime=true 跳过快照、直接读 QuantDB 全量
- *  —— 快照对概念板块只存前 50，会让「概念」分类缺板块，实时全量才有完整 422 个。 */
+ *  —— 快照库既无主力净额、又只存概念板块前 50，故顶层一律走实时全量。 */
 export async function getHeatmapTop(
   params: { category?: HeatmapDrillCategory; date?: string; realtime?: boolean } = {},
 ): Promise<HeatmapTopItem[]> {

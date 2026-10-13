@@ -65,10 +65,12 @@ export const HeatmapDrillCard: React.FC<HeatmapDrillCardProps> = ({
     setDrill(null);
   }, [category]);
 
-  // 顶层数据：shenwan 用页面预取值；其它分类走实时全量（快照对概念只存前 50，会漏板块）
+  // 顶层数据：一律走实时全量 —— 快照库（SQLite sector_mv）既不含主力净额，
+  // 又只存概念板块前 50，无法支撑「主力净额」着色与概念全量；页面预取的
+  // shenwan 快照仅作首屏即时铺底，实时数据到达后替换（无估值/无 L2 时不闪空态）。
   useEffect(() => {
-    if (category === 'shenwan') return;
     let cancelled = false;
+    setOwnTop([]);
     setTopLoading(true);
     getHeatmapTop({ category, date, realtime: true })
       .then((items) => {
@@ -105,7 +107,8 @@ export const HeatmapDrillCard: React.FC<HeatmapDrillCardProps> = ({
     };
   }, [drillName, category, date]);
 
-  const topData = category === 'shenwan' ? topItems : ownTop;
+  // 实时全量优先；尚未到达时用页面预取的 shenwan 快照铺底（避免首屏空态）
+  const topData = ownTop.length > 0 ? ownTop : topItems;
 
   // 个股层：名称 → symbol 映射（treemap 点击回传的是显示名）
   const symbolByName = useMemo(() => {

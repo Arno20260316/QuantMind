@@ -103,8 +103,8 @@ class Settings(BaseSettings):
     REMOTE_QUOTE_REDIS_PASSWORD: str = Field(default=MARKET_REDIS_PASSWORD)
     REMOTE_QUOTE_REDIS_DB: int = Field(default=MARKET_REDIS_DB)
 
-    # 无订阅时的保活拉取标的，确保时序/落库链路持续有数据
-    STREAM_WARMUP_SYMBOLS: str = "SZ000001,SH600000"
+    # 无订阅时的保活拉取标的，确保落库/推送链路持续有数据（后缀正典）
+    STREAM_WARMUP_SYMBOLS: str = "000001.SZ,600000.SH"
 
     # 远端行情 Redis 写入开关（OSS 默认只读）。
     # 行情快照/时序统一由上游提供，本容器只读、不发布：

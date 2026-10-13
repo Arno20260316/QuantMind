@@ -352,7 +352,7 @@ export function executionItemDrillEntries(
       hint: priceSourceHint(item.price_source),
       drill: {
         title: '取价来源 · 工程口径',
-        subtitle: 'T-P2-03 取价链唯一实现（L0/L1 新鲜价优先，降级如实标注）',
+        subtitle: '取价链唯一实现（L0/L1 新鲜价优先，降级如实标注）',
         entries: [
           { label: '本单标记', value: item.price_source || '—' },
           { label: '含义', value: priceSourceHint(item.price_source) },
@@ -401,7 +401,7 @@ export function planOrderDrillEntries(
       source: plan?.source,
       drill: {
         title: isExit ? '退出规则 · 为什么风控不可绕过' : '定期调仓 · 人工可调范围',
-        subtitle: '与执行同一 RebalanceCalculator（T-P2-04 退出规则单实现）',
+        subtitle: '与执行同一 RebalanceCalculator（退出规则单实现）',
         entries: isExit
           ? [
               { label: '触发', value: '止损/止盈等退出规则命中持仓', hint: order.reason },

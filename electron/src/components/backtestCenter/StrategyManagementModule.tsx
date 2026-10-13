@@ -269,7 +269,7 @@ export const StrategyManagementModule: React.FC = () => {
                                                     {['sim', 'live'].includes(String(strategy.rawStatus || '').toLowerCase()) && (
                                                         <span
                                                             className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border border-amber-200 bg-amber-50 text-amber-700"
-                                                            title="参数锁（T-P3-01）：运行中策略修改内容必须显式升版本"
+                                                            title="参数锁：运行中策略修改内容必须显式升版本"
                                                         >
                                                             <Lock className="w-3 h-3" />
                                                             锁

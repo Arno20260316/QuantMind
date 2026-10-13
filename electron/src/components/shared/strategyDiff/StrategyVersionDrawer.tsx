@@ -135,7 +135,7 @@ export const StrategyVersionDrawer: React.FC<StrategyVersionDrawerProps> = ({ op
           {isLocked && (
             <span
               className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700 shrink-0"
-              title="参数锁（T-P3-01）：运行中策略修改内容必须显式升版本（携带当前 version）"
+              title="参数锁：运行中策略修改内容必须显式升版本（携带当前 version）"
             >
               <Lock className="w-3 h-3" /> 参数锁（运行中）
             </span>

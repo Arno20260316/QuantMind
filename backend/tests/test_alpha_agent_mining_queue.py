@@ -43,6 +43,7 @@ from backend.services.engine.alpha_agent.launcher import (  # noqa: E402
     EvolutionTask,
     QueueFullError,
     TaskStatus,
+    _exit_code_hint,
 )
 
 
@@ -148,7 +149,7 @@ def test_running_capacity_env_and_defaults(monkeypatch) -> None:
     monkeypatch.delenv("ALPHA_AGENT_MAX_RUNNING_PER_USER", raising=False)
     monkeypatch.delenv("ALPHA_AGENT_MAX_RUNNING_GLOBAL", raising=False)
     launcher = _launcher()
-    assert launcher.running_capacity() == (2, 4)
+    assert launcher.running_capacity() == (2, 2)
 
     monkeypatch.setenv("ALPHA_AGENT_MAX_RUNNING_PER_USER", "5")
     monkeypatch.setenv("ALPHA_AGENT_MAX_RUNNING_GLOBAL", "9")
@@ -156,6 +157,50 @@ def test_running_capacity_env_and_defaults(monkeypatch) -> None:
 
     monkeypatch.setenv("ALPHA_AGENT_MAX_RUNNING_PER_USER", "abc")
     assert launcher.running_capacity() == (2, 9), "坏值回落默认，绝不因配置写错锁死入口"
+
+
+def test_running_capacity_clamped_by_available_memory(monkeypatch) -> None:
+    """内存吃紧 → 并发降到 1 路串行；内存充裕 → 配置值原样。
+
+    2026-10-13 OOM 事故：总量闸对 64.9GB 机器一路绿灯，但 4 路 RD-Agent 子进程
+    峰值 anon-rss 20–30GB → 内核 OOM 挨个 SIGKILL（任务行 `exited with code -9`）。
+    用户口径是「2 路并挖；内存不足就按 1 个挖」——不是拒绝提交。
+    """
+    from backend.services.engine.alpha_agent import hw_lock
+
+    launcher = _launcher()
+    monkeypatch.delenv("ALPHA_AGENT_MAX_RUNNING_PER_USER", raising=False)
+    monkeypatch.delenv("ALPHA_AGENT_MAX_RUNNING_GLOBAL", raising=False)
+
+    # 只够 1 路（单任务 14GB + 预留 10GB = 24GB；给 25GB）
+    monkeypatch.setattr(hw_lock, "probe_available_memory_gb", lambda: 25.0)
+    assert launcher.running_capacity() == (1, 1)
+
+    # 连 1 路都不够 → 仍是 1（串行推进，绝不把入口冻死）
+    monkeypatch.setattr(hw_lock, "probe_available_memory_gb", lambda: 3.0)
+    assert launcher.running_capacity() == (1, 1)
+
+    # 够 2 路（2×14 + 10 = 38GB；给 45GB）
+    monkeypatch.setattr(hw_lock, "probe_available_memory_gb", lambda: 45.0)
+    assert launcher.running_capacity() == (2, 2)
+
+    # 探测不到 → 不缩（回落配置值，总量闸仍在前兜底）
+    monkeypatch.setattr(hw_lock, "probe_available_memory_gb", lambda: 0.0)
+    assert launcher.running_capacity() == (2, 2)
+
+
+def test_running_capacity_memory_gate_can_be_skipped(monkeypatch) -> None:
+    from backend.services.engine.alpha_agent import hw_lock
+
+    launcher = _launcher()
+    monkeypatch.setenv("ALPHA_AGENT_MAX_RUNNING_GLOBAL", "6")
+    monkeypatch.setattr(hw_lock, "probe_available_memory_gb", lambda: 1.0)
+    assert launcher.running_capacity() == (1, 1), (
+        "两档一起降（全局 1 路时每用户也只能 1 路）"
+    )
+
+    monkeypatch.setenv("ALPHA_AGENT_SKIP_MEMORY_GATE", "1")
+    assert launcher.running_capacity() == (2, 6), "显式关闸 → 配置值原样"
 
 
 def test_queue_capacity_env_and_defaults(monkeypatch) -> None:

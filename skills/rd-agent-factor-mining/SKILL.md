@@ -36,12 +36,48 @@ cd ~/projects/quantmind && python3 scripts/alpha_agent/factor_pipeline.py --chec
 
 | 检查项 | 作用 | 失败处理 |
 |---|---|---|
-| `hardware` | 最低 **8 核 / 32GB**。RD-Agent 演化会把 CPU/内存打满，低于此规格直接 412 失败，避免整机卡死 | 换机器或关其他重负载；测试可设 `ALPHA_AGENT_SKIP_HW_LOCK=1`（生产勿开） |
+| `hardware` | 最低 **8 核 / 32GB**（**总量**尺子，开机判一次）。RD-Agent 演化会把 CPU/内存打满，低于此规格直接 412 失败，避免整机卡死 | 换机器或关其他重负载；测试可设 `ALPHA_AGENT_SKIP_HW_LOCK=1`（生产勿开） |
 | `conda_shim` | RD-Agent LocalEnv 硬编码 `rdagent4qlib` conda 环境，容器无 conda，靠 shim 映射到容器 python | 确认 `docker/conda-shim` 挂载 `/usr/local/bin/conda:ro` 且文件有 `+x` |
 | `litellm_patch` | litellm 1.97 + pydantic 2.13 冲突（`Message is not fully defined`） | 确认 `docker/litellm_sitecustomize.py` 挂载为 `site-packages/sitecustomize.py:ro` |
 | `deepseek_key` | 因子挖掘走 DeepSeek 通道（`llm_env.py` 优先级最高） | 更新 `~/projects/quantmind/.env` 的 `DEEPSEEK_API_KEY`，改后必须 `docker compose up -d quantmind` recreate |
 
 > preflight 机制全在管道脚本内置；手动检修环境见文末「常见问题」。
+
+### 0.1 并行路数与内存闸（第二把尺子）
+
+`hardware` 量的是**总量**（这台机器够不够格）；真正决定「**现在**能同时跑几路」
+的是 `backend/services/engine/alpha_agent/hw_lock.py` 的 `advisory_running_capacity`
+——每次读并发上限时按**可用内存**（`MemAvailable`，含可回收页缓存）现算：
+
+| 可用内存 | 并行路数 |
+|---|---|
+| `≥ 路数 × 单任务 + 预留` | 正常态（默认 **2 路**并挖） |
+| 只够 1 路 / 连 1 路都不够 | **1 路串行**——不是拒绝提交，也不是 0 |
+| 探测不到 / 显式关闸 | 不缩，配置上限原样生效 |
+
+默认口径：单任务 14GB、预留 10GB（PG/Redis/engine/桌面/页缓存）。可调：
+
+| env | 默认 | 含义 |
+|---|---|---|
+| `ALPHA_AGENT_TASK_MEMORY_GB` | 14 | 单个挖掘子进程的准入占用（不是峰值上界；实测峰值 20–30GB） |
+| `ALPHA_AGENT_MEMORY_RESERVE_GB` | 10 | 留给非挖掘部分 |
+| `ALPHA_AGENT_SKIP_MEMORY_GATE` | 关 | 跳过可用内存闸（**只在你要手动压测时开**） |
+| `ALPHA_AGENT_MAX_RUNNING_GLOBAL` / `_PER_USER` | 2 / 2 | 并发上限配置值（仍受上面内存闸收敛，不会放大） |
+
+**为什么要有这把尺子（2026-10-13 事故）**：总量尺子对 64.9GB 的机器一路绿灯，
+但 4 路并发时每个 RD-Agent 子进程 anon-rss 撑到 20–30GB → 内核 OOM Killer 挨个
+SIGKILL（任务行 `Process exited with code -9`），swap 吃满 → 整机假卡死。
+6 个任务同一秒提交、只成 1 个，就是这么来的。
+
+怎么看出当前实际被收敛到了几路（engine 日志，**只在结果变化时**记一笔，不刷屏）：
+
+```bash
+docker logs quantmind 2>&1 | grep "挖掘并发按可用内存收敛" | tail -3
+# [alpha-agent] 挖掘并发按可用内存收敛：4 → 1 路（可用内存 25.0GB ≥ 1×14GB + 预留 10GB）
+```
+
+提交时若撞 429，`detail` 会带上收敛理由（「内存不足已自动降为串行」和「你配的
+上限就到这」是两回事）；任务行 `exited with code -9` 现在也会补一句 OOM 线索。
 
 ## 1. 一键管线（推荐入口）
 

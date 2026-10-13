@@ -43,6 +43,7 @@ from backend.services.engine.alpha_agent.doc_store import get_doc_store
 from backend.services.engine.alpha_agent.hw_lock import HardwareLockError
 from backend.services.engine.alpha_agent.launcher import (
     QueueFullError,
+    capacity_clamp_reason,
     get_launcher,
     minute_scope,
     normalize_mining_config,
@@ -1282,18 +1283,27 @@ async def start_evolution(
     # 必须限流防止 fork 风暴。读取点收敛到 launcher（与排队判断同一份口径，
     # 坏值回落默认而非 ValueError 炸路由）。本端点保持 429 背压——满了立即
     # 拒（不排队），批量派发路径走 start_or_queue。
+    # 上限可能被可用内存自动收敛（内存吃紧 → 1 路串行）：文案要说清是
+    # 「机器内存不够」而不是「你配的上限就这么低」，否则用户会去改配置找答案。
     counts = launcher.count_running()
     max_per_user, max_global = launcher.running_capacity()
+    clamp_reason = capacity_clamp_reason()
+    clamp_hint = f"（{clamp_reason}）" if clamp_reason else ""
     user_running = counts["by_user"].get(auth_user_id, 0)
     if user_running >= max_per_user:
         raise HTTPException(
             status_code=429,
-            detail=f"您已有 {user_running} 个挖掘任务在运行（上限 {max_per_user}），请等待完成或先取消任务。",
+            detail=(
+                f"您已有 {user_running} 个挖掘任务在运行（上限 {max_per_user}）{clamp_hint}，"
+                "请等待完成或先取消任务。"
+            ),
         )
     if counts["global"] >= max_global:
         raise HTTPException(
             status_code=429,
-            detail=f"当前全平台挖掘任务数已达上限（{max_global}），请稍后再试。",
+            detail=(
+                f"当前全平台挖掘任务数已达上限（{max_global}）{clamp_hint}，请稍后再试。"
+            ),
         )
     try:
         task_id = await launcher.start_evolution(

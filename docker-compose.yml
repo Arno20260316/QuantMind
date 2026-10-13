@@ -340,6 +340,13 @@ services:
 
       # AlphaAgent 因子编码专家系统提示词
       - ALPHA_AGENT_SYSTEM_PROMPT=${ALPHA_AGENT_SYSTEM_PROMPT:-}
+      # 因子挖掘并行路数（2026-10-13 OOM 事故）：默认 2 路并挖；可用内存吃紧时
+      # 自动收敛到 1 路串行（不是拒绝提交）。下面三个键调「收敛判据」：
+      # 单任务准入占用 GB / 留给非挖掘部分的 GB / 跳过内存闸（压测用，生产勿开）。
+      # 上限（MAX_RUNNING_*）也是配置值，但同样受内存闸收敛、不会被放大。
+      - ALPHA_AGENT_TASK_MEMORY_GB=${ALPHA_AGENT_TASK_MEMORY_GB:-}
+      - ALPHA_AGENT_MEMORY_RESERVE_GB=${ALPHA_AGENT_MEMORY_RESERVE_GB:-}
+      - ALPHA_AGENT_SKIP_MEMORY_GATE=${ALPHA_AGENT_SKIP_MEMORY_GATE:-}
 
       # 因子挖掘文档链（上传文档/图片 → MinerU 云端解析 → 提示词整理 → RD-Agent 挖掘）。
       # ⚠️ 数据出网：上传的原件会送到 MinerU 云端 API。ENABLE_DOC_MINING 默认 false

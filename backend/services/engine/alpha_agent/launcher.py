@@ -38,6 +38,7 @@ from backend.services.engine.alpha_agent.algorithm_registry import (
     resolve_algorithm,
 )
 from backend.services.engine.alpha_agent.data_snapshot import snapshot_data_versions
+from backend.services.engine.alpha_agent.hw_lock import advisory_running_capacity
 from backend.services.engine.alpha_agent.mining_config import (
     ENV_FREQ,
     ENV_TASK_FINGERPRINT,
@@ -97,14 +98,23 @@ _ACTIVE_FOR_DEDUPE = (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING)
 
 #: 并发/排队上限的环境变量名与默认值（**唯一读取点**：路由 429 判定与排队
 #: 判断共用 :meth:`AlphaAgentLauncher.running_capacity` / ``queue_capacity``）。
+#: 运行上限还叠一道**可用内存收敛**（见 :meth:`running_capacity`）：默认 2 路是
+#: 「内存充裕」时的口径，吃紧时自动降到 1 路串行。
 ENV_MAX_RUNNING_PER_USER = "ALPHA_AGENT_MAX_RUNNING_PER_USER"
 ENV_MAX_RUNNING_GLOBAL = "ALPHA_AGENT_MAX_RUNNING_GLOBAL"
 ENV_MAX_QUEUED_PER_USER = "ALPHA_AGENT_MAX_QUEUED_PER_USER"
 ENV_MAX_QUEUED_GLOBAL = "ALPHA_AGENT_MAX_QUEUED_GLOBAL"
 DEFAULT_MAX_RUNNING_PER_USER = 2
-DEFAULT_MAX_RUNNING_GLOBAL = 4
+#: 全平台 4 → 2（2026-10-13 OOM 事故）：4 路子进程 × 实测峰值 anon-rss 20–30GB
+#: 远超本机 60GB 物理内存，内核 OOM Killer 挨个 SIGKILL（任务行显示
+#: ``Process exited with code -9``）。2 路是实测不炸的口径；要更高必须显式配
+#: ``ALPHA_AGENT_MAX_RUNNING_GLOBAL``，且仍受可用内存收敛约束。
+DEFAULT_MAX_RUNNING_GLOBAL = 2
 DEFAULT_MAX_QUEUED_PER_USER = 20
 DEFAULT_MAX_QUEUED_GLOBAL = 50
+
+#: 上一次「按可用内存收敛并发」的 (配置值, 收敛后) —— 抑制 60s 清扫器的重复日志。
+_capacity_clamp_log: tuple[int, int] | None = None
 
 
 #: 排空时的 LLM 配置重解析器（注册制，engine 启动期由路由注册）。
@@ -170,6 +180,52 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("%s=%r 不是整数，按默认 %d 处理", name, raw, default)
         return default
+
+
+def _log_capacity_clamp(configured: int, clamped: int, reason: str) -> None:
+    """只在收敛结果**变化**时记一笔（60s 清扫器会反复读这个值，不能刷屏）。"""
+    global _capacity_clamp_log
+    if _capacity_clamp_log == (configured, clamped):
+        return
+    _capacity_clamp_log = (configured, clamped)
+    logger.info(
+        "[alpha-agent] 挖掘并发按可用内存收敛：%d → %d 路（%s）",
+        configured,
+        clamped,
+        reason,
+    )
+
+
+def capacity_clamp_reason() -> str:
+    """全局并发被可用内存收敛时的理由；未收敛 → 空串。
+
+    模块级（不挂 launcher）：路由的 429 文案要能说清「上限为什么比配置低」——
+    「内存不足已自动降为串行」和「你配的上限就到这」对用户是两件事。
+    """
+    configured = _env_int(ENV_MAX_RUNNING_GLOBAL, DEFAULT_MAX_RUNNING_GLOBAL)
+    lanes, reason = advisory_running_capacity(configured)
+    return reason if lanes < configured else ""
+
+
+def _exit_code_hint(returncode: int) -> str:
+    """负返回值 → 附「被内核/信号杀掉」的可操作线索。
+
+    ``-9`` 是 OOM Killer 的 SIGKILL：任务行只写「Process exited with code -9」
+    时，用户根本不知道是内存打满（历史页 2026-10-13 那批 5 条就是这么躺着的）。
+    非负返回值（正常退出码）不加料。
+    """
+    if returncode >= 0:
+        return ""
+    if returncode == -signal.SIGKILL:
+        return (
+            "（被系统强制终止：通常是内存耗尽被 OOM Killer 杀掉——"
+            "请减少并行挖掘任务数或调低单个任务的资源占用）"
+        )
+    try:
+        name = signal.Signals(-returncode).name
+    except ValueError:
+        return "（被信号终止）"
+    return f"（被信号 {name} 终止）"
 
 
 def gc_task_logs(
@@ -1033,11 +1089,23 @@ class AlphaAgentLauncher:
         return None
 
     def running_capacity(self) -> tuple[int, int]:
-        """(每用户上限, 全平台上限)。路由 429 判定与排队判断共用同一读取点。"""
-        return (
-            _env_int(ENV_MAX_RUNNING_PER_USER, DEFAULT_MAX_RUNNING_PER_USER),
-            _env_int(ENV_MAX_RUNNING_GLOBAL, DEFAULT_MAX_RUNNING_GLOBAL),
+        """(每用户上限, 全平台上限)。路由 429 判定与排队判断共用同一读取点。
+
+        配置值是**上限**；实际值再叠一道**可用内存收敛**（2026-10-13 OOM 事故）：
+        内存吃紧时两档一起往下降（最低 1 路串行），而不是把入口拒掉——满额提交
+        转排队，等现役任务跑完/内存释放后自动补位。理由见
+        :func:`hw_lock.advisory_running_capacity`。
+        """
+        configured_user = _env_int(
+            ENV_MAX_RUNNING_PER_USER, DEFAULT_MAX_RUNNING_PER_USER
         )
+        configured_global = _env_int(ENV_MAX_RUNNING_GLOBAL, DEFAULT_MAX_RUNNING_GLOBAL)
+        lanes, reason = advisory_running_capacity(configured_global)
+        clamped_user = min(configured_user, lanes)
+        clamped_global = min(configured_global, lanes)
+        if clamped_global < configured_global:
+            _log_capacity_clamp(configured_global, clamped_global, reason)
+        return clamped_user, clamped_global
 
     def queue_capacity(self) -> tuple[int, int]:
         """(每用户排队深度, 全平台排队深度)。0 = 不许排队（满了直接拒）。"""
@@ -1742,7 +1810,8 @@ class AlphaAgentLauncher:
                 task.status = TaskStatus.FAILED
                 error_output = self._tail_error_log(task_log_dir)
                 task.error_message = (
-                    f"Process exited with code {process.returncode}: {error_output}"
+                    f"Process exited with code {process.returncode}"
+                    f"{_exit_code_hint(process.returncode)}: {error_output}"
                 )
                 logger.error(
                     "Factor mining failed for task %s: %s",

@@ -282,3 +282,90 @@ async def test_oss_parameter_precedence_preserves_code_fallback():
         )
     assert (config.topk, config.n_drop, config.rebalance_days) == (30, 10, 3)
     assert (overridden.topk, overridden.n_drop, overridden.rebalance_days) == (20, 0, 3)
+
+
+@pytest.mark.asyncio
+async def test_sync_hosted_sim_task_registers_hosted_sim_and_writes_stream():
+    """托管模拟调仓必须登记为 hosted_sim（非 queued）并写实盘日志流。
+
+    回归 Bug 2：模拟任务此前只写 simulation_rebalance_jobs，任务表 0 行、
+    日志流无写入，导致 StrategyConsole 的「查看任务日志」永远空白。
+    """
+    created: dict = {}
+    updated: dict = {}
+    logs: list = []
+
+    class _Persistence:
+        async def create_task(self, **kwargs):
+            created.update(kwargs)
+
+        async def update_task(self, **kwargs):
+            updated.update(kwargs)
+
+    class _Stream:
+        def append_log(self, **kwargs):
+            logs.append(kwargs)
+
+    with (
+        patch(
+            "backend.services.live_trading.services.manual_execution_persistence.manual_execution_persistence",
+            _Persistence(),
+        ),
+        patch(
+            "backend.services.live_trading.services.manual_execution_log_stream.manual_execution_log_stream",
+            _Stream(),
+        ),
+    ):
+        await hosted._sync_hosted_sim_task(
+            task_id="hosted_sim_x",
+            tenant_id="default",
+            user_id="10000001",
+            strategy_id="12",
+            strategy_name="测试策略",
+            live_trade_config={},
+        )
+        # 非 queued：手动执行 worker 只认领 queued，避免误跑实盘撮合
+        assert created["task_type"] == "hosted_sim"
+        assert created["status"] == "running"
+        assert created["trading_mode"] == "SIMULATION"
+        assert created["strategy_name"] == "测试策略"
+
+        await hosted._sync_hosted_sim_task(
+            task_id="hosted_sim_x",
+            tenant_id="default",
+            user_id="10000001",
+            strategy_id="12",
+            strategy_name="测试策略",
+            live_trade_config={},
+            result={
+                "status": "succeeded",
+                "signal_count": 5,
+                "order_count": 3,
+                "filled_count": 2,
+                "rejected_count": 1,
+            },
+        )
+
+    assert updated["status"] == "succeeded"
+    assert updated["order_count"] == 3
+    assert updated["success_count"] == 2
+    assert updated["failed_count"] == 1
+    assert len(logs) == 2
+    assert all(entry["task_id"] == "hosted_sim_x" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_sync_hosted_sim_task_skips_empty_task_id():
+    """没有 run_id 时不得落库（bootstrap 之外的无 task 调用）。"""
+    with patch(
+        "backend.services.live_trading.services.manual_execution_persistence.manual_execution_persistence",
+    ) as persistence:
+        await hosted._sync_hosted_sim_task(
+            task_id="",
+            tenant_id="default",
+            user_id="10000001",
+            strategy_id="12",
+            strategy_name="12",
+            live_trade_config={},
+        )
+    persistence.create_task.assert_not_called()

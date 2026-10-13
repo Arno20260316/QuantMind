@@ -480,6 +480,11 @@ async def start_trading(
                                 strategy_id=strategy_id or strategy_name,
                                 live_trade_config=live_config,
                                 run_id=bootstrap_task_id,
+                                strategy_name=str(strategy_name or strategy_id),
+                                trigger_context={
+                                    "run_id": bootstrap_task_id,
+                                    "trigger": "bootstrap_first_run",
+                                },
                             )
                             if bootstrap_result.get("status") == "failed":
                                 bootstrap_skipped_reason = str(
@@ -881,13 +886,26 @@ async def get_status(
         resolved_tenant_id,
         resolved_user_id,
     )
+    active_runtime_id = (
+        active_data.get("run_id")
+        if "active_data" in locals() and isinstance(active_data, dict)
+        else None
+    )
+    # 模拟盘与实盘共用 StrategyConsole 的「任务日志」入口：模拟模式优先取
+    # simulation 托管任务（task_type=hosted_sim），没有再回落实盘托管任务。
     latest_hosted_task = await manual_execution_service.get_latest_hosted_task(
         tenant_id=resolved_tenant_id,
         user_id=resolved_user_id,
-        active_runtime_id=active_data.get("run_id")
-        if "active_data" in locals() and isinstance(active_data, dict)
-        else None,
+        active_runtime_id=active_runtime_id,
+        task_type="hosted_sim" if current_mode == "SIMULATION" else "hosted",
     )
+    if latest_hosted_task is None and current_mode == "SIMULATION":
+        latest_hosted_task = await manual_execution_service.get_latest_hosted_task(
+            tenant_id=resolved_tenant_id,
+            user_id=resolved_user_id,
+            active_runtime_id=active_runtime_id,
+            task_type="hosted",
+        )
 
     # 下次托管窗口（今日无任务时前端“下个交易日计划”展示未来排期用）
     next_trigger = None

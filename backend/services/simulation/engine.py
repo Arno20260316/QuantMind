@@ -690,8 +690,11 @@ class SimulationEngine:
                     deterministic_buy_order=bool(
                         params.get("deterministic_buy_order", False)
                     ),
+                    # 默认开启（与回放 day_runner 对齐）：剔除股跌停/无有效行情时
+                    # 也按持仓价兜底挂单，交由撮合层显式拒绝并留痕，避免
+                    # 「该割的割不掉」在计算阶段被静默丢弃（买卖对账依赖此兜底）。
                     force_exit_on_limit_down=bool(
-                        params.get("force_exit_on_limit_down", False)
+                        params.get("force_exit_on_limit_down", True)
                     ),
                 )
         except Exception as e:

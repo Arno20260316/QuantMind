@@ -935,11 +935,12 @@ class ManualExecutionService:
 
     @staticmethod
     def _build_task_label(task_type: str) -> str:
-        return (
-            "自动托管任务"
-            if str(task_type or "").strip().lower() == "hosted"
-            else "手动执行任务"
-        )
+        normalized = str(task_type or "").strip().lower()
+        if normalized == "hosted":
+            return "自动托管任务"
+        if normalized == "hosted_sim":
+            return "模拟托管任务"
+        return "手动执行任务"
 
     @staticmethod
     def _build_strategy_snapshot(
@@ -2059,12 +2060,13 @@ class ManualExecutionService:
         tenant_id: str,
         user_id: str,
         active_runtime_id: str | None = None,
+        task_type: str = "hosted",
     ) -> dict[str, Any] | None:
         items = await manual_execution_persistence.list_tasks(
             tenant_id=tenant_id,
             user_id=user_id,
             limit=1,
-            task_type="hosted",
+            task_type=task_type,
             parent_runtime_id=active_runtime_id,
         )
         if items:
@@ -2074,7 +2076,7 @@ class ManualExecutionService:
                 tenant_id=tenant_id,
                 user_id=user_id,
                 limit=1,
-                task_type="hosted",
+                task_type=task_type,
             )
             return fallback[0] if fallback else None
         return None

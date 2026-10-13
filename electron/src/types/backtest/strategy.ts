@@ -20,6 +20,14 @@ export interface StrategyFile {
   cos_url?: string;          // COS 预签名 URL（私读，TTL=3600s）
   is_verified?: boolean;     // 是否通过回测验证
   is_system?: boolean;       // 是否为系统内置策略
+  /**
+   * 生命周期状态（T-P3-01 规范词表，DB 原词：DRAFT/VERIFIED/SIM/LIVE/ARCHIVED）。
+   * 启动资格由 `/eval/health/{id}` 的 `eligibility` 逐项给出——**不要用 `base_status`
+   * 反推**：它是展示用的有损词表（VERIFIED 与 ARCHIVED 都落 `repository`）。
+   */
+  status?: string;
+  /** 后端展示词表（`_normalize_base_status`）：draft / repository / live_trading，有损。 */
+  base_status?: string;
   parameters?: Record<string, unknown>;
   execution_config?: {
     max_buy_drop?: number;

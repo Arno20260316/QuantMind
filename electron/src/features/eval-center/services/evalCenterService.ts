@@ -78,9 +78,20 @@ export function getObjectSeries(objectType: string, objectId: string): Promise<E
   return getJson(`/series?${qs.toString()}`);
 }
 
-/** 策略体检档案（最新 + 历史 + 晋级门禁预演，与执行点同源） */
-export function getStrategyHealth(strategyId: string, limit = 24): Promise<StrategyHealthResponse> {
-  return getJson(`/health/${encodeURIComponent(strategyId)}?limit=${limit}`);
+/** 策略体检档案（最新 + 历史 + 晋级门禁预演，与执行点同源）
+ *
+ * `mode` 决定返回的 `eligibility[mode]` 是哪一档（默认 SIMULATION，向后兼容）。
+ * 想看实盘资格必须显式传 `'REAL'`——否则拿到的永远是模拟盘清单。
+ * `gate` 恒为模拟盘预演，不吃 `mode`。
+ */
+export function getStrategyHealth(
+  strategyId: string,
+  limit = 24,
+  mode?: 'SIMULATION' | 'REAL'
+): Promise<StrategyHealthResponse> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (mode) qs.set('mode', mode);
+  return getJson(`/health/${encodeURIComponent(strategyId)}?${qs.toString()}`);
 }
 
 export interface UploadHealthResponse {

@@ -64,6 +64,10 @@ class StrategyManagementService {
       cos_url: item?.cos_url || undefined,
       is_verified: !!item?.is_verified,
       is_system: !!item?.is_system,
+      // 后端已发（`StrategyListItem.status` / `.base_status`），此前在这里被丢掉，
+      // 前端因此无从展示「已回测验证 / 模拟中 / 实盘中」。仅透传，不在此处判资格。
+      status: item?.status || undefined,
+      base_status: item?.base_status || undefined,
       parameters: item?.parameters && typeof item.parameters === 'object' ? item.parameters : {},
       execution_config: item?.execution_config || config.execution_config,
       live_trade_config: item?.live_trade_config || config.live_trade_config,

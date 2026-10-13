@@ -95,7 +95,7 @@ export const GLOSSARY: Record<string, GlossaryEntry> = {
   },
   verdict_l: {
     plain: '运气嫌疑：统计上站不住',
-    detail: 'L：DSR<0.95 / 收益 CI 跨 0 / 剔除 Top5 日后 alpha 消失。不得晋级（T-P3-05 门槛）。',
+    detail: 'L：DSR<0.95 / 收益 CI 跨 0 / 剔除 Top5 日后 alpha 消失。不得晋级（晋级门槛）。',
     category: '体检',
   },
   verdict_e: {

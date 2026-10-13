@@ -14,6 +14,7 @@ import DeskTodayPage from '../../features/desk/DeskTodayPage';
 import { EvalCenterPanel } from '../../features/eval-center/components/EvalCenterPanel';
 import SignalsExplorerPage from './tabs/SignalsExplorerPage';
 import type { RealTradingStatus, AccountInfo, PreflightCheckResponse, PreflightCheckItem } from '../../services/realTradingService';
+import type { StartGateFailure } from '../../services/realTradingService';
 import {
     getPreferredAccountSource,
     subscribeAccountSourceChange,
@@ -34,6 +35,7 @@ import {
     type ConsoleTab,
 } from './utils/consoleTabs';
 import LiveTradeConfigWizard from './components/LiveTradeConfigWizard';
+import StartGateFailedModal from './components/StartGateFailedModal';
 import type { DeployMode, ExecutionConfig, LiveTradeConfig } from '../../types/liveTrading';
 
 /** 支持实盘(通达信桥)与模拟盘。口径见 `utils/consoleTabs.ts::ConsoleTradingMode`。 */
@@ -241,6 +243,8 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
     const [effectiveLiveTradeConfig, setEffectiveLiveTradeConfig] = useState<LiveTradeConfig | null>(null);
     const [pollingPausedByAuth, setPollingPausedByAuth] = useState(false);
     const [tradingReadinessResult, setTradingReadinessResult] = useState<TradingReadinessResult | null>(null);
+    // 启动门禁拒绝（生命周期 / 晋级体检）：常驻弹窗，非 toast —— 见 StartGateFailedModal 抬头注释。
+    const [startGateFailure, setStartGateFailure] = useState<StartGateFailure | null>(null);
     const [wizardOpen, setWizardOpen] = useState(false);
     const [wizardStrategy, setWizardStrategy] = useState<StrategyFile | null>(null);
     const [wizardMode, setWizardMode] = useState<DeployMode>('REAL');
@@ -432,6 +436,13 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
             return true;
         } catch (err: unknown) {
             const { realTradingService } = await import('../../services/realTradingService');
+            // 启动门禁（生命周期 / 晋级体检）：常驻弹窗，不弹 toast —— 理由见 StartGateFailedModal。
+            // 与下面的「交易准备度」自检是两个闸门，信封形状不同，先认门禁。
+            const gateFailure = realTradingService.extractStartGateFailure(err);
+            if (gateFailure) {
+                setStartGateFailure(gateFailure);
+                return false;
+            }
             const precheckFailure = realTradingService.extractTradingPrecheckFailure(err);
             if (precheckFailure) {
                 setPreflightStage('trading-readiness');
@@ -841,6 +852,12 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                 </div>
             </div>
         </div>
+
+            {/* 启动门禁拒绝：常驻说明（非 toast），列出逐项 ✗ 与下一步 */}
+            <StartGateFailedModal
+                failure={startGateFailure}
+                onClose={() => setStartGateFailure(null)}
+            />
 
             <Modal
                 title={preflightStage === 'trading-readiness' ? '交易准备度检测' : '启动前自检详情'}

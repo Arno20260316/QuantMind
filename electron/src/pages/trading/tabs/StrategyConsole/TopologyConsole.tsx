@@ -5,6 +5,7 @@ import type { StrategyFile } from '../../../../types/backtest/strategy';
 import { useRuntimeOverview } from './hooks/useRuntimeOverview';
 import type { ConsoleTradingMode } from './hooks/useRuntimeOverview';
 import { useAwayWhileRunning } from './hooks/useAwayWhileRunning';
+import { useStartEligibility } from './hooks/useStartEligibility';
 import { PlanSection } from '../../../../features/desk/components/DeskSections';
 import CommandBar from './layers/CommandBar';
 import GuardianStrip from './layers/GuardianStrip';
@@ -81,6 +82,14 @@ const TopologyConsole: React.FC<TopologyConsoleProps> = ({
     );
     const selectedStrategy = overview.strategies.find((s) => s.id === selectedStrategyId);
 
+    // 「启动资格」预演（T-P3-05）：选中策略 + 当前模式 → `/eval/health/{id}` 的逐项清单。
+    // 运行中不校验（按钮都收起了，没必要拉）；判据在后端，这里只取数展示。
+    const startEligibility = useStartEligibility(
+        selectedStrategy,
+        mode === 'simulation' ? 'SIMULATION' : 'REAL',
+        !isRunning,
+    );
+
     const defaultModelName = useMemo(() => {
         const metadata = (defaultModel?.metadata_json || {}) as Record<string, unknown>;
         const displayName = typeof metadata.display_name === 'string' ? metadata.display_name.trim() : '';
@@ -139,6 +148,7 @@ const TopologyConsole: React.FC<TopologyConsoleProps> = ({
                     onRefreshStrategies={() => void overview.ensureStrategies(true)}
                     onDeploy={handleDeploy}
                     onStop={() => setStopOpen(true)}
+                    startEligibility={startEligibility}
                     awayWhileRunning={awayWhileRunning}
                 />
 

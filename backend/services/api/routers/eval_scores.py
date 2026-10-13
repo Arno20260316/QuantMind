@@ -3,7 +3,8 @@
 用途（前端评估中心/评分卡/体检档案，T-FE-14/15/16）：
 - `GET /api/v1/eval/scores`        最新快照列表（评分卡网格；可选 latest_only 取每对象最新一条）
 - `GET /api/v1/eval/scores/history` 单对象历史序列（评分卡历史曲线）
-- `GET /api/v1/eval/health/{strategy_id}` 策略体检档案（最新 + 历史 + **晋级门禁预演**）
+- `GET /api/v1/eval/health/{strategy_id}` 策略体检档案（最新 + 历史 + **晋级门禁预演**
+  + **启动资格清单**：SIMULATION / REAL 两模式的逐项资格，启动前可见）
 
 纪律：
 - 只读；前端禁止直连表（契约收口在本路由）；
@@ -61,6 +62,101 @@ def build_gate_preview(health: dict[str, Any] | None, *, mode: str = "SIMULATION
 
     allowed, note = promotion_gate(health, mode=mode)
     return {"mode": mode, "allowed": allowed, "note": note}
+
+
+def _resolve_mode(mode: Any) -> str:
+    """`mode` 取参（纯函数）：FastAPI 走 HTTP 时收到字符串；测试直调端点时拿到的是
+    `Query(...)` 默认对象，故取 `.default` 兜底（与 `limit` 同一历史处理方式）。"""
+    value = getattr(mode, "default", mode)
+    return str(value or "SIMULATION").strip().upper()
+
+
+async def _strategy_lifecycle_status(strategy_id: str) -> Any:
+    """策略当前生命周期状态（尽力而为；读不到 → None，由 `normalize_status` 保守回落 DRAFT）。
+
+    `strategies` 表**没有 tenant_id 列**（策略 id 全库唯一），故与
+    `_resolve_display_names` 的 `strategy_health` 分支同口径不做租户过滤；
+    行不存在（体检留档早于策略落库等）不报错，返回 None。
+    """
+    from sqlalchemy import text as _text
+
+    try:
+        async with get_session(read_only=True) as session:
+            row = (
+                await session.execute(
+                    _text("SELECT status FROM strategies WHERE id = :sid"),
+                    {"sid": int(strategy_id)},
+                )
+            ).first()
+    except Exception as exc:  # noqa: BLE001 - 展示面读失败按「无记录」处理
+        logger.warning("[Eval] 策略状态读取失败 strategy=%s: %s", strategy_id, exc)
+        return None
+    return row[0] if row else None
+
+
+def _read_start_eligibility_inputs(
+    tenant_id: str, user_id: str, strategy_id: str
+) -> tuple[int | None, float | None]:
+    """SIM 交易日 / 跟踪误差（尽力而为：任何失败 → None，按既有「无数据只提示不拦」口径）。
+
+    身份经 `normalize_runtime_user` 收口——与启动侧 `stamp_sim_start` 写入
+    `sim_start_key` 用的 `resolved_user_id` 同一口径，否则键对不上恒读空。
+    """
+    from backend.shared.backtest_health import (
+        latest_user_tracking_error,
+        sim_trading_days_since,
+    )
+    from backend.shared.simulation_account_keys import normalize_runtime_user
+
+    try:
+        from backend.services.trade_shared.redis_client import get_redis as get_trade_redis
+
+        redis = get_trade_redis()
+        runtime_user = normalize_runtime_user(user_id)
+        return (
+            sim_trading_days_since(redis, tenant_id, runtime_user, strategy_id),
+            latest_user_tracking_error(redis, runtime_user),
+        )
+    except Exception as exc:  # noqa: BLE001 - 取数失败即「无记录」，绝不拦启动
+        logger.warning("[Eval] 启动资格取数失败（按无记录处理）: %s", exc)
+        return None, None
+
+
+async def build_start_eligibility_map(
+    strategy_id: str,
+    health: dict[str, Any] | None,
+    *,
+    tenant_id: str,
+    user_id: str,
+) -> dict[str, Any]:
+    """两模式启动资格清单（`build_start_eligibility` 的取数壳，判据全在执行点模块）。
+
+    取数口径与 `/real-trading/start` 的 400 `gate_items` 完全对齐：状态机 + 体检
+    结论 +（REAL）SIM 交易日 / 跟踪误差；`HEALTH_GATE_ENABLED=false` 时体检项同步
+    放行——展示面不夸大也不隐瞒门禁。
+    """
+    from backend.shared.backtest_health import gate_enabled
+    from backend.shared.start_eligibility import build_start_eligibility
+
+    gate_on = gate_enabled()
+    status = await _strategy_lifecycle_status(strategy_id)
+    sim_days: int | None = None
+    tracking_error: float | None = None
+    if gate_on:
+        sim_days, tracking_error = _read_start_eligibility_inputs(
+            tenant_id, user_id, strategy_id
+        )
+    return {
+        mode: build_start_eligibility(
+            status=status,
+            health=health,
+            mode=mode,
+            sim_trading_days=sim_days,
+            tracking_error=tracking_error,
+            health_gate_enabled=gate_on,
+        )
+        for mode in ("SIMULATION", "REAL")
+    }
 
 
 def _validate_object_type(object_type: str) -> str:
@@ -464,14 +560,22 @@ async def upload_health_check(
 async def strategy_health(
     strategy_id: str,
     limit: int = Query(24, ge=1, le=240),
+    mode: str = Query("SIMULATION", description="启动资格模式：SIMULATION / REAL"),
     current_user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """策略体检档案：最新报告 + 历史结论 + 晋级门禁预演（与执行点同源）。"""
+    """策略体检档案：最新报告 + 历史结论 + 晋级门禁预演 + 两模式启动资格清单。
+
+    `mode` 只影响返回的 `eligibility[mode]`（默认 SIMULATION，向后兼容）；
+    `gate` 恒为 SIMULATION 预演，既有消费方（体检档案面板）零改动。
+    """
     from sqlalchemy import text as _text
 
     sid = str(strategy_id or "").strip()
     if not sid.isdigit():
         raise HTTPException(status_code=400, detail="strategy_id 须为数字")
+    mode_key = _resolve_mode(mode)
+    if mode_key not in ("SIMULATION", "REAL"):
+        raise HTTPException(status_code=400, detail="mode 须为 SIMULATION 或 REAL")
     tenant_id = str(current_user.get("tenant_id") or "default")
     user_id = str(current_user.get("user_id") or "")
 
@@ -506,6 +610,9 @@ async def strategy_health(
             "evidence_source": (latest["inputs_version"] or {}).get("evidence_source"),
             "snapshot_date": latest["snapshot_date"],
         }
+    eligibility = await build_start_eligibility_map(
+        sid, latest_health, tenant_id=tenant_id, user_id=user_id
+    )
     return {
         "success": True,
         "data": {
@@ -521,6 +628,8 @@ async def strategy_health(
                 for h in history
             ],
             "gate": build_gate_preview(latest_health, mode="SIMULATION"),
+            "eligibility": eligibility,
+            "eligibility_mode": mode_key,
         },
         "meta": {"count": len(history)},
     }

@@ -418,12 +418,6 @@ async def start_trading(
             # T-P3-01 启动门禁（状态机）：SIM 须 VERIFIED（回测验证）；REAL 须 SIM（模拟证据）。
             # sys_ 模板/文件上传（source 非 user_strategy）不受状态机约束。
             if detail.get("source") == "user_strategy":
-                from backend.shared.strategy_lifecycle import can_start
-
-                gate_ok, gate_reason = can_start(detail.get("status"), mode)
-                if not gate_ok:
-                    raise HTTPException(status_code=400, detail=gate_reason)
-
                 # T-P4-06 ②：晋级门禁（T-P3-05 门槛总表）——回测体检须 A/B；
                 # 无体检记录/L（运气嫌疑）/E（证据不足）不得晋级。
                 # 应急开关：HEALTH_GATE_ENABLED=false 全局关闭（默认开）。
@@ -434,15 +428,19 @@ async def start_trading(
                     promotion_gate,
                     sim_trading_days_since,
                 )
+                from backend.shared.start_eligibility import build_start_eligibility
+                from backend.shared.strategy_lifecycle import can_start
 
-                if gate_enabled() and strategy_id:
+                gate_on = gate_enabled()
+                health = None
+                gate_sim_days = None
+                gate_tracking_error = None
+                if gate_on and strategy_id:
                     health = await latest_strategy_health(
                         strategy_id,
                         tenant_id=resolved_tenant_id,
                         user_id=resolved_user_id,
                     )
-                    gate_sim_days = None
-                    gate_tracking_error = None
                     if mode == "REAL":
                         gate_sim_days = sim_trading_days_since(
                             redis, resolved_tenant_id, resolved_user_id, strategy_id
@@ -450,6 +448,40 @@ async def start_trading(
                         gate_tracking_error = latest_user_tracking_error(
                             redis, resolved_user_id
                         )
+
+                def _gate_detail(gate: str, message: str) -> dict:
+                    """门禁拒绝信封：人话 `message` 逐字保留 + 逐项清单供前端常驻展示。
+
+                    清单与执行点同源（`build_start_eligibility` 内部就是
+                    `can_start` / `promotion_gate`），展示面不会与执行面漂移。
+                    """
+                    eligibility = build_start_eligibility(
+                        status=detail.get("status"),
+                        health=health,
+                        mode=mode,
+                        sim_trading_days=gate_sim_days,
+                        tracking_error=gate_tracking_error,
+                        health_gate_enabled=gate_on,
+                    )
+                    return {
+                        "message": message,
+                        "gate": gate,
+                        "mode": str(mode or "").strip().upper(),
+                        "gate_items": eligibility["items"],
+                        "next_step": eligibility["next_step"],
+                    }
+
+                # T-P3-01 启动门禁（状态机）：SIM 须 VERIFIED（回测验证）；
+                # REAL 须 SIM（模拟证据）。
+                # sys_ 模板/文件上传（source 非 user_strategy）不受状态机约束。
+                gate_ok, gate_reason = can_start(detail.get("status"), mode)
+                if not gate_ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_gate_detail("lifecycle", gate_reason),
+                    )
+
+                if gate_on and strategy_id:
                     health_ok, health_note = promotion_gate(
                         health,
                         mode=mode,
@@ -457,7 +489,10 @@ async def start_trading(
                         tracking_error=gate_tracking_error,
                     )
                     if not health_ok:
-                        raise HTTPException(status_code=400, detail=health_note)
+                        raise HTTPException(
+                            status_code=400,
+                            detail=_gate_detail("promotion", health_note),
+                        )
                     logger.info(
                         "[Lifecycle] 晋级门禁通过 strategy=%s mode=%s：%s",
                         strategy_id, mode, health_note,

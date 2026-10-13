@@ -139,7 +139,7 @@ def promotion_gate(
     mode_key = str(mode or "").strip().upper()
     if health is None:
         return False, (
-            "策略尚未完成回测体检（T-P4-06）：请在本页重跑一次回测，"
+            "策略尚未完成回测体检：请在本页重跑一次回测，"
             "回测完成后自动生成体检报告，结论 A/B 方可晋级。"
         )
     verdict = str(health.get("verdict") or "").strip().upper()
@@ -148,7 +148,7 @@ def promotion_gate(
     if verdict not in SIM_REQUIRED_VERDICTS:
         label = health.get("verdict_label") or verdict
         return False, (
-            f"回测体检结论为 {verdict}（{label}），不得晋级（T-P4-06 门禁需 A/B）。"
+            f"回测体检结论为 {verdict}（{label}），不得晋级（门禁需 A/B）。"
             + (f" 原因：{reasons}" if reasons else "")
             + (
                 " 建议："
@@ -166,14 +166,14 @@ def promotion_gate(
     if sim_trading_days is not None and sim_trading_days < LIVE_SIM_MIN_TRADING_DAYS:
         return False, (
             f"模拟盘运行 {sim_trading_days} 交易日 < 门槛 {LIVE_SIM_MIN_TRADING_DAYS} 日"
-            "（T-P3-05 晋级门槛），请继续模拟验证。"
+            "（晋级门槛），请继续模拟验证。"
         )
     if tracking_error is not None and tracking_error > LIVE_MAX_TRACKING_ERROR:
         return False, (
             f"模拟↔真单跟踪误差 {tracking_error:.2%} > 门槛 {LIVE_MAX_TRACKING_ERROR:.0%}"
-            "（T-P3-05 晋级门槛），请先排查执行偏差。"
+            "（晋级门槛），请先排查执行偏差。"
         )
-    return True, f"体检结论 {verdict}；模拟证据达标（T-P3-05）"
+    return True, f"体检结论 {verdict}；模拟证据达标"
 
 
 # ── IO：窗口取数 ────────────────────────────────────────────────────

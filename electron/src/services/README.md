@@ -105,6 +105,10 @@
   - 新增 `getTradingPrecheck(tradingMode)`，调用 `/api/v1/real-trading/trading-precheck` 检查“当前生产模型 + 当日特征”是否已就绪；
   - 新增 `TradingPrecheckResult/TradingPrecheckItem` 类型；
   - 新增 `extractTradingPrecheckFailure`，可从启动接口 `409` 结构化失败中提取 `items[]` 供 UI 回显。
+- **启动门禁失败面（T-P3-05）**:
+  - 新增 `extractStartGateFailure`，可从 `/real-trading/start` 的 `400` 信封中提取 `{message, gate, mode, items, next_step}`（结构与 `/eval/health/{id}` 的 `eligibility[mode]` 同源，均出自后端 `shared/start_eligibility.py`）；
+  - 与 `extractTradingPrecheckFailure` **互斥**：前者认 `detail.precheck_failed`，本函数认 `detail.gate_items` 是数组——两个闸门（交易准备度自检 / 生命周期与晋级体检）必须各自成面，别让一个吞掉另一个；
+  - 展示侧：`StrategyConsole` 顶栏「启动资格」条（点启动**之前**就可见，`useStartEligibility`）+ `StartGateFailedModal`（点启动**被打回后**的常驻弹窗，非 toast）；策略库 `PromotionGateCard` 并列「进模拟盘 / 进实盘」两档逐项判据。
 - **闭环诊断**: `preflight` 额外回传 Stream 闭环探针（`stream_series_freshness` / `stream_quote_persist_rate` / `stream_kline_fetch`），并在 `PreflightCheckItem.details` 中提供结构化明细。
 - **账户口径收敛（2026-04-09）**:
   - `getAccount/getRuntimeAccount` 对应的实盘账户快照现在优先消费 PostgreSQL 视图返回的 `payload_json.positions` 与 `position_count`，并将 `today_pnl`/`daily_pnl` 口径与 `day_open_equity` 对齐；

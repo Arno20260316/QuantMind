@@ -97,11 +97,43 @@ export interface HealthHistoryPoint {
   evidence_source?: string | null;
 }
 
+/**
+ * 启动资格清单单项（后端 `shared/start_eligibility.py` 产出，与 `/start` 的 400 信封同源）。
+ * `key`：lifecycle / health / sim_days / tracking_error。
+ */
+export interface StartEligibilityItem {
+  key: string;
+  /** 人话名（生命周期状态 / 回测体检 / 模拟交易日 / 跟踪误差） */
+  label: string;
+  /** 现状描述；**缺记录时后端给「无记录」，绝不渲染成 0** */
+  value: string;
+  passed: boolean;
+  /** 未通过时的理由（后端与 `/start` 400 文案逐字一致）；通过时为空串 */
+  reason: string;
+  /** 未通过时的可执行下一步；通过时为空串 */
+  next_step: string;
+}
+
+export interface StartEligibility {
+  allowed: boolean;
+  mode: string;
+  /** 内置模板/文件上传不吃门禁 → 空数组（视为放行） */
+  items: StartEligibilityItem[];
+  /** 首个未通过项的下一步；全通过时为空串 */
+  next_step: string;
+}
+
+/** 启动资格：按模式分（`gate` 只有 SIMULATION 预演，不要拿它当实盘门槛用） */
+export type StartEligibilityMap = Partial<Record<'SIMULATION' | 'REAL', StartEligibility>>;
+
 export interface StrategyHealthArchive {
   strategy_id: string;
   latest: HealthSnapshot | null;
   history: HealthHistoryPoint[];
   gate: { mode: string; allowed: boolean; note: string };
+  /** 两模式逐项启动资格（启动前可见）；后端新加的键，老响应可能缺省 */
+  eligibility?: StartEligibilityMap;
+  eligibility_mode?: string;
 }
 
 export interface StrategyHealthResponse {

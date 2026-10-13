@@ -2,6 +2,7 @@ import axios, { AxiosHeaders } from 'axios';
 import { SERVICE_ENDPOINTS, SERVICE_URLS } from '../config/services';
 import { authService } from '../features/auth/services/authService';
 import type { ExecutionConfig, LiveTradeConfig } from '../types/liveTrading';
+import type { StartEligibilityItem } from '../features/eval-center/types/evalCenter';
 
 function getTenantId(): string {
     const fromEnv = String((import.meta as any).env?.VITE_TENANT_ID || '').trim();
@@ -558,6 +559,23 @@ export interface TradingPrecheckFailure {
     signal_readiness?: SignalReadiness | null;
 }
 
+/**
+ * 启动门禁拒绝（`/real-trading/start` 的 400 信封）。
+ *
+ * 与 `TradingPrecheckFailure` 是**两个不同的闸门**，别混：那个是「交易准备度」自检，
+ * 这个是「生命周期 / 晋级体检」启动资格。前者用 `items[].detail`，后者用
+ * `gate_items[].reason + next_step`（结构与展示面清单同源），所以分开解析。
+ */
+export interface StartGateFailure {
+    /** 与执行点逐字一致的人话，例如「策略尚未模拟验证（VERIFIED）：REAL 须先经模拟盘（SIM）验证」 */
+    message: string;
+    /** `lifecycle`（状态机）| `promotion`（回测体检晋级） */
+    gate: string;
+    mode: string;
+    items: StartEligibilityItem[];
+    next_step: string;
+}
+
 function resolveErrorMessage(error: any): string {
     const status = error?.response?.status;
     const detail = error?.response?.data?.detail;
@@ -642,6 +660,37 @@ export const realTradingService = {
             first_failed_reason: typeof detail.first_failed_reason === 'string' ? detail.first_failed_reason : undefined,
             trading_permission: typeof detail.trading_permission === 'string' ? detail.trading_permission : undefined,
             signal_readiness: detail.signal_readiness && typeof detail.signal_readiness === 'object' ? detail.signal_readiness : null,
+        };
+    },
+
+    /**
+     * 从 `/real-trading/start` 的 400 里抽出「启动门禁」信封。
+     *
+     * 与 `extractTradingPrecheckFailure` 互斥：那个认 `detail.precheck_failed`，
+     * 这个认 `detail.gate_items`。两个都不命中就返回 `null`，调用方回落到通用文案。
+     *
+     * 认 `gate_items` 而不是认 `gate`：`gate` 只是个 `"lifecycle" | "promotion"` 的短串，
+     * 万一别的接口也用了同名键会误判；`gate_items` 是数组才是本信封的形状特征。
+     */
+    extractStartGateFailure: (error: any): StartGateFailure | null => {
+        const detail = error?.response?.data?.detail;
+        if (!detail || typeof detail !== 'object' || !Array.isArray(detail.gate_items)) {
+            return null;
+        }
+        const rawItems = detail.gate_items as Array<Record<string, unknown>>;
+        return {
+            message: typeof detail.message === 'string' ? detail.message : '当前策略不满足启动条件',
+            gate: typeof detail.gate === 'string' ? detail.gate : '',
+            mode: typeof detail.mode === 'string' ? detail.mode : '',
+            items: rawItems.map((it) => ({
+                key: String(it?.key ?? ''),
+                label: String(it?.label ?? ''),
+                value: String(it?.value ?? ''),
+                passed: it?.passed === true,
+                reason: typeof it?.reason === 'string' ? it.reason : '',
+                next_step: typeof it?.next_step === 'string' ? it.next_step : '',
+            })),
+            next_step: typeof detail.next_step === 'string' ? detail.next_step : '',
         };
     },
 

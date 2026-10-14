@@ -178,6 +178,12 @@ class RebalanceContext:
     extra_context: str = ""
     risk_block: str = ""
     industry_caution_block: str = ""
+    #: 【盘中市场状态】块（盘中 regime 快照渲染，见 ``shared/decision_blocks``）。
+    #: 空串 = 整段不出现——默认值下与上游金样逐字节一致。
+    market_state_block: str = ""
+    #: 【盘中模型信号】块（行情行内「信号分」的出处/刻度/覆盖率）。只注解行情块，
+    #: 行情块没渲染时它也不出现（见 :func:`_pool_lines`）。
+    signal_meta_block: str = ""
     quota_total: float = AGENT_QUOTA_TOTAL
     quota_used: float = 0.0
     per_stock_pct: float = DEFAULT_PER_STOCK_PCT
@@ -387,6 +393,10 @@ def _pool_lines(ctx: RebalanceContext) -> list[str]:
     qb = render_quote_block(ctx.quotes, ctx.quotes_stale_count)
     if qb:
         lines += ["", qb]
+        # 【盘中模型信号】只注解行情行内的「信号分」后缀——行情块没渲染时
+        # 它跟着不出现（没有后缀可注解）。默认空串 = 与上游金样逐字节一致。
+        if ctx.signal_meta_block:
+            lines += ["", ctx.signal_meta_block]
     return lines
 
 
@@ -442,12 +452,15 @@ def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
 
 
 def _context_body(ctx: RebalanceContext) -> list[str]:
-    """两套提示词**逐字节共用**的正文：持仓表 → 大盘方向 → 候选池 → 风险块。
+    """两套提示词**逐字节共用**的正文：持仓表 → 大盘方向 →（市场状态）→
+    候选池 →（行情+信号块）→ 风险块。
 
     分出来只为让「盘中轮与调仓轮看到的事实完全一致」这件事在代码里是显然的——
     两边唯一的差别是收尾段（:func:`_decision_rule_lines` /
     :func:`_intraday_rule_lines`）。**行序与空行位置一个都不能动**：调仓轮那侧
-    逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。
+    逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。带括号的两块是
+    QM 补块（``market_state_block``/``signal_meta_block``）——默认空串、
+    数据门控，金样路径不受影响。
     """
     display = ledger_cost_rows(ctx.holdings, ctx.ledger_positions)
     lines = [
@@ -466,6 +479,10 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
         _direction_line(ctx.direction),
         "",
     ]
+    # 【盘中市场状态】（大盘 regime 实时快照）：紧跟大盘方向之后——两者是
+    # 「同一件事的慢/快两拍」。空串 = 整段不出现（金样逐字节不动的默认路径）。
+    if ctx.market_state_block:
+        lines += [ctx.market_state_block, ""]
     if ctx.extra_context:
         lines += [ctx.extra_context, ""]
     lines += _pool_lines(ctx)

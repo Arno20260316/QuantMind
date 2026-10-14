@@ -379,6 +379,8 @@ def build_context(
     per_stock_pct: float | None = None,
     max_new_buys: int | None = None,
     extra_context: str = "",
+    market_state_block: str = "",
+    signal_meta_block: str = "",
 ) -> RebalanceContext:
     """把读到的四块拼成一轮上下文。
 
@@ -411,6 +413,8 @@ def build_context(
         extra_context=extra_context,
         risk_block=risk_block,
         industry_caution_block=industry_caution_block,
+        market_state_block=market_state_block,
+        signal_meta_block=signal_meta_block,
         quota_used=quota_used,
         **kwargs,
     )

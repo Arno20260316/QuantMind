@@ -1483,7 +1483,7 @@ export default function Live() {
                     className={`analyze-trigger ${analyzeState === 'busy' ? 'busy' : ''}`}
                     disabled={analyzeState === 'busy'}
                     onClick={() => void runManualAnalysis()}
-                    title="立即跑一轮模型分析（宿主队列，约 1 分钟内开跑；只出观点，不下单）"
+                    title="立即跑一轮模型分析（宿主队列，约 1 分钟内开跑；只出观点，不下单——盘中含下单的轮次由决策轮自动写「模型对话」）"
                   >
                     {analyzeState === 'busy' ? '提交中…' : '⚡ 立即分析'}
                   </button>

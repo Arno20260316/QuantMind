@@ -152,6 +152,10 @@ from backend.services.trade.services.decision_round_core import (
     snap_price,
     tier_numbers,
 )
+from backend.services.trade.services.decision_round_blocks import (
+    enrich_quotes_with_blocks,
+    load_round_snapshots,
+)
 from backend.services.trade.services.decision_round_io import (
     maybe_write_watch,
     record_round_dialogue,
@@ -347,10 +351,10 @@ async def _run_once_inner(
             day.strftime("%Y%m%d"),
         )
 
-    # ④ 行情。客户端不可用/读失败本身**不在这里中止**：守护轮与已有持仓仍要靠它，
-    # 而「池子整段没有价」能不能继续取决于时段——那由 ⑦ 的行情闸门判。
+    # ③b+④ 行情。客户端不可用/读失败本身**不在这里中止**：守护轮与已有持仓仍要靠
+    # 它，而「池子整段没有价」能不能继续取决于时段——那由 ⑦ 的行情闸门判。
+    # regime（增益块）与要价清单（持仓+池+regime 指数）的装配口径收在 io 助手。
     quote_client = None
-    snapped: Mapping[str, Mapping[str, Any]] = {}
     #: 行情不可用的**原因**（客户端构造失败/读取异常），进 abort 理由与日志。
     quotes_failure = ""
     holding_meta = pos_meta or {}
@@ -360,22 +364,9 @@ async def _run_once_inner(
     except Exception as exc:  # noqa: BLE001
         quotes_failure = f"行情客户端不可用：{type(exc).__name__}: {exc}"
         logger.warning("[DecisionRound] %s", quotes_failure)
-    # 要价的代码：持仓（原始 payload 直接取 symbol，不必先建一次持仓行）+ 池
-    codes = sorted(
-        {
-            StockCodeUtil.to_suffix(str(p.get("symbol") or "").strip())
-            for p in positions_list
-            if isinstance(p, Mapping) and p.get("symbol")
-        }
-        | {str(r.code) for r in pool_rows}
+    regime, snapped, quotes_failure = load_round_snapshots(
+        deps, round_id, quote_client, positions_list, pool_rows, quotes_failure
     )
-    if quote_client is not None and codes:
-        try:
-            snapped = deps.read_snaps(quote_client, codes) or {}
-        except Exception as exc:  # noqa: BLE001 读失败先记因，是否中止见 ⑦ 的行情闸门
-            quotes_failure = f"行情快照读取失败：{type(exc).__name__}: {exc}"
-            logger.warning("[DecisionRound] %s（按无行情继续）", quotes_failure)
-            snapped = {}
     holding_rows = positions_to_holding_rows(positions_list, snaps=snapped)
 
     # ④b 分账裁剪（P2.7）：**只把本 agent 名下的持仓交给模型与执行段**。
@@ -511,6 +502,13 @@ async def _run_once_inner(
         )
 
     quotes, stale = quotes_from_snapshots(snapped, kept, now)
+
+    # ⑦b/⑦c 分数填进行情行（「信号分」后缀）+ 两个补块：数据门控——未接线整段
+    # 不渲染、取数失败如实降级并留痕（口径收在 io 助手，渲染在 decision_blocks）。
+    quotes, market_state_block, signal_meta_block = await enrich_quotes_with_blocks(
+        deps, round_id, user, regime, snapped, quotes, now, notes
+    )
+
     context = build_context(
         agent=agent,
         holdings=holding_rows,
@@ -526,6 +524,8 @@ async def _run_once_inner(
         quota_used=quota_used,
         per_stock_pct=per_stock_pct,
         max_new_buys=max_new_buys,
+        market_state_block=market_state_block,
+        signal_meta_block=signal_meta_block,
     )
     # ⑧ LLM 调用（模型名与调用器同源，见 LLMBinding）：decide 同步阻塞 httpx（最长 ~120s），必须 to_thread
     prompt = render_prompt_for(context, slot.schema)

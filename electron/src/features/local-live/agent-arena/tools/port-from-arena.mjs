@@ -390,9 +390,9 @@ export const fetchFutuOrders = async (
   },
   {
     file: 'pages/Live.tsx',
-    why: '对话 tab「立即分析」按钮提示语改 QM 口径（复活后只出观点，不下单）',
+    why: '对话 tab「立即分析」按钮提示语改 QM 口径（复活后只出观点，不下单）；盘中含下单的轮次由决策轮自动写「模型对话」——按钮本身仍不下单，去哪看要指清（2026-10-14 Stage 2 收尾）',
     find: `                  <button\n                    className={\`analyze-trigger \${analyzeState === 'busy' ? 'busy' : ''}\`}\n                    disabled={analyzeState === 'busy'}\n                    onClick={() => void runManualAnalysis()}\n                    title="立即跑一轮完整分析（交易时段内与整点同权，可真下单；盘外只出决策）"\n                  >\n                    {analyzeState === 'busy' ? '提交中…' : '⚡ 立即分析'}\n                  </button>`,
-    replace: `                  <button\n                    className={\`analyze-trigger \${analyzeState === 'busy' ? 'busy' : ''}\`}\n                    disabled={analyzeState === 'busy'}\n                    onClick={() => void runManualAnalysis()}\n                    title="立即跑一轮模型分析（宿主队列，约 1 分钟内开跑；只出观点，不下单）"\n                  >\n                    {analyzeState === 'busy' ? '提交中…' : '⚡ 立即分析'}\n                  </button>`,
+    replace: `                  <button\n                    className={\`analyze-trigger \${analyzeState === 'busy' ? 'busy' : ''}\`}\n                    disabled={analyzeState === 'busy'}\n                    onClick={() => void runManualAnalysis()}\n                    title="立即跑一轮模型分析（宿主队列，约 1 分钟内开跑；只出观点，不下单——盘中含下单的轮次由决策轮自动写「模型对话」）"\n                  >\n                    {analyzeState === 'busy' ? '提交中…' : '⚡ 立即分析'}\n                  </button>`,
   },
   {
     file: 'components/RealAccountPanel.tsx',

@@ -410,6 +410,10 @@ def make_harness(**over) -> Harness:
         mirror_ready=over.pop("mirror_ready", None),
         # 默认无名册 = 单家路径（历史行为）。多模型用例自己传 ``roster=``。
         roster=over.pop("roster", None),
+        # 默认不接线（= 历史行为：两个补块整段不渲染，提示词与旧版逐字节一致）。
+        # 要钉补块口径的用例自己传 ``load_regime=`` / ``load_scores=``。
+        load_regime=over.pop("load_regime", None),
+        load_scores=over.pop("load_scores", None),
     )
     assert not over, f"未消费的替身参数：{sorted(over)}"
     return Harness(deps=deps, log=log)
@@ -1459,6 +1463,126 @@ async def test_unexpected_orchestration_error_is_error_status_not_a_crash():
     assert result.note.startswith("RuntimeError:")  # 异常类型与原因原样带上
     assert "档位存储炸了" in result.note
     assert result.round_id == "rnd-20260924-0935"  # 状态键里仍能对上号
+
+
+# ── 补块入提示词（Stage 2 第一批）：模型分数 + 市场状态 ──────────────────
+#
+# 数据面实测都在产（engine_signal_scores / db0 qm:regime:intraday），缺的只是
+# 「接进下单那条回路」——本批三条纪律：接线才渲染（旧替身历史字节不变）、
+# 缺失如实降级（不拦轮、不编数）、指数代码并入询价清单。
+
+REGIME_FIXTURE = {
+    "state": "bear",
+    "breadth": (
+        '{"coverage": "hot_set", "sample": 540, "up": 107, "down": 417,'
+        ' "flat": 16, "limit_up": 9, "limit_down": 2}'
+    ),
+    "ret": "-0.0748",
+    "window": "20",
+    "vol": "0.0083",
+    "position_hint": "0.3",
+    "generated_at": NOW.isoformat(),
+    "inputs_ok": "True",
+    "index": "000300.SH",
+    "notes": "[]",
+}
+
+
+def _scores_ok(rank_pct: float = 0.882):
+    async def load_scores(tenant, user):
+        return (
+            {
+                "SH600036": {
+                    "value": 0.31,
+                    "side": "BUY",
+                    "freq": "realtime",
+                    "asOf": "2026-09-24",
+                    "rank_pct": rank_pct,
+                }
+            },
+            {
+                "ok": True,
+                "model_id": "mdl_test_bucket",
+                "signal_date": "2026-09-24",
+                "rows": 591,
+                "realtime_rows": 591,
+                "fallback": False,
+            },
+        )
+
+    return load_scores
+
+
+@pytest.mark.asyncio
+async def test_round_renders_scores_and_regime_blocks_when_wired():
+    """接线后：行情行内「信号分」（研究评分刻度）+ 两个补块进提示词；
+    regime 的指数代码并入询价清单。"""
+    h = make_harness(load_regime=lambda: REGIME_FIXTURE, load_scores=_scores_ok())
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = h.log["llm"][0]["prompt"]
+    # 模型分数：rank_pct 0.882 → 研究评分 88.2（与前端/金样同刻度）
+    assert "· 信号分 88.2" in prompt
+    assert "【盘中模型信号】" in prompt
+    assert "mdl_test_bucket" in prompt
+    assert "该行所属推理批次内部的截面分位" in prompt
+    assert "可能混合多个推理批次" in prompt
+    # 市场状态块
+    assert "【盘中市场状态】" in prompt
+    assert "状态：偏弱（bear）" in prompt
+    assert "建议仓位系数 0.3" in prompt
+    assert "20 日收益 -7.48%" in prompt
+    assert "涨 107 ／ 跌 417" in prompt
+    # regime 指数并入询价（市场状态块的指数现价行用）
+    assert "000300.SH" in h.log["snaps"][0]
+
+
+@pytest.mark.asyncio
+async def test_round_unwired_blocks_keep_legacy_prompt_bytes():
+    """未接线（旧替身/历史行为）：两个补块整段不渲染——升级不动存量提示词。"""
+    h = make_harness()  # load_regime/load_scores 默认 None
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【盘中市场状态】" not in prompt
+    assert "【盘中模型信号】" not in prompt
+    assert "· 信号分" not in prompt  # 历史指令文本里的「信号分数」不算，看渲染后缀
+
+
+@pytest.mark.asyncio
+async def test_round_degrades_loudly_when_feeds_unavailable():
+    """接线了但取不到：**降级不拦轮**——块渲染「本轮不可得」、notes 留痕，
+    绝不静默消失（否则「当日提示词为什么没有信号分」无处可查）。"""
+
+    async def dead_scores(tenant, user):
+        return {}, {"ok": False, "reason": "分数快照取数失败: db down"}
+
+    h = make_harness(load_regime=lambda: None, load_scores=dead_scores)
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK  # 增益块缺失不改轮次状态
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【盘中市场状态】本轮不可得" in prompt
+    assert "【盘中模型信号】本轮不可得" in prompt
+    assert "不要凭空引用模型分数" in prompt
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("模型分数不可得" in n for n in notes)
+    assert any("regime 不可得" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_round_survives_score_loader_exception():
+    """分数取数抛异常：轮次照跑（按不可得降级），不许把真钱回路拖成 error。"""
+
+    async def boom(tenant, user):
+        raise RuntimeError("分数库连接炸了")
+
+    h = make_harness(load_regime=lambda: REGIME_FIXTURE, load_scores=boom)
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【盘中模型信号】本轮不可得" in prompt
+    assert "分数库连接炸了" in prompt  # 原因如实进块（排障痕迹）
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("模型分数不可得" in n for n in notes)
 
 
 # ══ E2. arena 文件面写侧（决策轮 → 前端「模型对话」tab）═══════════════
@@ -3057,6 +3181,77 @@ async def test_default_round_deps_closures_reach_the_real_entries(monkeypatch):
     assert seen["cal"]["user_id"]  # 日历按账户维度取（空身份会让日历查不到假期）
 
 
+def test_default_round_deps_regime_closure_reaches_the_real_reader(monkeypatch):
+    """regime 闭包要真打到 db0 ``qm:regime:intraday``——键名/库号接错在
+    ``is None`` 那层同样看不见，只有真调用才现形。"""
+    import redis as redis_lib
+
+    seen: dict = {}
+
+    class _Redis:
+        def __init__(self, **kw):
+            seen["kw"] = kw
+
+        def hgetall(self, key):
+            seen["key"] = key
+            return {"state": "bear", "ret": "-0.0748"}
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setenv("REDIS_DB_GENERAL", "0")
+    monkeypatch.setattr(redis_lib, "Redis", _Redis)
+    deps = IO.default_round_deps()
+    assert deps.load_regime() == {"state": "bear", "ret": "-0.0748"}
+    assert seen["key"] == "qm:regime:intraday"
+    assert seen["kw"]["db"] == 0  # 通用库（engine 写侧同一库）
+    assert seen["closed"]  # 客户端要关，连接不泄
+
+
+def test_load_intraday_regime_fails_open_on_a_dead_redis(monkeypatch):
+    """Redis 挂了 → ``None``（增益块取不到不拦轮），但客户端仍要关。"""
+    import redis as redis_lib
+
+    seen: dict = {}
+
+    class _Dead:
+        def __init__(self, **kw):
+            pass
+
+        def hgetall(self, key):
+            raise RuntimeError("redis 挂了")
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(redis_lib, "Redis", _Dead)
+    assert IO.load_intraday_regime() is None
+    assert seen["closed"]
+
+
+@pytest.mark.asyncio
+async def test_default_round_deps_scores_closure_reaches_the_real_reader(monkeypatch):
+    """分数闭包要真打到 ``shared.signal_scores.load_score_snapshot``（唯一实现），
+    user_id 传决策账户——桶隔离按它解析生效模型，丢了就读错桶。"""
+    from backend.shared import signal_scores as SS
+
+    seen: dict = {}
+
+    async def fake_load(tenant, *, user_id=None, model_id=None):
+        seen["args"] = (tenant, user_id, model_id)
+        return {"SH600036": {"rank_pct": 0.9}}, {
+            "ok": True,
+            "signal_date": "2026-09-24",
+        }
+
+    monkeypatch.setattr(SS, "load_score_snapshot", fake_load)
+    deps = IO.default_round_deps()
+    score_map, meta = await deps.load_scores("t1", "u1")
+    assert score_map == {"SH600036": {"rank_pct": 0.9}}
+    assert meta["ok"] is True
+    assert seen["args"] == ("t1", "u1", None)
+
+
 @pytest.mark.asyncio
 async def test_default_round_deps_refuse_a_degraded_trading_day_verdict(monkeypatch):
     """**降级判定必须被拒绝**：日历取不到时服务只按周末判断，节假日会被判成交易日。
@@ -3080,10 +3275,13 @@ async def test_default_round_deps_refuse_a_degraded_trading_day_verdict(monkeypa
 
 # ══ H. 分层与体量的源码守卫 ══════════════════════════════════════════
 def test_modules_stay_within_the_file_budget_and_layering():
-    """五块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动。
+    """六块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动、
+    blocks 只装配（补块：Stage 2 第一批）。
 
     每块 < 800 行——``round`` 曾在一个文件里同时装「一轮里发生了什么」与「哪些槽位
-    该跑」（900 行），拆出 ``tick`` 才回到预算内。
+    该跑」（900 行），拆出 ``tick`` 才回到预算内；``round``/``io`` 后来都顶到预算
+    顶，「分数/regime → 提示词补块」的装配于是拆出 ``blocks``（与 io 同层：可被
+    round import，彼此与上层互不反向 import）。
     """
     from pathlib import Path
 
@@ -3094,7 +3292,7 @@ def test_modules_stay_within_the_file_budget_and_layering():
             if name == "round"
             else (base / f"decision_round_{name}.py")
         ).read_text(encoding="utf-8")
-        for name in ("core", "io", "round", "tick", "runner", "alerts")
+        for name in ("core", "io", "blocks", "round", "tick", "runner", "alerts")
     }
     for name, text in src.items():
         assert len(text.splitlines()) < 800, f"decision_round_{name} 超出单文件上限"
@@ -3139,6 +3337,14 @@ def test_modules_stay_within_the_file_budget_and_layering():
             "decision_round_runner import",
         ),
         "io": (
+            "services.trade.services.decision_round import",
+            "decision_round_tick import",
+            "decision_round_runner import",
+        ),
+        # 补块装配层与 io 同层：``round`` 可以 import 它，它只许往下（core/shared）——
+        # 反向拉编排或取数层会让「补块降级不拦轮」这条纪律失去独立位置。
+        "blocks": (
+            "decision_round_io import",
             "services.trade.services.decision_round import",
             "decision_round_tick import",
             "decision_round_runner import",

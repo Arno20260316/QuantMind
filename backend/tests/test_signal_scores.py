@@ -47,7 +47,7 @@ class TestNormalizeAShareSymbol:
 
 class TestBuildScoreMap:
     def test_maps_rows_to_prefix_keyed_entries(self):
-        rows = [("600036", 0.31, "BUY", "batch", "2026-09-19")]
+        rows = [("600036", 0.31, "BUY", "batch", "2026-09-19", 0.882)]
         score_map, realtime_rows = build_score_map(rows, "2026-09-19")
 
         assert score_map == {
@@ -56,9 +56,24 @@ class TestBuildScoreMap:
                 "side": "BUY",
                 "freq": "daily",
                 "asOf": "2026-09-19",
+                "rank_pct": 0.882,
             }
         }
         assert realtime_rows == 0
+
+    def test_rank_pct_is_additive_with_none_for_old_rows(self):
+        # rank_pct 是 additive 契约列：老行（4/5 列）与 NULL 值都 → 键在值为 None
+        # （「没分位」与「分位是 0」不是一回事——0 是这批里垫底，None 是不知道），
+        # 决策轮的「信号分」只看这一列，None 就不给后缀。
+        rows = [
+            ("600036", 0.31, "BUY", "batch", "2026-09-19"),  # 5 列老调用方
+            ("000001", 0.1, "HOLD", "batch", "2026-09-19", None),  # 6 列 NULL
+        ]
+        score_map, _ = build_score_map(rows, "2026-09-19")
+
+        assert score_map["SH600036"]["rank_pct"] is None
+        assert score_map["SZ000001"]["rank_pct"] is None
+        assert "rank_pct" in score_map["SH600036"]  # 键必须在，不能悄悄缺
 
     def test_realtime_source_is_flagged_and_counted(self):
         # source='realtime' 是盘中热集推理落库的行 —— 前端据此标「实时」，不然
@@ -158,6 +173,11 @@ class TestSqlConstants:
         assert SYMBOL_FOLD_KEY in SQL_SCORES_BY_DATE
         assert "DISTINCT ON (symbol)" not in SQL_SCORES_BY_DATE
         assert "created_at DESC" in SQL_SCORES_BY_DATE
+
+    def test_scores_query_carries_rank_pct(self):
+        # rank_pct 是决策轮行情行内「信号分」的唯一原料（折算研究评分刻度）；
+        # 少取这一列 = 提示词永远没有信号分，且 SQL 层无任何报错（静默空转）。
+        assert "rank_pct" in SQL_SCORES_BY_DATE
 
     def test_scores_query_folds_prefix_form_too(self):
         # 前缀形（'SH600036'）也要折——它是自定义市场桶的唯一写法

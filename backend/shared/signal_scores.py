@@ -100,7 +100,8 @@ SQL_LATEST_ANY_DATE_TMPL = (
 )
 
 SQL_SCORES_BY_DATE_TMPL = (
-    "SELECT DISTINCT ON ({sym_key}) symbol, fusion_score, signal_side, source, trade_date "
+    "SELECT DISTINCT ON ({sym_key}) symbol, fusion_score, signal_side, source, "
+    "trade_date, rank_pct "
     "FROM engine_signal_scores "
     f"WHERE tenant_id = :tid AND trade_date = :d AND {A_SHARE_MARKET_SQL} {{bucket}}"
     "ORDER BY {sym_key}, created_at DESC, id DESC"
@@ -156,10 +157,15 @@ def normalize_position_symbol(raw: Any) -> str | None:
 def build_score_map(
     rows: list[Any], trade_date: str
 ) -> tuple[dict[str, dict[str, Any]], int]:
-    """DB 行 → ``{prefix: {value, side, freq, asOf}}``；返回 (map, realtime_count)。
+    """DB 行 → ``{prefix: {value, side, freq, asOf, rank_pct}}``；返回 (map, realtime_count)。
 
     行序 = ``DISTINCT ON`` 的结果序（每 symbol 仅一行，已是该标的最近一条）。
     分数为 NULL 的行仍进 map：NaN 分数与「没有分数」不同，前端要能区分。
+
+    ``rank_pct``（0–1 截面分位，0..1，``compute_rank_pct``/percent_rank 口径）为
+    **additive 契约列**：老行未回填时是 NULL → 键在、值为 None（「没分位」与
+    「分位是 0」不是一回事——0 是「这批里垫底」，None 是「不知道」）。行长度守卫
+    与 ``asOf`` 同式：只有 4/5 列的老调用方传进来也不能炸。
     """
     score_map: dict[str, dict[str, Any]] = {}
     realtime_rows = 0
@@ -175,6 +181,7 @@ def build_score_map(
             "side": r[2],
             "freq": freq,
             "asOf": str(r[4])[:10] if len(r) > 4 and r[4] is not None else trade_date,
+            "rank_pct": (float(r[5]) if len(r) > 5 and r[5] is not None else None),
         }
     return score_map, realtime_rows
 

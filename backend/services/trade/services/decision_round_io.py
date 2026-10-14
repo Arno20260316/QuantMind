@@ -208,6 +208,58 @@ async def load_agent_ledger(
     )
 
 
+def load_intraday_regime() -> dict[str, Any] | None:
+    """盘中 regime 快照（db0 通用库 ``qm:regime:intraday``，engine 侧 60 秒刷新）。
+
+    键与 ``services/engine/realtime_regime.SNAPSHOT_KEY`` 同字面量（该模块带引擎侧
+    heavy import，贸易服务不引它——重复的只有这一个字符串常量）;读侧先例见
+    ``advice_generator._load_regime_hint`` / ``routers/copilot``。
+
+    **fail-open 返回 ``None``**（不抛、不拦轮）：市场状态是增益块，服务没开时
+    提示词按「本轮不可得」如实降级——与资金面/分账那种「读不到本轮不做」不同，
+    模型没有 regime 仍能按池与分数决策。读失败留 warning（链路排障的入口）。
+    """
+    import redis as _redis_lib
+
+    client = _redis_lib.Redis(
+        host=os.getenv("REDIS_HOST") or "redis",
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        password=os.getenv("REDIS_PASSWORD") or None,
+        db=int(os.getenv("REDIS_DB_GENERAL", "0")),
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=5,
+    )
+    try:
+        doc = client.hgetall("qm:regime:intraday")
+    except Exception as exc:  # noqa: BLE001 增益块取不到不许拦轮
+        logger.warning(
+            "[DecisionRound] 盘中 regime 快照读取失败（按不可得降级）: %s", exc
+        )
+        return None
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return dict(doc) if doc else None
+
+
+async def load_signal_scores(
+    tenant_id: str, user_id: str
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """模型分数快照——**委托** ``shared.signal_scores.load_score_snapshot``（唯一实现）。
+
+    本模块不复制任何取数口径（见模块 docstring）：分数表读什么日、取哪一行、
+    桶隔离，全在那边一处收口——否则「列表显示 +0.12、决策轮按 −0.03 下单」这类
+    自相矛盾迟早出现。``user_id`` 传决策账户：桶隔离按该用户解析生效模型；
+    取数失败在那边已吞成 ``(空 map, ok=False + reason)``，本函数**不**再包 try。
+    """
+    from backend.shared.signal_scores import load_score_snapshot
+
+    return await load_score_snapshot(tenant_id, user_id=user_id)
+
+
 def load_excluded_symbols() -> ExclusionRead:
     """排除名单（blocking 且未过期）→ 集合 + 留痕文案。
 
@@ -397,6 +449,9 @@ def default_round_deps() -> RoundDeps:
         real_enabled=is_real_trading_enabled,
         mirror_ready=_mirror_ready,
         now=now_cn,
+        # Stage 2 第一批：模型分数 + 市场状态入提示词（读失败均降级不拦轮）
+        load_regime=load_intraday_regime,
+        load_scores=load_signal_scores,
     )
 
 

@@ -46,7 +46,10 @@ ENV_FILE = ROOT / ".env"
 #: 默认走 GLM 快端点（原 dsh 调用的同款选择，任务里时间盒 90~150s）；QM_NIGHT_POOL_MODEL 可覆写。
 DEFAULT_BRAIN_MODEL = "glm-5.3-flash"
 BRAIN_TIMEOUT_S = 420  # 原 dsh 调用同额，HTTP 侧留裕量
-BRAIN_MAX_TOKENS = 8000  # 20 只池 + 板块 JSON 约 2~3k tokens，留一倍余量
+#: glm 族是「始终思考」模型：reasoning token 计入 completion_tokens，8000 会被思考吃光
+#: 导致 length 截断（2026-10-15 实测首跑 exit 3）。故：思考降到 low 档
+#: （该端点官方档位 low/high/max，thinking 字段直接 400 code 1210）+ 预算翻倍到 16k。
+BRAIN_MAX_TOKENS = 16000  # 20 只池 + 板块 JSON 约 2~3k tokens，思考 low 档再留足余量
 
 
 def _dash8(d8: str) -> str:
@@ -381,6 +384,10 @@ def call_brain(
         "temperature": 0.2,
         "max_tokens": BRAIN_MAX_TOKENS,
     }
+    if model.startswith("glm"):
+        # glm 族始终思考、thinking 不可关闭（error 1210），官方档位 low/high/max；
+        # 本任务=按给定数据出结构化 JSON，low 最省且实测 reasoning=0（2026-10-15 探针）。
+        payload["reasoning_effort"] = "low"
     last_exc = None
     for attempt in range(2):
         try:

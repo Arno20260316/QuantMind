@@ -188,6 +188,10 @@ def test_call_brain_posts_chat_completions_with_resolved_model(npa, monkeypatch)
     assert payload["model"] == npa.DEFAULT_BRAIN_MODEL
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][1]["content"] == "任务文本"
+    # glm 族始终思考（thinking 不可关，error 1210）：必须带 low 档 + 16k 预算，
+    # 否则 reasoning 吃光 completion 预算 → length 截断（2026-10-15 首跑 exit 3 事故）
+    assert payload["reasoning_effort"] == "low"
+    assert payload["max_tokens"] == 16000
     assert timeout == npa.BRAIN_TIMEOUT_S
 
 
@@ -208,6 +212,8 @@ def test_call_brain_model_env_override_switches_key_prefix(npa, monkeypatch):
     assert url == "https://api.example.com/v1/chat/completions"
     assert headers["Authorization"] == "Bearer k-openai"
     assert payload["model"] == "deepseek-v4-pro"
+    # reasoning_effort 是 GLM 端点方言，非 glm 模型不得注入
+    assert "reasoning_effort" not in payload
 
 
 def test_call_brain_missing_keys_raises(npa, monkeypatch):

@@ -10,9 +10,13 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.services.live_trading.services import qmt_exec_reconciler as mod
 from backend.services.trade_shared.models.enums import OrderSide, OrderStatus
+
+#: 容器墙钟时区（Asia/Shanghai）；分账 filled_at 必须带它（aware 契约列）
+CN_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class FakeResult:
@@ -316,8 +320,9 @@ class TestAgentLedgerHook:
         assert kw["fill_key"] == "T1"
         assert kw["quantity"] == 40.0
         assert kw["price"] == 10.0
-        # 成交行与账本必须记同一个瞬时（成交日是账本幂等键的一半）
-        assert kw["filled_at"] == session.added[0].executed_at
+        # 成交行与账本必须记同一瞬时（成交日是账本幂等键的一半）；账本列是
+        # aware（as_utc 把 naive 当 UTC），交接值 = 墙钟 + 北京时区。
+        assert kw["filled_at"] == session.added[0].executed_at.replace(tzinfo=CN_TZ)
 
     def test_duplicate_trade_id_never_posts(self, monkeypatch: Any) -> None:
         """成交号已入账（桥重发）：既不插成交行，也不碰账本（否则双计额度）。"""

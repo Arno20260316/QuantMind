@@ -26,6 +26,7 @@ from typing import Any, Optional
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.services.live_trading.services.trading_session import TZ
 from backend.services.trade_shared.models.enums import OrderSide, OrderStatus
 from backend.services.trade_shared.models.order import Order
 from backend.services.trade_shared.models.trade import Trade
@@ -329,7 +330,14 @@ async def apply_execution_report(
                     fill_key=trade_id,
                     quantity=filled_qty,
                     price=price,
-                    filled_at=filled_stamp,
+                    # 账本列是 aware 瞬时（as_utc：naive 一律当 UTC）；
+                    # filled_stamp 是容器墙钟（北京），须贴好时区再交接，
+                    # 否则显示偏 +8h。trades.executed_at 保持墙钟不动。
+                    filled_at=(
+                        filled_stamp
+                        if filled_stamp.tzinfo
+                        else filled_stamp.replace(tzinfo=TZ)
+                    ),
                 )
                 order.filled_quantity = (
                     float(getattr(order, "filled_quantity", 0.0) or 0.0) + filled_qty

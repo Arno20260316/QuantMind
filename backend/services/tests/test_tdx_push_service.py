@@ -22,7 +22,7 @@ from backend.services.live_trading.services.tdx_push_service import (
 
 
 class _RowsResult:
-    """模拟 execute 返回: fetchall() 给 SELECT, scalar() 给 RETURNING。"""
+    """模拟 execute 返回: fetchall() 给 SELECT, scalar()/first() 给 RETURNING/探测。"""
 
     def __init__(self, rows):
         self._rows = list(rows)
@@ -33,19 +33,40 @@ class _RowsResult:
     def scalar(self):
         return self._rows[0] if self._rows else None
 
+    def first(self):
+        return self._rows[0] if self._rows else None
+
 
 class _FakeDb:
-    """迷你内存库: 记住 existing 映射, UPDATE/INSERT 记录参数。"""
+    """迷你内存库: 记住 existing 映射, UPDATE/INSERT/成交行记录参数。"""
 
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, baseline=0.0, duplicate_in_db=False):
         # {exchange_order_id: order_id}
         self.existing = dict(existing or {})
+        #: 乙2 基线: 假 trades 面里该单 cum- 行的累计量（0 = 无成交行）
+        self.baseline = float(baseline)
+        #: 乙2 去重探测: 键是否已在 trades
+        self.duplicate_in_db = duplicate_in_db
         self.updates: list[dict] = []
         self.inserts: list[dict] = []
+        self.added: list = []
 
     async def execute(self, stmt, params=None):
         if isinstance(stmt, Select):
-            return _RowsResult([(eid, oid) for eid, oid in self.existing.items()])
+            sql = str(stmt)
+            if "sum(" in sql:
+                # 乙2 基线: 该单已有 cum- 成交的累计量
+                return _RowsResult([self.baseline])
+            if "trades.trade_id" in sql:
+                # 乙2 先查后插的跨轮去重探测
+                return _RowsResult([(uuid4(),)] if self.duplicate_in_db else [])
+            # 预载 orders: 7 列, 列序同服务端 select
+            return _RowsResult(
+                [
+                    (eid, oid, "submitted", 0, 0.0, None, "")
+                    for eid, oid in self.existing.items()
+                ]
+            )
         if not isinstance(stmt, TextClause):
             return _RowsResult([])
         sql = str(stmt).strip().upper()
@@ -59,6 +80,10 @@ class _FakeDb:
             self.existing[params["exchange_order_id"]] = new_id
             return _RowsResult([new_id])
         return _RowsResult([])
+
+    def add(self, obj) -> None:
+        # 乙2/乙3 的 trades 行（commit 归调用方; 这里只记录）
+        self.added.append(obj)
 
 
 def _svc_with(pull_orders_result):
@@ -136,6 +161,9 @@ async def test_sync_inserts_new_bridge_order():
     assert row["trading_mode"] == "REAL"
     assert row["submitted_at"].hour == 9 and row["submitted_at"].minute == 30
     assert row["filled_at"] == row["submitted_at"]
+    # 乙2/乙3: 同一轮补出 cum- 台阶成交行（基线 0 → 全额一档）
+    assert len(db.added) == 1
+    assert db.added[0].exchange_trade_id == "cum-20260825-160356-2400"
 
 
 @pytest.mark.asyncio
@@ -155,6 +183,8 @@ async def test_sync_updates_existing_order_with_latest_fill():
     assert upd["filled_value"] == round(2400 * 50.90, 2)
     assert upd["commission"] == 31.76
     assert upd["filled_at"] is not None
+    # 乙2/乙3: 刷新路径同样按基线增量补成交行
+    assert len(db.added) == 1
 
 
 @pytest.mark.asyncio

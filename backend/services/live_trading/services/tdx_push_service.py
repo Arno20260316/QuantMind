@@ -18,6 +18,7 @@ from backend.services.live_trading.services.tdx_cancel_verify import (
     verify_cancel_terminal,
 )
 from backend.services.live_trading.services.trading_session import (
+    TZ,
     real_order_session_refusal,
 )
 from backend.shared.agent_ledger_fill import (
@@ -1069,7 +1070,16 @@ class TdxPushService:
                                 fill_key=fill_key,
                                 quantity=delta_qty,
                                 price=marginal,
-                                filled_at=executed_at,
+                                # 分账列是 aware 瞬时（as_utc：naive 一律当
+                                # UTC）。executed_at 是桥报北京墙钟（见上
+                                # wall_time 注释），naive 直传=13:01Z→显示
+                                # 21:01（2026-10-14 实况）；trades.executed_at
+                                # 保持墙钟不动。
+                                filled_at=(
+                                    executed_at
+                                    if executed_at.tzinfo
+                                    else executed_at.replace(tzinfo=TZ)
+                                ),
                                 trade_date=executed_at,
                             )
 

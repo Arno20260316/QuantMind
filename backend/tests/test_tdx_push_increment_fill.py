@@ -8,8 +8,9 @@
 * **基线从 trades 读**：已有 ``filled_quantity=800`` 但零成交行的历史单，
   照样补出一行 ``cum-`` 成交（拿 orders 的前值当基线会永远算出 0 增量）；
 * **幂等**：重投（桥 30s 重发同一回执 / poller 重启补拉）不新增行、不重记分账；
-* **成交瞬时只取一次**：``trades.executed_at`` 与分账 ``filled_at`` 同一个值
-  （北京墙钟，由桥 ``time`` HHMM 派生）；
+* **成交瞬时只取一次**：``trades.executed_at`` 与分账 ``filled_at`` 记同一瞬时
+  （北京墙钟，由桥 ``time`` HHMM 派生；分账是 aware 列，交接前贴北京时区——
+  naive 直传会被 ``as_utc`` 当成 UTC，显示偏 8 小时）；
 * **无价不落行 / 无键不落行**（乙4：计数 + 告警，不静默）。
 
 无库运行：``_FakeSession`` 只应答本链用到的五种 SQL。
@@ -20,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -32,9 +34,13 @@ from backend.services.trade_shared.models.enums import (
     TradingMode,
 )
 from backend.services.trade_shared.models.trade import Trade
+from backend.shared.utc_datetime import as_utc
 
 #: ``sync_account_to_pg`` 传入的 ``now``：naive UTC（北京 13:01 的 UTC 面）
 NOW = datetime(2026, 10, 14, 5, 1, 23)
+
+#: 桥报 HHMM 的墙钟时区（容器 TZ=Asia/Shanghai）；分账 filled_at 必须带它
+CN_TZ = ZoneInfo("Asia/Shanghai")
 
 _LOG = "backend.services.live_trading.services.tdx_push_service"
 
@@ -212,7 +218,13 @@ def test_historical_order_gets_backfilled_trade_and_ledger(ledger_calls):
     assert call["fill_key"] == trade.exchange_trade_id
     assert call["quantity"] == 800
     assert call["price"] == pytest.approx(11.83)
-    assert call["filled_at"] == trade.executed_at
+    # 分账 filled_at 是 aware 列（as_utc：naive 一律当 UTC）：北京墙钟须贴好
+    # 时区再交接，否则 13:01 成交落成 13:01Z、界面显示 21:01（2026-10-14 实况，
+    # glm-5.3-flash 首笔补记踩中）。
+    assert call["filled_at"] == datetime(2026, 10, 14, 13, 1, 0, tzinfo=CN_TZ)
+    assert as_utc(call["filled_at"]) == datetime(
+        2026, 10, 14, 5, 1, 0, tzinfo=timezone.utc
+    )
     assert call["trade_date"] == trade.executed_at
     assert call["order"].agent == "glm-5.3-flash"
     assert call["order"].side == "buy"
@@ -250,6 +262,9 @@ def test_incremental_step_uses_marginal_price(ledger_calls):
     assert trade.price == pytest.approx(11.788, rel=1e-9)
     assert trade.exchange_trade_id == "cum-20261014-202617-800"
     assert trade.executed_at == datetime(2026, 10, 14, 13, 5, 0)
+    assert ledger_calls[0]["filled_at"] == datetime(
+        2026, 10, 14, 13, 5, 0, tzinfo=CN_TZ
+    )
     assert ledger_calls[0]["quantity"] == 500
 
 

@@ -15,7 +15,7 @@ import { Checkbox, message } from 'antd';
 import type { NormalizedHolding, PositionSummary } from '../utils/positionMetrics';
 import { quoteAgeText, type QuoteFreshness } from '../utils/quoteFreshness';
 import { getDeskToday } from '../../../features/desk/services/deskService';
-import { executionUnavailableReason } from '../../../features/desk/deskModel';
+import { executionUnavailableReason, priceSourceHint } from '../../../features/desk/deskModel';
 import type { ExecutionItem } from '../../../features/desk/types';
 import { toSuffixCode } from '../../../utils/portfolioUtils';
 import { PushConfirmPanel } from '../../../features/stock-terminal/components/PushConfirmPanel';
@@ -646,7 +646,12 @@ export const ExecutionStrip: React.FC = () => {
                   {it.mode}
                 </span>
                 <span className={`shrink-0 font-bold ${isBuy ? 'text-red-600' : 'text-emerald-600'}`}>{isBuy ? '买' : '卖'}</span>
-                <span className="min-w-0 truncate font-mono text-slate-700">{it.symbol}</span>
+                <span
+                  className="min-w-0 truncate font-mono text-slate-700"
+                  title={it.price_source ? `取价来源：${priceSourceHint(it.price_source)}` : undefined}
+                >
+                  {it.symbol}
+                </span>
                 <span className="shrink-0 font-mono text-slate-400">{it.quantity} 股</span>
                 <span className={`ml-auto shrink-0 rounded border px-1.5 py-px text-[10px] font-bold ${tone}`}>
                   {s === 'FILLED' ? '成交' : s === 'REJECTED' ? '拒单' : s === 'SUBMITTED' || s === 'PENDING' || s === 'NEW' ? '已报' : it.status}

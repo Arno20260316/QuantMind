@@ -3,12 +3,10 @@
 import type {
   EvidenceRing,
   ExecutionBlock,
-  ExecutionItem,
   HealthBlock,
   PipelineStep,
   PlanBlock,
   PlanOrder,
-  PnlBlock,
   SignalItem,
   SignalsBlock,
 } from './types';
@@ -138,27 +136,6 @@ export function planKindLabel(kind: string | undefined): string {
   return String(kind || '—');
 }
 
-export interface PnlSummary {
-  available: boolean;
-  totalPnl: number;
-  todayPnl: number;
-  returnPct: number | null;
-}
-
-/** 盈亏汇总：总盈亏/今日盈亏/累计收益率（除初始本金；无本金 → null 不硬算） */
-export function pnlSummary(pnl: PnlBlock | null | undefined): PnlSummary {
-  if (!pnl || !pnl.available) {
-    return { available: false, totalPnl: 0, todayPnl: 0, returnPct: null };
-  }
-  const initial = Number(pnl.initial_capital || 0);
-  return {
-    available: true,
-    totalPnl: Number(pnl.total_pnl || 0),
-    todayPnl: Number(pnl.today_pnl || 0),
-    returnPct: initial > 0 ? Number(pnl.total_pnl || 0) / initial : null,
-  };
-}
-
 /**
  * 委托块「不可归集」原因（可用时返回 null）。
  *
@@ -171,21 +148,6 @@ export function executionUnavailableReason(
 ): string | null {
   if (execution?.available !== false) return null;
   return execution.reason || `${execution.market || '该市场'}委托暂不可按市场归集`;
-}
-
-/** 执行卡汇总：成交/拒单（缺字段回退 0，不推断） */
-export function executionSummary(execution: ExecutionBlock | null | undefined): {
-  simCount: number;
-  realCount: number;
-  filled: number;
-  rejected: number;
-} {
-  return {
-    simCount: Number(execution?.sim_count || 0),
-    realCount: Number(execution?.real_count || 0),
-    filled: Number(execution?.filled || 0),
-    rejected: Number(execution?.rejected || 0),
-  };
 }
 
 export interface HealthItemView {
@@ -212,27 +174,6 @@ export function healthItemViews(health: HealthBlock | null | undefined): HealthI
 export function formatMoney(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
   return Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-export function formatPct(value: number | null | undefined, digits = 2): string {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
-  return `${(Number(value) * 100).toFixed(digits)}%`;
-}
-
-/** 盈亏块 → 下钻条目（T-FE-03：数字 → 来源链；金额原样展示，不重算） */
-export function pnlDrillEntries(pnl: PnlBlock | null | undefined): DrillEntryLike[] {
-  if (!pnl || !pnl.available) {
-    return [{ label: '状态', value: '无资金快照', source: pnl?.source, hint: pnl?.detail }];
-  }
-  const summary = pnlSummary(pnl);
-  return [
-    { label: '总资产', value: formatMoney(pnl.total_asset), source: pnl.source },
-    { label: '初始本金', value: formatMoney(pnl.initial_capital), source: pnl.source },
-    { label: '累计收益', value: formatMoney(pnl.total_pnl), source: pnl.source, hint: summary.returnPct !== null ? `收益率 ${formatPct(summary.returnPct)}（累计收益 ÷ 初始本金）` : '本金缺失，不计算收益率' },
-    { label: '今日盈亏', value: formatMoney(pnl.today_pnl), source: pnl.source },
-    { label: '持仓市值', value: formatMoney(pnl.market_value), source: pnl.source },
-    { label: '快照日期', value: pnl.snapshot_date || '—', source: pnl.source },
-  ];
 }
 
 /** 计划块 → 下钻条目（顶部摘要 + 前 N 笔明细） */
@@ -331,48 +272,6 @@ export function signalItemDrillEntries(
           { label: '来源', value: signals?.source || '—' },
         ],
         raw: signals,
-      },
-    },
-  ];
-}
-
-/** 今日执行条目 → 下钻层（订单字段 → 取价来源说明 → 原始条目） */
-export function executionItemDrillEntries(
-  item: ExecutionItem,
-  execution: ExecutionBlock | null | undefined
-): DrillEntryLike[] {
-  return [
-    { label: '模式', value: item.mode === 'REAL' ? '实盘（镜像）' : '模拟盘' },
-    { label: '标的/方向', value: `${sideLabel(item.side)} ${symbolLabel(item.symbol, item.name)}` },
-    { label: '数量', value: `${item.quantity} 股` },
-    { label: '状态', value: item.status },
-    {
-      label: '取价来源',
-      value: item.price_source || '—',
-      hint: priceSourceHint(item.price_source),
-      drill: {
-        title: '取价来源 · 工程口径',
-        subtitle: '取价链唯一实现（L0/L1 新鲜价优先，降级如实标注）',
-        entries: [
-          { label: '本单标记', value: item.price_source || '—' },
-          { label: '含义', value: priceSourceHint(item.price_source) },
-          { label: '降级规则', value: '[RULE:PRICE-STALE]（陈旧价拒单/标注）' },
-        ],
-        raw: { price_source: item.price_source, symbol: item.symbol, client_order_id: item.client_order_id },
-      },
-    },
-    { label: '订单 ID', value: item.client_order_id || '—', source: execution?.source },
-    {
-      label: '原始条目',
-      value: '展开',
-      drill: {
-        title: `执行原始条目 · ${symbolLabel(item.symbol, item.name)}`,
-        subtitle: 'sim_orders/trades 投影行（含 reason/时间）',
-        entries: Object.entries(item as unknown as Record<string, unknown>).map(([k, v]) => ({
-          label: k,
-          value: v === null || v === undefined ? '—' : String(v),
-        })),
-        raw: item,
       },
     },
   ];

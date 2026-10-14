@@ -1,23 +1,19 @@
 /**
- * 交易台分栏组件（2026-09-17）：自今日交易台拆出，按用户归类归位——
- * - SignalsSection（候选信号）→ 模拟交易「候选信号」独立页签
- * - PlanSection（调仓计划（预演）+ 一键执行）→ 「手动任务」
- * - ExecutionSection（今日执行）→ 「持仓监控」
- * 每个 Section 自取数（/api/v1/desk/today）并自带下钻弹窗，宿主页零侵入。
+ * 交易台「调仓计划（预演）」区块（2026-09-17 自今日交易台拆出；2026-10-14 清理收口）。
+ *
+ * 现存仅 `PlanSection`（调仓计划预览 + 一键执行）→ 归位到「手动任务」页。
+ * 原先同文件里的 `SignalsSection`（候选信号）/ `ExecutionSection`（今日执行）已下线：
+ * 候选信号由模拟交易「候选信号」页签承担，今日执行由持仓监控页的 `ExecutionStrip` 承担，
+ * 两者都直接吃 `/api/v1/desk/today`，不必再绕这一层。
+ *
+ * 本 Section 自取数（/api/v1/desk/today）并自带下钻弹窗，宿主页零侵入。
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import { getDeskToday } from '../services/deskService';
 import type { DeskToday } from '../types';
 import { DrillDownDrawer, type DrillEntry } from '../../shared/DrillDownDrawer';
 import { PlanCard } from './PlanCard';
-import { ExecutionCard, SignalsCard } from './DeskCards';
-import {
-  executionItemDrillEntries,
-  planDrillEntries,
-  planOrderDrillEntries,
-  signalItemDrillEntries,
-  symbolLabel,
-} from '../deskModel';
+import { planDrillEntries, planOrderDrillEntries, symbolLabel } from '../deskModel';
 
 interface DrawerState {
   title: string;
@@ -72,40 +68,6 @@ const SectionShell: React.FC<{
   return <>{children}</>;
 };
 
-/** 候选信号（独立页签）：BUY/SELL/HOLD 分布 + rank 分位最强 Top10（可滚动、逐条下钻） */
-export const SignalsSection: React.FC = () => {
-  const { desk, loading, error } = useDesk(false);
-  const [drawer, setDrawer] = useState<DrawerState | null>(null);
-  return (
-    <>
-      <SectionShell loading={loading} error={error} empty={!desk}>
-        {desk && (
-          <SignalsCard
-            signals={desk.signals}
-            onItemDrill={(item) =>
-              setDrawer({
-                title: `信号 · ${symbolLabel(item.symbol, item.name)}`,
-                subtitle: '字段分解 → 原始条目 → 信号块载荷（engine_signal_scores）',
-                entries: signalItemDrillEntries(item, desk.signals) as DrillEntry[],
-                raw: item,
-              })
-            }
-          />
-        )}
-      </SectionShell>
-      <DrillDownDrawer
-        open={!!drawer}
-        presentation="modal"
-        title={drawer?.title || ''}
-        subtitle={drawer?.subtitle}
-        entries={drawer?.entries || []}
-        raw={drawer?.raw}
-        onClose={() => setDrawer(null)}
-      />
-    </>
-  );
-};
-
 /** 调仓计划（预演）→ 手动任务页：预览 + 一键执行调仓（dry-run 与执行共用同一计算器） */
 export const PlanSection: React.FC = () => {
   const { desk, loading, error, reload } = useDesk(true);
@@ -131,40 +93,6 @@ export const PlanSection: React.FC = () => {
                 subtitle: '预演与执行共用同一 RebalanceCalculator（dry-run，未执行）',
                 entries: planDrillEntries(desk.plan) as DrillEntry[],
                 raw: desk.plan,
-              })
-            }
-          />
-        )}
-      </SectionShell>
-      <DrillDownDrawer
-        open={!!drawer}
-        presentation="modal"
-        title={drawer?.title || ''}
-        subtitle={drawer?.subtitle}
-        entries={drawer?.entries || []}
-        raw={drawer?.raw}
-        onClose={() => setDrawer(null)}
-      />
-    </>
-  );
-};
-
-/** 今日执行 → 持仓监控页：今日订单执行状态（sim_orders / orders 投影） */
-export const ExecutionSection: React.FC = () => {
-  const { desk, loading, error } = useDesk(false);
-  const [drawer, setDrawer] = useState<DrawerState | null>(null);
-  return (
-    <>
-      <SectionShell loading={loading} error={error} empty={!desk}>
-        {desk && (
-          <ExecutionCard
-            execution={desk.execution}
-            onItemDrill={(item) =>
-              setDrawer({
-                title: `执行 · ${symbolLabel(item.symbol, item.name)}`,
-                subtitle: '订单字段 → 取价来源说明 → 原始条目（sim_orders 投影）',
-                entries: executionItemDrillEntries(item, desk.execution) as DrillEntry[],
-                raw: item,
               })
             }
           />

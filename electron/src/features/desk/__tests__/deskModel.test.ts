@@ -5,11 +5,8 @@ import {
   evidenceRingDrillEntries,
   evidenceSummary,
   excludedSymbolsFromPlan,
-  executionItemDrillEntries,
-  executionSummary,
   executionUnavailableReason,
   formatMoney,
-  formatPct,
   hasInvalidQuantityEdit,
   healthItemViews,
   pipelineStepDrillEntries,
@@ -18,8 +15,6 @@ import {
   planKindLabel,
   planOrderDrillEntries,
   planSummary,
-  pnlDrillEntries,
-  pnlSummary,
   quantityAdjustmentSummary,
   quantityOverridesFromPlan,
   signalItemDrillEntries,
@@ -94,28 +89,7 @@ describe('planSummary / planKindLabel', () => {
   });
 });
 
-describe('pnlSummary', () => {
-  it('可用且有本金 → 累计收益率；无本金 → null（不硬算）', () => {
-    const ok = pnlSummary({
-      available: true, source: 'x', total_pnl: 10000, today_pnl: 500, initial_capital: 100000,
-    });
-    expect(ok.returnPct).toBeCloseTo(0.1);
-    const noInitial = pnlSummary({ available: true, source: 'x', total_pnl: 1 });
-    expect(noInitial.returnPct).toBeNull();
-    const unavailable = pnlSummary({ available: false, source: 'x' });
-    expect(unavailable.available).toBe(false);
-    expect(pnlSummary(undefined).totalPnl).toBe(0);
-  });
-});
-
-describe('executionSummary / healthItemViews / 格式化', () => {
-  it('执行汇总缺字段回退 0', () => {
-    expect(executionSummary(undefined)).toEqual({ simCount: 0, realCount: 0, filled: 0, rejected: 0 });
-    expect(
-      executionSummary({ source: 's', sim_count: 2, real_count: 1, filled: 1, rejected: 1 })
-    ).toEqual({ simCount: 2, realCount: 1, filled: 1, rejected: 1 });
-  });
-
+describe('healthItemViews / 格式化', () => {
   it('不可归集的委托块识别出原因（不退化成"今天没交易"）', () => {
     // CN / 正常块 → 无原因
     expect(executionUnavailableReason(undefined)).toBeNull();
@@ -149,38 +123,13 @@ describe('executionSummary / healthItemViews / 格式化', () => {
     expect(views[1].suggestion).toContain('台账');
   });
 
-  it('金额/百分比格式化容错', () => {
+  it('金额格式化容错', () => {
     expect(formatMoney(null)).toBe('—');
     expect(formatMoney(1234.5)).toContain('1,234.50');
-    expect(formatPct(0.1234)).toBe('12.34%');
-    expect(formatPct(null)).toBe('—');
   });
 });
 
 describe('下钻条目（T-FE-03）', () => {
-  it('盈亏块 → 条目：字段分解 + source；不可用 → 状态条目（含 detail）', () => {
-    const entries = pnlDrillEntries({
-      available: true,
-      source: 'db:simulation_fund_snapshots',
-      total_asset: 2010176.58,
-      initial_capital: 2000000,
-      total_pnl: 10176.58,
-      today_pnl: 1797,
-      market_value: 521211,
-      snapshot_date: '2026-09-16',
-    });
-    const labels = entries.map((e) => e.label);
-    expect(labels).toContain('总资产');
-    expect(labels).toContain('累计收益');
-    expect(entries.every((e) => e.source === 'db:simulation_fund_snapshots')).toBe(true);
-    const pnlEntry = entries.find((e) => e.label === '累计收益');
-    expect(pnlEntry?.hint).toContain('0.51%'); // 收益率推算写入 hint
-
-    const empty = pnlDrillEntries({ available: false, source: 'x', detail: '无资金快照' });
-    expect(empty).toHaveLength(1);
-    expect(empty[0].value).toBe('无资金快照');
-  });
-
   it('计划块 → 摘要条目 + 前 N 笔明细（退出规则标注在 source 列）', () => {
     const plan = {
       available: true,
@@ -409,18 +358,6 @@ describe('逐层穿透下钻（T-FE-03 v2）', () => {
     const score = entries.find((e) => e.label === '研究评分');
     expect(score?.value).toBe('—');
     expect(score?.hint).toContain('不可直接比较');
-  });
-
-  it('执行条目：取价来源挂解释层（broker_fill/降级标记如实）', () => {
-    const entries = executionItemDrillEntries(
-      { mode: 'SIM', symbol: '600036', side: 'BUY', quantity: 1200, status: 'FILLED', price_source: 'prev_close_bar', client_order_id: 'sim-x-1' },
-      { source: 'db:sim_orders' }
-    );
-    const ps = entries.find((e) => e.label === '取价来源');
-    expect(ps?.value).toBe('prev_close_bar');
-    expect(ps?.hint).toContain('降级');
-    expect(ps?.drill?.entries.some((x) => x.label === '降级规则')).toBe(true);
-    expect(executionItemDrillEntries({ mode: 'SIM', symbol: 'X', side: 'BUY', quantity: 1, status: 'PENDING' }, null)[4].hint).toContain('未标注');
   });
 
   it('计划单：退出单与调仓单的触发类别说明不同；命中候选信号时可继续下钻', () => {

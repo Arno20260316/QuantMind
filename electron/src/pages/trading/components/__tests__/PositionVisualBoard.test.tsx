@@ -12,9 +12,9 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 
-import { PositionVisualBoard } from '../PositionVisualBoard';
+import { PositionVisualBoard, ExecutionStrip } from '../PositionVisualBoard';
 import type { NormalizedHolding, PositionSummary } from '../../utils/positionMetrics';
 
 vi.mock('echarts-for-react', () => ({
@@ -24,6 +24,12 @@ vi.mock('echarts-for-react', () => ({
 // 卖出预检面板会拉起 stock-terminal 的整条依赖；本文件只测展示口径
 vi.mock('../../../../features/stock-terminal/components/PushConfirmPanel', () => ({
   PushConfirmPanel: () => null,
+}));
+
+// ExecutionStrip 自取 `/api/v1/desk/today`（health:false, plan:false）
+const deskToday = vi.fn();
+vi.mock('../../../../features/desk/services/deskService', () => ({
+  getDeskToday: (...args: unknown[]) => deskToday(...args),
 }));
 
 afterEach(cleanup);
@@ -124,5 +130,54 @@ describe('PositionVisualBoard · 缺价行', () => {
     expect(row).toHaveTextContent('+28.80');
     expect(row).toHaveTextContent('+0.72%');
     expect(screen.queryByText('缺价')).toBeNull();
+  });
+});
+
+/**
+ * 执行条「取价来源」可见面（2026-10-14 自 `DeskCards.ExecutionCard` 移植）。
+ *
+ * 背景：原渲染点是交易台的 `ExecutionCard`，该卡自 2026-09-17 起已无活引用（死代码），
+ * 而它是前端**唯一**解释 `price_source` 降级标记的地方——直接删除会让
+ * 「这单用的是陈旧价 / 非当日收盘」这个降级事实从界面上消失（后端 desk.py 仍在投递该字段）。
+ * 故先把 tooltip 落到活的 `ExecutionStrip`，再删死卡。本用例钉住移植后的行为。
+ */
+describe('ExecutionStrip · 取价来源 tooltip', () => {
+  afterEach(() => {
+    deskToday.mockReset();
+  });
+
+  const stripOf = (items: unknown[]) => {
+    deskToday.mockResolvedValue({ success: true, data: { execution: { source: 'db:sim_orders+orders', items } } });
+    render(<ExecutionStrip />);
+  };
+
+  it('price_source 有值时出「取价来源：<人话>」title，缺失时不挂 title', async () => {
+    stripOf([
+      { mode: 'SIM', symbol: 'SH600036', side: 'BUY', quantity: 100, status: 'FILLED', price_source: 'prev_close_bar' },
+      { mode: 'SIM', symbol: 'SZ000001', side: 'SELL', quantity: 200, status: 'REJECTED' },
+    ]);
+
+    fireEvent.click(await screen.findByText('今日执行'));
+
+    const degraded = await screen.findByTitle(/^取价来源：/);
+    expect(degraded).toHaveTextContent('SH600036');
+    // 降级标记必须解释成「非当日」——只印枚举值等于没说
+    expect(degraded.getAttribute('title')).toContain('降级');
+    expect(degraded.getAttribute('title')).toContain('最近可用日线收盘');
+
+    await waitFor(() => expect(screen.getByText('SZ000001')).toBeTruthy());
+    expect(screen.getByText('SZ000001').getAttribute('title')).toBeNull();
+  });
+
+  it('price_source 为空时不挂 title（与移植前 ExecutionCard 的判据一致）', async () => {
+    stripOf([
+      { mode: 'SIM', symbol: 'SH601988', side: 'BUY', quantity: 100, status: 'FILLED', price_source: null },
+    ]);
+
+    fireEvent.click(await screen.findByText('今日执行'));
+
+    // 判据是 `it.price_source ? title : undefined`：没有标记就不编一个来源出来
+    const span = await screen.findByText('SH601988');
+    expect(span.getAttribute('title')).toBeNull();
   });
 });

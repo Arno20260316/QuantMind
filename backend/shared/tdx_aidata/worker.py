@@ -6,11 +6,14 @@
 2. **崩溃隔离**：原生库异常/段错误只死 worker，父服务不受影响；
 3. **单实例**：SDK 连接是进程级单例，多服务经同一 unix socket 共享。
 
-**配额闸门（2026-09-16 实测）**：该 token 每个冷却窗口仅放行 3 次请求（所有接口共享），
-第 4 次起服务端返回 Token Insufficient。因此 worker 自带预算门：
-- 窗口内请求数 >= ``max_requests_per_window``（默认 3）→ 直接快速失败（不触 SDK）；
+**配额闸门**：worker 自带预算门，默认上限见 ``config.DEFAULT_MAX_REQ_PER_WINDOW``
+（可用 Redis 配置项 ``max_requests_per_window`` 或 env ``TDX_AIDATA_MAX_REQ_PER_WINDOW`` 覆盖）：
+- 窗口内请求数 >= 上限 → 直接快速失败（不触 SDK）；
 - 服务端限流（可检出时）→ 提前进入冷却，冷却时长翻倍（180s 起、600s 封顶），成功即复位；
 - 窗口过期自动开新窗口。调用方据 ``retry_after_s`` 排队，绝不盲打 token。
+
+历史：2026-09-16 曾按旧 token 实测「每窗口仅 3 次」把上限写死为 3；2026-10-14 换 token 后
+40 连发零限流（≈21 req/s），3 已属自缚，改由配置驱动。
 
 协议：unix socket + JSONL（见 protocol.py）。启动：``python -m backend.shared.tdx_aidata.worker``。
 """
@@ -42,10 +45,12 @@ class _BudgetGate:
 
     def __init__(
         self,
-        max_requests_per_window: int = 3,
+        max_requests_per_window: int | None = None,
         initial_cooldown_s: float = 180.0,
         max_cooldown_s: float = 600.0,
     ) -> None:
+        if max_requests_per_window is None:
+            max_requests_per_window = config.max_requests_per_window()
         self.max_requests = max(1, int(max_requests_per_window))
         self.initial_cooldown_s = float(initial_cooldown_s)
         self.max_cooldown_s = float(max_cooldown_s)
@@ -144,7 +149,7 @@ class AidataWorker:
         socket_path: str | None = None,
         directory: str | None = None,
         *,
-        max_requests_per_window: int = 3,
+        max_requests_per_window: int | None = None,
     ) -> None:
         self.socket_path = socket_path or config.socket_path()
         self.directory = directory or config.resolve_dir()
@@ -659,8 +664,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--max-requests-per-window",
         type=int,
-        default=int(os.getenv("TDX_AIDATA_MAX_REQ_PER_WINDOW", "3")),
-        help="每个冷却窗口最大请求数（实测 token 为 3）",
+        default=None,
+        help=(
+            "每个冷却窗口最大请求数；缺省取 Redis 配置 > env "
+            f"TDX_AIDATA_MAX_REQ_PER_WINDOW > {config.DEFAULT_MAX_REQ_PER_WINDOW}"
+        ),
     )
     args = ap.parse_args(argv)
     worker = AidataWorker(

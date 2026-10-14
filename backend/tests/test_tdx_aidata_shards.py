@@ -402,7 +402,7 @@ def test_sdk_subscribe_resets_tqs_accumulator():
 
 @pytest.mark.unit
 def test_resubscribe_not_charged_to_request_budget_and_min_gap():
-    """订阅通道零配额（实证）——重订不得走「3 次/窗口」请求闸门；
+    """订阅通道零配额（实证）——重订不得走请求预算闸门（旧上限 3 次/窗口）；
     热集差分重订须受最小间隔约束（防 churn），间隔内推迟并计数。"""
     import time as _time
 

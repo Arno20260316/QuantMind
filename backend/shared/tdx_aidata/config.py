@@ -26,6 +26,12 @@ REDIS_CONFIG_KEY = "qm:market:tdx_aidata:config"
 DEFAULT_SOCKET = "/tmp/qm-tdx-aidata.sock"
 DEFAULT_HOT_SET_KEY = "qm:hot_set:symbols"
 
+# 请求预算窗口默认上限。2026-09-16 按**旧** token 实测「每窗口 3 次」把默认定死 3；
+# 2026-10-14 用新 token 复测 40 连发零失败（≈21 req/s），3 已是自缚——正常低频补数
+# （K线/分时/分笔）被自己挡住。默认放宽到 30，仍远低于"盲打"量级，且闸门本身
+# 有冷却翻倍（180s→600s）兜底。
+DEFAULT_MAX_REQ_PER_WINDOW = 30
+
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off"}
 
@@ -122,6 +128,26 @@ def shard_count() -> int:
         except (TypeError, ValueError):
             continue
     return 1
+
+
+def max_requests_per_window() -> int:
+    """请求预算窗口上限：Redis 配置 > env TDX_AIDATA_MAX_REQ_PER_WINDOW > 默认。
+
+    读侧与 worker 构造共用一处，保证前端展示 / API 回读 / 实际闸门三者同源。
+    非法/非正值一律回落默认（绝不因配置手滑把闸门关成 0 而全量拒单）。
+    """
+    cfg = _read_redis_config_sync()
+    for raw in (
+        cfg.get("max_requests_per_window"),
+        os.getenv("TDX_AIDATA_MAX_REQ_PER_WINDOW"),
+    ):
+        try:
+            value = int(str(raw).strip())
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_MAX_REQ_PER_WINDOW
 
 
 def ini_path(directory: str | None = None) -> str:
@@ -245,9 +271,9 @@ def save_config_sync(client, updates: dict[str, Any]) -> dict[str, str]:
 
     client 为同步 redis 客户端（调用方负责连接与线程卸载）。
     """
-    # Redis 配置优先；仅 dir/enabled 走既有写入面，shard_count 供运维/API 设置
+    # Redis 配置优先；仅 dir/enabled 走既有写入面，shard_count/预算窗口供运维/API 设置
     mapping = {}
-    for key in ("dir", "enabled", "shard_count"):
+    for key in ("dir", "enabled", "shard_count", "max_requests_per_window"):
         if key in updates and updates[key] is not None:
             value = str(updates[key]).strip()
             if value:
@@ -269,5 +295,6 @@ def public_config() -> dict[str, Any]:
         "dir_ready": ready,
         "socket_path": socket_path(),
         "shard_count": shard_count(),
+        "max_requests_per_window": max_requests_per_window(),
         "token": token_status(ini_path(directory)),
     }

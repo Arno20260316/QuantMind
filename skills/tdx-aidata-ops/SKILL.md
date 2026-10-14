@@ -1,6 +1,6 @@
 ---
 name: tdx-aidata-ops
-description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查——状态体检（6 分片/帧节拍/热集/静默片）、订阅推送与请求两通道语义（订阅零请求配额、请求仅 3 次/窗口）、SDK API 方法表、故障模式与证据采集（盘中零数据帧、错误码 10/13、Token Insufficient）、平台 REST 与前端入口。用户问「TdxAiData」「订阅推送」「行情主源」「盘中有没有数据」「零帧」「配额/限流」「错误码10/13」「tdx 自检」「重启 tdx」时使用。触发词：TdxAiData、tdx-aidata、订阅推送、行情主源、数据帧、零帧、配额、Token Insufficient、错误码10、错误码13、自检、重启worker"
+description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查——状态体检（分片/帧节拍/热集/静默片）、订阅推送与请求两通道语义（订阅零请求配额、请求按预算窗口限流）、SDK API 方法表、故障模式与证据采集（盘中零数据帧、错误码 11/10/13、Token Insufficient、ini 主机表缺失）、平台 REST 与前端入口。用户问「TdxAiData」「订阅推送」「行情主源」「盘中有没有数据」「零帧」「配额/限流」「错误码11/10/13」「Connection failed」「tdx 自检」「重启 tdx」时使用。触发词：TdxAiData、tdx-aidata、订阅推送、行情主源、数据帧、零帧、配额、Token Insufficient、错误码11、错误码10、错误码13、Connection failed、自检、重启worker"
 ---
 
 > ## ⚙️ 运行环境契约（最高优先级）
@@ -10,9 +10,11 @@ description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查�
 > 2. **绝不直接 import SDK/DLL 写业务脚本**——`backend/shared/tdx_aidata/worker.py` 是**唯一 SDK 引入口**
 >    （源守卫测试锁定）。取数一律走 `TdxAiDataClient`/`default_cluster()`（IPC socket），
 >    原生命令行实验会污染/争抢 SDK 会话（裸 ctypes 驱动帧计数不可靠且会 segfault）。
-> 3. **配额铁律**：请求类方法（K线/分时/分笔/快照）**全接口共享 3 次/冷却窗口**，第 4 次起
->    `错误码 13 Token Insufficient`。**先问用途再消耗**——一次诊断就烧掉 1/3 窗口，
->    别为"看一眼"浪费配额。
+> 3. **配额铁律**：请求类方法（K线/分时/分笔/快照）**全接口共享一个预算窗口**，
+>    上限由配置决定：Redis `qm:market:tdx_aidata:config.max_requests_per_window`
+>    > env `TDX_AIDATA_MAX_REQ_PER_WINDOW` > 默认 **30**（2026-10-14 换 token 后实测
+>    40 连发零限流 ≈21 req/s；此前「3 次/窗口」是**旧 token** 的实测值，已作废）。
+>    超限快速失败进冷却。**先问用途再消耗**——别为"看一眼"浪费窗口。
 > 4. **见数据才报数据**：`frames_meta`（心跳）流动 ≠ 有行情。判"有数据"的唯一口径是
 >    `frames_data`/`records`/`written` 增长；消费端另看 `market:snapshot` 新鲜度。
 
@@ -28,7 +30,7 @@ description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查�
 - **热集**：`qm:hot_set:symbols` 在**部署本地 Redis**（`shared/hot_set_store.py`，2026-09-17
   从公共行情服迁回）；**行情快照/序列写远端**（`market:snapshot:{sh600036}` 小写 /
   `market:series:{SH600036}` 大写）。
-- **预算闸门**：worker 内 3 次/窗口 + 冷却翻倍；超限快速失败（不触 SDK）。
+- **预算闸门**：worker 内按窗口上限（默认 30，可配）计数 + 冷却翻倍（180s 起、600s 封顶）；超限快速失败（不触 SDK）。
 
 ## 2. 体检（一条命令）
 
@@ -59,10 +61,11 @@ asyncio.run(m())"
 
 | 通道 | 调用 | 配额 | 老实话 |
 |---|---|---|---|
-| 订阅推送 | `tqs.subscribe`（worker 内） | **零请求配额** | 设计定位=盘中实时主源（五档全字段），**但 2026-09-17 全天实测盘中只推心跳帧、零数据行**——根因待 SDK 方确认，不得当"已验收" |
-| 请求接口 | `get_quote/get_klines/get_minute_data/get_tick_data` | **3 次/窗口**（全接口共享） | 盘中实测：`错误码 10 [Invalid server response]`，随后窗口配额即报 `错误码 13`；只可做低频补充 |
+| 订阅推送 | `tqs.subscribe`（worker 内） | **零请求配额** | 设计定位=盘中实时主源（五档全字段）。2026-09-17 曾全天只推心跳帧、零数据行（根因未明）；**2026-10-14 复测已推真实数据帧**（8 片 `frames_data`/`written` 持续增长、`redis_errors=0`，db3 落 538 快照键） |
+| 请求接口 | `get_quote/get_klines/get_minute_data/get_tick_data` | **预算窗口内 N 次**（默认 30，全接口共享） | 低频补充用（K线/分时/分笔）。2026-10-14 新 token 实测 40 连发零限流；窗口上限在面板「窗口上限」或 Redis 配置项调整 |
 
-错误码：`13`=Token Insufficient（配额）；`10`=服务端异常响应（`Invalid server response`）；
+错误码：`13`=Token Insufficient（配额）；`11`=Connection failed（**ini 主机表缺失**，
+见 §4）；`10`=服务端异常响应（`Invalid server response`）；
 `2`=订阅批量拒绝（>100 只，仅打印不抛）；错误映射见 `shared/tdx_aidata/protocol.py::map_sdk_error`。
 
 ## 4. 已知故障模式（故障 ⇒ 处置）
@@ -72,7 +75,8 @@ asyncio.run(m())"
 | 6 片 `data=0` 全天，meta 在涨 | **服务端不推数据帧**（2026-09-17 实盘，证据包 `data/p6_tdx_evidence_20260917/`）。排除项：分片/订阅规模/热集漂移（隔离探针同样零帧）。→ 找 SDK 方核对推送语义；不要在本机反复重订 |
 | 某片 `subscribed=0` 或整片静默 | 先查该片 `frames_meta` 是否流动；`last_error` 有 `[错误码 2]` 佐证 >100 只；重订前确认 `tqs` 账本已清（worker 已内建每次重订前清 `_sub_codes`） |
 | `hot_set read: Timeout connecting to server` | 历史遗留（热集在公共服时远端读超时）；热集本地化后应消失，若再现查本地 `redis` 连通与 `QM_HOT_SET_KEY` |
-| `Token Insufficient`（自检/取数失败） | 窗口配额已满（3 次/窗口，全接口共享）——等冷却窗口；**别重试风暴** |
+| `Token Insufficient`（自检/取数失败） | 窗口配额已满（默认 30 次/窗口，全接口共享）——等冷却窗口；**别重试风暴** |
+| **每次请求都 `{"Error":"Connection failed","ErrorId":11}`、订阅零帧** | **包内 `tdxaidata/lib/TdxAiData.ini` 的 `[TcHqHost]` 主机表被写坏**（只剩 `PrimaryHost=`，缺 `HostName/IPAddress/Port`）→ SDK 连不上行情主机。**2026-10-14 实盘踩过（约 5 小时全断）**：token 写入若用正则跨行替换，会把 `HostNum/HostName01/...` 全吃掉。修法=从 PyPI wheel 模板重建该 ini 再补 `[Token]`；**只写 token 行、先备份**。隔离判据：同一 `.so`+token，只有 ini 不同 → 报 11 的那个就是坏 ini |
 | worker 拉起失败/端口残留 | `client.restart()`（重读 ini/目录）；残留 socket 会被活体探针剔除后重拉（已修） |
 | 改 Token/安装目录 | 前端「数据管理→A股→数据源设置」（写 `TdxAiData.ini` 的 `[Token]` 行，原子替换），或 `POST /api/v1/admin/data-platform/tdx-aidata/config` |
 

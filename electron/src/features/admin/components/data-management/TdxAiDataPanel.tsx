@@ -19,6 +19,8 @@ interface TdxAiDataConfig {
     enabled: boolean;
     dir_ready: boolean;
     socket_path: string;
+    shard_count?: number;
+    max_requests_per_window?: number;
     token: TokenStatus;
 }
 
@@ -58,7 +60,8 @@ interface SelfcheckResult {
  * TdxAiData 实时数据源配置面板（P6 T-P6-01）。
  *
  * 说明（与后端实测一致）：该通道免 Windows 客户端；**订阅推送**为实时主源（五档全字段、
- * 零请求配额），**请求接口**每冷却窗口仅 3 次（实测）——面板如实展示配额窗口与冷却倒计时。
+ * 零请求配额），**请求接口**按预算窗口限流（订阅不吃配额）——面板如实展示配额窗口与
+ * 冷却倒计时，窗口上限/分片数均可在此调整（保存后重启全分片生效）。
  */
 export const TdxAiDataPanel: React.FC = () => {
     const [cfg, setCfg] = useState<TdxAiDataConfig | null>(null);
@@ -66,6 +69,8 @@ export const TdxAiDataPanel: React.FC = () => {
     const [dirInput, setDirInput] = useState('');
     const [tokenInput, setTokenInput] = useState('');
     const [enabledInput, setEnabledInput] = useState(true);
+    const [shardInput, setShardInput] = useState('');
+    const [maxReqInput, setMaxReqInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [saving, setSaving] = useState(false);
     const [checking, setChecking] = useState(false);
@@ -77,6 +82,8 @@ export const TdxAiDataPanel: React.FC = () => {
             setCfg(c);
             setDirInput(c.dir || '');
             setEnabledInput(!!c.enabled);
+            setShardInput(c.shard_count ? String(c.shard_count) : '');
+            setMaxReqInput(c.max_requests_per_window ? String(c.max_requests_per_window) : '');
         }
         setWorker(data?.worker ?? {});
     }, []);
@@ -101,11 +108,30 @@ export const TdxAiDataPanel: React.FC = () => {
     const handleSave = async () => {
         setSaving(true);
         try {
-            const payload: { dir?: string; enabled?: boolean; token?: string } = {
+            const payload: {
+                dir?: string;
+                enabled?: boolean;
+                token?: string;
+                shard_count?: number;
+                max_requests_per_window?: number;
+            } = {
                 enabled: enabledInput,
             };
             if (dirInput.trim() && dirInput.trim() !== cfg?.dir) payload.dir = dirInput.trim();
             if (tokenInput.trim()) payload.token = tokenInput.trim();
+            const shardNum = Number(shardInput);
+            if (shardInput.trim() && Number.isFinite(shardNum) && shardNum >= 1 && shardNum !== cfg?.shard_count) {
+                payload.shard_count = Math.floor(shardNum);
+            }
+            const maxReqNum = Number(maxReqInput);
+            if (
+                maxReqInput.trim() &&
+                Number.isFinite(maxReqNum) &&
+                maxReqNum >= 1 &&
+                maxReqNum !== cfg?.max_requests_per_window
+            ) {
+                payload.max_requests_per_window = Math.floor(maxReqNum);
+            }
             const resp = await adminService.saveTdxAiDataConfig(payload);
             applyConfig(resp?.data);
             setTokenInput('');
@@ -145,8 +171,11 @@ export const TdxAiDataPanel: React.FC = () => {
     };
 
     const gate = worker?.gate;
-    const maxReq = gate?.max_requests_per_window ?? 3;
+    const maxReq = gate?.max_requests_per_window ?? cfg?.max_requests_per_window ?? 30;
     const usedReq = Math.min(gate?.window_requests ?? 0, maxReq);
+    // 预算格逐格画只在格数可读时用；上限调到几十时改走「已用/上限」数字 + 比例条
+    const showPips = maxReq <= 12;
+    const usedPct = maxReq > 0 ? Math.min(100, (usedReq / maxReq) * 100) : 0;
     const workerDegraded = worker?.worker === 'degraded';
     const workerUp = worker?.worker === 'up' || workerDegraded;
     const sdkReady = worker?.sdk_ready === true;
@@ -209,14 +238,23 @@ export const TdxAiDataPanel: React.FC = () => {
                     <ApiOutlined className="text-slate-400" />
                     请求配额窗口
                     <span className="inline-flex items-center gap-1">
-                        <span className="inline-flex gap-0.5">
-                            {Array.from({ length: maxReq }).map((_, i) => (
+                        {showPips ? (
+                            <span className="inline-flex gap-0.5">
+                                {Array.from({ length: maxReq }).map((_, i) => (
+                                    <span
+                                        key={i}
+                                        className={`inline-block w-2 h-3 rounded-sm ${i < usedReq ? 'bg-sky-500' : 'bg-slate-200'}`}
+                                    />
+                                ))}
+                            </span>
+                        ) : (
+                            <span className="inline-block w-16 h-1.5 rounded-full bg-slate-200 overflow-hidden">
                                 <span
-                                    key={i}
-                                    className={`inline-block w-2 h-3 rounded-sm ${i < usedReq ? 'bg-sky-500' : 'bg-slate-200'}`}
+                                    className="block h-full bg-sky-500 transition-[width] duration-300"
+                                    style={{ width: `${usedPct}%` }}
                                 />
-                            ))}
-                        </span>
+                            </span>
+                        )}
                         <span className="text-[11px] text-slate-500">
                             {usedReq}/{maxReq}
                             {gate?.cooldown_active ? ` · 冷却剩 ${Math.ceil(gate.cooldown_remaining_s)}s` : ''}
@@ -228,7 +266,7 @@ export const TdxAiDataPanel: React.FC = () => {
             {/* 配置表单 */}
             <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
                 <Input
-                    className="md:col-span-5"
+                    className="md:col-span-4"
                     size="small"
                     addonBefore="安装目录"
                     value={dirInput}
@@ -243,7 +281,23 @@ export const TdxAiDataPanel: React.FC = () => {
                     onChange={(e) => setTokenInput(e.target.value)}
                     placeholder={cfg?.token?.configured ? '已配置（留空不修改）' : '粘贴通达信 Token'}
                 />
-                <div className="md:col-span-3 flex items-center gap-3">
+                <Input
+                    className="md:col-span-2"
+                    size="small"
+                    addonBefore="分片数"
+                    value={shardInput}
+                    onChange={(e) => setShardInput(e.target.value)}
+                    placeholder={cfg?.shard_count ? String(cfg.shard_count) : '1'}
+                />
+                <Input
+                    className="md:col-span-2"
+                    size="small"
+                    addonBefore="窗口上限"
+                    value={maxReqInput}
+                    onChange={(e) => setMaxReqInput(e.target.value)}
+                    placeholder={cfg?.max_requests_per_window ? String(cfg.max_requests_per_window) : '30'}
+                />
+                <div className="md:col-span-12 flex items-center gap-3">
                     <span className="text-xs text-slate-500 flex items-center gap-1">
                         启用
                         <Switch size="small" checked={enabledInput} onChange={setEnabledInput} />
@@ -254,6 +308,9 @@ export const TdxAiDataPanel: React.FC = () => {
                     <Button size="small" loading={checking} onClick={() => void handleSelfcheck()}>
                         连通性自检
                     </Button>
+                    <span className="text-[11px] text-slate-400">
+                        分片数经验值 = ceil(热集规模 / 100)；分片数/窗口上限为构造期配置，保存后重启全分片生效
+                    </span>
                 </div>
             </div>
 
@@ -285,8 +342,9 @@ export const TdxAiDataPanel: React.FC = () => {
             )}
 
             <div className="text-[11px] text-slate-400">
-                说明：订阅推送（五档盘口全字段）为盘中实时主源；请求接口每冷却窗口 3 次（实测），用于
-                K 线/分时/分笔等低频补充。自检消耗 1 次窗口配额。
+                说明：订阅推送（五档盘口全字段）为盘中实时主源、不占请求配额；请求接口（K 线/分时/分笔）
+                受「窗口上限」约束，超限快速失败并进入冷却（冷却时长翻倍，180s 起、600s 封顶）。
+                自检消耗 1 次窗口配额。
             </div>
         </div>
     );

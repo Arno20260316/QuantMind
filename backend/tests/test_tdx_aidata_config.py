@@ -76,6 +76,43 @@ def test_enabled_flag_precedence(monkeypatch):
 
 
 @pytest.mark.unit
+def test_max_requests_per_window_precedence(monkeypatch):
+    """预算窗口上限：Redis 配置 > env > 默认；非法/非正值一律回落默认（绝不关成 0）。
+
+    2026-10-14 换 token 后实测 40 连发零限流，旧的硬编码 3 属自缚 → 改配置驱动，
+    但闸门仍须有正下限兜底：配置手滑写 0/负数/字符串不得变成「全量拒单」。
+    """
+    from backend.shared.tdx_aidata import config
+
+    monkeypatch.setattr(config, "_read_redis_config_sync", lambda: {})
+    monkeypatch.delenv("TDX_AIDATA_MAX_REQ_PER_WINDOW", raising=False)
+    assert config.max_requests_per_window() == config.DEFAULT_MAX_REQ_PER_WINDOW
+    assert config.DEFAULT_MAX_REQ_PER_WINDOW == 30
+
+    # env 覆盖默认
+    monkeypatch.setenv("TDX_AIDATA_MAX_REQ_PER_WINDOW", "50")
+    assert config.max_requests_per_window() == 50
+
+    # Redis 配置（前端/API 保存）最高
+    monkeypatch.setattr(
+        config, "_read_redis_config_sync", lambda: {"max_requests_per_window": "12"}
+    )
+    assert config.max_requests_per_window() == 12
+
+    # 非法值回落默认（含 0 / 负数 / 非数字）——逐个断言，避免只挡住其中一类
+    monkeypatch.delenv("TDX_AIDATA_MAX_REQ_PER_WINDOW", raising=False)
+    for bad in ("0", "-5", "abc", "", "   "):
+        monkeypatch.setattr(
+            config,
+            "_read_redis_config_sync",
+            lambda b=bad: {"max_requests_per_window": b},
+        )
+        assert config.max_requests_per_window() == config.DEFAULT_MAX_REQ_PER_WINDOW, (
+            bad
+        )
+
+
+@pytest.mark.unit
 def test_socket_and_ini_paths_follow_dir(monkeypatch):
     from backend.shared.tdx_aidata import config
 

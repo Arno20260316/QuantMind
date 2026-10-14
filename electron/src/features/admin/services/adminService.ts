@@ -481,6 +481,8 @@ class AdminService {
         dir?: string;
         enabled?: boolean;
         token?: string;
+        shard_count?: number;
+        max_requests_per_window?: number;
     }): Promise<any> {
         const resp = await this.axiosInstance.post('/admin/data-platform/tdx-aidata/config', payload);
         return resp.data;

@@ -2,8 +2,8 @@
 
 机构纪律：
 - ping/status 不计配额（不触 SDK），必须先绿；
-- 真实取数受 token 窗口配额约束（实测 3 次/窗口）——命中限流时**如实跳过并携带
-  retry_after**（不得假绿、不得重试轰炸）；
+- 真实取数受 token 窗口配额约束（上限默认 30，可由 Redis 配置/env 覆盖）——命中限流时
+  **如实跳过并携带 retry_after**（不得假绿、不得重试轰炸）；
 - 测试用独立 socket 路径（不干扰生产 worker）；
 - 结束清理：SIGTERM 掉本测试拉起的 worker（pid 来自 ping）。
 """
@@ -52,7 +52,7 @@ def _skip_if_rate_limited(exc) -> None:
 
     if isinstance(exc, TdxAiDataError) and exc.code == "rate_limited":
         pytest.skip(
-            f"token 窗口限流中（实测 3 次/窗口）：{exc.message} "
+            f"token 窗口限流中（上限见 worker gate）：{exc.message} "
             f"retry_after={exc.retry_after_s}s"
         )
     raise exc
@@ -117,7 +117,7 @@ async def test_worker_budget_gate_fast_fails_without_sdk(live_client):
     st = await live_client.status()
     assert st["worker"] == "up", st
     used = int((st.get("gate") or {}).get("window_requests") or 0)
-    max_req = int((st.get("gate") or {}).get("max_requests_per_window") or 3)
+    max_req = int((st.get("gate") or {}).get("max_requests_per_window") or 30)
 
     errors = 0
     for _ in range(max_req + 2 - min(used, max_req)):

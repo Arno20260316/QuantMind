@@ -412,7 +412,8 @@ class SubscriptionEngine:
 
         **不占请求预算（2026-09-17 盘中事故修正）**：订阅通道实测**零请求配额**
         （T-P6-01 探针：订阅期间请求仍受限流但订阅本身不耗窗口；盘中多分片反复重订
-        亦无 Token Insufficient）。旧版把订阅计入「3 次/窗口」请求闸门——热集每 60s
+        亦无 Token Insufficient）。旧版把订阅计入请求闸门（当时上限写死 3 次/窗口，
+        现由配置驱动）——热集每 60s
         漂移时预算瞬耗 → 重订被 defer 饿死 → 全片静默（叠加 tqs 累积 bug 后无法自愈）。
         订阅节流改由两道自有约束：热集差分最小间隔（sync_hot_set_once）+ 静默重订
         最小间隔（resubscribe_min_gap_s，run 循环）。

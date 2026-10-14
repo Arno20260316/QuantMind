@@ -1,7 +1,7 @@
 """TdxAiData 数据源管理 API（P6 T-P6-01）。
 
 GET  /api/v1/admin/data-platform/tdx-aidata/config    配置 + worker 状态（不拉起）
-POST /api/v1/admin/data-platform/tdx-aidata/config    保存配置（目录/开关/Token；Token 写 ini）
+POST /api/v1/admin/data-platform/tdx-aidata/config    保存配置（目录/开关/Token/分片数/预算窗口；Token 写 ini）
 POST /api/v1/admin/data-platform/tdx-aidata/selfcheck 连通性自检（按需拉起 + 真实取一次快照）
 POST /api/v1/admin/data-platform/tdx-aidata/restart   重启 worker（重读 ini/目录）
 
@@ -44,6 +44,12 @@ class TdxAiDataConfigRequest(BaseModel):
         le=32,
         description="订阅分片数（SDK 单进程上限 100 只/片；保存后重启全分片生效）",
     )
+    max_requests_per_window: int | None = Field(
+        None,
+        ge=1,
+        le=100000,
+        description="请求类接口每冷却窗口预算上限（订阅推送不占配额；保存后重启全分片生效）",
+    )
 
 
 def _redis_sync():
@@ -59,6 +65,7 @@ def _config_and_status() -> dict[str, Any]:
         "config": tdx_config.public_config(),
         "socket_path": tdx_config.socket_path(),
         "shard_count": tdx_config.shard_count(),
+        "max_requests_per_window": tdx_config.max_requests_per_window(),
     }
 
 
@@ -89,6 +96,8 @@ async def save_tdx_aidata_config(
         updates["enabled"] = "true" if req.enabled else "false"
     if req.shard_count is not None:
         updates["shard_count"] = str(int(req.shard_count))
+    if req.max_requests_per_window is not None:
+        updates["max_requests_per_window"] = str(int(req.max_requests_per_window))
     if updates:
         await asyncio.to_thread(tdx_config.save_config_sync, _redis_sync(), updates)
 

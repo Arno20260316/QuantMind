@@ -25,9 +25,10 @@
 
 * 不取数、不读文件、不连 Redis——``render_prompt`` 只吃已经拿到的快照；
 * 不做预算裁剪（``plan_affordable`` 在 IO 侧调用本模块的 ``min_buy_cost`` 口径）；
-* 不自己造 ``risk_block`` / ``industry_caution_block`` 的内容：QM 侧这两个数据源
-  （隔壁 ``risk_block.json`` / ``industry_risk.json``）**目前不存在**，所以它们
-  以「已渲染好的一段文本」入参，缺省空串即整段不出现。缺口登记在迁移计划 P2.2。
+* 不自己造 ``risk_block`` / ``industry_caution_block`` 的内容：这两个数据源
+  （``data/risk_block.json`` / ``industry_risk.json`` / ``fundamental_flags.json``）
+  由 ``shared/decision_risk_blocks`` 渲染成文本后入参（取数在决策轮 feeds 层，
+  Stage 2 第二批起接线），缺省空串即整段不出现。
 
 两套收尾（正文共用，见 :func:`_context_body`）：
 
@@ -184,6 +185,18 @@ class RebalanceContext:
     #: 【盘中模型信号】块（行情行内「信号分」的出处/刻度/覆盖率）。只注解行情块，
     #: 行情块没渲染时它也不出现（见 :func:`_pool_lines`）。
     signal_meta_block: str = ""
+    #: 丁8【数据新鲜度警告】（各块降级留痕汇总）：置顶渲染（开场白之后、持仓表
+    #: 之前）。空串 = 本轮无降级，整段不出现。
+    alert_block: str = ""
+    #: 丁5【大盘指数】行（指数快照 + 板块涨幅门控）。空串 = 未接线/未取到路径由
+    #: 调用方自决（渲染序字节冻结纪律同 `market_state_block`）。
+    indices_block: str = ""
+    #: Stage 2 第二批聚合块：丁1 盘口 / 丁3 分钟 / 丁2 L2 门控 / 丁4 新闻 /
+    #: 丁6 跨 agent / 丁9 上一轮（装配顺序即渲染顺序，见 ``shared/decision_blocks``）。
+    #: 空串 = 未接线（旧替身）→ 提示词逐字节等于历史。
+    stage2_block: str = ""
+    #: 丁7【风险预算档位】（当前 tiers 五键）。空串 = 未接线。
+    tier_block: str = ""
     quota_total: float = AGENT_QUOTA_TOTAL
     quota_used: float = 0.0
     per_stock_pct: float = DEFAULT_PER_STOCK_PCT
@@ -452,15 +465,15 @@ def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
 
 
 def _context_body(ctx: RebalanceContext) -> list[str]:
-    """两套提示词**逐字节共用**的正文：持仓表 → 大盘方向 →（市场状态）→
-    候选池 →（行情+信号块）→ 风险块。
+    """两套提示词**逐字节共用**的正文：持仓表 → 大盘方向 →（新鲜度/市场状态/
+    指数）→（唤醒）→ 候选池 →（行情+信号块）→（盘口/分钟/L2/新闻/互看/上一轮）
+    → 风险块 →（档位）。
 
     分出来只为让「盘中轮与调仓轮看到的事实完全一致」这件事在代码里是显然的——
     两边唯一的差别是收尾段（:func:`_decision_rule_lines` /
     :func:`_intraday_rule_lines`）。**行序与空行位置一个都不能动**：调仓轮那侧
-    逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。带括号的两块是
-    QM 补块（``market_state_block``/``signal_meta_block``）——默认空串、
-    数据门控，金样路径不受影响。
+    逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。带括号的各块是
+    QM 补块（Stage 2 两批）——默认空串、数据门控，金样路径不受影响。
     """
     display = ledger_cost_rows(ctx.holdings, ctx.ledger_positions)
     lines = [
@@ -468,8 +481,12 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
         f"管理 ¥{ctx.quota_total:,.0f} 虚拟额度（已用 ¥{ctx.quota_used:,.0f}，"
         f"剩余 ¥{ctx.quota_remaining:,.0f}）。",
         "",
-        *_HOLDINGS_HEADER,
     ]
+    # 丁8 新鲜度/降级警告：置顶（开场白之后、持仓表之前）——模型先知道哪些
+    # 数据是降级的，再读事实。空串 = 无降级，不出现。
+    if ctx.alert_block:
+        lines += [ctx.alert_block, ""]
+    lines += [*_HOLDINGS_HEADER]
     lines += [_holding_row_line(h) for h in display]
     lines += [
         "",
@@ -483,9 +500,16 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
     # 「同一件事的慢/快两拍」。空串 = 整段不出现（金样逐字节不动的默认路径）。
     if ctx.market_state_block:
         lines += [ctx.market_state_block, ""]
+    # 丁5【大盘指数】行：状态块的取数面（同一批快照）。空串 = 未接线。
+    if ctx.indices_block:
+        lines += [ctx.indices_block, ""]
     if ctx.extra_context:
         lines += [ctx.extra_context, ""]
     lines += _pool_lines(ctx)
+    # Stage 2 第二批聚合块（丁1/丁3/丁2/丁4/丁6/丁9）：池与行情之后、风险块之前。
+    # 空串 = 未接线（旧替身）→ 以下所有块与历史逐字节一致。
+    if ctx.stage2_block:
+        lines += ["", ctx.stage2_block]
     # 事件风险警示：持仓命中提示退出、候选命中别选（闸门已硬拦买入，这里省一轮
     # 无效决策）。**无前置空行**——与隔壁逐字节一致。
     if ctx.risk_block:
@@ -493,6 +517,9 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
     # 行业整体劣化：赛道级软提示，不硬拦。有前置空行。
     if ctx.industry_caution_block:
         lines += ["", ctx.industry_caution_block]
+    # 丁7【风险预算档位】：收尾块（「本轮受什么约束」显式化）。空串 = 未接线。
+    if ctx.tier_block:
+        lines += ["", ctx.tier_block]
     return lines
 
 

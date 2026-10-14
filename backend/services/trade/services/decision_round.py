@@ -153,6 +153,7 @@ from backend.services.trade.services.decision_round_core import (
     tier_numbers,
 )
 from backend.services.trade.services.decision_round_blocks import (
+    build_round_context,
     enrich_quotes_with_blocks,
     load_round_snapshots,
 )
@@ -225,7 +226,6 @@ async def _run_once_inner(
     )
     from backend.shared.decision.watch_map import plan_watch
     from backend.shared.decision_context_source import (
-        build_context,
         positions_to_holding_rows,
         quotes_from_snapshots,
     )
@@ -502,14 +502,14 @@ async def _run_once_inner(
         )
 
     quotes, stale = quotes_from_snapshots(snapped, kept, now)
-
     # ⑦b/⑦c 分数填进行情行（「信号分」后缀）+ 两个补块：数据门控——未接线整段
     # 不渲染、取数失败如实降级并留痕（口径收在 io 助手，渲染在 decision_blocks）。
-    quotes, market_state_block, signal_meta_block = await enrich_quotes_with_blocks(
-        deps, round_id, user, regime, snapped, quotes, now, notes
+    quotes, blocks = await enrich_quotes_with_blocks(
+        deps, round_id, agent, user, regime, snapped, quotes, holding_rows, now, notes
     )
 
-    context = build_context(
+    context = build_round_context(
+        blocks,
         agent=agent,
         holdings=holding_rows,
         pool=kept,
@@ -524,8 +524,8 @@ async def _run_once_inner(
         quota_used=quota_used,
         per_stock_pct=per_stock_pct,
         max_new_buys=max_new_buys,
-        market_state_block=market_state_block,
-        signal_meta_block=signal_meta_block,
+        market_state_block=blocks.market_state_block,
+        signal_meta_block=blocks.signal_meta_block,
     )
     # ⑧ LLM 调用（模型名与调用器同源，见 LLMBinding）：decide 同步阻塞 httpx（最长 ~120s），必须 to_thread
     prompt = render_prompt_for(context, slot.schema)

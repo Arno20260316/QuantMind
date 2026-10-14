@@ -1,36 +1,76 @@
-"""决策轮**补块装配**（Stage 2 第一批）：快照/分数 → 提示词增量的取数与口径。
+"""决策轮**补块装配**（Stage 2 第一批/第二批）：快照/分数/名单/台账 → 提示词增量。
 
 ``decision_round.py`` 与 ``decision_round_io.py`` 都已顶到 800 行预算顶（分层守卫
-``test_modules_stay_within_the_file_budget_and_layering``），本批「模型分数 +
-市场状态进提示词」的装配（要价清单、regime/分数取数、降级留痕、补块文本）独立成
+``test_modules_stay_within_the_file_budget_and_layering``），两批「模型分数 +
+市场状态 + 丁1–丁9 块」的装配（要价清单、取数、降级留痕、补块文本）独立成
 这一块，**与 io 同层**：只许 import core 与 shared（要调 ``RoundDeps`` 上的取数
 闭包，所以进不了纯函数 core），不许碰编排/调度/驱动/io。
 
-两条纪律（细节在各函数 docstring，渲染在 ``shared/decision_blocks``）：
+两条纪律（细节在各函数 docstring，渲染在 ``shared/decision_blocks`` 与
+``shared/decision_risk_blocks``）：
 
-1. **降级不拦轮**：regime/分数都是增益块——读失败 → 「本轮不可得」如实渲染并
-   留痕审计，绝不静默消失、绝不编 0（``signal_score=0`` 的语义是「垫底」）。
+1. **降级不拦轮**：所有块都是增益面——读失败 → 「本轮不可得」如实渲染（丁8
+   置顶汇总）并留痕，绝不静默消失、绝不编 0。
 2. **未接线 = 历史字节**：``deps`` 上对应闭包为 ``None``（旧替身）→ 对应块整段
-   空串，提示词与升级前逐字节一致（上游金样不破）。
+   空串，提示词与升级前逐字节一致（上游金样不破）。第二批以
+   ``deps.read_series_summary`` 为**总接线标记**（生产 io 同批全量注入，见
+   :func:`enrich_quotes_with_blocks`）——没它整批不渲染。
+
+``RoundBlocks`` 是装配结果的信封：编排层把 ``build_context`` 的历史参数原样
+转发给 :func:`build_round_context`，其余各块由 ``replace`` 注入——
+**决策轮签名零改动**即完成接线（``decision_round.py`` 已顶 799/800 行）。
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
 from backend.services.trade.services.decision_round_core import TENANT_ID, RoundDeps
-from backend.shared.decision.context import PoolQuote
+from backend.shared.decision.context import PoolQuote, RebalanceContext
 from backend.shared.decision_blocks import (
+    INDEX_CODES,
     attach_signal_scores,
+    build_cross_agent_block,
+    build_freshness_block,
+    build_indices_block,
+    build_l2_block,
     build_market_state_block,
+    build_minute_block,
+    build_news_block,
+    build_orderbook_block,
+    build_prev_round_block,
     build_signal_meta_block,
+    build_tier_block,
 )
+from backend.shared.decision_context_source import build_context
+from backend.shared.decision_risk_blocks import (
+    build_industry_caution_block,
+    build_risk_block,
+)
+from backend.shared.freshness import FRESH, quote_policy
 from backend.shared.stock_utils import StockCodeUtil
 
 logger = logging.getLogger(__name__)
+
+#: 毫秒戳归一阈值（快照 ``timestamp`` 契约是秒；>1e12 一律按毫秒折算）。
+_MS_TS_CUTOFF = 1e12
+
+
+def _snap_ts(snap: Mapping[str, Any] | None) -> float | None:
+    """快照成员 ``timestamp`` → epoch 秒；缺失/坏值 → ``None``（不猜）。"""
+    if not isinstance(snap, Mapping):
+        return None
+    try:
+        ts = float(snap.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if ts > _MS_TS_CUTOFF:
+        ts /= 1000.0
+    return ts if ts > 0 else None
 
 
 def load_round_snapshots(
@@ -44,9 +84,11 @@ def load_round_snapshots(
     """③b+④ 盘中 regime + 行情快照（要价清单装配在编排层之外，见细案）。
 
     要价清单（suffix 形）= 持仓（原始 payload 直接取 symbol，不必先建持仓行）+
-    池 + regime 指数——指数是【盘中市场状态】块「指数现价」行的原料，缺了它
-    那一行会如实渲染「未取到」。regime（db0 ``qm:regime:intraday``）是**增益
-    块**：未接线/读失败 → ``None``（不拦轮、指数不进清单），降级渲染与留痕在
+    池 + regime 指数 + **丁5 四只展示指数**（``decision_blocks.INDEX_CODES``：
+    深市两只是本批新加的常驻源，见 ``hot_set.REGIME_INDEXES``）——指数是
+    【盘中市场状态】【大盘指数】块的原料，缺了它对应行如实渲染「未取到」。
+    regime（db0 ``qm:regime:intraday``）是**增益块**：未接线/读失败 → ``None``
+    （不拦轮、指数不进清单），降级渲染与留痕在
     :func:`enrich_quotes_with_blocks` 收口。
 
     快照读取失败同样**不在这里拦轮**（守护轮与已有持仓仍要靠行情；「池子整段
@@ -67,6 +109,7 @@ def load_round_snapshots(
         }
         | {str(r.code) for r in pool_rows}
         | ({StockCodeUtil.to_suffix(index)} if index else set())
+        | set(INDEX_CODES)
     )
     snapped: Mapping[str, Mapping[str, Any]] = {}
     if quote_client is not None and codes:
@@ -78,28 +121,97 @@ def load_round_snapshots(
     return regime, snapped, quotes_failure
 
 
+@dataclass(frozen=True, slots=True)
+class RoundBlocks:
+    """补块信封：进 ``build_context`` 的两块 + Stage 2 各新块（同名同义字段）。
+
+    前两个字段由编排层原样转进 ``build_context``（历史参数位）；其余交给
+    :func:`build_round_context` 用 ``replace`` 落到 ``RebalanceContext`` 的对应
+    字段（含既有风险两槽与 ``extra_context`` 唤醒位）。默认空串 = 未接线，
+    渲染端逐字节冻结。
+    """
+
+    market_state_block: str = ""
+    signal_meta_block: str = ""
+    alert_block: str = ""
+    indices_block: str = ""
+    stage2_block: str = ""
+    tier_block: str = ""
+    extra_context: str = ""
+    risk_block: str = ""
+    industry_caution_block: str = ""
+
+
+def build_round_context(blocks: RoundBlocks, **legacy: Any) -> RebalanceContext:
+    """装配信封 → ``RebalanceContext``：``legacy`` = ``build_context`` 的原始参数。
+
+    **编排层的签名零改动**：它把 ``blocks`` 与历史 kwargs 一起递进来，其余各块在
+    这里注入。``replace`` 要求字段存在（Stage 2 第二批已加）——字段名写错会
+    即刻 TypeError，不会静默丢块。
+    """
+    return replace(
+        build_context(**legacy),
+        alert_block=blocks.alert_block,
+        indices_block=blocks.indices_block,
+        stage2_block=blocks.stage2_block,
+        tier_block=blocks.tier_block,
+        extra_context=blocks.extra_context,
+        risk_block=blocks.risk_block,
+        industry_caution_block=blocks.industry_caution_block,
+    )
+
+
+def _snap_freshness_alert(
+    snapped: Mapping[str, Mapping[str, Any]], now: datetime
+) -> str:
+    """行情快照整体新鲜度一句话（``freshness.quote_policy`` 唯一分级）；fresh → ""。"""
+    age_s: float | None = None
+    for snap in snapped.values():
+        ts = _snap_ts(snap)
+        if ts is None:
+            continue
+        age = now.timestamp() - ts
+        age_s = age if age_s is None else min(age_s, age)
+    if age_s is None:
+        return "行情快照无时间戳：新鲜度无法验证" if snapped else ""
+    if age_s < -60:
+        return "行情快照时间戳异常（未来戳）：新鲜度无法验证"
+    level = quote_policy().classify(age_s)
+    if level == FRESH:
+        return ""
+    return f"行情快照整体不新鲜（最新 {age_s / 60:.0f} 分钟前，分级 {level}）"
+
+
 async def enrich_quotes_with_blocks(
     deps: RoundDeps,
     round_id: str,
+    agent: str,
     user: str,
     regime: Mapping[str, Any] | None,
     snapped: Mapping[str, Mapping[str, Any]],
     quotes: Sequence[PoolQuote],
+    holdings: Sequence[Any],
     now: datetime,
     notes: list[str],
-) -> tuple[tuple[PoolQuote, ...], str, str]:
-    """⑦b+⑦c 行情行填「信号分」+ 两个提示词补块。
+) -> tuple[tuple[PoolQuote, ...], RoundBlocks]:
+    """⑦b+⑦c 行情行填「信号分」+ 全部提示词补块（两批合并收口）。
 
-    返回 ``(填分后的行情, 【盘中市场状态】块, 【盘中模型信号】块)``。口径（细案
-    Stage 2 第一批，渲染在 ``shared/decision_blocks``）：
+    返回 ``(填分后的行情, 信封)``。口径：
 
     1. 分数取数只有 ``load_score_snapshot`` 一个入口（``deps.load_scores``）；
        抛异常或 ``ok=False`` → **降级不拦轮**：行内无后缀、信号块如实说
-       「不可得」，原因追进 ``notes``（审计）与日志。
-    2. 「信号分」= ``rank_pct`` 折算研究评分（0–100 刻度）；**绝不编 0**——
-       ``signal_score=0`` 的语义是「垫底/明确不入场」。
-    3. 未接线（``None``，旧替身/历史行为）→ 对应块整段空串：提示词逐字节不变。
+       「不可得」，原因进 ``notes``（审计）与丁8。绝不编 0。
+    2. **总接线标记 = ``deps.read_series_summary``**（生产 ``default_round_deps``
+       第二批闭包同批全量注入）：为 ``None``（旧替身）→ 丁1/丁3/丁2/丁5/丁7
+       整批空串，提示词逐字节等于历史。丁4/丁6/丁9/风险两槽/唤醒块各自以
+       自己的闭包（``load_news_files``/``load_decision_rows``/
+       ``load_risk_files``/``read_wake_ctx``）为门——未接线即空串。
+    3. 降级姿态：每块「本轮不可得」如实渲染；**汇总一句进丁8置顶**
+       （``build_freshness_block``），读不到与没有是两件事。
+    4. 丁7 档位经 ``deps.load_tier`` **再读一次**（编排 ⑤ 已读）：同源同值，
+       重复读只是为免改编排签名；失败按未接线降级。
     """
+    # ── 分数（Stage 2 第一批，原样）─────────────────────────────────
     score_map: dict[str, dict[str, Any]] = {}
     score_meta: dict[str, Any] = {"ok": False, "reason": "分数快照未接线"}
     scores_wired = deps.load_scores is not None
@@ -114,6 +226,7 @@ async def enrich_quotes_with_blocks(
             notes.append(note)
             logger.warning("[DecisionRound] %s %s", round_id, note)
     scored_quotes, scored_n = attach_signal_scores(quotes, score_map)
+    scored_seq = tuple(scored_quotes)
 
     market_state_block = ""
     if deps.load_regime is not None:
@@ -125,8 +238,141 @@ async def enrich_quotes_with_blocks(
             notes.append(note)
             logger.warning("[DecisionRound] %s %s", round_id, note)
     signal_meta_block = (
-        build_signal_meta_block(score_meta, filled=scored_n, total=len(scored_quotes))
+        build_signal_meta_block(score_meta, filled=scored_n, total=len(scored_seq))
         if scores_wired
         else ""
     )
-    return scored_quotes, market_state_block, signal_meta_block
+
+    # ── Stage 2 第二批：先收集降级留痕（丁8 置顶汇总）───────────────
+    alerts: list[str] = []
+    if scores_wired and not score_meta.get("ok"):
+        alerts.append(f"模型分数不可得（{score_meta.get('reason')}）")
+    if deps.load_regime is not None and regime is None:
+        alerts.append("盘中 regime 不可得：市场状态块降级")
+    enabled = deps.read_series_summary is not None  # 本批总接线标记
+    held_codes = [str(h.code) for h in holdings]
+    pool_codes = [str(q.code) for q in scored_seq]
+
+    # 丁5 指数行（快照取数面）
+    indices_block = ""
+    if enabled:
+        indices_block = build_indices_block(snapped, now)
+        if not snapped:
+            alerts.append("行情快照整体未取到（快照源不可用）")
+        else:
+            have = sum(1 for c in INDEX_CODES if snapped.get(c))
+            if have < len(INDEX_CODES):
+                alerts.append(f"指数快照未取全（{have}/{len(INDEX_CODES)}）")
+        alert = _snap_freshness_alert(snapped, now)
+        if alert:
+            alerts.append(alert)
+
+    # 丁1 盘口 / 丁3 分钟 / 丁2 L2 门控（微观结构面，同属总接线标记）
+    orderbook_block = minute_block = l2_block = ""
+    if enabled:
+        series: Mapping[str, Any] = {}
+        if holdings:
+            try:
+                series = deps.read_series_summary(held_codes) or {}
+            except Exception as exc:  # noqa: BLE001 序列读不到按不可得降级
+                logger.warning("[DecisionRound] %s 行情序列读取异常: %s", round_id, exc)
+                series = {}
+        orderbook_block = build_orderbook_block(holdings, snapped, series, now)
+        minute_block = build_minute_block(holdings, series, now)
+        l2_block = build_l2_block()
+        if holdings and not series:
+            alerts.append("行情序列 market:series 本轮无成员：盘口涨速/分钟特征缺位")
+
+    # 丁4 新闻（自有接线）
+    news_block = ""
+    if deps.load_news_files is not None:
+        brief: Mapping[str, Any] | None = None
+        watch: Mapping[str, Any] | None = None
+        try:
+            brief, watch = deps.load_news_files()
+        except Exception as exc:  # noqa: BLE001 简报读不到按不可得降级
+            logger.warning("[DecisionRound] %s 新闻简报读取异常: %s", round_id, exc)
+        news_block = build_news_block(brief, watch, held_codes, now)
+        if brief is None:
+            alerts.append("新闻简报文件缺失：盘中消息面缺位")
+
+    # 丁6 跨 agent / 丁9 上一轮（台账，自有接线）
+    cross_block = prev_block = ""
+    if deps.load_decision_rows is not None:
+        try:
+            rows: Sequence[Any] = await deps.load_decision_rows(now.date(), user)
+        except Exception as exc:  # noqa: BLE001 读失败两块整段不出（防谎报「首轮」）
+            logger.warning("[DecisionRound] %s 决策台账读取异常: %s", round_id, exc)
+            alerts.append(
+                f"决策台账读取失败（{type(exc).__name__}）：互看/上一轮块降级"
+            )
+        else:
+            rows = rows or ()
+            cross_block = build_cross_agent_block(rows, agent)
+            prev_block = build_prev_round_block(rows, agent, now)
+
+    stage2_block = "\n\n".join(
+        part
+        for part in (
+            orderbook_block,
+            minute_block,
+            l2_block,
+            news_block,
+            cross_block,
+            prev_block,
+        )
+        if part
+    )
+
+    # 风险两槽（risk_block / industry_caution，上游既有槽，第二批补取数）
+    risk_block = ""
+    industry_caution = ""
+    if deps.load_risk_files is not None:
+        risk_doc: Mapping[str, Any] | None = None
+        industry_doc: Mapping[str, Any] | None = None
+        fund_doc: Mapping[str, Any] | None = None
+        try:
+            risk_doc, industry_doc, fund_doc = deps.load_risk_files()
+        except Exception as exc:  # noqa: BLE001 名单读不到按缺位降级
+            logger.warning("[DecisionRound] %s 风险清单读取异常: %s", round_id, exc)
+        names = {str(h.code): str(h.name) for h in holdings}
+        names.update({str(q.code): str(q.name) for q in scored_seq})
+        risk_block = build_risk_block(
+            risk_doc, fund_doc, held_codes, pool_codes, names, now
+        )
+        industry_caution = build_industry_caution_block(
+            industry_doc, held_codes, pool_codes
+        )
+        if risk_doc is None:
+            alerts.append("事件风险清单未产出：风险警示段缺位")
+        if industry_doc is None:
+            alerts.append("行业风险清单未产出：行业提示段缺位")
+
+    # 丁7 档位（总接线标记门控；读失败按未接线降级）
+    tier_block = ""
+    if enabled:
+        try:
+            tier_block = build_tier_block(deps.load_tier())
+        except Exception as exc:  # noqa: BLE001 档位读不到按未接线降级
+            logger.warning("[DecisionRound] %s 档位读取异常: %s", round_id, exc)
+
+    # 丙1 唤醒上下文（合成槽轮的触发说明；非唤醒轮读回空串）
+    extra_context = ""
+    if deps.read_wake_ctx is not None:
+        try:
+            extra_context = str(deps.read_wake_ctx(round_id) or "")
+        except Exception as exc:  # noqa: BLE001 读失败按非唤醒轮降级
+            logger.warning("[DecisionRound] %s 唤醒上下文读取异常: %s", round_id, exc)
+
+    blocks = RoundBlocks(
+        market_state_block=market_state_block,
+        signal_meta_block=signal_meta_block,
+        alert_block=build_freshness_block(alerts),
+        indices_block=indices_block,
+        stage2_block=stage2_block,
+        tier_block=tier_block,
+        extra_context=extra_context,
+        risk_block=risk_block,
+        industry_caution_block=industry_caution,
+    )
+    return scored_seq, blocks

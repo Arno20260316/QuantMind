@@ -19,7 +19,7 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -28,14 +28,17 @@ from backend.shared.decision.context import DirectionBlock, PoolRow
 from backend.shared.decision.contract import SCHEMA_INTRADAY, SCHEMA_REBALANCE
 from backend.shared.decision.llm_call import decide_with_retry
 from backend.shared.decision.watch_writer import WatchWriteResult
+from backend.shared.decision_blocks import INDEX_CODES, SeriesSummary
 from backend.shared.decision_context_source import PoolDoc
 from backend.services.trade.services import decision_round as R
 from backend.services.trade.services import decision_round_alerts as A
+from backend.services.trade.services import decision_round_feeds as F
 from backend.services.trade.services import decision_round_io as IO
 from backend.services.trade.services import decision_round_runner as RUN
 from backend.services.trade.services import decision_round_tick as TICK
+from backend.services.trade.services import decision_round_wake as W
 from backend.services.trade.services.decision_round import run_once
-from backend.services.trade.services.decision_round_tick import round_tick
+from backend.services.trade.services.decision_round_tick import round_tick, wake_tick
 from backend.services.trade.services.decision_round_io import (
     CLAIM_AUTO,
     CLAIM_MANUAL,
@@ -100,7 +103,13 @@ class Verdict:
 
 
 class FakeNative:
-    """原生 redis 客户端的字典替身：``set(nx=True)`` 的语义与真件一致。"""
+    """原生 redis 客户端的字典替身：``set(nx=True)`` 的语义与真件一致。
+
+    哈希/列表面（第二批 wake 用）：``hset/hgetall`` 真存真取（唤起状态键靠它
+    解码）；``lpush/ltrim/lrange`` 真存真取且序与 redis 一致（列表首 = 最新，
+    log 头判据读的就是 ``lrange(LOG_KEY, 0, 0)``）。``ttl`` 只记调用（唤醒状态
+    的过期是运维面，不是判据）。
+    """
 
     def __init__(
         self,
@@ -109,13 +118,17 @@ class FakeNative:
         fail_get: bool = False,
         fail_done_set: bool = False,
         fail_delete: bool = False,
+        fail_hset: bool = False,
     ) -> None:
         self.store: dict[str, str] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
+        self.lists: dict[str, list[str]] = {}
         self.calls: list[tuple] = []
         self.fail_claim = fail_claim
         self.fail_get = fail_get
         self.fail_done_set = fail_done_set
         self.fail_delete = fail_delete
+        self.fail_hset = fail_hset
         self.closed = False
 
     def set(self, key, value, nx=False, ex=None):  # noqa: A002 - 与 redis-py 同形
@@ -142,13 +155,40 @@ class FakeNative:
             raise RuntimeError("redis 删不下来")
         return 1 if self.store.pop(key, None) is not None else 0
 
+    def hset(self, key, mapping=None, **kw):
+        self.calls.append(("hset", key))
+        if self.fail_hset:
+            raise RuntimeError("redis 哈希写不下来")
+        bucket = self.hashes.setdefault(key, {})
+        for field, value in dict(mapping or {}, **kw).items():
+            bucket[str(field)] = value
+        return len(bucket)
+
+    def hgetall(self, key):
+        if self.fail_get:
+            raise RuntimeError("redis 读不下来")
+        return dict(self.hashes.get(key, {}))
+
+    def expire(self, key, seconds):
+        self.calls.append(("expire", key, seconds))
+        return True
+
     def lpush(self, key, value):
         self.calls.append(("lpush", key))
-        return 1
+        self.lists.setdefault(key, []).insert(0, str(value))
+        return len(self.lists[key])
 
     def ltrim(self, key, start, end):
         self.calls.append(("ltrim", key))
+        rows = self.lists.get(key, [])
+        stop = None if end == -1 else int(end) + 1
+        self.lists[key] = rows[int(start) : stop]
         return True
+
+    def lrange(self, key, start, end):
+        rows = self.lists.get(key, [])
+        stop = None if end == -1 else int(end) + 1
+        return rows[int(start) : stop]
 
     def close(self):
         self.closed = True
@@ -414,6 +454,13 @@ def make_harness(**over) -> Harness:
         # 要钉补块口径的用例自己传 ``load_regime=`` / ``load_scores=``。
         load_regime=over.pop("load_regime", None),
         load_scores=over.pop("load_scores", None),
+        # Stage 2 第二批注入点：默认 None = 未接线（丁1–丁9/丙1 整段不渲染，
+        # 历史用例的提示词字节冻结）。要钉块口径的用例自己传同名关键字。
+        load_news_files=over.pop("load_news_files", None),
+        load_risk_files=over.pop("load_risk_files", None),
+        read_series_summary=over.pop("read_series_summary", None),
+        load_decision_rows=over.pop("load_decision_rows", None),
+        read_wake_ctx=over.pop("read_wake_ctx", None),
     )
     assert not over, f"未消费的替身参数：{sorted(over)}"
     return Harness(deps=deps, log=log)
@@ -1585,6 +1632,432 @@ async def test_round_survives_score_loader_exception():
     assert any("模型分数不可得" in n for n in notes)
 
 
+# ══ E1b. Stage 2 第二批：丁1–丁9 块 + 风险两槽 + 丙1 唤醒上下文 ═════════
+# 五个新注入点（load_news_files / load_risk_files / read_series_summary /
+# load_decision_rows / read_wake_ctx）各自门控对应块：默认 None = 未接线 =
+# 历史字节；接线后按细案顺序渲染、缺失按「本轮不可得」如实降级。
+SERIES_FIXTURE = {
+    "600036.SH": SeriesSummary(
+        last_ts=NOW.timestamp() - 60,
+        last_price=38.5,
+        mom30m_pct=1.2,
+        mom5m_pct=0.4,
+        vol5m_shares=12300,
+        source="tdx_bridge",
+    )
+}
+INDEX_SNAPS = {
+    "000300.SH": {"Now": 3500.0, "PreClose": 3480.0, "timestamp": NOW.timestamp()},
+    "000001.SH": {"Now": 3100.0, "PreClose": 3090.0, "timestamp": NOW.timestamp()},
+    "399001.SZ": {"Now": 10200.0, "PreClose": 10150.0, "timestamp": NOW.timestamp()},
+    "399006.SZ": {"Now": 2050.0, "PreClose": 2040.0, "timestamp": NOW.timestamp()},
+}
+RISK_FIXTURE = {
+    "asof": "2026-09-24",
+    "items": {
+        "600036": {"reason": "立案调查", "expire": "2026-10-01"},
+        # 预算外标的（600519 一手 17 万 > 单票预算被池过滤）不进风险宇宙——
+        # 下面断言它有名单口径却**不**渲染（名单条目 ⊆ 宇宙 的求交纪律）。
+        "600519": {"reason": "监管问询", "expire": "2026-10-05"},
+        "601988": {"reason": "大额解禁", "expire": "2026-10-08"},
+    },
+    "watch": {},
+    "warns": {},
+}
+INDUSTRY_FIXTURE = {
+    "asof": "2026-09-24",
+    "warn_codes": {"600036": "银行"},
+    "items": [{"industry": "银行", "n": 30, "total": 42, "rate": 0.714}],
+}
+BRIEF_FIXTURE = {
+    "ts": (NOW - timedelta(minutes=10)).isoformat(),
+    "holdings": [
+        {
+            "code": "600036.SH",
+            "name": "招商银行",
+            "verdict": "利空",
+            "event_type": "公告",
+            "headline": "高管变动",
+            "impact": -1.5,
+            "source": "news",
+        }
+    ],
+}
+
+
+class _Rec:
+    """审计行最小同形（丁6/丁9 只读这七个属性，见 ``decision_blocks``）。"""
+
+    def __init__(self, **kw) -> None:
+        self.__dict__.update(kw)
+
+
+REC_SELL = _Rec(
+    # 单家路径的 agent 名 = normalize_agent(binding.model)（见 decision_round.py
+    # 「agent 名先归一」）——"本 agent 上一轮"的判据就是这个名字，不是空串。
+    agent="fake-model",
+    round_id="rnd-20260924-0935",
+    decided_at=datetime(2026, 9, 24, 9, 36, tzinfo=CST),
+    id=101,
+    action="sell",
+    code="600519.SH",
+    code_raw="",
+    pct=0.5,
+    reason="估值过高",
+)
+REC_PRO = _Rec(
+    agent="pro",
+    round_id="rnd-20260924-0935",
+    decided_at=datetime(2026, 9, 24, 9, 38, tzinfo=CST),
+    id=102,
+    action="buy",
+    code="600519.SH",
+    code_raw="",
+    pct=None,
+    reason="主力流入",
+)
+
+
+def _rows_fixture(*rows):
+    async def load_decision_rows(trade_date, user):
+        return tuple(rows)
+
+    return load_decision_rows
+
+
+@pytest.mark.asyncio
+async def test_round_renders_batch2_blocks_when_wired():
+    """接线后九个块按细案顺序进提示词：唤醒说明在池前、丁1–丁9 在池后、
+    风险两槽随后、丁7 最末；唤醒说明经 ``read_wake_ctx`` 按 round_id 真读回。"""
+    native = FakeNative()
+    wake_rids: list[str] = []
+
+    def _read_wake_ctx(round_id):
+        wake_rids.append(round_id)
+        return F.read_wake_ctx(native, round_id)
+
+    # 低价候选（601988，一手 ¥420 过预算）加进池：风险块的「候选池命中」侧
+    # 只有在池票真进宇宙时才可断言（600519 一手 17 万被池过滤，是反例）。
+    cheap = PoolRow(
+        code="601988.SH", name="中国银行", industry="银行", score=1.0, fusion=0.6, rank=3
+    )
+    h = make_harness(
+        pool=pool_doc(BANK_ROW, PRICEY_ROW, cheap),
+        snaps={
+            **SNAPS,
+            **INDEX_SNAPS,
+            "601988.SH": {"Now": 4.2, "PreClose": 4.15, "timestamp": NOW.timestamp()},
+        },
+        read_series_summary=lambda codes: dict(SERIES_FIXTURE),
+        load_news_files=lambda: (BRIEF_FIXTURE, None),
+        load_decision_rows=_rows_fixture(REC_SELL, REC_PRO),
+        load_risk_files=lambda: (RISK_FIXTURE, INDUSTRY_FIXTURE, None),
+        read_wake_ctx=_read_wake_ctx,
+    )
+    promised = round_id_for(DAY, SLOT_0935)
+    native.store[W.WAKE_CTX_KEY.format(round_id=promised)] = (
+        "【本轮为触发唤醒】（10:52，非整点槽位——盘中触发器把控制权叫醒）\n"
+        "- 波动 招商银行(600036.SH)：浮盈 -5.00% → +5.26%"
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = h.log["llm"][0]["prompt"]
+
+    # 丁1 盘口（五档缺失 → 不渲染失衡段；5 分钟涨速来自 series）
+    assert "【实时盘口】" in prompt
+    assert "- 招商银行(600036.SH) 现价 40.00（+1.27%）" in prompt
+    assert " ｜ 5分钟涨速 +0.40%" in prompt
+    # 丁3 分钟特征（12300 股 = 123 手）
+    assert "【分钟特征】" in prompt
+    assert "30 分钟 +1.20% ｜ 5 分钟 +0.40% ｜ 5 分钟量 123 手" in prompt
+    # 丁2 L2：门控块恒渲染「不可得」，不静默
+    assert "【L2 微观结构】本轮不可得" in prompt
+    # 丁4 新闻：简报持仓命中
+    assert "【盘中新闻】（news_brief 简报：持仓命中 + 池外异动）" in prompt
+    assert "- [利空] 招商银行(600036.SH) 公告：高管变动（news）" in prompt
+    # 丁6 其他 agent / 丁9 上一轮
+    assert "- pro（09:38）：买入 600519.SH：主力流入" in prompt
+    assert "【上一轮你的建议】（09:36，1 条）" in prompt
+    assert "- 卖出 50% 600519.SH：估值过高" in prompt
+    assert "一致性规则" in prompt
+    # 丁5 大盘指数（四只全取到）
+    assert "【大盘指数】" in prompt
+    assert "- 沪深300：3,500.00（+0.57%）" in prompt
+    assert "本轮未取到" not in prompt
+    # 事件风险（持仓条目 + 候选池条目标注「本轮勿买」）
+    assert "【事件风险警示（系统风险清单，硬约束）】（清单日期 2026-09-24）" in prompt
+    assert "- 600036.SH 招商银行：立案调查（有效期至 2026-10-01）" in prompt
+    assert (
+        "- 601988.SH 中国银行：大额解禁（有效期至 2026-10-08）"
+        "（候选池命中，本轮勿买）" in prompt
+    )
+    # 名单里有、但（被预算过滤的）600519 不在宇宙：求交后**不**渲染
+    assert "600519.SH 贵州茅台" not in prompt
+    # 行业劣化（银行命中持仓）
+    assert "【行业整体劣化（赛道级软提示，不硬拦）】（清单日期 2026-09-24）" in prompt
+    assert "- 银行：长期排除清单剔除率 71.4%（30/42 只）" in prompt
+    # 丙1 唤醒说明（extra_context）
+    assert "【本轮为触发唤醒】（10:52" in prompt
+    # 丁7 风险预算档位
+    assert "【风险预算档位】（normal，来源 doc）" in prompt
+    assert "- 单票买入上限 15% ｜ 单轮最多新开 2 只" in prompt
+    # 全部健康 → 丁8 整段不出现
+    assert "【数据新鲜度警告】" not in prompt
+    # 渲染顺序（细案 line 487–522）：指数 < 唤醒说明 < 丁1… < 风险 < 行业 < 丁7 最末
+    order = [
+        "【大盘指数】",
+        "【本轮为触发唤醒】",
+        "【实时盘口】",
+        "【分钟特征】",
+        "【L2 微观结构】",
+        "【盘中新闻】",
+        "【其他 agent 动态】",
+        "【上一轮你的建议】",
+        "【事件风险警示",
+        "【行业整体劣化",
+        "【风险预算档位】",
+    ]
+    idx = [prompt.index(m) for m in order]
+    assert idx == sorted(idx), [(m, i) for m, i in zip(order, idx)]
+    # 唤醒说明按 **本轮 round_id** 真读回（写读两侧同库同键）
+    assert wake_rids == [promised]
+    # 丁5 四只指数进了询价清单（深市两只是本批常驻源）
+    assert set(INDEX_CODES).issubset(set(h.log["snaps"][0]))
+
+
+@pytest.mark.asyncio
+async def test_round_unwired_batch2_keeps_legacy_prompt_bytes():
+    """未接线（旧替身/历史行为）：丁1–丁9 与风险两槽整段不渲染——
+    升级不动存量提示词（字节冻结纪律的第二批延续）。"""
+    h = make_harness()
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    prompt = h.log["llm"][0]["prompt"]
+    for marker in (
+        "【实时盘口】",
+        "【分钟特征】",
+        "【L2 微观结构】",
+        "【盘中新闻】",
+        "【其他 agent 动态】",
+        "【上一轮你的建议】",
+        "【大盘指数】",
+        "【数据新鲜度警告】",
+        "【事件风险警示",
+        "【行业整体劣化",
+        "【风险预算档位】",
+        "【本轮为触发唤醒】",
+    ):
+        assert marker not in prompt, marker
+
+
+@pytest.mark.asyncio
+async def test_round_batch2_degrades_loudly_and_never_fakes_first_round():
+    """接线了但取数坏：**降级不拦轮**——各块「本轮不可得」+ 丁8 置顶汇总；
+    台账读失败时丁6/丁9 **整段不出**（绝不谎报「今日首轮」）。"""
+
+    def boom():
+        raise RuntimeError("文件读不了")
+
+    def series_boom(codes):
+        raise RuntimeError("序列库不可用")
+
+    async def rows_boom(trade_date, user):
+        raise RuntimeError("台账库连接炸了")
+
+    native = FakeNative()
+    h = make_harness(
+        read_series_summary=series_boom,
+        load_news_files=lambda: (None, None),
+        load_decision_rows=rows_boom,
+        load_risk_files=boom,
+        read_wake_ctx=lambda rid: F.read_wake_ctx(native, rid),
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK  # 增益块全灭不改轮次状态
+    prompt = h.log["llm"][0]["prompt"]
+    # 丁8 置顶汇总（开场白之后、持仓段之前）
+    assert "【数据新鲜度警告】" in prompt
+    assert prompt.index("【数据新鲜度警告】") < prompt.index("【你名下的现有持仓】")
+    assert "指数快照未取全（0/4）" in prompt
+    assert "行情序列 market:series 本轮无成员" in prompt
+    assert "新闻简报文件缺失" in prompt
+    assert "决策台账读取失败（RuntimeError）" in prompt
+    assert "事件风险清单未产出" in prompt
+    assert "行业风险清单未产出" in prompt
+    # 各块自身的「不可得」姿态（读不到与没有是两件事）
+    assert "【盘中新闻】本轮不可得" in prompt
+    assert "【分钟特征】本轮不可得" in prompt
+    assert "- 沪深300：本轮未取到" in prompt
+    assert "【实时盘口】" in prompt  # 快照还在：盘口行照渲染
+    assert "现价 40.00（+1.27%）" in prompt
+    # 台账坏 → 两块整段不出，且绝不出现假「今日首轮」
+    assert "【其他 agent 动态】" not in prompt
+    assert "【上一轮你的建议】" not in prompt
+    assert "今日首轮" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_round_batch2_empty_ledger_is_an_honest_first_round():
+    """台账**读成功但为空**才是真「今日首轮」——与读失败是两回事。"""
+    h = make_harness(
+        load_decision_rows=_rows_fixture(),
+        read_series_summary=lambda codes: dict(SERIES_FIXTURE),
+    )
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【上一轮你的建议】本轮为今日首轮分析，无上一轮建议。" in prompt
+    assert "【其他 agent 动态】今日暂无可参考的他家决策。" in prompt
+
+
+# ── 丙1 唤醒编排（wake_tick：闸门 → 观测 → 判据 → 合成槽轮）──────────
+#: 10:52：无槽位临期（10:05 窗到 10:50）、小时内评估节拍已过——唤醒轮的可跑时刻。
+WAKE_NOW = datetime(2026, 9, 24, 10, 52, tzinfo=CST)
+
+
+def _seed_wake_state(native, *, day="20260924", **fields):
+    """预置唤醒状态键（走真实编解码：encode → hset → 被测代码 hgetall/decode）。"""
+    state = W.WakeState(day=day, **fields)
+    native.hset(W.WAKE_STATE_KEY.format(day=day), mapping=W.encode_state(state))
+    return state
+
+
+def _state_of(native, *, day="20260924"):
+    return W.decode_state(native.hashes.get(W.WAKE_STATE_KEY.format(day=day)), day=day)
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_fires_a_synthetic_round_on_a_volatility_trigger():
+    """浮盈偏离基线 10.26pp → 合成槽 1052 跑一轮：唤醒说明进提示词（经真读回）、
+    状态计数/心跳/冷却落键、round_id 与合成槽一致。"""
+    native = FakeNative()
+    seen: list[str] = []
+
+    def _read_wake_ctx(round_id):
+        seen.append(round_id)
+        return F.read_wake_ctx(native, round_id)
+
+    h = make_harness(read_wake_ctx=_read_wake_ctx)
+    _seed_wake_state(
+        native,
+        last_eval_ts=WAKE_NOW.timestamp() - 120,
+        baselines={"600036.SH": {"pnl": -5.0, "chg": None, "imb5": None}},
+    )
+    results = await wake_tick(deps=h.deps, native=native, now=WAKE_NOW)
+    assert [r.status for r in results] == [R.STATUS_OK]
+    assert results[0].slot.hhmm == "1052"
+    assert results[0].round_id == "rnd-20260924-1052"
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【本轮为触发唤醒】（10:52" in prompt
+    assert "波动 招商银行(600036.SH)：浮盈 -5.00% → +5.26%（Δ+10.26pp）" in prompt
+    # 唤醒说明按本轮 round_id 写键、轮内按同一键读回
+    ctx_key = W.WAKE_CTX_KEY.format(round_id="rnd-20260924-1052")
+    assert ctx_key in native.store
+    assert "本轮结论只针对以上触发事项" in native.store[ctx_key]
+    assert seen == ["rnd-20260924-1052"]
+    # 状态推进：计数 +1、心跳、同码同向冷却 60 分钟、基线重置为当前观测
+    st = _state_of(native)
+    assert st.wake_count == 1
+    assert st.last_eval_ts == WAKE_NOW.timestamp()
+    assert st.cooldowns["600036.SH|up"] == (
+        WAKE_NOW.timestamp() + W.SAME_DIR_COOLDOWN_MIN * 60
+    )
+    assert st.baselines["600036.SH"]["pnl"] == 5.2632
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_gates_skip_without_burning_the_round(caplog):
+    """四道闸门各自拦住评估：节拍（60s，不写心跳）、距上轮 <20min（写心跳）、
+    槽位临期（写心跳）、非交易时段（连 Redis 都不碰）。"""
+    h = make_harness()
+    # ① 评估节拍未到（距上次评估 30 秒）→ 不评、状态原样
+    native = FakeNative()
+    _seed_wake_state(native, last_eval_ts=WAKE_NOW.timestamp() - 30)
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    assert _state_of(native).last_eval_ts == WAKE_NOW.timestamp() - 30
+    # ② 距上一轮不足 20 分钟（轮次日志键头）→ 不评，心跳照推
+    native = FakeNative()
+    _seed_wake_state(native, last_eval_ts=WAKE_NOW.timestamp() - 120)
+    native.lpush(
+        LOG_KEY, json.dumps({"ts": (WAKE_NOW - timedelta(minutes=5)).isoformat()})
+    )
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    assert _state_of(native).last_eval_ts == WAKE_NOW.timestamp()
+    # ③ 槽位临期（09:35 时 0900/0935 都在宽限窗内）→ 不评（正点轮本来就要跑）
+    native = FakeNative()
+    _seed_wake_state(native, last_eval_ts=NOW.timestamp() - 120)
+    assert await wake_tick(deps=h.deps, native=native, now=NOW) == ()
+    assert _state_of(native).last_eval_ts == NOW.timestamp()
+    assert h.log["llm"] == []  # 全程没有一轮被烧掉
+    # ④ 非交易时段 → 连 Redis 都不碰
+    native = FakeNative()
+    h2 = make_harness(is_trading_time=lambda now: False)
+    assert await wake_tick(deps=h2.deps, native=native, now=WAKE_NOW) == ()
+    assert native.calls == []
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_off_switch_and_redis_failure_never_raise(monkeypatch):
+    """总开关关（唯一读法 env_flag）→ 不评不碰 Redis；状态键读失败 → 跳过
+    （基线没了 = 判据失真），两条路都**绝不抛**（runner 里只有一行裸 await）。"""
+    h = make_harness()
+    monkeypatch.setenv("QM_DECISION_WAKE_ENABLED", "false")
+    native = FakeNative()
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    assert native.calls == []
+    monkeypatch.delenv("QM_DECISION_WAKE_ENABLED")
+    # 状态键读不下来（hgetall 抛）→ 跳过而不是带着空基线误判
+    broken = FakeNative(fail_get=True)
+    assert await wake_tick(deps=h.deps, native=broken, now=WAKE_NOW) == ()
+    assert h.log["llm"] == []
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_budget_exhausted_records_cooldown_without_a_round():
+    """日预算（20 轮）用尽：照记冷却防 60 秒一遍刷屏，但**不跑轮**（丙2 护栏）。"""
+    h = make_harness()
+    native = FakeNative()
+    _seed_wake_state(
+        native,
+        last_eval_ts=WAKE_NOW.timestamp() - 120,
+        wake_count=W.DAILY_WAKE_LIMIT,
+        baselines={"600036.SH": {"pnl": -5.0, "chg": None, "imb5": None}},
+    )
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    assert h.log["llm"] == []  # 不跑轮
+    assert W.WAKE_CTX_KEY.format(round_id="rnd-20260924-1052") not in native.store
+    st = _state_of(native)
+    assert "预算用尽" in st.last_note
+    assert st.cooldowns["600036.SH|up"] > WAKE_NOW.timestamp()  # 冷却照落
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_idle_marks_the_sector_gap_once_per_day():
+    """无触发（基线就等于当前值）：不跑轮；板块判据无源**每日一次**留痕——
+    已留过的日子不再追加（状态键里运营可见，不静默）。"""
+    h = make_harness()
+    native = FakeNative()
+    _seed_wake_state(
+        native,
+        last_eval_ts=WAKE_NOW.timestamp() - 120,
+        baselines={"600036.SH": {"pnl": 5.2632, "chg": 1.2658, "imb5": None}},
+    )
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    st = _state_of(native)
+    assert st.wake_count == 0
+    assert "板块类判据无源" in st.last_note
+    assert st.sector_gap_day == "20260924"
+    # 同日后评：已有留痕 → 不重复追加（预置 last_note 原样保留）
+    native2 = FakeNative()
+    _seed_wake_state(
+        native2,
+        last_eval_ts=WAKE_NOW.timestamp() - 120,
+        baselines={"600036.SH": {"pnl": 5.2632, "chg": 1.2658, "imb5": None}},
+        sector_gap_day="20260924",
+        last_note="既有留痕",
+    )
+    assert await wake_tick(deps=h.deps, native=native2, now=WAKE_NOW) == ()
+    assert _state_of(native2).last_note == "既有留痕"
+
+
 # ══ E2. arena 文件面写侧（决策轮 → 前端「模型对话」tab）═══════════════
 @pytest.fixture()
 def arena_root() -> Path:
@@ -2553,10 +3026,18 @@ async def test_worker_loop_heartbeats_logs_and_survives_a_failing_round(
             )
         raise RuntimeError("这一轮炸了")
 
+    wake_calls = {"n": 0}
+
+    async def fake_wake():
+        wake_calls["n"] += 1
+        return ()
+
     monkeypatch.setenv(RUN.ENV_FLAG, "true")
     # 补丁打在 **runner** 上（它按值 import 了 round_tick）：打在编排层上不生效，
-    # 这个用例会退化成「真的去连 Redis 跑一轮」。
+    # 这个用例会退化成「真的去连 Redis 跑一轮」。wake_tick 同理——不桩掉它就是
+    # 真构造生产 deps 去连 Redis（交易时段里甚至会真的触发一轮合成槽）。
     monkeypatch.setattr(RUN, "round_tick", fake_tick)
+    monkeypatch.setattr(RUN, "wake_tick", fake_wake)
     monkeypatch.setattr(RUN, "asyncio", _Sleep)
     monkeypatch.setattr(
         "backend.shared.scheduler_registry.heartbeat",
@@ -2568,6 +3049,8 @@ async def test_worker_loop_heartbeats_logs_and_survives_a_failing_round(
 
     assert beats == ["decision_round", "decision_round"]  # 每轮都敲，包括失败那轮
     assert calls["n"] == 2 and shim_sleeps == [30, 30]
+    # 唤醒评估与 tick 同任务串行、**每轮都评**（哪怕 tick 炸了那轮）
+    assert wake_calls["n"] == 2
     rendered = [r.getMessage() for r in caplog.records]
     assert any("rnd-20260924-0935" in m and "status=ok" in m for m in rendered)
     assert any("tick 异常" in m and "这一轮炸了" in m for m in rendered)
@@ -2591,8 +3074,12 @@ async def test_worker_keeps_looping_when_the_heartbeat_write_throws(monkeypatch)
     async def no_slots(*, grace_min):
         return ()
 
+    async def no_wake():
+        return ()
+
     monkeypatch.setenv(RUN.ENV_FLAG, "true")
     monkeypatch.setattr(RUN, "round_tick", no_slots)
+    monkeypatch.setattr(RUN, "wake_tick", no_wake)  # 不许真连 Redis（同上）
     monkeypatch.setattr(RUN, "asyncio", _Sleep)
     monkeypatch.setattr("backend.shared.scheduler_registry.heartbeat", boom_heartbeat)
     with pytest.raises(_Stop):
@@ -3275,13 +3762,14 @@ async def test_default_round_deps_refuse_a_degraded_trading_day_verdict(monkeypa
 
 # ══ H. 分层与体量的源码守卫 ══════════════════════════════════════════
 def test_modules_stay_within_the_file_budget_and_layering():
-    """六块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动、
-    blocks 只装配（补块：Stage 2 第一批）。
+    """八块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动、
+    blocks/feeds 只装配与取数（补块：Stage 2 第一/第二批）、wake 只判据（纯逻辑）。
 
     每块 < 800 行——``round`` 曾在一个文件里同时装「一轮里发生了什么」与「哪些槽位
     该跑」（900 行），拆出 ``tick`` 才回到预算内；``round``/``io`` 后来都顶到预算
-    顶，「分数/regime → 提示词补块」的装配于是拆出 ``blocks``（与 io 同层：可被
-    round import，彼此与上层互不反向 import）。
+    顶，「分数/regime → 提示词补块」的装配于是拆出 ``blocks``，第二批的取数面拆出
+    ``feeds``（都与 io 同层：可被 round import，彼此与上层互不反向 import）；唤醒
+    判据（丙1）是纯函数，单独成 ``wake`` 供 tick 编排层 import。
     """
     from pathlib import Path
 
@@ -3292,7 +3780,17 @@ def test_modules_stay_within_the_file_budget_and_layering():
             if name == "round"
             else (base / f"decision_round_{name}.py")
         ).read_text(encoding="utf-8")
-        for name in ("core", "io", "blocks", "round", "tick", "runner", "alerts")
+        for name in (
+            "core",
+            "io",
+            "blocks",
+            "round",
+            "tick",
+            "runner",
+            "alerts",
+            "wake",
+            "feeds",
+        )
     }
     for name, text in src.items():
         assert len(text.splitlines()) < 800, f"decision_round_{name} 超出单文件上限"
@@ -3361,6 +3859,24 @@ def test_modules_stay_within_the_file_budget_and_layering():
             "services.trade.services.decision_round import",
             "decision_round_tick import",
             "decision_round_runner import",
+        ),
+        # 取数面（Stage 2 第二批）与 blocks 同层：io 可以 import 它，它只许往下
+        # （core/wake/shared）。反向拉 io/tick 会把「取数降级不拦轮」的独立位置
+        # 变成环——wake 上下文客户端的库口径（trade db2）就是靠这条保住的。
+        "feeds": (
+            "decision_round_io import",
+            "services.trade.services.decision_round import",
+            "decision_round_tick import",
+            "decision_round_runner import",
+        ),
+        # 唤醒判据层（丙1）是**纯函数**，谁都能 import 它，它谁也不许往回拉——
+        # 拉了取数（feeds）或编排（tick/round）就再也无法脱库单测。
+        "wake": (
+            "decision_round_io import",
+            "services.trade.services.decision_round import",
+            "decision_round_tick import",
+            "decision_round_runner import",
+            "decision_round_feeds import",
         ),
     }
     for layer, markers in forbidden.items():

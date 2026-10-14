@@ -300,11 +300,18 @@ async def test_build_once_empty_sources_replaces_empty_real_env():
         builder._collect_pool = lambda *a, **k: ([], None, "")
         report = await builder.build_once(tenant_filter=tenant)
         # T-P6-13 起：空股票源 → 仅常驻指数（regime 源）；旧集合被**替换**（过期订阅退订）
-        assert report["kept"] == 2
-        assert set(hs.smembers(hot_key)) == {"000300.SH", "000001.SH"}
+        # Stage 2 第二批（丁5）：REGIME_INDEXES 扩容 399001.SZ/399006.SZ（四指数常驻，
+        # 大盘指数块展示用；不占 cap）
+        assert report["kept"] == 4
+        assert set(hs.smembers(hot_key)) == {
+            "000300.SH",
+            "000001.SH",
+            "399001.SZ",
+            "399006.SZ",
+        }
         assert (
             json.loads(hs.hget(f"{hot_key}:meta", "sources") or "{}").get("indexes")
-            == 2
+            == 4
         )
     finally:
         hs.delete(hot_key, f"{hot_key}:meta")

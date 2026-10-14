@@ -33,8 +33,10 @@ done 键写入失败              照常返回本轮结果（决策已做、单�
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Callable, Sequence
+import os
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
@@ -49,11 +51,15 @@ from backend.services.trade.services.decision_round_alerts import (
 from backend.services.trade.services.decision_round_core import (
     DEFAULT_GRACE_MIN,
     DONE_TTL_S,
+    ENV_GRACE_MIN,
+    LOG_KEY,
     STATUS_SKIPPED,
+    TENANT_ID,
     AgentRun,
     RoundDeps,
     RoundResult,
     RoundSlot,
+    as_float,
     due_slots,
     round_id_for,
     select_runs,
@@ -65,6 +71,33 @@ from backend.services.trade.services.decision_round_io import (
     native_redis_client,
     write_status,
 )
+from backend.services.trade.services.decision_round_wake import (
+    CTX_TTL_S,
+    DAILY_WAKE_LIMIT,
+    MIN_ROUND_GAP_MIN,
+    STATE_TTL_S,
+    WAKE_CTX_KEY,
+    WAKE_EVAL_MIN_INTERVAL_S,
+    WAKE_STATE_KEY,
+    NewsHit,
+    WakeObs,
+    WakeState,
+    budget_ok,
+    context_text,
+    decode_state,
+    encode_state,
+    evaluate_triggers,
+    filter_triggers,
+    idle_state,
+    one_line_note,
+    snapshot_pnl,
+    wake_enabled,
+    woken_state,
+)
+from backend.shared.decision.contract import SCHEMA_INTRADAY
+from backend.shared.decision_blocks import book_imbalance, parse_brief_ts
+from backend.shared.decision_context_source import day_change_pct
+from backend.shared.stock_utils import StockCodeUtil
 
 logger = logging.getLogger(__name__)
 
@@ -335,3 +368,326 @@ async def round_tick(
                 client.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ══ 丙1 唤醒评估（Stage 2 第二批）══════════════════════════════════════
+#
+# 判据全在 ``decision_round_wake``（纯函数）；本层只做**编排**：闸门 → 观测 →
+# 判 → 合成槽轮（复用 ``round_tick`` 显式槽位路径，认领/done/执行/审计全套不改）。
+# 与 ``round_tick`` 同任务串行（runner 先 await round_tick 再 await wake_tick），
+# 由此天然没有「唤醒轮与正点轮并发下单」的窗口。
+
+#: 板块类判据每日一次的可见留痕（无源门控的姿态说明，见 ``wake.sector_triggers``）。
+_SECTOR_GAP_NOTE = "板块类判据无源（880xxx 板块指数未常驻热集）：本轮不评，判据就绪待源"
+
+
+def _wake_grace_min() -> int:
+    """唤醒评估的「槽位临期不评」窗（与 ``runner._grace_min`` 同式同 env）。
+
+    tick 不许反向 import runner（源码守卫钉死分层），这里复写四行而不是借道。
+    """
+    try:
+        return max(0, int(os.getenv(ENV_GRACE_MIN, "") or DEFAULT_GRACE_MIN))
+    except ValueError:
+        return DEFAULT_GRACE_MIN
+
+
+def _snap_now(snap: Mapping[str, Any] | None) -> float | None:
+    """快照现价（``Now``/``now``）——与 ``shared.decision_blocks`` 同口径的本地小抄。"""
+    if not isinstance(snap, Mapping):
+        return None
+    raw = snap.get("Now") if snap.get("Now") is not None else snap.get("now")
+    return as_float(raw)
+
+
+def _log_head_ts(client: Any) -> float:
+    """轮次日志键头（最近一轮状态）→ epoch；读不到/坏值 → 0.0（当无近轮放行）。
+
+    解析失败 **fail-open**：把「读不到」当「刚跑过」会让真触发被 20 分钟闸门静默
+    吞掉——漏一次止损唤醒远比多发一轮贵。
+    """
+    try:
+        head = client.lrange(LOG_KEY, 0, 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DecisionRound] 轮次日志读取失败（按无近轮评估）: %s", exc)
+        return 0.0
+    if not head:
+        return 0.0
+    try:
+        return datetime.fromisoformat(
+            str(json.loads(head[0]).get("ts") or "")
+        ).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
+def _write_wake_state(client: Any, key: str, state: WakeState) -> None:
+    """状态键落库（心跳/基线/冷却）。失败只降可见性——判据下轮重算，不影响决策。"""
+    try:
+        client.hset(key, mapping=encode_state(state))
+        client.expire(key, STATE_TTL_S)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DecisionRound] 唤醒状态写入失败 %s: %s", key, exc)
+
+
+async def gather_wake_obs(deps: RoundDeps) -> WakeObs | None:
+    """一次评估的观测（丙1 判据原料）：持仓（桥口径）× 快照 × 简报。
+
+    持仓读不到 → ``None``（**不评**：没有观测的「无触发」是假阴性）；行情/简报
+    缺位只让对应字段为 ``None``/0（判据自己跳过缺数项）。持仓取**桥账户整座**
+    不做分账裁剪：触发器看的是账户真实盈亏，按分账裁剪会让另一家的票跌穿也不叫醒
+    （可见性防线在轮内，不在评估器）。
+    """
+    user = str(deps.account_user() or "").strip()
+    if not user:
+        return None
+    try:
+        positions, _meta = await deps.load_positions(TENANT_ID, user)
+    except Exception as exc:  # noqa: BLE001 观测缺失 → 本轮不评
+        logger.warning("[DecisionRound] 唤醒评估：持仓读取失败，跳过: %s", exc)
+        return None
+    codes: list[str] = []
+    names: dict[str, str] = {}
+    costs: dict[str, float] = {}
+    for p in (positions or {}).values():
+        if not isinstance(p, Mapping):
+            continue
+        raw = str(p.get("symbol") or "").strip()
+        if not raw:
+            continue
+        code = StockCodeUtil.to_suffix(raw)
+        if not code or code in names:
+            continue
+        codes.append(code)
+        names[code] = str(p.get("name") or "").strip() or code
+        cost = as_float(p.get("cost_price"))
+        if cost is not None:
+            costs[code] = cost
+    if not codes:
+        return WakeObs()  # 空仓 = 有效观测（无触发），与「观测失败」是两回事
+
+    snapped: Mapping[str, Mapping[str, Any]] = {}
+    try:
+        client = deps.quote_client()
+    except Exception as exc:  # noqa: BLE001 行情不可用：字段缺数，判据自跳过
+        logger.warning("[DecisionRound] 唤醒评估：行情客户端不可用: %s", exc)
+        client = None
+    if client is not None:
+        try:
+            snapped = deps.read_snaps(client, codes) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DecisionRound] 唤醒评估：快照读取失败: %s", exc)
+            snapped = {}
+
+    pnl_pct: dict[str, float | None] = {}
+    day_chg: dict[str, float | None] = {}
+    imb5: dict[str, float | None] = {}
+    for code in codes:
+        snap = snapped.get(code)
+        pnl_pct[code] = snapshot_pnl(costs.get(code), _snap_now(snap))
+        day_chg[code] = day_change_pct(snap)
+        imb5[code] = book_imbalance(snap)
+
+    brief_ts = 0.0
+    news_hits: list[NewsHit] = []
+    if deps.load_news_files is not None:
+        brief: Mapping[str, Any] | None = None
+        try:
+            brief, _watch = deps.load_news_files()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DecisionRound] 唤醒评估：新闻简报读取失败: %s", exc)
+        brief_ts = parse_brief_ts(brief) or 0.0
+        held = set(codes)
+        items = (brief or {}).get("holdings")
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, Mapping):
+                continue
+            code = str(item.get("code") or "").strip()
+            if code not in held:
+                continue
+            news_hits.append(
+                NewsHit(
+                    code=code,
+                    name=str(item.get("name") or ""),
+                    verdict=str(item.get("verdict") or ""),
+                    impact=as_float(item.get("impact")),
+                    event_type=str(item.get("event_type") or ""),
+                    headline=str(item.get("headline") or ""),
+                )
+            )
+    return WakeObs(
+        codes=tuple(codes),
+        names=names,
+        pnl_pct=pnl_pct,
+        day_chg=day_chg,
+        imb5=imb5,
+        brief_ts=brief_ts,
+        news_hits=tuple(news_hits),
+    )
+
+
+async def wake_tick(
+    *,
+    deps: RoundDeps | None = None,
+    native: Any = None,
+    now: datetime | None = None,
+    notify: Notifier | None = None,
+) -> tuple[RoundResult, ...]:
+    """唤醒评估（每次轮询一调）：四类触发 → 合成槽轮 → 复用 ``round_tick``。
+
+    **契约：绝不抛**（runner 里就一行 ``await wake_tick()``，循环不许因它出事）。
+    闸门从外到内：总开关 → 交易时段/交易日 → Redis → 评估节拍（60s，兼作评估器
+    存活心跳 ``last_eval_ts``）→ 槽位临期不评 → 距上一轮任何轮 ≥20 分钟
+    （判据在轮次日志键头）→ 观测 → 四类触发 → 冷却过滤 → 日预算。放行则
+    **先落唤醒说明、先推状态、再跑轮**：轮若中途夭折，预算与冷却已经消费，
+    不会 60 秒一遍死循环。
+    """
+    try:
+        return await _wake_tick(deps=deps, native=native, now=now, notify=notify)
+    except Exception as exc:  # noqa: BLE001 唤醒评估绝不拖累轮次循环
+        logger.error("[DecisionRound] 唤醒评估异常: %s", exc, exc_info=True)
+        return ()
+
+
+async def _wake_tick(
+    *,
+    deps: RoundDeps | None,
+    native: Any,
+    now: datetime | None,
+    notify: Notifier | None,
+) -> tuple[RoundResult, ...]:
+    if not wake_enabled():
+        return ()
+    deps = deps or default_round_deps()
+    now = now or deps.now()
+    try:
+        if not deps.is_trading_time(now):
+            return ()
+        trading_day = await deps.is_trading_day(now.date())
+    except Exception as exc:  # noqa: BLE001 判不了就不评（与 round_tick 同 fail-closed）
+        logger.warning("[DecisionRound] 唤醒评估：时段/交易日判定失败，跳过: %s", exc)
+        return ()
+    if not trading_day:
+        return ()
+    client = native
+    if client is None:
+        try:
+            client = native_redis_client()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[DecisionRound] 唤醒评估：Redis 客户端构造失败: %s", exc)
+            return ()
+    try:
+        return await _wake_cycle(deps, client, now, notify)
+    finally:
+        if native is None and client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _wake_cycle(
+    deps: RoundDeps, client: Any, now: datetime, notify: Notifier | None
+) -> tuple[RoundResult, ...]:
+    """闸门与判据（客户端已就绪、时段已验）。``now`` 为 aware 北京墙钟。"""
+    day_str = f"{now:%Y%m%d}"
+    state_key = WAKE_STATE_KEY.format(day=day_str)
+    try:
+        raw = client.hgetall(state_key)
+    except Exception as exc:  # noqa: BLE001 状态读不到 → 不评（基线没了 = 判据失真）
+        logger.warning("[DecisionRound] 唤醒评估：状态读取失败，跳过: %s", exc)
+        return ()
+    state = decode_state(raw, day=day_str)
+    if now.timestamp() - state.last_eval_ts < WAKE_EVAL_MIN_INTERVAL_S:
+        return ()
+
+    def _heartbeat(st: WakeState) -> WakeState:
+        return replace(st, last_eval_ts=now.timestamp())
+
+    # 槽位临期不评：正点槽宽限窗里 round_tick 自己会跑，唤醒白烧一轮预算。
+    if due_slots(now, grace_min=_wake_grace_min()):
+        _write_wake_state(client, state_key, _heartbeat(state))
+        return ()
+    log_round_ts = _log_head_ts(client)
+    if log_round_ts and now.timestamp() - log_round_ts < MIN_ROUND_GAP_MIN * 60.0:
+        _write_wake_state(client, state_key, _heartbeat(state))
+        return ()
+    obs = await gather_wake_obs(deps)
+    if obs is None:
+        _write_wake_state(client, state_key, _heartbeat(state))
+        return ()
+
+    fired, held = filter_triggers(evaluate_triggers(obs, state, now), state, now)
+    sector_note = "" if state.sector_gap_day == day_str else _SECTOR_GAP_NOTE
+    if not fired:
+        new_state = idle_state(state, obs, now=now, log_round_ts=log_round_ts)
+        parts = [one_line_note((), held)] if held else []
+        if sector_note:
+            parts.append(sector_note)
+        _write_wake_state(
+            client,
+            state_key,
+            replace(
+                new_state,
+                last_note="；".join(parts) or new_state.last_note,
+                sector_gap_day=day_str,
+            ),
+        )
+        return ()
+    if not budget_ok(state):
+        # 预算用尽：照 ``woken_state`` 记冷却（防 60 秒一遍刷屏），但**不跑轮**。
+        new_state = woken_state(
+            state, obs, now=now, fired=fired, log_round_ts=log_round_ts
+        )
+        note = f"日唤醒预算用尽（{DAILY_WAKE_LIMIT} 轮）：{one_line_note(fired, held)}"
+        _write_wake_state(
+            client,
+            state_key,
+            replace(new_state, last_note=note, sector_gap_day=day_str),
+        )
+        logger.warning("[DecisionRound] %s", note)
+        return ()
+
+    slot = RoundSlot(f"{now:%H%M}", SCHEMA_INTRADAY)
+    round_id = round_id_for(now.date(), slot)
+    # 先落说明与状态、再跑轮（顺序即契约，见 wake_tick docstring）。
+    try:
+        client.set(
+            WAKE_CTX_KEY.format(round_id=round_id),
+            context_text(fired, now, suppressed=held),
+            ex=CTX_TTL_S,
+        )
+    except Exception as exc:  # noqa: BLE001 说明写失败：轮照跑（退化为普通轮）
+        logger.warning("[DecisionRound] 唤醒说明写入失败 %s: %s", round_id, exc)
+    new_state = woken_state(state, obs, now=now, fired=fired, log_round_ts=log_round_ts)
+    _write_wake_state(
+        client,
+        state_key,
+        replace(
+            new_state,
+            last_note=one_line_note(fired, held),
+            sector_gap_day=day_str,
+        ),
+    )
+    logger.warning(
+        "[DecisionRound] 触发唤醒（%s）→ 合成槽 %s：%s",
+        now.strftime("%H:%M"),
+        slot.label,
+        one_line_note(fired, held),
+    )
+    results = await round_tick(
+        deps=deps, native=client, now=now, slot=slot, notify=notify
+    )
+    for r in results:
+        logger.info(
+            "[DecisionRound] 唤醒轮 %s agent=%s status=%s decisions=%d legs=%d "
+            "submitted=%d note=%s",
+            r.round_id,
+            r.agent or "-",
+            r.status,
+            r.decisions,
+            r.legs,
+            r.submitted,
+            r.note,
+        )
+    return results

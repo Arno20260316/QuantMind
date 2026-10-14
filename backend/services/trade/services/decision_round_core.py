@@ -448,6 +448,16 @@ class RoundDeps:
         ]
         | None
     ) = None
+    #: () → (news_brief|None, watch|None)；丁4 新闻取数面。None = 未接线。
+    load_news_files: Callable[[], tuple[Mapping[str, Any] | None, ...]] | None = None
+    #: () → (risk|None, industry|None, fund|None)；风险两槽取数面（见 feeds）。
+    load_risk_files: Callable[[], tuple[Mapping[str, Any] | None, ...]] | None = None
+    #: (codes) → {suffix: SeriesSummary}；丁1/丁3 原料。**第二批总接线标记**。
+    read_series_summary: Callable[[Sequence[str]], Mapping[str, Any]] | None = None
+    #: (trade_date, user) → 当日审计行（丁6/丁9）。口径同 build_records 写侧。
+    load_decision_rows: Callable[[date, str], Awaitable[Sequence[Any]]] | None = None
+    #: (round_id) → 丙1 唤醒文本（非唤醒轮 ""）。写 wake_tick，渲染 extra_context。
+    read_wake_ctx: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True, slots=True)

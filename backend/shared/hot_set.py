@@ -21,7 +21,14 @@ from typing import Any
 
 _SUFFIX_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
 DEFAULT_CAP = 2000
-REGIME_INDEXES: tuple[str, ...] = ("000300.SH", "000001.SH")  # 沪深300 + 上证指数（regime 常驻源）
+#: regime 常驻指数：沪深300 + 上证指数（regime 判定用）+ 深成/创业板（丁5【大盘指数】
+#: 展示四只用，本批一并常驻；都不占 cap，渲染名在 ``decision_blocks.INDEX_DISPLAY``）。
+REGIME_INDEXES: tuple[str, ...] = (
+    "000300.SH",
+    "000001.SH",
+    "399001.SZ",
+    "399006.SZ",
+)
 
 
 def normalize_hot_symbol(symbol: object) -> str | None:

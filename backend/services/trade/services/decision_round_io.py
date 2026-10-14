@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
 
+from backend.services.trade.services import decision_round_feeds as feeds
 from backend.services.trade.services.decision_round_core import (
     CST,
     ENV_ACCOUNT_USER,
@@ -452,7 +453,34 @@ def default_round_deps() -> RoundDeps:
         # Stage 2 第一批：模型分数 + 市场状态入提示词（读失败均降级不拦轮）
         load_regime=load_intraday_regime,
         load_scores=load_signal_scores,
+        # Stage 2 第二批：丁1–丁9 取数面 + 丙1 唤醒上下文（口径与降级见 feeds 模块）
+        load_news_files=feeds.read_news_files,
+        load_risk_files=feeds.read_risk_files,
+        read_series_summary=feeds.series_summaries,
+        load_decision_rows=feeds.load_decision_rows,
+        read_wake_ctx=_read_wake_ctx,
     )
+
+
+def _read_wake_ctx(round_id: str) -> str:
+    """唤醒上下文读口：现造现关的原生客户端（**交易库 db2，与写侧同库**）。
+
+    与写侧 ``wake_tick`` 同库是契约——不同库 = 卡片永远读不到且全链无报错
+    （memory: qq-push-3slot-briefing 的 db0/db2 陷阱）。连接失败按非唤醒轮降级。
+    """
+    client = None
+    try:
+        client = native_redis_client()
+        return feeds.read_wake_ctx(client, round_id)
+    except Exception as exc:  # noqa: BLE001 连不上就当非唤醒轮
+        logger.warning("[DecisionRound] 唤醒上下文客户端不可用: %s", exc)
+        return ""
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def native_redis_client() -> Any:

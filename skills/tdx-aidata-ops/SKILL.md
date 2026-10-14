@@ -1,6 +1,6 @@
 ---
 name: tdx-aidata-ops
-description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查——状态体检（分片/帧节拍/热集/静默片）、订阅推送与请求两通道语义（订阅零请求配额、请求按预算窗口限流）、SDK API 方法表、故障模式与证据采集（盘中零数据帧、错误码 11/10/13、Token Insufficient、ini 主机表缺失）、平台 REST 与前端入口。用户问「TdxAiData」「订阅推送」「行情主源」「盘中有没有数据」「零帧」「配额/限流」「错误码11/10/13」「Connection failed」「tdx 自检」「重启 tdx」时使用。触发词：TdxAiData、tdx-aidata、订阅推送、行情主源、数据帧、零帧、配额、Token Insufficient、错误码11、错误码10、错误码13、Connection failed、自检、重启worker"
+description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查——状态体检（分片/帧节拍/热集/静默片）、订阅推送与请求两通道语义（订阅零请求配额、请求按预算窗口限流）、SDK API 方法表、故障模式与证据采集（盘中零数据帧、错误码 11/10/13、Token Insufficient、ini 主机表缺失）、平台 REST 与前端入口。用户问「TdxAiData」「订阅推送」「行情主源」「盘中有没有数据」「零帧」「配额/限流」「错误码11/10/13」「Connection failed」「tdx 自检」「重启 tdx」时使用。触发词：TdxAiData、tdx-aidata、订阅推送、行情主源、数据帧、零帧、零推送、ini撕裂、-5397、配额、Token Insufficient、错误码11、错误码10、错误码13、Connection failed、自检、重启worker、集群拉起"
 ---
 
 > ## ⚙️ 运行环境契约（最高优先级）
@@ -31,6 +31,12 @@ description: "TdxAiData（通达信 AI 数据 SDK）通道运维与取数速查�
   从公共行情服迁回）；**行情快照/序列写远端**（`market:snapshot:{sh600036}` 小写 /
   `market:series:{SH600036}` 大写）。
 - **预算闸门**：worker 内按窗口上限（默认 30，可配）计数 + 冷却翻倍（180s 起、600s 封顶）；超限快速失败（不触 SDK）。
+- **集群自愈**：`tdx_cluster_watch`（trade 常驻任务，2026-10-14 起）60s 巡检一次，worker
+  掉线/分片不齐自动 `ensure_all()`（最小间隔 120s，env `QM_TDX_CLUSTER_WATCH_INTERVAL_S`/
+  `QM_TDX_CLUSTER_WATCH_MIN_GAP_S`），心跳键 `qm:sched:hb:tdx_cluster_watch`——**容器/
+  节点重建后无需再人工点自检**；面板「连通性自检」保留作真取数验证（消耗配额）。
+- **core dump**：worker `main()` 设 `RLIMIT_CORE=0`（2026-10-14），崩溃不再产 core；
+  `/opt/tdx-aidata` 下历史 `core.*`（曾有 9 个 ≈6.5GB）可直删。
 
 ## 2. 体检（一条命令）
 
@@ -67,6 +73,10 @@ asyncio.run(m())"
 错误码：`13`=Token Insufficient（配额）；`11`=Connection failed（**ini 主机表缺失**，
 见 §4）；`10`=服务端异常响应（`Invalid server response`）；
 `2`=订阅批量拒绝（>100 只，仅打印不抛）；错误映射见 `shared/tdx_aidata/protocol.py::map_sdk_error`。
+推送信封里的 `ErrorId=10` + `RetFlag=-5397` = **订阅服务器对本次推送返错误信封**
+（约 1% 帧、载荷无 ResultSets、**无数据丢失**、帧流不断；2026-10-14 定案，**先记录不追**）：
+计入 `counters.parse_error_codes`（键 `server_errorid_10_retflag_-5397`）+
+`last_parse_error_preview` 留证，判"服务端偶发"与"本地解析坏"看这两个键即可。
 
 ## 4. 已知故障模式（故障 ⇒ 处置）
 
@@ -77,6 +87,8 @@ asyncio.run(m())"
 | `hot_set read: Timeout connecting to server` | 历史遗留（热集在公共服时远端读超时）；热集本地化后应消失，若再现查本地 `redis` 连通与 `QM_HOT_SET_KEY` |
 | `Token Insufficient`（自检/取数失败） | 窗口配额已满（默认 30 次/窗口，全接口共享）——等冷却窗口；**别重试风暴** |
 | **每次请求都 `{"Error":"Connection failed","ErrorId":11}`、订阅零帧** | **包内 `tdxaidata/lib/TdxAiData.ini` 的 `[TcHqHost]` 主机表被写坏**（只剩 `PrimaryHost=`，缺 `HostName/IPAddress/Port`）→ SDK 连不上行情主机。**2026-10-14 实盘踩过（约 5 小时全断）**：token 写入若用正则跨行替换，会把 `HostNum/HostName01/...` 全吃掉。修法=从 PyPI wheel 模板重建该 ini 再补 `[Token]`；**只写 token 行、先备份**。隔离判据：同一 `.so`+token，只有 ini 不同 → 报 11 的那个就是坏 ini |
+| **订阅成功但零推送、全链无任何报错**（`frames_data` 恒 0、`last_error` 为空、快照键停更） | **包内 `tdxaidata/lib/TdxAiData.ini` 撕裂**：分片 worker 启动时 .so 各自**无锁**回写该文件（归一化为 `[TcHqHost]+[Token]`），并发下曾产出**键截断态**（`[TcHqHost]` 缺 `HostName01/HostNum/IPAddress01`、多出 `ress01` 碎片键）→ 每代会话订阅成功但零推送。**2026-10-14 实盘踩过（10:32~13:56 全断）**。worker 启动已内建自愈（`config.repair_pkg_ini_if_broken`，**SDK 引入前**执行）；体检判据 `config.pkg_ini_problems`：存在的段必须键齐——**.so 归一化后丢掉 `[TcDsHost]` 属合法态，不算问题、别乱"修"**。事故 169 字节现场留证 `lib/TdxAiData.ini.bak-corrupt-20261014` |
+| 三份 ini 的 token 尾 4 位不一致 | 三处副本：顶层 `TdxAiData.ini`、包内 `tdxaidata/lib/TdxAiData.ini`（订阅会话只读它）、库托管 `user.ini`（.so 自读写）。`config.write_token` 已三处同步（`user.ini` 不存在不新建）；换 token 后核三处一致 |
 | worker 拉起失败/端口残留 | `client.restart()`（重读 ini/目录）；残留 socket 会被活体探针剔除后重拉（已修） |
 | 改 Token/安装目录 | 前端「数据管理→A股→数据源设置」（写 `TdxAiData.ini` 的 `[Token]` 行，原子替换），或 `POST /api/v1/admin/data-platform/tdx-aidata/config` |
 

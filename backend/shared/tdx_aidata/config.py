@@ -179,6 +179,11 @@ def write_token(ini_file: str, token: str) -> None:
     新发行方式（PyPI 包 tdxaidata≥1.2.1）下动态库**订阅会话**只读它自身所在目录的
     ``lib/TdxAiData.ini``——写入顶层 ini 不够，必须一并写包内 lib 那份（2026-10-13 实测：
     只写顶层时快照正常但订阅静默 Need Token；双写后订阅才收帧）。
+
+    另同步**库托管副本** ``user.ini``（与 ini 同目录）：.so 内嵌
+    ``[config] failed to update user.ini key=%s``，实测其内容同为 ``[Token] token=``
+    形态——2026-10-14 发现它停在旧 token（换 token 后没人写它），留「三份两份新一份旧」
+    的隐性漂移。写入侧一并同步；文件不存在**不新建**（不凭空制造库的私有状态文件）。
     """
     _write_token_to(str(ini_file), token)
     # 包内 lib ini（新包形态：tdxaidata/lib/TdxAiData.ini；旧包无 lib 目录则跳过）
@@ -186,6 +191,9 @@ def write_token(ini_file: str, token: str) -> None:
     pkg_ini = dir_path / "tdxaidata" / "lib" / "TdxAiData.ini"
     if pkg_ini.is_file():
         _write_token_to(str(pkg_ini), token)
+    user_ini = dir_path / "user.ini"
+    if user_ini.is_file():
+        _write_token_to(str(user_ini), token)
 
 
 def _write_token_to(path_str: str, token: str) -> None:
@@ -241,6 +249,88 @@ def _write_token_to(path_str: str, token: str) -> None:
             pass
         raise
     logger.info("tdx ini token 已更新: %s", path)
+
+
+def _parse_ini_sections(text: str) -> dict[str, set[str]]:
+    """极简 ini 解析：section(小写) → key 集合（值不参与比对）。"""
+    sections: dict[str, set[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(";") or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1].strip().lower()
+            sections.setdefault(current, set())
+            continue
+        if current is None or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip().lower()
+        if key:
+            sections[current].add(key)
+    return sections
+
+
+def pkg_ini_problems(ini_file: str) -> list[str]:
+    """包内 lib ini 结构体检（返回问题列表，空 = 可用）。
+
+    背景（2026-10-14 订阅静默零帧事故）：``tdxaidata/lib/TdxAiData.ini`` 是 SDK
+    **订阅会话**实际读取的配置；8 个分片 worker 启动时 .so 会各自无锁回写该文件，
+    并发下曾产出**键被截断的撕裂态**（[TcHqHost] 缺 HostName01/HostNum/IPAddress01、
+    带 "ress01" 碎片键），此后每代会话订阅成功但零推送、全链无报错，直到有人
+    手工修理该文件。判据：
+
+    - lib ini 中**存在的段**，其键集必须覆盖顶层 ini 同名段的全部键（值不比对）；
+    - 段整体缺失**不算问题**：.so 归一化后会丢掉 [TcDsHost]，单分片重启实验实证
+      订阅照常收帧（推送主机有内置默认），不得为此反复"修复"；
+    - 包内文件不存在 → 无问题（旧目录形态，自愈不负责无中生有）。
+    """
+    top_path = Path(str(ini_file))
+    lib_path = top_path.parent / "tdxaidata" / "lib" / "TdxAiData.ini"
+    if not lib_path.is_file():
+        return []
+    top = _parse_ini_sections(top_path.read_text(encoding="utf-8", errors="replace"))
+    lib = _parse_ini_sections(lib_path.read_text(encoding="utf-8", errors="replace"))
+    problems: list[str] = []
+    for sec, keys in lib.items():
+        ref = top.get(sec)
+        if ref is None:
+            continue
+        missing = sorted(ref - keys)
+        if missing:
+            problems.append(f"[{sec}] 缺键: {', '.join(missing)}")
+    return problems
+
+
+def repair_pkg_ini_if_broken(ini_file: str) -> list[str]:
+    """包内 lib ini 撕裂自愈：有撕裂即以顶层 ini **原子整篇复制**修复。
+
+    返回修复前的问题列表（``[]`` = 未动）。worker 在 SDK 引入前调用（见
+    ``worker._load_sdk``），保证每代会话初始化读到结构完整的配置。写入为
+    同目录临时文件 + ``os.replace``（与 token 写入同款原子替换）；多 worker
+    同时启动时写的是同一份内容，幂等无害。.so 之后仍会按自己的节奏把文件
+    归一化回 [TcHqHost]+[Token] 形态——体检只看"存在的段是否完整"，两种
+    形态都判可用，系统自然收敛。
+    """
+    problems = pkg_ini_problems(ini_file)
+    if not problems:
+        return []
+    top_path = Path(str(ini_file))
+    lib_path = top_path.parent / "tdxaidata" / "lib" / "TdxAiData.ini"
+    text = top_path.read_text(encoding="utf-8", errors="replace")
+    fd, tmp_path = tempfile.mkstemp(prefix=".ini-repair-", dir=str(lib_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, lib_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    logger.warning("包内 TdxAiData.ini 撕裂，已从顶层重建: %s", "; ".join(problems))
+    return problems
 
 
 def token_status(ini_file: str) -> dict[str, Any]:

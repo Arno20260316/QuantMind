@@ -185,6 +185,123 @@ def test_write_token_dual_writes_pkg_ini(tmp_path):
 
 
 @pytest.mark.unit
+def test_write_token_syncs_user_ini_when_present(tmp_path):
+    """库托管副本 user.ini 一并同步（存在才写）。
+
+    2026-10-14 复查：.so 自身读写同目录 ``user.ini``（strings 实证
+    ``[config] failed to update user.ini key=%s``），换 token 后没人写它 →
+    实际留成「顶层+包内=新、user.ini=旧」的三份漂移。写入侧一并同步；
+    文件不存在**不新建**（不凭空制造库的私有状态文件）。
+    """
+    from backend.shared.tdx_aidata import config
+
+    top = tmp_path / "TdxAiData.ini"
+    top.write_text(_SAMPLE_INI, encoding="utf-8")
+    user_ini = tmp_path / "user.ini"
+    user_ini.write_text("[Token]\ntoken=STALE_USER_TOKEN\n", encoding="utf-8")
+
+    config.write_token(str(top), "SYNC_TOKEN")
+
+    assert "token=SYNC_TOKEN" in top.read_text(encoding="utf-8")
+    user_text = user_ini.read_text(encoding="utf-8")
+    assert "token=SYNC_TOKEN" in user_text
+    assert "STALE_USER_TOKEN" not in user_text
+
+    # 不存在时不新建（旧目录形态：库没生成过 user.ini 就不制造它）
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    fresh_ini = fresh / "TdxAiData.ini"
+    fresh_ini.write_text("[Token]\ntoken=OLD\n", encoding="utf-8")
+    config.write_token(str(fresh_ini), "T2")
+    assert not (fresh / "user.ini").exists()
+
+
+@pytest.mark.unit
+def test_pkg_ini_problems_detects_torn_state(tmp_path):
+    """包内 lib ini 撕裂体检（2026-10-14 订阅静默零帧事故的判据）。
+
+    真实撕裂态（事故现场 169 字节）：[TcHqHost] 在但键被截断
+    （缺 HostName01/HostNum/IPAddress01，多出 "ress01" 碎片键）。
+    归一化态（.so 回写后的 [TcHqHost]+[Token]，无 [TcDsHost]）**不算问题**——
+    单分片重启实验实证订阅照常收帧（推送主机有内置默认）。
+    """
+    from backend.shared.tdx_aidata import config
+
+    top = tmp_path / "TdxAiData.ini"
+    top.write_text(_SAMPLE_INI, encoding="utf-8")
+    pkg = tmp_path / "tdxaidata" / "lib" / "TdxAiData.ini"
+    pkg.parent.mkdir(parents=True)
+
+    # 完好副本 → 无问题
+    pkg.write_text(_SAMPLE_INI, encoding="utf-8")
+    assert config.pkg_ini_problems(str(top)) == []
+    # 归一化态（.so 回写形态，丢 [TcDsHost]）→ 无问题
+    pkg.write_text(
+        "[TcHqHost]\nHostName01=hq.example.com\nHostNum=1\n"
+        "IPAddress01=10.0.0.2\nPort01=7709\nPrimaryHost=1\n\n"
+        "[Token]\ntoken=OLD_TOKEN_VALUE\n",
+        encoding="utf-8",
+    )
+    assert config.pkg_ini_problems(str(top)) == []
+    # 撕裂态（缺键）→ 报问题，指明段与缺键
+    pkg.write_text(
+        "[TcHqHost]\n"
+        "ress01=aihs.tdx.com.cn\n"
+        "IPAddress02=aihs2.tdx.com.cn\n"
+        "Port01=7709\nPort02=7709\nPrimaryHost=0\n\n"
+        "[Token]\ntoken=OLD_TOKEN_VALUE\n",
+        encoding="utf-8",
+    )
+    problems = config.pkg_ini_problems(str(top))
+    assert problems and "tchqhost" in problems[0].lower()
+    assert "hostnum" in problems[0].lower() and "hostname01" in problems[0].lower()
+    # 包内文件缺失 → 无问题（自愈不负责无中生有，旧目录形态）
+    pkg.unlink()
+    assert config.pkg_ini_problems(str(top)) == []
+
+
+@pytest.mark.unit
+def test_repair_pkg_ini_if_broken_rewrites_from_top(tmp_path):
+    from backend.shared.tdx_aidata import config
+
+    top = tmp_path / "TdxAiData.ini"
+    top.write_text(_SAMPLE_INI, encoding="utf-8")
+    pkg = tmp_path / "tdxaidata" / "lib" / "TdxAiData.ini"
+    pkg.parent.mkdir(parents=True)
+    pkg.write_text("[TcHqHost]\nPrimaryHost=0\n\n[Token]\ntoken=X\n", encoding="utf-8")
+
+    problems = config.repair_pkg_ini_if_broken(str(top))
+    assert problems, "撕裂态必须报问题"
+    assert pkg.read_text(encoding="utf-8") == _SAMPLE_INI  # 原子整篇复制
+    # 已修好 → 幂等（不再动文件）
+    assert config.repair_pkg_ini_if_broken(str(top)) == []
+
+    # 归一化态不触发修复（.so 自己的形态，合法）
+    pkg.write_text(
+        "[TcHqHost]\nHostName01=hq.example.com\nHostNum=1\n"
+        "IPAddress01=10.0.0.2\nPort01=7709\nPrimaryHost=1\n\n"
+        "[Token]\ntoken=NEW\n",
+        encoding="utf-8",
+    )
+    before = pkg.read_text(encoding="utf-8")
+    assert config.repair_pkg_ini_if_broken(str(top)) == []
+    assert pkg.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.unit
+def test_worker_repairs_pkg_ini_before_sdk_load():
+    """接线守卫：worker 必须在 **SDK 引入前**执行包内 ini 撕裂自愈。
+
+    自愈若被移到 SDK 加载之后（或整个漏掉），撕裂态下每代会话订阅成功但零推送
+    ——2026-10-14 事故正是此形态（10:32~13:56 全片静默，表层无任何报错）。
+    """
+    src = (_BACKEND / "shared/tdx_aidata/worker.py").read_text(encoding="utf-8")
+    call_idx = src.index("repair_pkg_ini_if_broken")
+    sdk_idx = src.index("from tdxaidata import tqs")
+    assert call_idx < sdk_idx, "自愈调用必须在 SDK 引入之前"
+
+
+@pytest.mark.unit
 def test_read_token_status_masked(tmp_path):
     from backend.shared.tdx_aidata import config
 

@@ -28,10 +28,26 @@ _RECORD = {
     "limit_up": 45.21,
     "limit_down": 36.99,
     "seal_amount": 0.0,
-    "bid1": 40.91, "bid2": 40.90, "bid3": 40.89, "bid4": 40.88, "bid5": 40.87,
-    "bid_vol1": 12.0, "bid_vol2": 160.0, "bid_vol3": 186.0, "bid_vol4": 169.0, "bid_vol5": 969.0,
-    "ask1": 40.92, "ask2": 40.93, "ask3": 40.94, "ask4": 40.95, "ask5": 40.96,
-    "ask_vol1": 182.0, "ask_vol2": 5.0, "ask_vol3": 16.0, "ask_vol4": 66.0, "ask_vol5": 27.0,
+    "bid1": 40.91,
+    "bid2": 40.90,
+    "bid3": 40.89,
+    "bid4": 40.88,
+    "bid5": 40.87,
+    "bid_vol1": 12.0,
+    "bid_vol2": 160.0,
+    "bid_vol3": 186.0,
+    "bid_vol4": 169.0,
+    "bid_vol5": 969.0,
+    "ask1": 40.92,
+    "ask2": 40.93,
+    "ask3": 40.94,
+    "ask4": 40.95,
+    "ask5": 40.96,
+    "ask_vol1": 182.0,
+    "ask_vol2": 5.0,
+    "ask_vol3": 16.0,
+    "ask_vol4": 66.0,
+    "ask_vol5": 27.0,
 }
 
 _CST = timezone(timedelta(hours=8))
@@ -80,7 +96,9 @@ def test_refresh_time_epoch_with_rollover_guard():
     # 正常：当天 15:30:53
     now = datetime(2026, 9, 16, 20, 0, 0, tzinfo=_CST)
     ts = collector.refresh_time_to_epoch("153053", now)
-    assert datetime.fromtimestamp(ts, tz=_CST).strftime("%F %T") == "2026-09-16 15:30:53"
+    assert (
+        datetime.fromtimestamp(ts, tz=_CST).strftime("%F %T") == "2026-09-16 15:30:53"
+    )
 
     # 跨日守卫：凌晨 00:00:30 的进程收到昨日 15:30 帧（理论不会，但守卫必须显式）——
     # 解析结果若晚于 now 超过 5 分钟，回退一天
@@ -128,10 +146,90 @@ def test_symbol_normalization_and_skip_counter():
     from backend.shared.tdx_aidata import collector
 
     # 返回 (原生订阅码[后缀式，真机 subscribe 实测用法], 标准键前缀[大写])
-    assert collector.normalize_subscription_symbol("600036.SH") == ("600036.SH", "SH600036")
+    assert collector.normalize_subscription_symbol("600036.SH") == (
+        "600036.SH",
+        "SH600036",
+    )
     # 已带前缀（大写/小写）都能归一
-    assert collector.normalize_subscription_symbol("SH600036") == ("600036.SH", "SH600036")
-    assert collector.normalize_subscription_symbol("000858.SZ") == ("000858.SZ", "SZ000858")
+    assert collector.normalize_subscription_symbol("SH600036") == (
+        "600036.SH",
+        "SH600036",
+    )
+    assert collector.normalize_subscription_symbol("000858.SZ") == (
+        "000858.SZ",
+        "SZ000858",
+    )
     # 非法 → None（调用方计数跳过，绝不猜测）
     assert collector.normalize_subscription_symbol("") is None
     assert collector.normalize_subscription_symbol("NOT-A-SYMBOL-XYZ") is None
+
+
+@pytest.mark.unit
+def test_push_error_kind_classifier():
+    """推送解析异常 → 稳定分类键（2026-10-14：区分服务端错误信封与本地解析坏了）。
+
+    真机背景：约 1% 推送帧是服务端错误信封（ErrorId=10 + Error 文本携带
+    RetFlag=-5397），此前只计 parse_errors 一个总数——事后无法区分「服务端
+    偶发」与「本地解析器坏了」。分类键是这两种故障的判据来源。
+    """
+    from backend.shared.tdx_aidata import protocol
+
+    # 真机形态：服务端错误信封（ErrorId=10 + Error 文本携带 RetFlag=-5397）
+    assert (
+        protocol.push_error_kind(
+            "推送错误 ErrorId=10: 订阅服务器返回错误 RetFlag=-5397"
+        )
+        == "server_errorid_10_retflag_-5397"
+    )
+    # 有 ErrorId 无 RetFlag（如 ErrorId=11 连接失败）
+    assert protocol.push_error_kind("推送错误 ErrorId=11: None") == "server_errorid_11"
+    # 本地解析失败两类
+    assert protocol.push_error_kind("推送非 JSON: Expecting value") == "non_json"
+    assert protocol.push_error_kind("推送类型不支持: bytes") == "unsupported_type"
+    # 未知形态兜底（不猜）
+    assert protocol.push_error_kind(None) == "other"
+
+
+@pytest.mark.unit
+def test_on_push_error_envelope_counted_and_kept_as_evidence():
+    """on_push 解析失败：分类计数 + 出错原文留证（成功帧不覆盖）。
+
+    旧实现只有 last_frame_preview——下一帧成功推就把它覆盖了，ErrorId=10/-5397
+    这种 ~1% 的偶发信封事后无证据可查；last_parse_error_preview 是出错侧独立留证位。
+    """
+    import json
+
+    from backend.shared.tdx_aidata.collector import SubscriptionEngine
+
+    engine = SubscriptionEngine(
+        sdk_subscribe=lambda codes, cb: None,
+        sdk_unsubscribe=lambda: None,
+        budget_gate=None,
+        redis_factory=None,
+    )
+    raw_err = json.dumps({"ErrorId": 10, "Error": "订阅服务器返回错误 RetFlag=-5397"})
+    assert engine.on_push(raw_err) == 1  # 计数跳过，帧流继续
+    assert engine.counters["parse_errors"] == 1
+    assert engine.counters["parse_error_codes"] == {
+        "server_errorid_10_retflag_-5397": 1
+    }
+    assert "RetFlag=-5397" in engine.counters["last_parse_error_preview"]
+
+    # 后续成功帧：frames 走通、出错留证不被覆盖（两个键互不干扰）
+    ok = json.dumps(
+        {
+            "ErrorId": 0,
+            "ResultSets": [
+                {"ColDes": ["code", "price"], "Content": [["600036.SH", "40.92"]]}
+            ],
+        }
+    )
+    engine.on_push(ok)
+    assert engine.counters["frames"] == 1
+    assert engine.counters["last_frame_records"] == 1
+    assert "RetFlag=-5397" in engine.counters["last_parse_error_preview"]
+
+    # 非 JSON（本地解析坏了）单独归类，不与服务端信封混计
+    engine.on_push("not-json")
+    assert engine.counters["parse_error_codes"]["non_json"] == 1
+    assert engine.counters["parse_errors"] == 2

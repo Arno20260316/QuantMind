@@ -72,6 +72,7 @@ async def lifespan(app: FastAPI):
     advice_generator_task = None
     tdx_hot_set_feed_task = None
     quote_freshness_watch_task = None
+    tdx_cluster_watch_task = None
     health_recheck_task = None
     close_audit_task = None
     daily_pnl_report_task = None
@@ -366,6 +367,29 @@ async def lifespan(app: FastAPI):
         else:
             quote_freshness_watch_task = None
             logger.info("quote freshness watch disabled (QM_QUOTE_WATCH_ENABLED=false)")
+
+        # TdxAiData 订阅集群守护（2026-10-14）：分片 worker 无其他拉起入口——
+        # 容器重建/崩溃后订阅静默不在；本任务体检缺片即拉起（订阅关时空转）
+        if str(
+            os.getenv("QM_TDX_CLUSTER_WATCH_ENABLED", "true")
+        ).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            from backend.services.live_trading.services.tdx_cluster_watch import (
+                run_tdx_cluster_watch_task,
+            )
+
+            tdx_cluster_watch_task = asyncio.create_task(
+                run_tdx_cluster_watch_task(), name="tdx-cluster-watch"
+            )
+        else:
+            tdx_cluster_watch_task = None
+            logger.info(
+                "tdx cluster watch disabled (QM_TDX_CLUSTER_WATCH_ENABLED=false)"
+            )
 
         # 哨兵告警（T-P6-15）：总线消费→留痕→分级推送 + T+1 回填（Redis 门控热读）
         if str(os.getenv("QM_SENTINEL_WORKER_ENABLED", "true")).strip().lower() not in {
@@ -916,6 +940,7 @@ async def lifespan(app: FastAPI):
         advice_generator_task,
         tdx_hot_set_feed_task,
         quote_freshness_watch_task,
+        tdx_cluster_watch_task,
         risk_tier_task,
         decision_round_task,
         leverage_trim_task,

@@ -154,7 +154,12 @@ def test_parse_push_payload_rejects_error_and_garbage():
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_push_payload("not-json")
     # 缺 code 的行跳过（不假造 symbol）
-    assert protocol.parse_push_payload({"ErrorId": 0, "ResultSets": [{"ColDes": ["price"], "Content": [["1.0"]]}]}) == []
+    assert (
+        protocol.parse_push_payload(
+            {"ErrorId": 0, "ResultSets": [{"ColDes": ["price"], "Content": [["1.0"]]}]}
+        )
+        == []
+    )
 
 
 class FakeWorker:
@@ -166,12 +171,16 @@ class FakeWorker:
         self.requests: list[dict] = []
         self.mode = "ok"  # ok | rate_limited | hang | crash
         self.spawns = 0
+        self._writers: list[asyncio.StreamWriter] = []
+        self._tasks: list[asyncio.Task | None] = []
 
     async def start(self):
         self.server = await asyncio.start_unix_server(self._handle, path=str(self.path))
         return self
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self._writers.append(writer)
+        self._tasks.append(asyncio.current_task())
         try:
             while True:
                 line = await reader.readline()
@@ -217,7 +226,10 @@ class FakeWorker:
                     resp = {
                         "id": req["id"],
                         "ok": True,
-                        "result": {"symbol": req["params"].get("symbol"), "price": 40.92},
+                        "result": {
+                            "symbol": req["params"].get("symbol"),
+                            "price": 40.92,
+                        },
                         "error": None,
                         "meta": {"duration_ms": 3.0, "attempts": 1},
                     }
@@ -227,9 +239,29 @@ class FakeWorker:
             return
 
     async def close(self):
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
+        """确定性收摊：server.close() + 显式关闭每条已接纳连接 + 取消未退出 handler。
+
+        坑（Python 3.12.1+ 语义）：``Server.wait_closed()`` 会一直等到所有活动连接
+        断开；而流式协议的 ``eof_received()`` 对非 SSL 返回 True（半关语义，允许
+        对端 FIN 后继续写）——对端关闭**不会**自动收掉服务侧 transport，其对端
+        close() 后 wait_closed() 会永久挂起（3.10/3.11 的 wait_closed 立即返回，
+        曾把此坑盖住；本地 venv 3.12.13 实跑复现）。handler 自己也不关 writer
+        （ok 模式等 EOF 直接 return，hang 模式还在 sleep）。修复=这里显式
+        ``writer.close()``（触发 transport._call_connection_lost → server._detach
+        → 唤醒 wait_closed）+ cancel 仍在跑的 handler 任务（hang 模式）。
+        """
+        if self.server is None:
+            return
+        self.server.close()
+        for writer in self._writers:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001 - 收摊尽力而为
+                pass
+        for task in self._tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        await self.server.wait_closed()
 
 
 @pytest.mark.asyncio

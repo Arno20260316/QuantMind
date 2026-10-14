@@ -60,7 +60,9 @@ def refresh_time_to_epoch(hhmmss: str, now: datetime) -> int | None:
     local_now = now.astimezone(CST)
     try:
         dt = local_now.replace(
-            hour=int(text[:2]), minute=int(text[2:4]), second=int(text[4:]),
+            hour=int(text[:2]),
+            minute=int(text[2:4]),
+            second=int(text[4:]),
             microsecond=0,
         )
     except ValueError:
@@ -79,7 +81,11 @@ def normalize_subscription_symbol(symbol: object) -> tuple[str, str] | None:
     except Exception:  # noqa: BLE001
         return None
     prefix = str(prefix or "").strip().upper()
-    if len(prefix) != 8 or prefix[:2] not in {"SH", "SZ", "BJ"} or not prefix[2:].isdigit():
+    if (
+        len(prefix) != 8
+        or prefix[:2] not in {"SH", "SZ", "BJ"}
+        or not prefix[2:].isdigit()
+    ):
         return None
     return f"{prefix[2:]}.{prefix[:2]}", prefix
 
@@ -121,9 +127,13 @@ def frame_to_redis(record: dict, now: datetime) -> dict[str, Any] | None:
         "symbol": prefix,
     }
     for src, dst in (
-        ("high", "High"), ("low", "Low"), ("volume", "Volume"),
-        ("limit_up", "LimitUp"), ("limit_down", "LimitDown"),
-        ("seal_amount", "SealAmount"), ("open", "PreOpenRaw"),
+        ("high", "High"),
+        ("low", "Low"),
+        ("volume", "Volume"),
+        ("limit_up", "LimitUp"),
+        ("limit_down", "LimitDown"),
+        ("seal_amount", "SealAmount"),
+        ("open", "PreOpenRaw"),
     ):
         if record.get(src) is not None:
             snapshot_fields[dst] = str(record[src])
@@ -236,7 +246,9 @@ class SubscriptionEngine:
         self._redis_factory = redis_factory
         self._hot_set_reader = hot_set_reader  # 热集读取（部署本地 Redis；None=回落写侧客户端，测试/兼容路径）
         self._archiver = archiver  # l05_store.SnapshotArchiver | None（L0.5 落盘 sink）
-        self._latency = latency  # latency_metrics.LatencyRecorder | None（T-P6-05 时延打点）
+        self._latency = (
+            latency  # latency_metrics.LatencyRecorder | None（T-P6-05 时延打点）
+        )
         self._hot_set_key = hot_set_key
         self.cap = int(cap)
         self.silence_s = float(silence_s)
@@ -273,8 +285,14 @@ class SubscriptionEngine:
             records = protocol.parse_push_payload(raw)
         except Exception as exc:  # noqa: BLE001
             self.counters["parse_errors"] += 1
+            # 分类计数 + 保留出错原文预览（2026-10-14）：区分「服务端偶发错误信封」
+            # （ErrorId=10/RetFlag=-5397，约 1% 帧、无数据丢失）与「本地解析坏了」。
+            # 旧实现只回 last_frame_preview，会被下一帧成功推覆盖 → 事后无证据。
+            kind = protocol.push_error_kind(exc)
+            codes = self.counters.setdefault("parse_error_codes", {})
+            codes[kind] = int(codes.get(kind, 0)) + 1
             self.counters["last_error"] = f"push parse: {exc}"
-            self.counters["last_frame_preview"] = str(raw)[:120]
+            self.counters["last_parse_error_preview"] = str(raw)[:160]
             return 1
         self.counters["frames"] += 1
         self.counters["last_frame_preview"] = str(raw)[:120]
@@ -338,9 +356,15 @@ class SubscriptionEngine:
                     pipe.expire(mapped["snapshot_key"], SNAPSHOT_TTL)
                     pipe.zadd(
                         mapped["series_key"],
-                        {json.dumps(mapped["series_payload"], ensure_ascii=False): mapped["ts"]},
+                        {
+                            json.dumps(
+                                mapped["series_payload"], ensure_ascii=False
+                            ): mapped["ts"]
+                        },
                     )
-                    pipe.zremrangebyrank(mapped["series_key"], 0, -(SERIES_MAX_POINTS + 1))
+                    pipe.zremrangebyrank(
+                        mapped["series_key"], 0, -(SERIES_MAX_POINTS + 1)
+                    )
                     pipe.expire(mapped["series_key"], SERIES_TTL)
                 pipe.execute()
                 self.counters["written"] += written
@@ -445,7 +469,10 @@ class SubscriptionEngine:
             self.counters["over_cap"] = True
             logger.error(
                 "分片 %d/%d 应订 %d 只超 SDK 上限 %d：截断（请上调 QM_SUB_SHARDS）",
-                self.shard_id, self.shard_count, len(desired), SDK_SUBSCRIBE_MAX,
+                self.shard_id,
+                self.shard_count,
+                len(desired),
+                SDK_SUBSCRIBE_MAX,
             )
             desired = desired[:SDK_SUBSCRIBE_MAX]
         else:
@@ -466,9 +493,16 @@ class SubscriptionEngine:
             return {"changed": False, "current": len(self._current)}
         # 热集差分重订最小间隔（防 churn 抖动；订阅不占请求预算后的自有节流，见 resubscribe）
         now = time.time()
-        if self._last_resubscribe_ts and now - self._last_resubscribe_ts < self.resubscribe_min_gap_s:
+        if (
+            self._last_resubscribe_ts
+            and now - self._last_resubscribe_ts < self.resubscribe_min_gap_s
+        ):
             self.counters["resubscribe_deferred_gap"] += 1
-            return {"changed": False, "reason": "min_gap", "current": len(self._current)}
+            return {
+                "changed": False,
+                "reason": "min_gap",
+                "current": len(self._current),
+            }
         ok = self.resubscribe(desired)
         return {
             "changed": ok,
@@ -482,7 +516,10 @@ class SubscriptionEngine:
     async def run(self) -> None:
         logger.info(
             "subscription engine started hot_set=%s shard=%d/%d silence=%.0fs",
-            self._hot_set_key, self.shard_id, self.shard_count, self.silence_s,
+            self._hot_set_key,
+            self.shard_id,
+            self.shard_count,
+            self.silence_s,
         )
         while not self._stop.is_set():
             try:
@@ -497,7 +534,8 @@ class SubscriptionEngine:
                 ):
                     logger.warning(
                         "订阅静默 %.0fs，强制重订阅 %d 只",
-                        now - (self.last_frame_ts or now), len(self._current),
+                        now - (self.last_frame_ts or now),
+                        len(self._current),
                     )
                     await asyncio.to_thread(self.resubscribe, set(self._current))
             except Exception as exc:  # noqa: BLE001 - 循环永不退出

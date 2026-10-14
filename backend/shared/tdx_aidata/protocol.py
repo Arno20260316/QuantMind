@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -90,9 +91,7 @@ def _dates(data: dict) -> list[str]:
             break
     if sample is None:
         return []
-    return [
-        str(d.date()) if hasattr(d, "date") else str(d) for d in list(sample.index)
-    ]
+    return [str(d.date()) if hasattr(d, "date") else str(d) for d in list(sample.index)]
 
 
 def _val(data: dict, field: str, symbol: str, i: int) -> Any:
@@ -163,15 +162,31 @@ def bars_from_market_data(data: dict, symbol: str) -> list[dict[str, Any]]:
 # limit_down/cage_up/cage_down/after_hours_flag/tomorrow_limit_up(tomorrow_limit_down)/
 # sdunit_status/seal_amount/ask1..5/ask_vol1..5/bid1..5/bid_vol1..5。
 
-_PUSH_NUMERIC = frozenset(
-    {
-        "decimal", "price", "pre_close", "open", "high", "low", "volume",
-        "bond_match_price", "limit_up", "limit_down", "cage_up", "cage_down",
-        "tomorrow_limit_up", "tomorrow_limit_down", "seal_amount",
-    }
-) | {f"ask{i}" for i in range(1, 6)} | {f"ask_vol{i}" for i in range(1, 6)} | {
-    f"bid{i}" for i in range(1, 6)
-} | {f"bid_vol{i}" for i in range(1, 6)}
+_PUSH_NUMERIC = (
+    frozenset(
+        {
+            "decimal",
+            "price",
+            "pre_close",
+            "open",
+            "high",
+            "low",
+            "volume",
+            "bond_match_price",
+            "limit_up",
+            "limit_down",
+            "cage_up",
+            "cage_down",
+            "tomorrow_limit_up",
+            "tomorrow_limit_down",
+            "seal_amount",
+        }
+    )
+    | {f"ask{i}" for i in range(1, 6)}
+    | {f"ask_vol{i}" for i in range(1, 6)}
+    | {f"bid{i}" for i in range(1, 6)}
+    | {f"bid_vol{i}" for i in range(1, 6)}
+)
 
 
 def _to_number(value: Any) -> float | None:
@@ -233,13 +248,49 @@ def parse_push_payload(raw: Any) -> list[dict[str, Any]]:
 # ── 错误映射 ────────────────────────────────────────────────────────
 
 
+_PUSH_ERR_ID_RE = re.compile(r"ErrorId=(\d+)")
+_PUSH_RETFLAG_RE = re.compile(r"RetFlag=(-?\d+)")
+
+
+def push_error_kind(message: object) -> str:
+    """推送解析失败 → 稳定分类键（计数/证据用；只归类，不改判）。
+
+    已知形态（2026-10-14 全链实测）：``ErrorId=10`` + ``RetFlag=-5397`` = 订阅服务
+    对本次推送返回错误信封（载荷无 ResultSets、无数据丢失，约 1% 帧，帧流不断）；
+    ``推送非 JSON`` = 载荷破损；其余归 ``other``。分类键进
+    ``SubscriptionEngine.counters["parse_error_codes"]``，供排障一眼分辨「服务端
+    偶发」与「本地解析坏了」。
+    """
+    text = str(message or "")
+    m = _PUSH_ERR_ID_RE.search(text)
+    if m:
+        kind = f"server_errorid_{m.group(1)}"
+        r = _PUSH_RETFLAG_RE.search(text)
+        if r:
+            kind += f"_retflag_{r.group(1)}"
+        return kind
+    if "推送非 JSON" in text:
+        return "non_json"
+    if "推送类型不支持" in text:
+        return "unsupported_type"
+    return "other"
+
+
 def map_sdk_error(message: object) -> tuple[str, str]:
     """SDK 异常/打印文本 → 统一错误 code。"""
     text = str(message or "")
     low = text.lower()
     if "insufficient" in low or "code=13" in low or "错误码 13" in text:
-        return "rate_limited", f"Token Insufficient（配额不足，冷却窗口后重试）: {text[:80]}"
-    if "不是对象" in text or "invalid parameter" in low or "code=6" in low or "错误码 6" in text:
+        return (
+            "rate_limited",
+            f"Token Insufficient（配额不足，冷却窗口后重试）: {text[:80]}",
+        )
+    if (
+        "不是对象" in text
+        or "invalid parameter" in low
+        or "code=6" in low
+        or "错误码 6" in text
+    ):
         return "invalid_params", f"参数错误: {text[:120]}"
     if "不可用" in text or "not loaded" in low or "动态库" in text:
         return "sdk_unavailable", f"SDK 不可用: {text[:120]}"

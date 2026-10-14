@@ -63,6 +63,9 @@ _HEARTBEAT_WIRED = {
     "live_equity_sampler": "services/live_trading/services/live_equity_sampler.py",
     # M8 行情快照断流监视：给**数据**判活（写侧循环心跳证明不了「有数据落库」）
     "quote_freshness_watch": "services/live_trading/services/quote_freshness_watch.py",
+    # 2026-10-14 TdxAiData 订阅集群守护：分片 worker 无其他拉起入口，本任务
+    # 是「订阅集群到底有没有人在看着」的唯一观测面（心跳写在巡检循环里）。
+    "tdx_cluster_watch": "services/live_trading/services/tdx_cluster_watch.py",
     # P0-3 训练僵尸作业回收器（住在 API 进程；心跳写在清扫循环里）
     "training_reaper": "services/engine/training/job_reaper.py",
     # P2-5 值班摘要（trade 常驻，15:40）：心跳写在常驻循环里；它同时是死手
@@ -286,6 +289,8 @@ def test_schedule_ctl_dispatch_covers_rerun_declared_jobs():
         "duty_deadman",
         # 2026-10-12 QQ 情报速览（重跑 = 立刻冲刷一轮；done 键挡住已发档期）
         "intel_briefing",
+        # 2026-10-14 TdxAiData 订阅集群守护（重跑 = 体检 + 缺片真拉起 worker 进程）
+        "tdx_cluster_watch",
     }
 
     # 未知任务 → 退出码 2（纯函数路径，不触发真实执行）

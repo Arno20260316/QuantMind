@@ -29,6 +29,7 @@ import re
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from backend.shared.tdx_aidata import config, protocol
@@ -303,6 +304,16 @@ class AidataWorker:
         if not config.dir_ready(self.directory):
             self.sdk_error = f"安装目录不完整: {self.directory}"
             return
+        # 包内 lib ini 撕裂自愈（2026-10-14 事故，必须先于 SDK 引入）：.so 并发
+        # 无锁回写该文件会产出键截断的撕裂态 → 订阅成功但零推送、全链无报错。
+        try:
+            broken = config.repair_pkg_ini_if_broken(
+                str(Path(self.directory) / "TdxAiData.ini")
+            )
+            if broken:
+                logger.warning("包内 TdxAiData.ini 撕裂已自愈: %s", "; ".join(broken))
+        except Exception as exc:  # noqa: BLE001 - 自愈失败不阻断启动（体检 C 面可见）
+            logger.warning("包内 TdxAiData.ini 自愈失败: %s", exc)
         os.chdir(
             self.directory
         )  # .so 依赖同目录 NewTc.dat；本进程专用于此，无副作用顾虑
@@ -653,7 +664,24 @@ class AidataWorker:
             pass
 
 
+def _disable_core_dumps() -> None:
+    """禁止 worker 产生 core dump（磁盘保护）。
+
+    原生库段错误时内核会把 core 落到进程 CWD=安装目录：2026-09 曾撑爆根分区，
+    2026-10-14 审计仍有 9 个共 ≈6.5GB（单次 600MB~1.7GB × 分片数）。原生库闭源、
+    core 诊断价值低（排障走 SDK 日志 + fd 级诊断 + counters），事故面远大于收益。
+    需要 core 取证时手动以 ``ulimit -c unlimited`` 直跑单实例（隔离探针模式）。
+    """
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:  # noqa: BLE001 - 非 POSIX 或受限环境：保持默认，不阻断启动
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _disable_core_dumps()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

@@ -370,6 +370,10 @@ def _sum_counters(snaps: list[dict[str, Any]]) -> dict[str, Any]:
 
     ``hot_set_size`` 例外：各分片视角同值（全量热集），聚合取 **max** 而非求和
     （否则 6 片会把 527 报成 3162——2026-09-17 首跑验收仪器实测踩到）。
+
+    嵌套 dict（``parse_error_codes`` 等分类计数）**逐键求和**——旧实现走
+    "非数值取首个非空"分支，整字典只留首片的映射（2026-10-14 实盘踩到：
+    集群视图只显示 s0 的 8023，真实全集群是 8 片之和，静默少报 87%）。
     """
     merged: dict[str, Any] = {}
     for snap in snaps:
@@ -381,6 +385,17 @@ def _sum_counters(snaps: list[dict[str, Any]]) -> dict[str, Any]:
                     merged[key] = max(merged.get(key, 0), value)
                 else:
                     merged[key] = merged.get(key, 0) + value
+            elif isinstance(value, dict):
+                acc = merged.get(key)
+                if not isinstance(acc, dict):
+                    acc = merged[key] = {}
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, bool):
+                        acc[sub_key] = bool(acc.get(sub_key, False)) or sub_value
+                    elif isinstance(sub_value, (int, float)):
+                        acc[sub_key] = acc.get(sub_key, 0) + sub_value
+                    elif sub_value is not None and not acc.get(sub_key):
+                        acc[sub_key] = sub_value
             elif value is not None and not merged.get(key):
                 merged[key] = value
     return merged

@@ -509,7 +509,9 @@ def _run_tca_report(date_str: str | None, force: bool) -> int:
     print(f"\n[TCA] 已落盘 {json_path} / {md_path}")
     sample_n = int((rep.get("sample") or {}).get("n") or 0)
     if sample_n < MIN_SAMPLE:
-        print(f"[TCA] 样本 {sample_n} < {MIN_SAMPLE}：只展示不做结论（退出码 1 = 注意）")
+        print(
+            f"[TCA] 样本 {sample_n} < {MIN_SAMPLE}：只展示不做结论（退出码 1 = 注意）"
+        )
         return 1
     return 0
 
@@ -624,6 +626,29 @@ def _run_intel_briefing(date_str: str | None, force: bool) -> int:
     return 0
 
 
+def _run_tdx_cluster_watch(date_str: str | None, force: bool) -> int:
+    """TdxAiData 订阅集群「重跑」= 立刻做一次集群体检 + 缺片拉起（真拉起 worker 进程）。
+
+    ``date_str`` 不适用；``--force`` 无特殊语义（本任务的重跑本身就是执行）。
+    订阅关/通道关时只体检不拉起（与常驻循环同一判据，绝不因手跑就绕过开关）。
+    退出码 1 = 有分片拉起失败（如实标注，不假装全绿）。
+    """
+    import asyncio
+
+    from backend.shared.tdx_aidata import config
+    from backend.shared.tdx_aidata.client import default_cluster
+
+    if not (config.is_enabled() and config.subscription_enabled()):
+        print(
+            "tdx 通道或订阅未启用（is_enabled/subscription_enabled 有假）：只体检不拉起"
+        )
+        return 0
+    started = asyncio.run(default_cluster().ensure_all())
+    up = sum(1 for ok in started.values() if ok)
+    print(f"tdx_cluster_watch: 分片就绪 {up}/{len(started)} → {started}")
+    return 0 if started and up == len(started) else 1
+
+
 def _run_duty_deadman(date_str: str | None, force: bool) -> int:
     """值班死手「重跑」= 核对一遍；``--force`` 跳过非交易日闸门与当日封账键。
 
@@ -718,6 +743,9 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # 2026-10-12 QQ 速览：重跑 = 立刻冲刷一轮（做的是当天最近一档；已发过
     # 的由 done 键挡住，不会重复推）。
     "intel_briefing": _run_intel_briefing,
+    # 2026-10-14 TdxAiData 订阅集群守护：重跑 = 立刻体检 + 缺片真拉起 worker 进程
+    # （订阅关时只体检不拉起，与常驻循环同判据）。
+    "tdx_cluster_watch": _run_tdx_cluster_watch,
 }
 
 

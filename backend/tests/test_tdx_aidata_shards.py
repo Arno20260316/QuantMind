@@ -173,6 +173,13 @@ def test_merge_subscriptions_aggregate():
                 "last_error": None,
                 "over_cap": False,
                 "hot_set_size": 527,  # 分片视角同值：聚合必须取 max（求和会报成 3162）
+                # 嵌套 dict 计数（2026-10-14）：聚合必须逐键求和——旧实现整字典
+                # 只留首片（merged.get(key) 已存在即跳过），集群视图静默少报。
+                "parse_error_codes": {
+                    "server_errorid_10_retflag_-5397": 8023,
+                    "non_json": 2,
+                },
+                "last_parse_error_preview": None,
             },
             "archiver": {
                 "pending_rows": 5,
@@ -196,6 +203,11 @@ def test_merge_subscriptions_aggregate():
                 "last_error": "boom",
                 "over_cap": True,
                 "hot_set_size": 527,
+                "parse_error_codes": {
+                    "server_errorid_10_retflag_-5397": 7137,
+                    "non_json": 1,
+                },
+                "last_parse_error_preview": "推送错误 ErrorId=10 ... RetFlag=-5397",
             },
             "archiver": {
                 "pending_rows": 3,
@@ -216,6 +228,15 @@ def test_merge_subscriptions_aggregate():
     assert merged["counters"]["last_error"] == "boom"  # 字符串取首个非空
     assert merged["counters"]["over_cap"] is True  # bool 逐片或
     assert merged["counters"]["hot_set_size"] == 527  # 同值取 max 而非求和
+    # 嵌套 dict 逐键求和（集群视图 = 全部分片之和，不得只留首片）
+    assert merged["counters"]["parse_error_codes"] == {
+        "server_errorid_10_retflag_-5397": 8023 + 7137,
+        "non_json": 3,
+    }
+    assert (
+        merged["counters"]["last_parse_error_preview"]
+        == "推送错误 ErrorId=10 ... RetFlag=-5397"
+    )  # 字符串取首个非空（None 跳过、跳到 s1）
     assert (
         merged["archiver"]["rows"] == 1900 and merged["archiver"]["flush_errors"] == 1
     )
@@ -431,7 +452,11 @@ def test_resubscribe_not_charged_to_request_budget_and_min_gap():
         sdk_subscribe=lambda codes, cb: subs.append(list(codes)),
         sdk_unsubscribe=lambda: None,
         budget_gate=gate,
-        redis_factory=lambda: type("R", (), {"smembers": lambda self, k: set(members), "close": lambda self: None})(),
+        redis_factory=lambda: type(
+            "R",
+            (),
+            {"smembers": lambda self, k: set(members), "close": lambda self: None},
+        )(),
         resubscribe_min_gap_s=60.0,
     )
     engine.sync_hot_set_once()
@@ -522,7 +547,10 @@ def test_engine_reads_hot_set_via_local_reader_not_write_client():
     assert result["changed"] is True
     assert engine._current == {"600036.SH", "000001.SZ"}
     assert "999999.SH" not in engine._current
-    assert calls["subscribe"] and set(calls["subscribe"][-1]) == {"600036.SH", "000001.SZ"}
+    assert calls["subscribe"] and set(calls["subscribe"][-1]) == {
+        "600036.SH",
+        "000001.SZ",
+    }
 
 
 @pytest.mark.unit

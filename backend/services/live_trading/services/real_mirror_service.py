@@ -1346,7 +1346,7 @@ async def _submit_payload(
     tenant = str(payload.get("tenant_id") or "default")
     user_id = str(payload.get("user_id") or "")
 
-    def _skip(reason: str) -> dict[str, Any]:
+    def _skip(reason: str, **extra: Any) -> dict[str, Any]:
         logger.info(
             "[Mirror] 提交前跳过 %s %s qty=%s cid=%s reason=%s",
             symbol,
@@ -1363,7 +1363,7 @@ async def _submit_payload(
             reason=reason,
             source=str(payload.get("source") or "submit"),
         )
-        return {"status": "skipped", "reason": reason, "symbol": symbol}
+        return {"status": "skipped", "reason": reason, "symbol": symbol, **extra}
 
     ref_price = await _reference_price(symbol)
     if ref_price <= 0:
@@ -1496,7 +1496,9 @@ async def _submit_payload(
             snapshot.get("daily_orders", 0),
             snapshot.get("daily_symbols", 0),
         )
-        return {"status": "skipped", "reason": reason, "symbol": symbol, **snapshot}
+        # 走 _skip 记台账：限额跳过原先裸 return，对账报表读不到 → 缺口永远
+        # unexplained（2026-10-14 max_order_value 三笔隐形）。
+        return _skip(reason, **snapshot)
     was_new_symbol = _as_int(snapshot.get("new_symbol")) == 1
     quota_date = str(snapshot.get("date") or "")
 
@@ -1518,7 +1520,8 @@ async def _submit_payload(
             symbol,
             blocked,
         )
-        return {"status": "skipped", "reason": blocked, "symbol": symbol, **snapshot}
+        # 同限额路径：复检拦截也必须记台账，否则对账报表把这类缺口判成 unexplained。
+        return _skip(blocked, **snapshot)
 
     from backend.services.live_trading.services.internal_strategy_dispatcher import (
         dispatch_internal_strategy_order,

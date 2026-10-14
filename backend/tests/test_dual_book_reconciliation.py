@@ -128,6 +128,119 @@ class TestSkipRecording:
         assert mirror.load_skips(FakeRedis(), "20260911") == {}
 
 
+class TestSubmitPayloadSkipLedger:
+    """``_submit_payload`` 里**两条裸返回**的跳过路径也必须进跳过台账。
+
+    限额拒绝（``_reserve_quota`` → max_order_value 等）与下发前复检拦截
+    （``_dispatch_gate_blocked`` → 急停/开关/名单）原先直接 return 不 record_skip：
+    停在 15:10 对账报表里就是 unexplained 缺口 → 假告警（2026-10-14 实测：
+    3 笔 max_order_value 跳过全部隐形）。
+    """
+
+    _PAYLOAD = {
+        "symbol": "600338.SH",
+        "side": "BUY",
+        "quantity": 800.0,
+        "price": 10.0,
+        "client_order_id": "mir-test-1",
+        "source": "llm_decision",
+    }
+
+    def _run(self, redis, *, reserve, blocked=None, released=None):
+        async def _ref_price(symbol):
+            return 10.0
+
+        async def _acct(redis_):
+            return {"cash": 1e9, "available_volume": {}}
+
+        patches = [
+            patch.object(mirror, "_reference_price", _ref_price),
+            patch.object(mirror, "_account_snapshot", _acct),
+            patch.object(mirror, "_reserve_quota", reserve),
+        ]
+        if blocked is not None:
+            patches.append(
+                patch.object(mirror, "_dispatch_gate_blocked", lambda *a, **k: blocked)
+            )
+            patches.append(
+                patch.object(
+                    mirror, "_release_quota", released or (lambda *a, **k: None)
+                )
+            )
+        return patches
+
+    def _invoke(self, redis):
+        return asyncio.run(
+            mirror._submit_payload(
+                db=None,
+                redis=redis,
+                cfg=mirror.MirrorConfig(),
+                payload=dict(self._PAYLOAD),
+            )
+        )
+
+    def test_quota_reject_records_skip_with_source(self) -> None:
+        redis = FakeRedis()
+
+        def _reject(redis_, cfg_, *, symbol, value):
+            return (
+                False,
+                "max_order_value",
+                {
+                    "date": "20261014",
+                    "daily_value": 99999.0,
+                    "daily_orders": 3,
+                    "daily_symbols": 2,
+                },
+            )
+
+        patches = self._run(redis, reserve=_reject)
+        with patches[0], patches[1], patches[2]:
+            result = self._invoke(redis)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "max_order_value"
+        counts = mirror.load_skips(redis)
+        assert counts["600338.SH:max_order_value"] == 1
+        # detail 里带得出 source（排障要能分清哪条链跳的）
+        key = next(k for k in redis.client.hashes if k.startswith("mirror:skipped:"))
+        detail = redis.client.hashes[key]["600338.SH:max_order_value:detail"]
+        assert '"source": "llm_decision"' in detail
+
+    def test_dispatch_gate_block_records_skip_and_releases_quota(self) -> None:
+        redis = FakeRedis()
+        released: list[dict] = []
+
+        def _reserve(redis_, cfg_, *, symbol, value):
+            return (
+                True,
+                "",
+                {
+                    "date": "20261014",
+                    "new_symbol": 1,
+                    "daily_value": 8160.0,
+                    "daily_orders": 1,
+                    "daily_symbols": 1,
+                },
+            )
+
+        def _release(redis_, cfg_, **kwargs):
+            released.append(kwargs)
+
+        patches = self._run(
+            redis, reserve=_reserve, blocked="kill_switch", released=_release
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = self._invoke(redis)
+
+        assert result["reason"] == "kill_switch"
+        assert mirror.load_skips(redis)["600338.SH:kill_switch"] == 1
+        # 额度回滚仍发生，且带回预留时的日期键
+        assert released and released[0]["symbol"] == "600338.SH"
+        assert released[0]["was_new_symbol"] is True
+        assert released[0]["date_str"] == "20261014"
+
+
 # --------------------------------------------------------------------------
 # 双轨对账
 # --------------------------------------------------------------------------
@@ -188,6 +301,66 @@ class TestReconciliationReport:
         assert report["diffs"][0]["kind"] == "excess"
         assert report["sim_symbols"] == 0
         assert report["real_symbols"] == 1
+
+
+class TestSymbolNormalization:
+    """跨栈符号口径必须归一后再 join：模拟账前缀式（SH600338）、真单/台账键后缀式
+    （600338.SH、``mirror:skipped`` 键）。
+
+    不归一化时同一标的在两账里是「两个代码」：既报一笔假 excess 又报一笔假
+    shortfall，且跳过记录永远挂不上缺口 → 全判 unexplained（2026-10-14 15:10
+    实测假告警：600338 被拆成 600338.SH 多 800 + SH600338 缺 2800）。
+    """
+
+    def test_prefix_sim_and_suffix_real_join_into_one_shortfall(self) -> None:
+        report = reconcile.build_reconciliation_report(
+            date_str="20261014",
+            sim_rows=[("SH600338", "BUY", 2800)],
+            real_rows=[("600338.SH", "BUY", 800)],
+            skips={},
+        )
+        assert len(report["diffs"]) == 1
+        diff = report["diffs"][0]
+        assert diff["symbol"] == "600338.SH"
+        assert diff["kind"] == "shortfall"
+        assert diff["delta"] == -2000
+        assert report["sim_symbols"] == 1
+        assert report["real_symbols"] == 1
+
+    def test_suffix_skip_key_explains_prefix_sim_row(self) -> None:
+        report = reconcile.build_reconciliation_report(
+            date_str="20261014",
+            sim_rows=[("SH600338", "BUY", 2800)],
+            real_rows=[("600338.SH", "BUY", 800)],
+            skips={"600338.SH:max_order_value": 3},
+        )
+        diff = report["diffs"][0]
+        assert diff["explained"] is True
+        assert diff["skip_reasons"] == {"max_order_value": 3}
+        assert report["ok"] is True
+
+    def test_bare_digit_sim_row_joins_suffix_real_row(self) -> None:
+        report = reconcile.build_reconciliation_report(
+            date_str="20261014",
+            sim_rows=[("000681", "BUY", 900)],
+            real_rows=[("000681.SZ", "BUY", 900)],
+            skips={},
+        )
+        assert report["diffs"] == []
+        assert report["ok"] is True
+
+    def test_mixed_forms_of_same_symbol_aggregate_once(self) -> None:
+        report = reconcile.build_reconciliation_report(
+            date_str="20261014",
+            sim_rows=[("SH600338", "BUY", 100), ("600338.SH", "BUY", 200)],
+            real_rows=[],
+            skips={"sh600338:price_drift": 1},  # 小写台账键同样要能挂上
+        )
+        assert report["sim_symbols"] == 1
+        diff = report["diffs"][0]
+        assert diff["symbol"] == "600338.SH"
+        assert diff["sim_quantity"] == 300
+        assert diff["explained"] is True
 
 
 class TestFailureAwareness:

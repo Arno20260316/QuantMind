@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, select
 
 from backend.services.live_trading.services.trading_session import TZ
+from backend.shared.stock_utils import StockCodeUtil
 
 logger = logging.getLogger(__name__)
 
@@ -98,13 +99,18 @@ def cst_day_window(date_str: str) -> tuple[datetime, datetime]:
 
 
 def _by_symbol(ledger: dict[str, int] | None) -> dict[str, dict[str, int]]:
-    """``{"symbol:reason": count}`` → ``{SYMBOL: {reason: count}}``（两张台账同形状）。"""
+    """``{"symbol:reason": count}`` → ``{SUFFIX码: {reason: count}}``（两张台账同形状）。
+
+    键一律归一为后缀式（``StockCodeUtil.to_suffix``）：台账键与 sim/real 两账
+    必须同一口径才能挂得上（前缀式 ``SH600338`` vs 后缀式 ``600338.SH`` 是
+    2026-10-14 对账假告警的根因）。
+    """
     out: dict[str, dict[str, int]] = {}
     for field, count in (ledger or {}).items():
         symbol, _, reason = str(field).partition(":")
         if not symbol or not reason:
             continue
-        out.setdefault(symbol.upper(), {})[reason] = int(count)
+        out.setdefault(StockCodeUtil.to_suffix(symbol), {})[reason] = int(count)
     return out
 
 
@@ -124,6 +130,11 @@ def build_reconciliation_report(
 
     两个 ``*_reasons`` 的语义**不同**：``skip_reasons`` 非空 ⇒ 缺口已解释（不算告警）；
     ``failure_reasons`` 非空 ⇒ 缺口**照旧告警**，只是附上了原因。
+
+    **符号口径**：两侧都归一到后缀式（``StockCodeUtil.to_suffix``）再 join——sim
+    账（``sim_trades``）写前缀式、真单（``orders``）写后缀式，不归一化同一标的会
+    被拆成两笔假差异（一笔 excess + 一笔 shortfall）。报表输出的 ``symbol`` 为
+    后缀式，与行情层口径一致。
     """
     skips_by_symbol = _by_symbol(skips)
     failures_by_symbol = _by_symbol(failures)
@@ -131,7 +142,7 @@ def build_reconciliation_report(
     def _aggregate(rows: list[tuple[str, str, float]]) -> dict[tuple[str, str], dict]:
         agg: dict[tuple[str, str], dict] = {}
         for symbol, side, quantity in rows:
-            key = (str(symbol or "").upper(), str(side or "").upper())
+            key = (StockCodeUtil.to_suffix(str(symbol or "")), str(side or "").upper())
             item = agg.setdefault(key, {"quantity": 0.0, "count": 0})
             item["quantity"] += float(quantity or 0)
             item["count"] += 1

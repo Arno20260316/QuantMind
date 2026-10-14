@@ -10,13 +10,27 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from backend.shared.decision.context import PoolQuote
+from backend.shared.decision.context import HoldingRow, PoolQuote
 from backend.shared.decision_blocks import (
+    CONSISTENCY_RULES,
+    INDEX_CODES,
+    SeriesSummary,
     attach_signal_scores,
+    book_imbalance,
+    build_cross_agent_block,
+    build_freshness_block,
+    build_indices_block,
+    build_l2_block,
     build_market_state_block,
+    build_minute_block,
+    build_news_block,
+    build_orderbook_block,
+    build_prev_round_block,
     build_signal_meta_block,
+    build_tier_block,
+    parse_brief_ts,
 )
 
 CST = timezone(timedelta(hours=8))
@@ -302,3 +316,392 @@ class TestRendererIntegration:
         assert without == with_empty
         assert "【盘中市场状态】" not in without
         assert "【盘中模型信号】" not in without
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Stage 2 第二批：丁1–丁9 渲染器
+#
+# 同一组守卫：缺失一律显式「—/不可得」绝不编数；未接线 → 空串（字节冻结）；
+# 坏值（指数五档垃圾大数）挡在渲染外但绝不静默——降级必须说出来。
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _holding(code: str = "600036.SH", name: str = "招商银行") -> HoldingRow:
+    return HoldingRow(
+        code=code,
+        name=name,
+        volume=1000,
+        cost=38.0,
+        price=40.0,
+        pnl_pct=5.26,
+        day_chg=1.2,
+        avail=1000,
+    )
+
+
+def _book_snap(
+    *,
+    now: float = 40.0,
+    pre_close: float = 39.5,
+    open_px: float | None = 39.8,
+    bid1: float = 39.99,
+    ask1: float = 40.01,
+    bid_vol1: float = 300.0,
+    ask_vol1: float = 100.0,
+    extra_bids: tuple[tuple[float, float], ...] = (),
+    extra_asks: tuple[tuple[float, float], ...] = (),
+) -> dict:
+    snap: dict = {
+        "Now": now,
+        "PreClose": pre_close,
+        "bid1": bid1,
+        "ask1": ask1,
+        "bid_vol1": bid_vol1,
+        "ask_vol1": ask_vol1,
+    }
+    if open_px is not None:
+        snap["Open"] = open_px
+    for i, (px, vol) in enumerate(extra_bids, start=2):
+        snap[f"bid{i}"] = px
+        snap[f"bid_vol{i}"] = vol
+    for i, (px, vol) in enumerate(extra_asks, start=2):
+        snap[f"ask{i}"] = px
+        snap[f"ask_vol{i}"] = vol
+    return snap
+
+
+class TestBookImbalance:
+    def test_computes_gross_imbalance(self):
+        snap = _book_snap(extra_bids=((39.98, 300.0),), extra_asks=((40.02, 100.0),))
+        # (600−200)/(600+200) = +0.5
+        assert book_imbalance(snap) == 0.5
+
+    def test_missing_half_of_book_is_none(self):
+        # 只有买侧无卖侧 → 不可验证，绝不返回 +1.0 冒充单边强势
+        assert book_imbalance({"bid1": 10.0, "bid_vol1": 100.0}) is None
+        assert book_imbalance(None) is None
+        assert book_imbalance({}) is None
+
+    def test_index_garbage_prices_are_rejected(self):
+        # 指数帧五档实测是垃圾大数（415065178112.0）→ 整体 None（不出失衡行）
+        snap = _book_snap(
+            bid1=415065178112.0,
+            ask1=415065178112.0,
+            bid_vol1=1.0,
+            ask_vol1=1.0,
+        )
+        assert book_imbalance(snap) is None
+        # 0 价同样不可验证（撮合价永非 0）
+        assert book_imbalance(_book_snap(bid1=0.0)) is None
+
+    def test_zero_total_volume_is_none(self):
+        snap = _book_snap(bid_vol1=0.0, ask_vol1=0.0)
+        assert book_imbalance(snap) is None
+
+
+class TestBuildOrderbookBlock:
+    def test_per_holding_line_with_book_gap_and_speed(self):
+        snaps = {"600036.SH": _book_snap()}
+        series = {"600036.SH": SeriesSummary(mom5m_pct=-0.42)}
+        text = build_orderbook_block((_holding(),), snaps, series, NOW)
+
+        assert text.startswith("【实时盘口】")
+        assert "量比：5 日均量源未接入，不渲染" in text
+        assert "招商银行(600036.SH) 现价 40.00（+1.27%）" in text
+        assert "买一 39.99×300手 卖一 40.01×100手" in text
+        assert "五档失衡 +50.0%" in text and "买盘强" in text
+        assert "跳空 +0.76%（开 39.80）" in text
+        assert "5分钟涨速 -0.42%" in text
+
+    def test_missing_speed_renders_dash_not_zero(self):
+        text = build_orderbook_block(
+            (_holding(),), {"600036.SH": _book_snap()}, {}, NOW
+        )
+        assert "5分钟涨速 —" in text
+
+    def test_all_snapshots_missing_says_unavailable(self):
+        text = build_orderbook_block((_holding(),), {}, {}, NOW)
+        assert "【实时盘口】本轮不可得" in text
+        assert "不要凭记忆里的价格判断盘口" in text
+
+    def test_partial_missing_is_counted(self):
+        snaps = {"600036.SH": _book_snap()}
+        text = build_orderbook_block(
+            (_holding(), _holding("600519.SH", "贵州茅台")), snaps, {}, NOW
+        )
+        assert "另有 1 只持仓本轮快照未取到" in text
+
+    def test_no_holdings_and_unwired_are_empty(self):
+        # 无持仓 → 空串；整段不进提示词（未接线/无对象一律字节中性）
+        assert build_orderbook_block((), {"600036.SH": _book_snap()}, {}, NOW) == ""
+
+
+class TestBuildMinuteBlock:
+    def test_renders_series_summary(self):
+        series = {
+            "600036.SH": SeriesSummary(
+                mom30m_pct=0.85,
+                mom5m_pct=-0.42,
+                vol5m_shares=123400.0,
+                source="tdx_bridge",
+            )
+        }
+        text = build_minute_block((_holding(),), series, NOW)
+
+        assert "30 分钟 +0.85%" in text
+        assert "5 分钟 -0.42%" in text
+        assert "5 分钟量 1,234 手（同源差）" in text
+
+    def test_empty_series_renders_unavailable(self):
+        text = build_minute_block((_holding(),), {}, NOW)
+        assert "【分钟特征】本轮不可得" in text
+
+    def test_missing_code_in_series_says_dash(self):
+        text = build_minute_block((_holding(),), {"600519.SH": SeriesSummary()}, NOW)
+        assert "30 分钟 —" in text and "5 分钟量 —" in text
+
+    def test_no_holdings_is_empty(self):
+        assert build_minute_block((), {"600036.SH": SeriesSummary()}, NOW) == ""
+
+
+class TestParseBriefTs:
+    def test_aware_iso_parses(self):
+        stamp = parse_brief_ts({"ts": "2026-10-14T09:00:00+08:00"})
+        assert stamp == datetime(2026, 10, 14, 9, 0, tzinfo=CST).timestamp()
+
+    def test_naive_and_garbage_are_none(self):
+        # 契约是 aware ISO；naive 当坏值不猜时区
+        assert parse_brief_ts({"ts": "2026-10-14T09:00:00"}) is None
+        assert parse_brief_ts({"ts": "{不是时间}"}) is None
+        assert parse_brief_ts({"ts": ""}) is None
+        assert parse_brief_ts(None) is None
+        assert parse_brief_ts({}) is None
+
+    def test_epoch_number_accepted(self):
+        assert parse_brief_ts({"ts": 1000.0}) == 1000.0
+
+
+class TestBuildNewsBlock:
+    BRIEF = {
+        "ts": NOW.isoformat(),
+        "holdings": [
+            {
+                "code": "600036.SH",
+                "name": "招商银行",
+                "verdict": "利空",
+                "impact": 1.0,
+                "event_type": "公告",
+                "headline": "某利空",
+                "source": "东财",
+                "note": "关注",
+            },
+            {
+                "code": "600519.SH",
+                "name": "贵州茅台",
+                "verdict": "利好",
+                "impact": 2.0,
+                "event_type": "业绩",
+                "headline": "某利好（非持仓）",
+            },
+        ],
+    }
+    WATCH = {
+        "ts": NOW.isoformat(),
+        "items": [
+            {"code": "000001.SZ", "ts": NOW.isoformat(), "why": "直线拉升"},
+            {"code": "600036.SH", "ts": NOW.isoformat(), "why": "持仓的池外重复项须滤"},
+        ],
+    }
+
+    def test_holding_hits_and_watch_pool_render(self):
+        text = build_news_block(self.BRIEF, self.WATCH, ("600036.SH",), NOW)
+
+        assert "[利空] 招商银行(600036.SH) 公告：某利空（东财）；关注" in text
+        assert "贵州茅台" not in text  # 非持仓不进命中
+        assert "池外异动 000001.SZ：直线拉升" in text
+        assert "持仓的池外重复项须滤" not in text  # 持仓码不进池外段
+
+    def test_no_holding_hit_says_so_not_silent(self):
+        text = build_news_block(self.BRIEF, None, ("000002.SZ",), NOW)
+        assert "本轮简报无持仓相关条目" in text
+
+    def test_missing_file_says_unavailable(self):
+        text = build_news_block(None, None, (), NOW)
+        assert "【盘中新闻】本轮不可得" in text
+
+    def test_unwired_is_empty(self):
+        assert build_news_block(None, None, (), NOW, wired=False) == ""
+
+    def test_stale_brief_marked(self):
+        stale = {**self.BRIEF, "ts": (NOW - timedelta(hours=9)).isoformat()}
+        text = build_news_block(stale, None, ("600036.SH",), NOW)
+        assert "简报已 9.0 小时未更新，当旧闻读" in text
+
+    def test_watch_capped_at_five(self):
+        watch = {
+            "items": [{"code": f"00000{i}.SZ", "why": f"异动{i}"} for i in range(1, 8)]
+        }
+        text = build_news_block(self.BRIEF, watch, (), NOW)
+        assert "异动5" in text and "异动6" not in text
+
+
+class TestBuildIndicesBlock:
+    def test_renders_four_indices_and_sector_gated_line(self):
+        snaps = {
+            "000300.SH": {"Now": 4590.12, "PreClose": 4615.5},
+            "000001.SH": {"Now": 3300.0, "PreClose": 3289.0},
+        }
+        text = build_indices_block(snaps, NOW)
+
+        assert "沪深300：4,590.12（-0.55%）" in text
+        assert "上证指数：3,300.00（+0.33%）" in text
+        assert "深证成指：本轮未取到" in text
+        assert "创业板指：本轮未取到" in text
+        assert "板块涨幅源未接入" in text
+
+    def test_index_codes_table(self):
+        assert INDEX_CODES == ("000300.SH", "000001.SH", "399001.SZ", "399006.SZ")
+
+
+class TestBuildL2Block:
+    def test_always_honest_unavailable(self):
+        text = build_l2_block()
+        assert "【L2 微观结构】本轮不可得" in text
+        assert "五档失衡" in text and "代理" in text
+
+
+def _tier(**kw):
+    from backend.shared.risk.tiers import TierState
+
+    base = {
+        "level": "defensive",
+        "label": "防守",
+        "source": "doc",
+        "budget": {
+            "leverage_max": 1.2,
+            "per_stock_pct": 0.15,
+            "max_new_buys": 2,
+            "leverage_trim_to": 1.15,
+            "per_stock_pos_pct": 0.25,
+        },
+    }
+    base.update(kw)
+    return TierState(**base)
+
+
+class TestBuildTierBlock:
+    def test_five_keys_render_with_zh_labels(self):
+        text = build_tier_block(_tier())
+
+        assert "【风险预算档位】（defensive·防守，来源 doc）" in text
+        assert "杠杆上限 1.20" in text
+        assert "单票买入上限 15%" in text
+        assert "单轮最多新开 2 只" in text
+        assert "减仓线（触达降至） 1.15" in text
+        assert "单票持仓上限 25%" in text
+        assert "按此档位收紧" in text
+
+    def test_unconfigured_budget_still_renders_default_note(self):
+        # 档位未配置照样出块：说「按默认防守」比让模型假设无约束强
+        text = build_tier_block(_tier(level="", label="", budget={}, source="absent"))
+        assert "档位未配置" in text and "默认防守参数" in text
+
+    def test_problems_are_flagged(self):
+        text = build_tier_block(_tier(problems=("文档日期缺失",)))
+        assert "档位异常：文档日期缺失" in text
+
+    def test_unwired_is_empty(self):
+        assert build_tier_block(None) == ""
+
+
+def _rec(
+    *,
+    id: str,
+    agent: str = "a1",
+    round_id: str = "rnd-1",
+    action: str = "buy",
+    code: str = "600036.SH",
+    pct: float | None = 0.2,
+    reason: str = "理由",
+    minute: int = 30,
+):
+    from backend.shared.decision_ledger_store import DecisionRecord
+
+    return DecisionRecord(
+        id=id,
+        pool_key="k",
+        round_id=round_id,
+        tenant_id="t",
+        user_id="u",
+        agent=agent,
+        market="CN",
+        trade_date=date(2026, 10, 14),
+        decided_at=datetime(2026, 10, 14, 9, minute, tzinfo=CST),
+        code=code,
+        action=action,
+        pct=pct,
+        reason=reason,
+    )
+
+
+class TestBuildPrevRoundBlock:
+    def test_first_round_says_no_prior(self):
+        assert "今日首轮分析" in build_prev_round_block((), "a1", NOW)
+        only_others = (_rec(id="x1", agent="a2"),)
+        assert "今日首轮分析" in build_prev_round_block(only_others, "a1", NOW)
+
+    def test_latest_round_of_own_agent_with_consistency_rules(self):
+        rows = (
+            _rec(id="x1", round_id="rnd-1", minute=5, action="buy"),
+            _rec(
+                id="x2",
+                round_id="rnd-2",
+                minute=40,
+                action="sell",
+                pct=1.0,
+                reason="破位",
+            ),
+        )
+        text = build_prev_round_block(rows, "a1", NOW)
+
+        assert "09:40，1 条" in text
+        assert "- 卖出 100% 600036.SH：破位" in text
+        assert "09:05" not in text  # 只取最新一轮
+        assert CONSISTENCY_RULES in text
+
+    def test_hold_only_round_renders_explicitly(self):
+        rows = (_rec(id="x1", action="hold", minute=12),)
+        text = build_prev_round_block(rows, "a1", NOW)
+        assert "09:12 一轮全部为 hold" in text
+
+
+class TestBuildCrossAgentBlock:
+    def test_lists_other_agents_latest_rounds(self):
+        rows = (
+            _rec(id="x1", agent="a2", round_id="rnd-1", minute=5),
+            _rec(id="x2", agent="a2", round_id="rnd-2", minute=25, action="sell"),
+            _rec(id="x3", agent="a1", round_id="rnd-2", minute=26),  # 自己不算
+            _rec(id="x4", agent="a3", round_id="rnd-2", minute=27, action="hold"),
+        )
+        text = build_cross_agent_block(rows, "a1")
+
+        assert "a2（09:25）：卖出 20% 600036.SH" in text
+        assert "09:05" not in text
+        assert "a3（09:27 一轮）：全 hold" in text
+        assert "【其他 agent 动态】" in text
+
+    def test_no_others_says_so(self):
+        text = build_cross_agent_block((_rec(id="x1", agent="a1"),), "a1")
+        assert "今日暂无可参考的他家决策" in text
+
+
+class TestBuildFreshnessBlock:
+    def test_empty_alerts_unwired_is_empty(self):
+        assert build_freshness_block(()) == ""
+        assert build_freshness_block(["", " "]) == ""
+
+    def test_renders_downgrades(self):
+        text = build_freshness_block(["行情序列缺成员：分钟动量不可得", "L2 无源"])
+        assert text.startswith("【数据新鲜度警告】")
+        assert "- 行情序列缺成员：分钟动量不可得" in text
+        assert "- L2 无源" in text

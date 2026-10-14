@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -287,4 +287,427 @@ def build_market_state_block(
         lines.append(stamp)
     elif notes:
         lines.append("- 注：" + "；".join(notes))
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Stage 2 第二批：丁1–丁9（细案「Stage 2 第二批」；全部数据门控纯函数）
+#
+# 同一批纪律：不取数、不连 Redis、不读文件；缺失一律显式「—/不可得」，
+# 绝不编 0；未接线 → 调用方传空 → 对应块整段空串（历史字节冻结）。
+# ══════════════════════════════════════════════════════════════════════
+
+#: 展示面指数（丁5）：沪深300/上证/深成/创业板。与 hot_set ``REGIME_INDEXES``
+#: 是两件事：前者=取快照的要价清单（含深市两指数，需在热集常驻源），本表=渲染名。
+INDEX_DISPLAY: tuple[tuple[str, str], ...] = (
+    ("000300.SH", "沪深300"),
+    ("000001.SH", "上证指数"),
+    ("399001.SZ", "深证成指"),
+    ("399006.SZ", "创业板指"),
+)
+INDEX_CODES: tuple[str, ...] = tuple(code for code, _ in INDEX_DISPLAY)
+
+#: 五档失衡「强」阈值（上游 ±30% 口径；方向强弱标注用，不参与触发）。
+OB_IMB_STRONG = 0.30
+
+#: 新闻简报新鲜窗（小时）：超过仍在块里（情报仍有价值），但头部标旧。
+NEWS_BLOCK_STALE_H = 8.0
+
+#: 价格合理性上限：指数快照的五档字段实测是垃圾大数（415065178112.0），
+#: 个股档位×100 以内都远小于此——用它把「指数五档」等坏值挡在渲染外。
+_BOOK_PRICE_CAP = 1e7
+
+
+def book_imbalance(snap: Mapping[str, Any] | None, *, levels: int = 5) -> float | None:
+    """快照 → 五档失衡 ``(Σ买量−Σ卖量)/(Σ买量+Σ卖量)``；不可验证一律 ``None``。
+
+    单位=手（TDX 帧口径）。守卫（对齐 ``redis_series_quote`` 的「不可验证一律
+    None，绝不返回 0 冒充」）：任一档价格非有限/越界（指数垃圾值/0）→ ``None``；
+    档位缺失按缺档求和（至少要有买一卖一）；两侧量全 0 → ``None``。
+    """
+    if not isinstance(snap, Mapping):
+        return None
+    bid_v = 0.0
+    ask_v = 0.0
+    seen = 0
+    for i in range(1, levels + 1):
+        bp = _f(snap.get(f"bid{i}"))
+        ap = _f(snap.get(f"ask{i}"))
+        for price in (bp, ap):
+            if price is not None and not 0 < price < _BOOK_PRICE_CAP:
+                return None  # 出现的价格必须合理（指数帧垃圾值 → 整票拒）
+        if i == 1 and (bp is None or ap is None):
+            return None  # 买一卖一缺任一 = 盘口不可验证
+        if bp is not None:
+            bv = _f(snap.get(f"bid_vol{i}"))
+            if bv is not None and bv >= 0:
+                bid_v += bv
+                seen += 1
+        if ap is not None:
+            av = _f(snap.get(f"ask_vol{i}"))
+            if av is not None and av >= 0:
+                ask_v += av
+                seen += 1
+    if seen < 2 or bid_v + ask_v <= 0:
+        return None
+    return (bid_v - ask_v) / (bid_v + ask_v)
+
+
+def _pct2(value: float | None) -> str:
+    """百分比单元格：缺失 → ``—``（口径同 ``_pct``，简写版）。"""
+    if value is None or not isinstance(value, (int, float)) or value != value:
+        return "—"
+    return f"{value:+.2f}%"
+
+
+def _lots_text(shares: float | None) -> str:
+    """股 → 手文本（series volume 契约：手；差值为股，显示折回手）。"""
+    if shares is None or not isinstance(shares, (int, float)) or shares != shares:
+        return "—"
+    return f"{shares / 100.0:,.0f} 手"
+
+
+def _snap_now(snap: Mapping[str, Any] | None) -> float | None:
+    if not isinstance(snap, Mapping):
+        return None
+    return _f(snap.get("Now") if snap.get("Now") is not None else snap.get("now"))
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesSummary:
+    """``market:series`` 每码摘要（feeds 层产出、本层消费）。
+
+    ``momentum*_pct`` = 现价相对 (last_ts − N 分钟) 前最近成员的涨跌 %；
+    ``vol5m_shares`` = 窗口内**同源**累计量差（股；口径与 ``redis_series_quote.
+    recent_traded_shares`` 同源，不可验证 → ``None``）。
+    """
+
+    last_ts: float = 0.0
+    last_price: float | None = None
+    mom30m_pct: float | None = None
+    mom5m_pct: float | None = None
+    vol5m_shares: float | None = None
+    source: str = ""
+
+
+def build_orderbook_block(
+    holdings: Sequence[Any],
+    snaps: Mapping[str, Mapping[str, Any]] | None,
+    series: Mapping[str, SeriesSummary] | None,
+    now: datetime,
+) -> str:
+    """丁1【实时盘口】：持仓逐股五档失衡/跳空/5 分钟涨速（量比无源不渲染）。
+
+    指数/坏值（五档垃圾）→ 该股不进行中= ``—``；快照整段缺失 → 「本轮不可得」。
+    无持仓 → 空串（块无对象）。空串即整段不出现在提示词（字节冻结纪律）。
+    """
+    if not holdings:
+        return ""
+    snaps = snaps or {}
+    series = series or {}
+    lines: list[str] = []
+    missing = 0
+    for h in holdings:
+        snap = snaps.get(str(h.code))
+        if not snap:
+            missing += 1
+            continue
+        now_px = _snap_now(snap)
+        chg = day_change_pct(snap)
+        head = f"- {h.name}({h.code})"
+        if now_px is not None and now_px > 0:
+            head += f" 现价 {now_px:.2f}（{_pct2(chg)}）"
+        imb = book_imbalance(snap)
+        if imb is not None:
+            b1 = _f(snap.get("bid1"))
+            a1 = _f(snap.get("ask1"))
+            bv1 = _f(snap.get("bid_vol1"))
+            av1 = _f(snap.get("ask_vol1"))
+            book = " ｜ 买一 " + (f"{b1:.2f}" if b1 is not None else "—")
+            if bv1 is not None:
+                book += f"×{bv1:,.0f}手"
+            book += " 卖一 " + (f"{a1:.2f}" if a1 is not None else "—")
+            if av1 is not None:
+                book += f"×{av1:,.0f}手"
+            strength = ""
+            if abs(imb) >= OB_IMB_STRONG:
+                strength = "，买盘强" if imb > 0 else "，卖盘强"
+            head += (
+                book + f" ｜ 五档失衡 {imb:+.1%}（强阈 ±{OB_IMB_STRONG:.0%}{strength}）"
+            )
+        # 跳空：开盘 vs 昨收；两个价都在才算。
+        open_px = _f(snap.get("Open"))
+        pre_close = _f(snap.get("PreClose"))
+        if open_px and pre_close and pre_close > 0 and open_px > 0:
+            gap = (open_px - pre_close) / pre_close * 100.0
+            head += f" ｜ 跳空 {gap:+.2f}%（开 {open_px:.2f}）"
+        summary = series.get(str(h.code))
+        head += f" ｜ 5分钟涨速 {_pct2(summary.mom5m_pct if summary else None)}"
+        lines.append(head)
+    if not lines:
+        if missing:
+            return (
+                "【实时盘口】本轮不可得（持仓快照缺失——行情源或热集未覆盖持仓标的）。"
+                "五档/跳空/短涨速均无数据，不要凭记忆里的价格判断盘口。"
+            )
+        return ""
+    header = (
+        "【实时盘口】（持仓逐股五档；单位手。量比：5 日均量源未接入，不渲染。"
+        "指数五档在行情帧里是坏值，天然不出现）"
+    )
+    if missing:
+        lines.append(f"- （另有 {missing} 只持仓本轮快照未取到）")
+    return "\n".join([header] + lines)
+
+
+def build_minute_block(
+    holdings: Sequence[Any],
+    series: Mapping[str, SeriesSummary] | None,
+    now: datetime,
+) -> str:
+    """丁3【分钟特征】：mom30m/mom5m/vol5m（同源口径）；量比无源不渲染。"""
+    if not holdings:
+        return ""
+    series = series or {}
+    if not series:
+        return (
+            "【分钟特征】本轮不可得（行情序列 ``market:series`` 无成员——订阅引擎"
+            "未运行、断流或非交易时段）。30 分钟/5 分钟动量与短窗成交量均缺位。"
+        )
+    lines = []
+    for h in holdings:
+        s = series.get(str(h.code))
+        lines.append(
+            f"- {h.name}({h.code})：30 分钟 {_pct2(s.mom30m_pct if s else None)}"
+            f" ｜ 5 分钟 {_pct2(s.mom5m_pct if s else None)}"
+            f" ｜ 5 分钟量 {_lots_text(s.vol5m_shares if s else None)}（同源差）"
+        )
+    header = "【分钟特征】（market:series 实时序列；量与撮合同一口径=手、同源）"
+    return "\n".join([header] + lines)
+
+
+def build_l2_block() -> str:
+    """丁2【L2 微观结构】门控块：QM 无盘中逐笔 L2 源——如实不可得，永不静默。"""
+    return (
+        "【L2 微观结构】本轮不可得——QM 未接入盘中逐笔 L2 源（内外盘/大单/主力"
+        "资金等逐笔指标缺位；日频 L2 因子在 QuantDB，不构成盘中口径）。盘口类"
+        "异动的替代口径是五档失衡（见【实时盘口】，那是代理、不是 L2）。"
+        "不要凭空推断逐笔资金流向。"
+    )
+
+
+def parse_brief_ts(brief: Mapping[str, Any] | None) -> float | None:
+    """新闻简报 ``ts``（ISO，含 +08:00）→ epoch 秒；坏值 → ``None``。"""
+    raw = (brief or {}).get("ts")
+    if isinstance(raw, (int, float)) and raw == raw and raw > 0:
+        return float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None  # 契约是 aware（+08:00）；naive 当坏值，不猜时区
+    return moment.timestamp()
+
+
+def build_news_block(
+    brief: Mapping[str, Any] | None,
+    watch: Mapping[str, Any] | None,
+    held_codes: Sequence[str],
+    now: datetime,
+    *,
+    wired: bool = True,
+) -> str:
+    """丁4【盘中新闻】：简报持仓命中 + 池外异动观察（``intraday_watch``）。
+
+    ``wired=False``（未接线）→ 空串；接线但文件缺失 → 「本轮不可得」；文件在但
+    本轮没有持仓相关条目 → 只出头部（「无持仓相关」一行）——**读不到与没新闻
+    是两件事**，前者必须说出来。简报 ts 超 :data:`NEWS_BLOCK_STALE_H` 小时 → 标旧。
+    """
+    if not wired:
+        return ""
+    held = {str(c) for c in held_codes}
+    if not brief:
+        return (
+            "【盘中新闻】本轮不可得（news_brief 简报文件缺失或未产出——"
+            "持仓相关消息面本轮缺位，不要凭空引用未在上下文里的新闻）。"
+        )
+    lines: list[str] = []
+    headers_hits = 0
+    for item in _json_list(brief.get("holdings")):
+        if not isinstance(item, Mapping):
+            continue
+        code = str(item.get("code") or "").strip()
+        if code not in held:
+            continue
+        verdict = str(item.get("verdict") or "情报")
+        name = str(item.get("name") or "")
+        event = str(item.get("event_type") or "")
+        headline = str(item.get("headline") or "")
+        source = str(item.get("source") or "")
+        note = str(item.get("note") or "")
+        tail = f"（{source}）" if source else ""
+        extra = f"；{note}" if note else ""
+        lines.append(f"- [{verdict}] {name}({code}) {event}：{headline}{tail}{extra}")
+        headers_hits += 1
+    watch_lines: list[str] = []
+    for item in _json_list((watch or {}).get("items")):
+        if not isinstance(item, Mapping):
+            continue
+        code = str(item.get("code") or "").strip()
+        if not code or code in held:
+            continue
+        why = str(item.get("why") or "").strip()
+        watch_lines.append(f"- 池外异动 {code}：{why}")
+    watch_lines = watch_lines[:5]
+
+    stamp = parse_brief_ts(brief)
+    head = "【盘中新闻】（news_brief 简报：持仓命中 + 池外异动）"
+    if stamp is not None:
+        age_h = max(0.0, (now.timestamp() - stamp)) / 3600.0
+        if age_h > NEWS_BLOCK_STALE_H:
+            head += f"——简报已 {age_h:.1f} 小时未更新，当旧闻读"
+    if not headers_hits:
+        lines.append("- （本轮简报无持仓相关条目）")
+    if watch_lines:
+        lines.append("- 池外异动观察（非持仓，信息面参考）：")
+        lines.extend(watch_lines)
+    return "\n".join([head] + lines)
+
+
+def build_indices_block(
+    snaps: Mapping[str, Mapping[str, Any]] | None,
+    now: datetime,
+) -> str:
+    """丁5【大盘指数】：四只指数现价+涨跌；板块行门控（无源，如实标注）。"""
+    snaps = snaps or {}
+    lines = ["【大盘指数】（实时快照；板块涨幅源未接入——行业面见「行业风险」段）"]
+    for code, name in INDEX_DISPLAY:
+        snap = snaps.get(code)
+        price = _snap_now(snap)
+        if price is not None and price > 0:
+            chg = day_change_pct(snap)
+            lines.append(f"- {name}：{price:,.2f}（{_pct2(chg)}）")
+        else:
+            lines.append(f"- {name}：本轮未取到")
+    return "\n".join(lines)
+
+
+#: 丁9 一致性规则（移植上游 ``live_hourly_analysis.py:688-702`` 的行为约束）。
+CONSISTENCY_RULES = (
+    "一致性规则：反转必须有硬理由（新事实/新价格），否则沿用上一轮判断；"
+    "上一轮已卖出、现已不在持仓里的股票不要再输出 sell；同一只票不要在一日内"
+    "无理由来回翻转。"
+)
+
+
+def _decision_line(rec: Any) -> str:
+    action_zh = {"buy": "买入", "sell": "卖出"}.get(str(rec.action), str(rec.action))
+    pct = ""
+    if rec.pct is not None:
+        try:
+            pct = f" {float(rec.pct):.0%}"
+        except (TypeError, ValueError):
+            pct = ""
+    reason = str(rec.reason or "").strip()
+    if len(reason) > 60:
+        reason = reason[:60] + "…"
+    tail = f"：{reason}" if reason else ""
+    return f"- {action_zh}{pct} {rec.code or rec.code_raw}{tail}"
+
+
+def _actionable(rows: Sequence[Any]) -> list[Any]:
+    """可参考的决策行：买/卖（hold 不进互看块——那是噪音）。"""
+    return [r for r in rows if str(getattr(r, "action", "")) in ("buy", "sell")]
+
+
+def build_prev_round_block(rows: Sequence[Any], agent: str, now: datetime) -> str:
+    """丁9【上一轮你的建议】：本 agent 今日最近一轮（买入/卖出行）+ 一致性规则。"""
+    mine = [r for r in rows if str(getattr(r, "agent", "")) == agent]
+    if not mine:
+        return "【上一轮你的建议】本轮为今日首轮分析，无上一轮建议。"
+    latest_round = max(mine, key=lambda r: (r.decided_at, r.id)).round_id
+    round_rows = _actionable([r for r in mine if r.round_id == latest_round])
+    if not round_rows:
+        return (
+            "【上一轮你的建议】（"
+            f"{max(r.decided_at for r in mine):%H:%M} 一轮全部为 hold）"
+            "——" + CONSISTENCY_RULES
+        )
+    lines = [
+        f"【上一轮你的建议】（{round_rows[0].decided_at:%H:%M}，{len(round_rows)} 条）"
+    ]
+    lines.extend(_decision_line(r) for r in round_rows)
+    lines.append(CONSISTENCY_RULES)
+    return "\n".join(lines)
+
+
+def build_cross_agent_block(rows: Sequence[Any], agent: str) -> str:
+    """丁6【其他 agent 动态】：每家最新一轮的买/卖行（互看防同码对撞）。"""
+    others = [r for r in rows if str(getattr(r, "agent", "")) != agent]
+    if not others:
+        return "【其他 agent 动态】今日暂无可参考的他家决策。"
+    by_agent: dict[str, list[Any]] = {}
+    for r in others:
+        by_agent.setdefault(str(r.agent), []).append(r)
+    lines = ["【其他 agent 动态】（各家今日最新一轮的买卖动作；同码反向注意对撞）"]
+    for name, group in sorted(by_agent.items()):
+        latest_round = max(group, key=lambda r: (r.decided_at, r.id)).round_id
+        picks = _actionable([r for r in group if r.round_id == latest_round])
+        stamp = max(r.decided_at for r in group if r.round_id == latest_round)
+        if not picks:
+            lines.append(f"- {name}（{stamp:%H:%M} 一轮）：全 hold")
+            continue
+        for r in picks:
+            lines.append(f"- {name}（{stamp:%H:%M}）：{_decision_line(r)[2:]}")
+    return "\n".join(lines)
+
+
+_TIER_KEY_LABELS: tuple[tuple[str, str, str], ...] = (
+    ("leverage_max", "杠杆上限", "{:.2f}"),
+    ("per_stock_pct", "单票买入上限", "{:.0%}"),
+    ("max_new_buys", "单轮最多新开", "{:.0f} 只"),
+    ("leverage_trim_to", "减仓线（触达降至）", "{:.2f}"),
+    ("per_stock_pos_pct", "单票持仓上限", "{:.0%}"),
+)
+
+
+def build_tier_block(tier: Any) -> str:
+    """丁7【风险预算档位】：当前档位五键 + 「本轮已按其收紧」。
+
+    ``tier`` = ``risk/tiers.TierState``；``None``（未接线）→ 空串。档位未配置
+    （budget 空）照样出块：说「按默认防守参数」比让模型假设无约束强。
+    """
+    if tier is None:
+        return ""
+    budget = getattr(tier, "budget", None) or {}
+    level = str(getattr(tier, "level", "") or "")
+    label = str(getattr(tier, "label", "") or "")
+    source = str(getattr(tier, "source", "") or "")
+    head = f"【风险预算档位】（{level or '未配置'}{f'·{label}' if label else ''}，来源 {source or '—'}）"
+    lines = [head]
+    parts: list[str] = []
+    for key, zh, fmt in _TIER_KEY_LABELS:
+        value = budget.get(key)
+        if isinstance(value, (int, float)):
+            parts.append(f"{zh} {fmt.format(value)}")
+    if parts:
+        lines.append("- " + " ｜ ".join(parts))
+        lines.append("- 本轮的询价/开仓/减仓按此档位收紧（成交与风控段仍为准）。")
+    else:
+        lines.append("- 档位未配置（无预算文档）：按默认防守参数执行。")
+    if getattr(tier, "problems", ()):
+        lines.append("- 档位异常：" + "；".join(str(p) for p in tier.problems[:3]))
+    return "\n".join(lines)
+
+
+def build_freshness_block(alerts: Sequence[str]) -> str:
+    """丁8【数据新鲜度警告】：各块降级留痕汇总（置顶渲染）。无降级 → 空串。"""
+    items = [str(a) for a in alerts if str(a).strip()]
+    if not items:
+        return ""
+    lines = ["【数据新鲜度警告】以下数据源本轮降级/缺位，判断前先看这里："]
+    lines.extend(f"- {a}" for a in items)
     return "\n".join(lines)

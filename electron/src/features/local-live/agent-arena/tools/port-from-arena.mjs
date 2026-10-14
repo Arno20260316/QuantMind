@@ -628,6 +628,46 @@ export const fetchFutuOrders = async (
     find: `String(overview.data.bridge.server_time).slice(11, 19)`,
     replace: `fmtBeijingClock(overview.data.bridge.server_time)`,
   },
+
+  // ===== 已完成/日期可读性（2026-10-15，用户报「已完成没有持仓日期、信息不全、日期字太小」）=====
+  // 后端 /live/closed 倒走归因出 entry_date（该轮持仓起点）→ 展示层画区间+完整持仓
+  // 时长；日期类小字（9–10px #888）只经 qm-arena-overrides.css 提亮，不动布局。
+  {
+    file: 'api/client.ts',
+    why: '已完成 feed 买入日：ClosedTradeDetail 增 entry_date（后端倒走归因；日志中途才开始 → null 显「—」）',
+    find: `  symbol: string;\n  exit_date: string; // YYYY-MM-DD`,
+    replace: `  symbol: string;\n  exit_date: string; // YYYY-MM-DD\n  /** 买入日 = 该轮持仓起点（后端倒走归因；日志中途才开始时为 null → 显「—」） */\n  entry_date?: string | null;`,
+  },
+  {
+    file: 'components/CompletedFeed.tsx',
+    why: '持仓时长「天+小时」：小数天不再裸出（1.84 曾显示成 1.84D 0H），小时位取尾数换算，进位 24 折进天数避免 2D 24H',
+    find: `/** 持仓时长：≥1 天按天、<1 天按小时（与 LastTradesTable 一致） */\nconst holdText = (days: number | null): string => {\n  if (days == null) return '—';\n  if (days < 1) return \`\${Math.round(days * 24)}H 0M\`;\n  return \`\${days}D 0H\`;\n};`,
+    replace: `/** 持仓时长：≥1 天按「天+小时」、<1 天按小时（与 LastTradesTable 一致）。\n *  小数天不再裸出（1.84 曾显示成 '1.84D 0H'）：小时位取小数天尾数换算，\n *  尾数四舍五入到 24 时折进天数，避免出现「2D 24H」。 */\nconst holdText = (days: number | null): string => {\n  if (days == null) return '—';\n  if (days < 1) return \`\${Math.round(days * 24)}H 0M\`;\n  const d = Math.floor(days);\n  const h = Math.round((days - d) * 24);\n  return h === 24 ? \`\${d + 1}D 0H\` : \`\${d}D \${h}H\`;\n};`,
+  },
+  {
+    file: 'components/CompletedFeed.tsx',
+    why: '已完成（A股）卡片角日期：从「只有平仓日」改「买入日 → 平仓日」区间（entry_date 缺失退化为单日）',
+    find: `              <span className="feed-date">{t.exit_date.slice(5)}</span>`,
+    replace: `              <span className="feed-date">{t.entry_date ? \`\${t.entry_date.slice(5)} → \${t.exit_date.slice(5)}\` : t.exit_date.slice(5)}</span>`,
+  },
+  {
+    file: 'components/CompletedFeed.tsx',
+    why: '已完成（港股）卡片角日期：slice 裸截留下「T」（09-24T14:41），空格分隔',
+    find: `                <span className="feed-date">{t.exit_date ? t.exit_date.slice(5, 16) : '—'}</span>`,
+    replace: `                <span className="feed-date">{t.exit_date ? t.exit_date.slice(5, 16).replace('T', ' ') : '—'}</span>`,
+  },
+  {
+    file: 'pages/Live.tsx',
+    why: '成交卡时刻：slice 裸截留下「T」（09-24T14:41），空格分隔（对账卡/成交卡两处同型，全局替换）',
+    find: /\{e\.ts\.slice\(5, 16\)\}/g,
+    replace: `{e.ts.slice(5, 16).replace('T', ' ')}`,
+  },
+  {
+    file: 'pages/Live.tsx',
+    why: '持仓卡买入行：时刻补空格分隔；买入日缺失（富途映射器不带买时）从「买入 」空尾改「买入日未知」',
+    find: `<span>买入 {p.buy_time.slice(5)}</span>`,
+    replace: `<span>{p.buy_time ? \`买入 \${p.buy_time.slice(5).replace('T', ' ')}\` : '买入日未知'}</span>`,
+  },
 ];
 
 // ────────────────────────────── 闭包解析 ──────────────────────────────

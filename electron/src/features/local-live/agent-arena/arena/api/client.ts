@@ -644,6 +644,8 @@ export const fetchTokenUsage = () =>
 export interface ClosedTradeDetail {
   symbol: string;
   exit_date: string; // YYYY-MM-DD
+  /** 买入日 = 该轮持仓起点（后端倒走归因；日志中途才开始时为 null → 显「—」） */
+  entry_date?: string | null;
   qty: number;
   /** 实盘（通达信桥）行可能缺成本价 → 0 */
   entry_price: number;

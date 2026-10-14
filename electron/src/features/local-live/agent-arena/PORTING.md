@@ -1,7 +1,7 @@
 # arena → QuantMind 实盘栏 移植清单（自动生成，勿手改）
 
 - 源：`/home/zbox/quant-Trader/arena/src`（arena 仓库 bd228b7，2026-10-08T12:42:46+09:00，工作区 干净）
-- 生成时间：2026-10-10T06:09:09.255Z
+- 生成时间：2026-10-14T15:53:11.260Z
 - 重新同步：`node electron/src/features/local-live/agent-arena/tools/port-from-arena.mjs`
 
 ## 搬运的文件（68 个）
@@ -97,12 +97,16 @@
 - api/client.ts：A6-① fetchIbkrAccount 函数体 → 直接失败
 - api/client.ts：A6-① fetchIbkrOrders → 直接失败（不发请求）
 - api/client.ts：T3-2（审计 C5）：LogLine 增 data_gaps —— 数据缺口标记随日志条目走，横幅判据=字段存在（不靠正文刮擦）
+- api/client.ts：已完成 feed 买入日：ClosedTradeDetail 增 entry_date（后端倒走归因；日志中途才开始 → null 显「—」）
 - components/ChatStream.tsx：T3-2：合规尾注引入宿主 compliance 单一来源组件（AI 生成提示 + 统一免责横条，勿抄字面量）
 - components/ChatStream.tsx：T3-2（审计 C5）：MixedRound 增 dataGaps 字段（跨行日志把缺口标记并进回合）+ McDisclaimer 合规尾注组件
 - components/ChatStream.tsx：T3-2（审计 C5）：缺口标记按日志行并进当前回合（去重）——A股单行含 user+assistant，标记挂在同一行也要能落到回合上
 - components/ChatStream.tsx：T3-2：空态也挂免责尾注（列表空时同样是 AI 展示面口径）
 - components/ChatStream.tsx：T3-2（审计 C5）：桥不可达轮挂「无实盘账户数据」横幅（判据=data_gaps 字段；常显不折叠），防 LLM 幻觉持仓点评被当事实读
 - components/ChatStream.tsx：T3-2：列表尾部挂 McDisclaimer（有分析记录时也出免责）
+- components/CompletedFeed.tsx：持仓时长「天+小时」：小数天不再裸出（1.84 曾显示成 1.84D 0H），小时位取尾数换算，进位 24 折进天数避免 2D 24H
+- components/CompletedFeed.tsx：已完成（A股）卡片角日期：从「只有平仓日」改「买入日 → 平仓日」区间（entry_date 缺失退化为单日）
+- components/CompletedFeed.tsx：已完成（港股）卡片角日期：slice 裸截留下「T」（09-24T14:41），空格分隔
 - components/EquityChart.tsx：日终账本线（real-ledger-*）的 tooltip 尾注（2026-10-08）：该线是实盘账户金额序列，不带前缀会落到「虚拟净值（¥10万起步）」兜底文案（对 ¥91.8 万实账是假的）；dollar 口径下 ±% 是「自首个记录日」，把窗口写清楚
 - components/EquityChart.tsx：E1 成交标记 x 先换算到联合轴序号（nearestIdxOfTime 给的是本线序号）
 - components/EquityChart.tsx：E1 对账台阶标注的可见窗口判断同样换算联合轴序号
@@ -132,9 +136,11 @@
 - pages/Live.tsx：富途恢复（2026-10-08）：实盘账户区块注释（hk 已恢复、us 仍下线）
 - pages/Live.tsx：下单面板（QM 本地新增 2026-10-08）：import HkOrderPanel（生成物外的本地组件，勿由 arena 覆盖）
 - pages/Live.tsx：下单面板：实盘 tab 港股分支在账户双卡后追加最小下单/撤单面板
-- pages/Live.tsx：对话 tab「立即分析」按钮提示语改 QM 口径（该按钮走 analysis 链，只出观点、不下单；盘中**包含下单**的轮次不由此按钮触发，而是决策轮常规写入「模型对话」tab——2026-10-14 起）
+- pages/Live.tsx：对话 tab「立即分析」按钮提示语改 QM 口径（复活后只出观点，不下单）；盘中含下单的轮次由决策轮自动写「模型对话」——按钮本身仍不下单，去哪看要指清（2026-10-14 Stage 2 收尾）
 - pages/Live.tsx：T6-3：宿主 timeBeijing 导入（实盘账户 ts 可能是 aware UTC）
 - pages/Live.tsx：T6-3：持仓 tab 快照时刻从裸 slice(0,16) 改 fmtBeijingDateTime
+- pages/Live.tsx：成交卡时刻：slice 裸截留下「T」（09-24T14:41），空格分隔（对账卡/成交卡两处同型，全局替换）
+- pages/Live.tsx：持仓卡买入行：时刻补空格分隔；买入日缺失（富途映射器不带买时）从「买入 」空尾改「买入日未知」
 - pages/ModelDetail.tsx：详情页由路由参数改为宿主传入的 props（栏内下钻，不再注册路由）
 - pages/ModelDetail.tsx：同上：签名收 props
 - pages/ModelDetail.tsx：同上：useParams 取值删掉（改由 props）
@@ -201,10 +207,8 @@
    404 噪声），面板保留并显示「通道已下线」。
    「立即分析」两枚按钮**已复活**：改走 QM 原生 `/api/v1/agent-arena/analysis/*`
    （任务台账 `/data/logs/analysis_jobs.jsonl` + 宿主 cron
-   `scripts/analysis_trigger_worker.py` 消费）；对话按钮提示语为
-   「只出观点，不下单」——该口径仍准确（按钮只触发分析链），但别把它误读成
-   「arena 里的分析都不下单」：盘中**真下单**的决策轮自 2026-10-14 起就是
-   「模型对话」tab 的常规写者（甲3/甲5），下单与对话出自同一个回路。行情回测的转写/对话/写库端点（runPineBacktest、
+   `scripts/analysis_trigger_worker.py` 消费）；对话按钮提示语改为
+   「只出观点，不下单」。行情回测的转写/对话/写库端点（runPineBacktest、
    savePineSource、sendChat、apply/revert 等）**已全量迁移（同批 2026-10-08）**：
    客户端函数恢复为上游原样（不再有「直接失败」补丁），API 面已挂
    `market_lab_family` 写端点；执行在宿主——cron 跑

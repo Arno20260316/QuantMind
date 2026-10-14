@@ -48,11 +48,15 @@ interface HkFeedItem {
   kind: 'closed' | 'sell'; // 已平仓持仓 / 卖出成交
 }
 
-/** 持仓时长：≥1 天按天、<1 天按小时（与 LastTradesTable 一致） */
+/** 持仓时长：≥1 天按「天+小时」、<1 天按小时（与 LastTradesTable 一致）。
+ *  小数天不再裸出（1.84 曾显示成 '1.84D 0H'）：小时位取小数天尾数换算，
+ *  尾数四舍五入到 24 时折进天数，避免出现「2D 24H」。 */
 const holdText = (days: number | null): string => {
   if (days == null) return '—';
   if (days < 1) return `${Math.round(days * 24)}H 0M`;
-  return `${days}D 0H`;
+  const d = Math.floor(days);
+  const h = Math.round((days - d) * 24);
+  return h === 24 ? `${d + 1}D 0H` : `${d}D ${h}H`;
 };
 
 const fmtQty = (v: number): string => v.toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -218,7 +222,7 @@ export default function CompletedFeed({
                   </b>{' '}
                   {t.kind === 'closed' ? '完成了一笔已平仓交易！' : '完成了一笔卖出成交！'}
                 </span>
-                <span className="feed-date">{t.exit_date ? t.exit_date.slice(5, 16) : '—'}</span>
+                <span className="feed-date">{t.exit_date ? t.exit_date.slice(5, 16).replace('T', ' ') : '—'}</span>
               </div>
               <div className="feed-price">
                 成本: {fmtPrice(t.entry_price, currency)}
@@ -285,7 +289,7 @@ export default function CompletedFeed({
                 </b>{' '}
                 完成了一笔交易！
               </span>
-              <span className="feed-date">{t.exit_date.slice(5)}</span>
+              <span className="feed-date">{t.entry_date ? `${t.entry_date.slice(5)} → ${t.exit_date.slice(5)}` : t.exit_date.slice(5)}</span>
             </div>
             <div className="feed-price">
               成本: {fmtPrice(t.entry_price, currency)}

@@ -948,7 +948,7 @@ export default function Live() {
                   </span>
                 </div>
                 <div className="live-pos-sub">
-                  <span>买入 {p.buy_time.slice(5)}</span>
+                  <span>{p.buy_time ? `买入 ${p.buy_time.slice(5).replace('T', ' ')}` : '买入日未知'}</span>
                   <span>{Number(p.total_volume).toLocaleString('en-US')} 股{Number(p.available_volume) < Number(p.total_volume) ? `（可卖 ${Number(p.available_volume).toLocaleString('en-US')}）` : ''}</span>
                   <span>成本 {fmtPrice(Number(p.cost_price), meta.currency)}</span>
                   <span>现价 {fmtPrice(Number(p.last_price), meta.currency)}</span>
@@ -1139,7 +1139,7 @@ export default function Live() {
                           <span className="trade-side info">⚖ 对账</span>
                           <b className="trade-card-symbol">{e.name}</b>
                           <span className="trade-card-code">{e.code}</span>
-                          <span className="trade-card-date">{e.ts.slice(5, 16)}</span>
+                          <span className="trade-card-date">{e.ts.slice(5, 16).replace('T', ' ')}</span>
                         </div>
                         <div className="trade-card-grid">
                           <span>归属{' '}
@@ -1174,7 +1174,7 @@ export default function Live() {
                         </span>
                         <b className="trade-card-symbol">{e.name}</b>
                         <span className="trade-card-code">{e.code}</span>
-                        <span className="trade-card-date">{e.ts.slice(5, 16)}</span>
+                        <span className="trade-card-date">{e.ts.slice(5, 16).replace('T', ' ')}</span>
                       </div>
                       <div className="trade-card-grid">
                         <span>归属{' '}

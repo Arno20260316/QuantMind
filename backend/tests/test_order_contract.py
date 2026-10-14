@@ -105,6 +105,57 @@ def test_order_service_writer_wired():
     assert "ensure_order_contract_columns_async()" in src
 
 
+def test_source_column_width_is_one_number_in_all_write_points():
+    """``source`` 宽度必须全程同数（乙1，2026-10-14）：契约列 / ``db_init.sql``（新装）/
+    两个 ORM 模型，且三个写点都过**共享**归一实现。改动一处漏一处 = PG 入库时静默
+    截断或 schema 抛校验错，同一条腿在两张表里成了两个来源（同 ``normalize_agent``）。
+    """
+    import re
+
+    from backend.shared.order_contract import SOURCE_LEN, normalize_source
+
+    assert SOURCE_LEN == 32
+    for name, col_type in (*SIM_ORDER_COLUMNS, *ORDER_COLUMNS):
+        if name == "source":
+            assert col_type == f"VARCHAR({SOURCE_LEN})"
+
+    ddl = (_BACKEND / "shared/db_init.sql").read_text(encoding="utf-8")
+    for table in ("orders", "sim_orders"):
+        block = ddl.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1].split(");", 1)[0]
+        assert re.search(rf"\bsource\s+VARCHAR\({SOURCE_LEN}\)", block), table
+
+    for rel in (
+        "services/trade_shared/models/order.py",
+        "services/simulation/models/order.py",
+    ):
+        src = (_BACKEND / rel).read_text(encoding="utf-8")
+        assert re.search(rf"source[^\n]*String\({SOURCE_LEN}\)", src), rel
+
+    # 三个写点必须**调用**共享实现（行内断言而非 `in src`：后者在注释里出现也算过——
+    # 本仓在「明文口令漏检前缀」上已经栽过一次同形状的假通过）。
+    wired = {
+        "services/trade_shared/services/order_service.py": [
+            r"source=normalize_source\(order_data\.source\)"
+        ],
+        "services/live_trading/services/internal_strategy_dispatcher.py": [
+            r'source=normalize_source\(order_data\.get\("source"\)\)'
+        ],
+        "services/simulation/services/order_service.py": [
+            r"order\.source = normalize_source\("
+        ],
+    }
+    for rel, patterns in wired.items():
+        src = (_BACKEND / rel).read_text(encoding="utf-8")
+        for pat in patterns:
+            assert re.search(pat, src), f"{rel} 缺 {pat}"
+    # 反面：裸截断不许复活（写点各写一份 [:32] 正是本测试要钉住的漂移）
+    sim_src = (
+        _BACKEND / "services/simulation/services/order_service.py"
+    ).read_text(encoding="utf-8")
+    assert not re.search(r"trigger_source[^\n]*\)\[:32\]", sim_src)
+    assert normalize_source("x" * 99) == "x" * SOURCE_LEN
+
+
 def test_stream_consumer_writer_wired():
     src = (_BACKEND / "services/trade/services/execution_stream_consumer.py").read_text(
         encoding="utf-8"
@@ -177,6 +228,47 @@ def test_normalize_agent_strips_and_truncates_never_raises():
     assert normalize_agent("   ") == ""
     long_name = normalize_agent("x" * (AGENT_LEN + 20))
     assert len(long_name) == AGENT_LEN
+
+
+def test_normalize_source_strips_and_truncates_never_raises():
+    """空串**不做默认填充**：缺省属于产生意图那一层（模拟台账缺省 manual），
+    本函数只管形态——编一个默认值会把「不知道从哪来」写成某一种来源。"""
+    from backend.shared.order_contract import SOURCE_LEN, normalize_source
+
+    assert normalize_source("  llm_decision ") == "llm_decision"
+    assert normalize_source(None) == ""
+    assert normalize_source("") == ""
+    assert normalize_source("   ") == ""
+    assert normalize_source(123) == "123"  # 任意类型不许抛（写侧吞异常的场合多）
+    assert len(normalize_source("x" * (SOURCE_LEN + 20))) == SOURCE_LEN
+
+
+def test_real_order_create_schema_keeps_the_source_field():
+    """``OrderCreate`` 必须**显式声明** ``source``（乙1）：pydantic 默认对未声明字段
+    是静默丢弃——镜像载荷传了 source、台账里却是 NULL，且全链无报错（有来源与没有
+    来源在库里长得一样）。宽度按列封顶（超宽抛校验错是兜底：调用方一律先过
+    ``normalize_source``，走到 schema 时已经合法），缺省 **None**（非 LLM 腿留空，
+    不许在 schema 层编默认值）。
+    """
+    from pydantic import ValidationError
+
+    from backend.services.trade_shared.models.enums import (
+        OrderSide,
+        OrderType,
+    )
+    from backend.services.trade_shared.schemas.order import OrderCreate
+
+    kw = {
+        "portfolio_id": 0,
+        "symbol": "600036.SH",
+        "side": OrderSide("buy"),
+        "order_type": OrderType("market"),
+        "quantity": 100.0,
+    }
+    assert OrderCreate(**kw, source="llm_decision").source == "llm_decision"
+    assert OrderCreate(**kw).source is None
+    with pytest.raises(ValidationError):
+        OrderCreate(**kw, source="x" * 33)
 
 
 def test_create_schemas_keep_the_agent_field():

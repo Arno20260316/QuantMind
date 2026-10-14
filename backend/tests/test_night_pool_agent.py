@@ -1,0 +1,330 @@
+"""宿主晚间研究轮（``scripts/night_pool_agent.py``）测试。
+
+覆盖 2026-10-14 改接（戊1）：
+1. **大脑改接**：``call_brain`` 直连 OpenAI 兼容端点（原 dsh CLI + BayMax MCP
+   栈已退役）——glm* 前缀走 ``GLM_*`` 键、``QM_NIGHT_POOL_MODEL`` 可覆写、
+   失败重试 1 次、``finish_reason=length`` 截断即 raise（半截 JSON 不可救）；
+2. **空壳不再写池文件**：大脑失败 / 输出非 JSON / pool 为空 → **不写**
+   ``{target}_agent_picks.json``——该后缀在 ``decision_context_source.pool_path``
+   里**优先于** ``_picks.json``，空壳会遮蔽在产池（2026-09-15 事故口径：主跑失败
+   落 0 只池 → 当天全系统无候选池）；研究纪要与对话流照写（展示面不静默变空）；
+3. **成功路径**：池文件按目标交易日命名 + usage 进对话行（/token-usage 可计）。
+4. **``_load_env``**：环境变量优先，repo .env 补缺（与 live_model_analysis 同口径）。
+
+脚本不是包内模块，用 importlib 从 ``scripts/`` 直接装载（import 无副作用：
+只插 sys.path、拼路径常量，不读 .env、不连桥、不建目录）。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import requests
+
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "night_pool_agent.py"
+
+SESSION = "20261013"
+TARGET = "20261014"
+
+_BRAIN_PAYLOAD = {
+    "date": "2026-10-13",
+    "market_view": "震荡偏强，主线在半导体",
+    "sectors": [{"name": "半导体", "strength": "强", "reason": "资金回流"}],
+    "pool": [
+        {"code": "600338.SH", "name": "西藏珠峰", "score": 88, "reason": "板块主线"},
+        {"code": "688183", "name": "生益电子", "score": 81, "reason": "强势延续"},
+    ],
+}
+_BRAIN_JSON = json.dumps(_BRAIN_PAYLOAD, ensure_ascii=False)
+_BRAIN_USAGE = {"prompt_tokens": 1200, "completion_tokens": 800, "total_tokens": 2000}
+
+
+@pytest.fixture(scope="module")
+def npa():
+    spec = importlib.util.spec_from_file_location(
+        "night_pool_agent_under_test", _SCRIPT
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Resp:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def _ok_body(content: str, finish: str = "stop") -> dict:
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": finish}],
+        "usage": dict(_BRAIN_USAGE),
+    }
+
+
+def _install_stub_modules(monkeypatch, *, market_state_text="盘面状态（测试）"):
+    """把 run() 的数据/桥依赖换成桩：market_state / event_radar / risk_list /
+    agent_tools.brokers.tdx_bridge（都在 run() 里 import，逐个顶掉 sys.modules 项）。"""
+    ms = types.ModuleType("market_state")
+    ms.build_market_state = lambda broker=None: market_state_text
+    monkeypatch.setitem(sys.modules, "market_state", ms)
+
+    er = types.ModuleType("event_radar")
+    er.tag_events = lambda codes: {}
+    monkeypatch.setitem(sys.modules, "event_radar", er)
+
+    rl = types.ModuleType("risk_list")
+    rl.load_risk = lambda: {}
+    monkeypatch.setitem(sys.modules, "risk_list", rl)
+
+    at = types.ModuleType("agent_tools")
+    at.__path__ = []
+    ab = types.ModuleType("agent_tools.brokers")
+    ab.__path__ = []
+    at.brokers = ab
+    tb = types.ModuleType("agent_tools.brokers.tdx_bridge")
+    tb.TdxBridgeBroker = lambda *a, **k: object()
+    monkeypatch.setitem(sys.modules, "agent_tools", at)
+    monkeypatch.setitem(sys.modules, "agent_tools.brokers", ab)
+    monkeypatch.setitem(sys.modules, "agent_tools.brokers.tdx_bridge", tb)
+
+
+@pytest.fixture()
+def sandbox(npa, monkeypatch, tmp_path):
+    """run() 的全隔离环境：ROOT/两个产物目录指向 tmp_path，数据与桥全桩。"""
+    root = tmp_path / "repo-harness"
+    picks = root / "data" / "reports" / "stock_picks"
+    picks.mkdir(parents=True)
+    monkeypatch.setattr(npa, "ROOT", root)
+    monkeypatch.setattr(npa, "NIGHT_POOL_DIR", root / "logs" / "night_pool")
+    monkeypatch.setattr(npa, "PICKS_DIR", picks)
+    monkeypatch.setattr(
+        npa,
+        "build_candidates",
+        lambda session: (
+            [
+                {
+                    "code": "600338.SH",
+                    "name": "西藏珠峰",
+                    "chg1": 3.2,
+                    "amount_yi": 12.5,
+                    "score": 88.0,
+                },
+                {
+                    "code": "688183.SH",
+                    "name": "生益电子",
+                    "chg1": 1.1,
+                    "amount_yi": 8.0,
+                    "score": 81.0,
+                },
+            ],
+            session,
+        ),
+    )
+    monkeypatch.setattr(npa, "_news_block", lambda d0: "")
+    _install_stub_modules(monkeypatch)
+    return root
+
+
+def _dialogue_rows(root: Path) -> list[dict]:
+    lf = (
+        root
+        / "data"
+        / "agent_data_astock"
+        / "market-research"
+        / "log"
+        / "2026-10-14"
+        / "log.jsonl"
+    )
+    if not lf.is_file():
+        return []
+    return [json.loads(x) for x in lf.read_text(encoding="utf-8").splitlines() if x]
+
+
+def _picks_file(root: Path) -> Path:
+    return root / "data" / "reports" / "stock_picks" / f"{TARGET}_agent_picks.json"
+
+
+# ── 1. call_brain：直连 OpenAI 兼容端点 ─────────────────────────────────
+
+
+def _env_stub(**over):
+    env = {
+        "OPENAI_API_BASE": "https://api.example.com/v1",
+        "OPENAI_API_KEY": "k-openai",
+        "GLM_API_BASE": "https://glm.example.com/v1",
+        "GLM_API_KEY": "k-glm",
+    }
+    env.update(over)
+    return env
+
+
+def test_call_brain_posts_chat_completions_with_resolved_model(npa, monkeypatch):
+    monkeypatch.setattr(npa, "_load_env", lambda: _env_stub())
+    calls: list[tuple] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append((url, headers, json, timeout))
+        return _Resp(_ok_body("研究结论"))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    content, usage = npa.call_brain("任务文本")
+
+    assert content == "研究结论"
+    assert usage == _BRAIN_USAGE
+    url, headers, payload, timeout = calls[0]
+    assert url == "https://glm.example.com/v1/chat/completions"  # 默认模型 glm 系
+    assert headers["Authorization"] == "Bearer k-glm"
+    assert payload["model"] == npa.DEFAULT_BRAIN_MODEL
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][1]["content"] == "任务文本"
+    assert timeout == npa.BRAIN_TIMEOUT_S
+
+
+def test_call_brain_model_env_override_switches_key_prefix(npa, monkeypatch):
+    monkeypatch.setattr(
+        npa, "_load_env", lambda: _env_stub(QM_NIGHT_POOL_MODEL="deepseek-v4-pro")
+    )
+    calls: list[tuple] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append((url, headers, json, timeout))
+        return _Resp(_ok_body("ok"))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    npa.call_brain("任务文本")
+
+    url, headers, payload, _ = calls[0]
+    assert url == "https://api.example.com/v1/chat/completions"
+    assert headers["Authorization"] == "Bearer k-openai"
+    assert payload["model"] == "deepseek-v4-pro"
+
+
+def test_call_brain_missing_keys_raises(npa, monkeypatch):
+    monkeypatch.setattr(npa, "_load_env", lambda: {})
+    with pytest.raises(RuntimeError, match="缺失"):
+        npa.call_brain("任务文本")
+
+
+def test_call_brain_retries_once_then_raises(npa, monkeypatch):
+    monkeypatch.setattr(npa, "_load_env", lambda: _env_stub())
+    attempts = {"n": 0}
+
+    def fake_post(*a, **k):
+        attempts["n"] += 1
+        raise ConnectionError("网络不通")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(ConnectionError):
+        npa.call_brain("任务文本")
+    assert attempts["n"] == 2  # 重试 1 次
+
+
+def test_call_brain_truncated_finish_reason_raises(npa, monkeypatch):
+    monkeypatch.setattr(npa, "_load_env", lambda: _env_stub())
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: _Resp(_ok_body("半截", finish="length"))
+    )
+    with pytest.raises(RuntimeError, match="截断"):
+        npa.call_brain("任务文本")
+
+
+# ── 2. _load_env：环境变量优先，repo .env 补缺 ──────────────────────────
+
+
+def test_load_env_env_wins_file_fills_gaps(npa, monkeypatch, tmp_path):
+    envf = tmp_path / ".env"
+    envf.write_text(
+        "OPENAI_API_KEY=from-file\nOPENAI_API_BASE=https://file.example/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(npa, "ENV_FILE", envf)
+    monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+
+    env = npa._load_env()
+
+    assert env["OPENAI_API_KEY"] == "from-env"  # env 优先
+    assert env["OPENAI_API_BASE"] == "https://file.example/v1"  # 文件补缺
+
+
+# ── 3. run()：空壳不写池文件（遮蔽在产池的隐患） ─────────────────────────
+
+
+def test_brain_failure_writes_notes_and_dialogue_but_no_agent_picks(
+    npa, sandbox, monkeypatch
+):
+    def boom(task, *a, **k):
+        raise RuntimeError("端点 500")
+
+    monkeypatch.setattr(npa, "call_brain", boom)
+    rc = npa.run(SESSION, TARGET)
+
+    assert rc != 0
+    assert not _picks_file(sandbox).exists()  # 关键：不落空壳
+    notes = sandbox / "logs" / "night_pool" / f"{SESSION}.md"
+    assert notes.is_file() and "研究 agent 失败" in notes.read_text(encoding="utf-8")
+    rows = _dialogue_rows(sandbox)
+    assert rows and "研究 agent 失败" in rows[0]["new_messages"][-1]["content"]
+
+
+def test_malformed_brain_output_writes_no_agent_picks(npa, sandbox, monkeypatch):
+    monkeypatch.setattr(
+        npa, "call_brain", lambda task, *a, **k: ("没有 JSON 的散文", None)
+    )
+    rc = npa.run(SESSION, TARGET)
+
+    assert rc != 0
+    assert not _picks_file(sandbox).exists()
+    assert _dialogue_rows(sandbox)  # 展示面照写
+
+
+def test_empty_pool_writes_no_agent_picks(npa, sandbox, monkeypatch):
+    empty = json.dumps({"date": "2026-10-13", "market_view": "x", "pool": []})
+    monkeypatch.setattr(npa, "call_brain", lambda task, *a, **k: (empty, None))
+    rc = npa.run(SESSION, TARGET)
+
+    assert rc != 0
+    assert not _picks_file(sandbox).exists()
+
+
+def test_valid_pool_writes_agent_picks_with_usage_row(npa, sandbox, monkeypatch):
+    monkeypatch.setattr(
+        npa, "call_brain", lambda task, *a, **k: (_BRAIN_JSON, dict(_BRAIN_USAGE))
+    )
+    rc = npa.run(SESSION, TARGET)
+
+    assert rc == 0
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert doc["date"] == TARGET  # 池按**目标交易日**命名（09:35 消费的就是当日池）
+    assert doc["session"] == SESSION
+    assert [p["code"] for p in doc["picks"]] == ["600338.SH", "688183"]
+    assert doc["picks"][0]["side"] == "HOLD"  # 占位侧，无信息量（读侧不展示）
+    assert doc["picks"][0]["reason"] == "板块主线"
+    rows = _dialogue_rows(sandbox)
+    assert rows[0]["signature"] == "market-research"
+    assert rows[0]["kind"] == "night_pool"
+    assert rows[0]["usage"] == _BRAIN_USAGE
+
+
+# ── 4. 纯函数 ───────────────────────────────────────────────────────────
+
+
+def test_filter_risk_candidates_matches_suffix_codes_by_6_digits(npa):
+    cands = [
+        {"code": "600338.SH", "name": "西藏珠峰"},
+        {"code": "688183", "name": "生益电子"},
+    ]
+    kept, dropped = npa.filter_risk_candidates(cands, {"600338": {"reason": "解禁"}})
+    assert [c["code"] for c in kept] == ["688183"]
+    assert dropped[0][0]["code"] == "600338.SH"

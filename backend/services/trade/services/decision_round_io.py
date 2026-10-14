@@ -44,6 +44,13 @@ from backend.services.trade.services.decision_round_core import (
 from backend.shared.decision.agent_ledger import DEFAULT_AGENT_QUOTA
 from backend.shared.decision.contract import SCHEMA_INTRADAY
 
+# arena 文件面写侧是**本机独有**的包（与「实盘交易」栏同纪律，见 .gitignore）：
+# 公开仓缺它时轮次与端点树都不许变，故缺席即 ``None``（用法见 ``record_round_dialogue``）。
+try:  # pragma: no cover - 取决于本机是否有该包
+    from backend.services.agent_arena import arena_files
+except ImportError:  # pragma: no cover
+    arena_files = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -492,6 +499,107 @@ def write_stall_check(
     except Exception as exc:  # noqa: BLE001 回执写失败不抛（见 docstring）
         logger.warning("[DecisionRound] 停滞检查回执写入失败: %s", exc)
         return False
+
+
+def record_round_dialogue(
+    *,
+    agent: str,
+    prompt: str,
+    attempt: Any,
+    now: datetime,
+    notes: list[str],
+) -> None:
+    """⑧b 对话落盘——arena「模型对话」tab 的**写侧**。
+
+    为什么这件事归决策轮
+    --------------------
+    上游 ``live_hourly_analysis.py`` 是**一个回路**：同一次调用既产出给人看的分析
+    文本（落 ``log.jsonl`` → 前端模型对话），又产出给程序执行的决策 JSON（→ 闸门 →
+    下单）。迁 QM 时这两半被拆开，决策这半落在决策轮、对话那半落在一个**明令不下单
+    的只读脚本**里，两边互不知情——于是真在下单的那轮全过程在 arena 上一个字都看不到
+    （前端三个 tab 全停在 2026-09-29 的根因之一）。写侧接回后，一轮 = 一行，
+    对话与腿出自同一次调用、天然对得上。
+
+    三条纪律
+    --------
+    * **在闸门之前调用**（见 ``_run_once_inner`` 的调用点）：模型说了什么与腿发没发
+      是两件事。放在执行段之后，执行段一抛异常这轮对话就整条丢失——而「模型当时怎么
+      想的」恰恰是复盘最需要的。展示面的可靠性不与真钱链路的成败挂钩。
+    * **只记成功的轮**：调用方在 ``attempt`` 失败时已早返回。失败轮不写——补跑槽会再
+      来一次，先写一条会在同一槽位留多条半截对话，界面还要展示一条空的助手回复；
+      失败本身已由 ``decision_round_alerts`` 走 QQ + 状态键两路可见。
+    * **写失败不改轮次状态，但必须留痕**：真钱链路照走；一行日志没人看，所以同一句
+      话也进 ``notes`` → 审计行的 ``context_meta.notes``（那一列是要被复盘的）。
+
+    文本取 ``display_text``（= 模型原文全文）而不是 ``attempt.raw``：后者是**审计
+    额度**内的文本，被 ``RAW_LIMIT`` 截到 8000 字符。实测历史 2700 条回复里 4.4%
+    超限（峰值 13958），拿被截的写盘会静默切掉近 5% 的对话、切口在句子中间。
+
+    ``arena_files`` 是本机独有的包（与「实盘交易」栏同纪律，见 ``.gitignore``）：
+    公开仓缺它时**轮次照跑**，只是这一轮不落对话——那种部署里 arena 栏本身也不存在，
+    「看得见却没数据」这个面不会出现。范式同 ``services/api/main.py`` 的 try/except 注册。
+    """
+    if arena_files is None:  # pragma: no cover - 取决于本机是否有该包
+        return
+    try:
+        ok = arena_files.append_round_dialogue(
+            agent=agent,
+            prompt=prompt,
+            response=getattr(attempt, "display_text", "") or "",
+            usage=getattr(attempt, "usage", None),
+            timestamp=now,
+        )
+    except Exception as exc:  # noqa: BLE001 写侧任何异常都不许打断真钱回路
+        logger.error("[DecisionRound] arena 对话落盘异常: %s", exc, exc_info=True)
+        ok = False
+    if not ok:
+        notes.append("arena 对话落盘未完成（模型对话 tab 本轮不可见，详见日志）")
+
+
+def record_round_position(
+    *,
+    agent: str,
+    ledger: AgentLedgerRead,
+    now: datetime,
+    notes: list[str],
+) -> None:
+    """⑩b 持仓落盘——arena「持仓/净值」文件面的**快照写侧**（甲4）。
+
+    上游 ``tool_trade.py`` 在每笔成交落一行 ``position.jsonl``（``this_action``），
+    迁 QM 后这个写者随 quant-Trader 退役，文件冻结在 2026-09-29——前端 8 个读侧
+    （``load_position_records``/``compute_equity_series``/``list_agents`` 的 cash …）
+    全部对着一个没有写者的文件。本函数把写侧接回来：**每跑成一轮 = 每家一行快照**
+    （无 ``this_action``，``load_trades`` 靠这个键区分成交行与快照行）。
+
+    数据源取**本 agent 的分账账本**（``qm_agent_ledger_*``，即 ``ledger`` 那份读）：
+    共用账户里桥的持仓是全账户混合口径，只有账本段知道「哪些票是这家的、还剩多少
+    虚拟现金」。依赖 TDX 桥链路的分账落账（乙2）先修——否则账本冻结在 10-09，
+    写出来的快照也是旧值（写侧不编数：账本说什么就落什么）。
+
+    **只落快照，不落成交行**：真单的成交（价/量/时刻）由桥回询**异步**入账，
+    决策时刻还没有它；此刻按委托价补一条 ``this_action`` 就是把「打算成交」写成
+    「已经成交」。成交面另有读侧（``live_family.load_real_fills_pg`` 读 PG ``trades``
+    ⨝ ``orders``），那里才是逐笔事实。
+
+    纪律同 ``record_round_dialogue``：写失败不改轮次状态（真钱链路照走），但同一句
+    话也进 ``notes`` → 审计行 ``context_meta.notes``。``arena_files`` 缺席（公开仓）
+    时整段静默跳过——那种部署里 arena 栏本身不存在，每轮记一条只会淹掉真注记。
+    """
+    if arena_files is None:  # pragma: no cover - 取决于本机是否有该包
+        return
+    try:
+        ok = arena_files.append_position(
+            agent=agent,
+            positions=arena_files.positions_from_ledger(
+                ledger.positions, ledger.virtual_cash
+            ),
+            when=now,
+        )
+    except Exception as exc:  # noqa: BLE001 写侧任何异常都不许打断真钱回路
+        logger.error("[DecisionRound] arena 持仓落盘异常: %s", exc, exc_info=True)
+        ok = False
+    if not ok:
+        notes.append("arena 持仓落盘未完成（持仓/净值文件面本轮无新行，详见日志）")
 
 
 def maybe_write_watch(

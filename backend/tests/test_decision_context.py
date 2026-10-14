@@ -23,6 +23,13 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from backend.shared.decision import context as ctxmod
+from backend.shared.decision.contract import (
+    INTRADAY_SCHEMA_JSON,
+    REBALANCE_SCHEMA_JSON,
+    SCHEMA_INTRADAY,
+    SCHEMA_REBALANCE,
+    parse_decisions,
+)
 from backend.shared.decision.context import (
     COST_SRC_BRIDGE,
     COST_SRC_LEDGER,
@@ -34,7 +41,9 @@ from backend.shared.decision.context import (
     RebalanceContext,
     budget_filter_note,
     ledger_cost_rows,
+    render_intraday_prompt,
     render_prompt,
+    render_prompt_for,
     render_quote_block,
 )
 
@@ -422,3 +431,114 @@ def test_block_order_holdings_direction_pool_risk_rules() -> None:
         out.rindex("【决策规则】"),
     ]
     assert order == sorted(order)
+
+
+# ---------------------------------------------------------------------------
+# 7. 盘中轮提示词（四段式 + watch schema）——arena「模型对话」的分段依据
+# ---------------------------------------------------------------------------
+
+
+def _intraday_ctx() -> RebalanceContext:
+    """带满块的盘中轮快照（持仓 + 池 + 行情 + 两个软块，覆盖所有可选段）。"""
+    return RebalanceContext(
+        agent="flash",
+        now=datetime(2026, 10, 14, 13, 0, 0, tzinfo=CN),
+        holdings=(_row(),),
+        direction=DirectionBlock("偏空", 4),
+        pool=(PoolRow(code="600519.SH", name="贵州茅台", score=0.9),),
+        quotes=(PoolQuote("600519.SH", "贵州茅台", 1523.40, 1.0),),
+        extra_context="【盘面状态】…",
+        risk_block="【事件风险警示】…",
+        industry_caution_block="【行业整体劣化】…",
+    )
+
+
+def test_intraday_prompt_has_the_four_section_markers() -> None:
+    """四段式标记必须齐、且按 ①②③④ 顺序出现。
+
+    这是**前端契约**：``parseAnalysis.ts`` 用 ``/①|【总体总结】/`` …
+    ``/④|【决策】/`` 四处 ``indexOf`` 切段，任一标记缺席或乱序，切出来的段就
+    串位（总结栏拿到决策块、决策卡拿到散文）。改标记 = 同时改前端。
+    """
+    out = render_intraday_prompt(_intraday_ctx())
+    idx = [
+        out.index(m)
+        for m in ("①【总体总结】", "②【分析链路】", "③【推理论证】", "④【决策】")
+    ]
+    assert idx == sorted(idx)
+
+
+def test_intraday_prompt_carries_watch_schema_not_the_rebalance_one() -> None:
+    """盘中轮的输出契约是 ``INTRADAY_SCHEMA_JSON``——含 watch 一族字段。
+
+    反面同样要钉：调仓轮的 ``REBALANCE_SCHEMA_JSON`` 里没有 ``watch``，
+    它出现在盘中提示词里会让模型漏掉条件位（实测 ``watch_armed`` 恒 0 的根因）。
+    """
+    out = render_intraday_prompt(_intraday_ctx())
+    assert INTRADAY_SCHEMA_JSON in out
+    assert REBALANCE_SCHEMA_JSON not in out
+    assert "watch" in out and "stop_loss" in out and "move_stop" in out
+
+
+def test_rebalance_prompt_gains_no_four_section_marker() -> None:
+    """调仓轮一个字不改：四段式是**盘中轮专用**收尾。
+
+    调仓轮的字节被隔壁金样钉死（见本文件 1/2 节），这里再钉一次语义面：
+    它不该出现任何 ①②③④ 标记，否则前端会把一份纯 JSON 的轮次也当成四段式切。
+    """
+    out = render_prompt(_intraday_ctx())
+    assert "【总体总结】" not in out and "①" not in out
+    assert REBALANCE_SCHEMA_JSON in out and INTRADAY_SCHEMA_JSON not in out
+
+
+def test_both_slots_see_the_identical_body_bytes() -> None:
+    """两槽位的事实面**逐字节相同**——只有收尾段不同。
+
+    分开渲染两遍事实（持仓/大盘/池/风险块）是这类双槽位最容易长出来的漂移：
+    某天给盘中轮单独加一列，模型在两个槽位看到的账户就不是同一个了。
+    """
+    ctx = _intraday_ctx()
+    intraday, rebalance = render_intraday_prompt(ctx), render_prompt(ctx)
+    # 调仓轮的正文（收尾段之前）必须是盘中轮的**前缀**——同一份字节，逐字相同
+    head = rebalance.split("【决策规则】")[0]
+    assert head.startswith("现在是北京时间")
+    assert intraday.startswith(head)
+
+
+def test_intraday_rules_render_the_round_limits() -> None:
+    """收尾段里的额度/新开仓上限随 ctx 走（风控档位会覆写这两个数）。"""
+    ctx = replace(_intraday_ctx(), per_stock_pct=0.08, max_new_buys=1)
+    out = render_intraday_prompt(ctx)
+    assert "≤8%" in out and "≤1 只" in out
+    assert "≤20%" not in out and "≤3 只" not in out
+
+
+def test_render_prompt_for_dispatches_on_schema() -> None:
+    """调用方只认这一个入口：schema 决定提示词。"""
+    ctx = _intraday_ctx()
+    assert render_prompt_for(ctx, SCHEMA_INTRADAY) == render_intraday_prompt(ctx)
+    assert render_prompt_for(ctx, SCHEMA_REBALANCE) == render_prompt(ctx)
+    # 未知 schema 回退最保守的那份（纯 JSON、无 watch），不让新 schema 静默
+    # 继承 watch 提示词——白名单对不上时报错该由 parse_decisions 抛。
+    assert render_prompt_for(ctx, "whatever") == render_prompt(ctx)
+
+
+def test_fenced_decision_block_as_the_prompt_asks_is_parseable() -> None:
+    """提示词要什么，解析器就得吃什么——四段式散文 + ```json 围栏。
+
+    这一条把「提示词契约」与「解析契约」焊在一起：改动任一侧而忘了另一侧，
+    模型会按新格式输出、解析器却取不出决策，整轮 ``llm_failed``。
+    """
+    reply = (
+        "①【总体总结】仓位轻，持有为主。（置信度 中）\n\n"
+        "②【分析链路】桥快照 → 13:00 现价，新鲜；账本成本已按分账口径改写。\n\n"
+        "③【推理论证】大盘震荡 → 港口/石油顺风 → 国轩高科逆风。\n\n"
+        "④【决策】\n```json\n"
+        '{"decisions": [{"action": "watch", "code": "600338.SH", '
+        '"stop_loss": 11.5, "pct": 0.3, "reason": "跌破 11.5 减三成"}]}\n'
+        "```\n"
+    )
+    batch = parse_decisions(reply, schema=SCHEMA_INTRADAY)
+    assert batch.ok
+    assert [d.action for d in batch.decisions] == ["watch"]
+    assert batch.decisions[0].stop_loss == 11.5

@@ -24,7 +24,7 @@ from backend.services.live_trading.services.real_mirror_service import (
     mirror_virtual_fill,
 )
 from backend.shared.live_trading_gate import ensure_real_trading_allowed
-from backend.shared.order_contract import normalize_agent
+from backend.shared.order_contract import normalize_agent, normalize_source
 
 logger = logging.getLogger(__name__)
 
@@ -631,6 +631,11 @@ async def dispatch_internal_strategy_order(
                 # 超宽时 schema 的 max_length 会**抛校验错**（整笔单丢失），
                 # 而共享实现按列宽截断——与 sim_orders 侧逐字节同值。
                 agent=normalize_agent(order_data.get("agent")) or None,
+                # T-P1-03 来源分类（乙1）：镜像载荷（``mirror_virtual_fill`` 排队时写的
+                # ``source``）一路透传到这里——此前它只出现在 remarks 的 ``mirror:`` 前缀里，
+                # ``orders.source`` 恒 NULL（列在、写点缺）。归一用共享实现，理由同 agent：
+                # 超宽 schema 会抛校验错，代价是整笔真单。
+                source=normalize_source(order_data.get("source")) or None,
                 # P1.6 TCA 基准价：调用方（镜像/强平/人工腿）给的**决策时点参考价**。
                 # 这里只做透传与**正数校验**：0/负/NaN 一律丢弃（`gt=0` 会抛校验错，
                 # 把整笔真单打回去——比缺一个观测字段的代价大得多）。

@@ -10,8 +10,10 @@ agent**——券商回报只带来订单号、成交号、量、价；「这一�
 
 1. **没有 agent = 静默跳过**（返回 ``None``）。人点单/风控单/托管单/隔壁桥镜像单都不
    写分账——它们的成交属于账户，不属于任何模型，这些单的 ``orders.agent`` 恒 NULL。
-2. **一笔成交一根幂等键**（``fill_key`` = 券商成交号）。重投（桥重发、poller 重启补拉、
-   对账重放）在账本侧第一步就停住：返回 ``duplicate=True``，不会再记一笔。
+2. **一笔成交一根幂等键**（``fill_key`` = 券商成交号；桥不给成交号时用
+   :func:`derive_cumulative_fill_key` 派生的「累计量台阶」键）。重投（桥重发、
+   poller 重启补拉、对账重放）在账本侧第一步就停住：返回 ``duplicate=True``，
+   不会再记一笔。
 3. **不 catch**：与调用方**同 session 同事务**。账本写不进去 ⇒ 这笔成交也不落库
    （调用方 commit 一起失败）⇒ 下一轮轮询重投 ⇒ 重试落账。宁可晚记，不可「成交在、
    账本无」：这本账用来算「这家模型还能买多少」，少记一笔就是把额度放给不该买的腿。
@@ -36,6 +38,7 @@ from typing import Any
 from backend.shared.agent_ledger_store import ApplyOutcome, apply_fill
 from backend.shared.order_contract import normalize_agent
 from backend.shared.stock_utils import StockCodeUtil
+from backend.shared.trade_contract import CUMULATIVE_TRADE_PREFIX
 from backend.shared.utc_datetime import as_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,58 @@ DEFAULT_MARKET = "CN"
 def market_of(symbol: str) -> str:
     """标的 → 账本的市场列：走共享判据，判不出按 :data:`DEFAULT_MARKET`。"""
     return StockCodeUtil.detect_market(str(symbol or "")) or DEFAULT_MARKET
+
+
+#: 委托号在派生键里的最大长度（见 :func:`derive_cumulative_fill_key`）：
+#: 键要同时塞进 ``trades.exchange_trade_id``(100) 与账本 ``fill_key``(128)。
+#: 取 60 后最坏长度 = 4(前缀) + 8(日) + 1 + 60 + 1 + 11(累计量) = 85，两边都富余。
+_BROKER_ORDER_ID_MAX = 60
+
+
+def _key_date(value: Any) -> str:
+    """成交日 → 键里的 ``YYYYMMDD``；形态不对返回空串（宁可拒记，也不猜日子）。"""
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    digits = str(value or "").strip().replace("-", "").replace("/", "")
+    return digits if len(digits) == 8 and digits.isdigit() else ""
+
+
+def derive_cumulative_fill_key(
+    *, broker_order_id: Any, cumulative_volume: Any, trade_date: Any
+) -> str:
+    """无逐笔成交号的桥回执 → 幂等键 ``cum-<日>-<委托号>-<累计量>``（空串 = 不能记账）。
+
+    为什么这么派生（**键的形状只有这一份**，写侧 ``tdx_push_service`` 与对账侧共用）：
+
+    * **台阶锚**：桥回执只带委托级累计成交量（通达信 ``CjVol``）与柜面均价
+      （``CjPrice``），没有成交号；累计量每上一个台阶有且只有一笔成交落在那一档
+      ⇒ 同一台阶被 30s 轮询重复读到就是同一个键，账本幂等当场拦下（不双记）。
+      台阶之间的**差额**才是增量成交，价由调用方按「累计金额差 ÷ 数量差」还原。
+    * **带日期**：委托号（``Wtbh``）**按日重置**、跨日复用，而 ``trades`` 的唯一索引
+      是 ``(tenant, user, exchange_trade_id)`` **不带日期**——键里不带日，隔天撞上
+      同委托号同累计量时，第二天的成交会被唯一键当重复**静默丢掉**（成交在、
+      账本无）。日期进了键，这条撞法就不可能发生。
+    * **委托号截断**：超长键在账本侧是 ``ValueError``（当场炸），在成交侧被列宽
+      静默截断（两笔并一笔）——两头都不许，故在键的形状层截到
+      :data:`_BROKER_ORDER_ID_MAX`。
+
+    委托号/成交日缺失、累计量非整数或非正 → 空串：调用方**不得**在那个分支上落
+    成交行（没有唯一号就没有幂等，落下去重投必双记）。非整数刻意也拒：截断成整数
+    会让 ``2400.4`` 与 ``2400.6`` 两个台阶撞成同一个键。
+    """
+    oid = str(broker_order_id or "").strip()[:_BROKER_ORDER_ID_MAX]
+    try:
+        volume = float(cumulative_volume)
+    except (TypeError, ValueError):
+        return ""
+    if not oid or not volume.is_integer() or volume <= 0:
+        return ""
+    day = _key_date(trade_date)
+    if not day:
+        return ""
+    return f"{CUMULATIVE_TRADE_PREFIX}{day}-{oid}-{int(volume)}"
 
 
 async def post_fill_for_order(

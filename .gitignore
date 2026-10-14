@@ -82,6 +82,10 @@ config/keeper.env
 # 见 agent_tools/brokers/bridge_discovery.py 与 qmt_bridge.py 的 _OVERRIDE_FILE。
 config/tdx_bridge.json
 config/qmt_bridge.json
+# 决策轮「在岗」标记（甲5）：容器内 worker 每轮心跳重写、宿主对话轮 cron 读它让位。
+# 纯运行时产物（内容每次心跳都变），两份实现见 decision_round_onduty.py 与
+# decision_round_runner._mark_on_duty。
+config/decision_round.onduty.json
 # Databases
 *.duckdb
 *.duckdb.tmp/
@@ -326,6 +330,7 @@ docs/local/
 backend/services/agent_arena/
 backend/services/api/routers/agent_arena/
 backend/tests/test_agent_arena_native.py
+backend/tests/test_arena_files.py
 # arena 行情回测宿主链路（2026-10-08 随 B2 worker 迁移，同一纪律）：Pine 转写 CLI +
 # 两个文件队列 worker + 索引构建器；宿主 pynecore 运行时目录（122MB，不进仓）。
 # 公开仓无这些文件时，只读面与新挂写端点会在导入/入队处如实报错，不产生假活。

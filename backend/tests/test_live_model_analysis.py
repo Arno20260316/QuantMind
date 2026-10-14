@@ -310,3 +310,144 @@ def test_call_model_truncated_twice_raises(lma, monkeypatch):
     env = {"OPENAI_API_BASE": "https://x.test/v1", "OPENAI_API_KEY": "k"}
     with pytest.raises(lma.TruncatedOutputError):
         lma.call_model(env, "deepseek-v4-flash", "deepseek-v4-flash", "x")
+
+
+# ── 5. 甲5：决策轮在岗到点 → 盘中轮让位（宿主和决策轮同槽同文件，不许双写） ──
+
+
+def _marker(tmp_path, monkeypatch, *, slots, age_s=0.0):
+    """写一份「决策轮在岗」标记并把读侧的默认落点指到 tmp（不碰仓库里的 config/）。"""
+    from backend.shared import decision_round_onduty as od
+
+    path = tmp_path / "decision_round.onduty.json"
+    monkeypatch.setattr(od, "MARKER_PATH", path)
+    at = datetime.now(_CN_TZ) - timedelta(seconds=age_s)
+    assert od.write_on_duty(slots, now=at, path=path) is True
+    return od
+
+
+def _slot_at(now: datetime, offset_min: int = 0) -> str:
+    shifted = now + timedelta(minutes=offset_min)
+    return shifted.strftime("%H%M")
+
+
+def _run_main(lma, monkeypatch, tmp_path, argv, *, env=None):
+    """跑一次 ``main()``：返回 ``(返回码, 调过的模型, 落盘条数)``。全程不碰网络/磁盘真路径。"""
+    monkeypatch.setattr(lma, "LOCK", tmp_path / "lock")
+    monkeypatch.setattr(lma, "_load_env", lambda: dict(env or {}))
+    monkeypatch.setattr(lma, "build_user_content", lambda e, **kw: ("提示词", []))
+    monkeypatch.setattr(lma, "notify_qq", lambda *a, **kw: False)
+    monkeypatch.setattr(lma, "LOG_DIR", tmp_path / "logs")
+    called: list[str] = []
+    monkeypatch.setattr(
+        lma,
+        "call_model",
+        lambda e, sig, model, content: (called.append(sig) or "分析正文", None),
+    )
+    monkeypatch.setattr(lma, "append_log", lambda *a, **kw: None)
+    monkeypatch.setattr(sys, "argv", ["live_model_analysis.py", *argv])
+    return lma.main(), called
+
+
+def test_intraday_round_yields_when_the_decision_round_is_on_duty(
+    lma, monkeypatch, tmp_path, capsys
+):
+    """决策轮在岗且当前落在它的槽位窗内 → 一个模型都不调，返回 0，并打印让位理由。
+
+    这是甲5 的全部目的：同一个槽位只该有一份对话（决策轮那份），否则用户在「模型
+    对话」里会看到两张卡片——一张拍板落单、一张明令不下单。
+    """
+    now = datetime.now(_CN_TZ)
+    _marker(tmp_path, monkeypatch, slots=[_slot_at(now)])
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, [])
+
+    assert code == 0 and called == []
+    out = capsys.readouterr().out
+    assert "[让位]" in out and "--force" in out  # 让位是看得见的行为，不是静默跳过
+
+
+def test_intraday_round_yields_only_inside_the_slot_window(lma, monkeypatch, tmp_path):
+    """标记新鲜但当前**不在**槽位窗内 → 照跑（12:00 之外的空档不归决策轮管）。"""
+    now = datetime.now(_CN_TZ)
+    _marker(tmp_path, monkeypatch, slots=[_slot_at(now, 30)])
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, [])
+
+    assert code == 0 and called == list(lma.ROSTER)
+
+
+def test_stale_marker_makes_the_dialogue_round_resume(lma, monkeypatch, tmp_path):
+    """worker 死了 → 心跳停 → 标记过期 → **照跑**。
+
+    方向是故意的：判据失灵时宁可回到「两边同跑」的老行为，也不能让「模型对话」
+    静默变空——那正是本次要修的投诉。
+    """
+    from backend.shared.decision_round_onduty import MAX_AGE_S
+
+    now = datetime.now(_CN_TZ)
+    _marker(
+        tmp_path,
+        monkeypatch,
+        slots=[_slot_at(now)],
+        age_s=MAX_AGE_S + 60,
+    )
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, [])
+
+    assert code == 0 and called == list(lma.ROSTER)
+
+
+def test_force_overrides_the_yield(lma, monkeypatch, tmp_path):
+    """``--force``（「立即分析」按钮走这条路）在人按的场景下永不让位。"""
+    now = datetime.now(_CN_TZ)
+    _marker(tmp_path, monkeypatch, slots=[_slot_at(now)])
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, ["--force"])
+
+    assert code == 0 and called == list(lma.ROSTER)
+
+
+def test_review_mode_never_yields(lma, monkeypatch, tmp_path):
+    """15:30 复盘轮是收盘语义（非盘中决策），决策轮在岗也不让位。"""
+    now = datetime.now(_CN_TZ)
+    _marker(tmp_path, monkeypatch, slots=[_slot_at(now)])
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, ["--mode", "review"])
+
+    assert code == 0 and called == list(lma.ROSTER)
+
+
+def test_yield_switch_off_restores_the_old_double_write(lma, monkeypatch, tmp_path):
+    """``QM_DIALOGUE_YIELD_TO_DECISION_ROUND=off`` 是运维的逃生门（回到两边同跑）。"""
+    now = datetime.now(_CN_TZ)
+    _marker(tmp_path, monkeypatch, slots=[_slot_at(now)])
+
+    code, called = _run_main(
+        lma,
+        monkeypatch,
+        tmp_path,
+        [],
+        env={"QM_DIALOGUE_YIELD_TO_DECISION_ROUND": "off"},
+    )
+
+    assert code == 0 and called == list(lma.ROSTER)
+
+
+def test_yield_predicate_failure_falls_open_to_running(lma, monkeypatch, tmp_path):
+    """判据本身炸了（模块缺失/标记不可读）→ 照跑，并把「判据不可用」打进日志。
+
+    fail-open 是契约的一部分（见 ``_yield_to_decision_round`` 的 docstring）：
+    判据失灵只该让展示面重复，不该让它空。
+    """
+    now = datetime.now(_CN_TZ)
+    od = _marker(tmp_path, monkeypatch, slots=[_slot_at(now)])
+
+    def boom(**kwargs):
+        raise OSError("盘掉")
+
+    monkeypatch.setattr(od, "read_on_duty", boom)
+
+    code, called = _run_main(lma, monkeypatch, tmp_path, [])
+
+    assert code == 0 and called == list(lma.ROSTER)

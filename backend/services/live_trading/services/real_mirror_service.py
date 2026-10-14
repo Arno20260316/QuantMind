@@ -1536,6 +1536,10 @@ async def _submit_payload(
                 "strategy_id": payload.get("strategy_id") or None,
                 "client_order_id": mirror_cid,
                 "remarks": f"mirror:{payload.get('source') or 'sim'}",
+                # T-P1-03 来源分类（乙1）：队列载荷里的 ``source`` 一路落到
+                # ``orders.source``——此前只有 remarks 前缀，列恒 NULL，交易台按来源
+                # 下钻（llm_decision / sltp / internal_dispatcher:*）就断在这里。
+                "source": str(payload.get("source") or ""),
                 # P2.7：归属随真单落 orders.agent（队列载荷是跨进程数据，缺了就空）
                 "agent": payload.get("agent") or None,
                 # P1.6 TCA 基准价 = **决策腿当时看到的价**（载荷 price，即模拟虚拟

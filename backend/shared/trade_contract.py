@@ -26,6 +26,11 @@
   ——同一订单同一时刻只会有一条，随后被真实明细**就地改键**（升级）。
   改键撞上「真实行已存在」时的收口在 ``qmt_exec_poller._upgrade_synth_trade``
   （删合成行而不是改键），本模块只提供前缀常量。
+* **累计锚成交**：``cum-<日>-<委托号>-<累计量>``（``CUMULATIVE_TRADE_PREFIX``）。
+  桥回执**只有委托级累计成交量**、没有逐笔成交号时（通达信桥即此形态），用
+  「委托号 + 累计量台阶」当锚：累计量每上一个台阶有且只有一笔成交落在那一档。
+  派生实现在 ``agent_ledger_fill.derive_cumulative_fill_key``——键的形状只有一份，
+  写侧（``tdx_push_service``）与对账侧共用，不在两边各拼一次字面量。
 
 ## 撞键之后的语义
 
@@ -54,6 +59,22 @@ TRADE_UNIQUE_INDEX = "uq_trades_scope_exchange_trade_id"
 #: 不再自己写一份字面量）；登记在这里是为了让对账/体检认得出「键不是券商编号」
 #: 的那批行——它们与真实成交的幂等键**不同族**，对账要按族分开处理。
 SYNTH_TRADE_PREFIX = "qmt-synth-"
+
+#: 累计锚派生键前缀（桥回执只有委托级累计成交、没有逐笔成交号）。唯一生产者是
+#: 通达信桥链路 ``tdx_push_service._sync_orders_to_pg``；与合成键同为「非券商编号」
+#: 族（代价口径都是柜面均价，见 ``is_derived_trade_id``）。
+CUMULATIVE_TRADE_PREFIX = "cum-"
+
+
+def is_derived_trade_id(trade_id: Any) -> bool:
+    """键是否**不在券商编号族**（合成 / 累计锚派生）。
+
+    这两族的价都取「柜面累计均价」口径而非逐笔明细价，读侧（TCA 的
+    ``price_source``、对账）要能把它们单列出来——判据只有这一份，别处不许再
+    各写一次 ``startswith``（多写一份 = 新族加进来时会漏掉一个消费方）。
+    """
+    text = str(trade_id or "")
+    return text.startswith((SYNTH_TRADE_PREFIX, CUMULATIVE_TRADE_PREFIX))
 
 #: 存量重复扫描（唯一索引的预检，也是体检 C14 的判定输入）。
 #: 一条 SQL 两处用，避免「预检口径」与「体检口径」漂移。

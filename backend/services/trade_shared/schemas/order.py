@@ -45,6 +45,12 @@ class OrderCreate(OrderBase):
     trading_mode: TradingMode | None = None
     #: P2.7 分账：这条腿属于哪家模型（镜像单从模拟单继承）。非 LLM 腿留空。
     agent: str | None = Field(None, max_length=64)
+    #: T-P1-03 Order 契约列：来源分类（``order_contract.SOURCE_*``）。**REAL 侧此前
+    #: 全程不落库**（列在、写点缺，2026-10-14 乙1 补）：镜像/内部派发的 ``order_data``
+    #: 早已带 ``source``（``mirror_virtual_fill`` 的队列载荷），是本 schema 把它丢了。
+    #: 调用方应过 ``order_contract.normalize_source``（列宽 32；schema 的 max_length
+    #: 是兜底——超宽会抛校验错，整笔真单发不出去）。
+    source: str | None = Field(None, max_length=32)
     #: P1.6 TCA 基准价：**决策时点我们看到的那个价**（LLM 腿 = 决策报价；镜像腿 =
     #: 模拟虚拟成交价/强平盘口价）。**不是** ``price``（我方限价 = 愿意出的价），
     #: 两者量的是不同的事——前端直单没有决策参考价，一律留空。

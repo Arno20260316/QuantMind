@@ -6,7 +6,9 @@
 执行脚本：
   - ``type=news`` → ``scripts/news_brief.py``（QM 原生新闻管线，不受交易日闸门限制）
   - ``type=live`` → ``scripts/live_model_analysis.py``（模型对话轮；**只出观点
-    不下单**——上游「时段内可真下单 / 盘外 --force」语义不恢复，故无窗口分支）
+    不下单**——上游「时段内可真下单」语义不恢复，故本管线没有下单分支。脚本上
+    那个 ``--force`` 是**本仓自己的**语义：越过「决策轮在岗则让位」判据（甲5），
+    与上游的「盘外强下单」无关）
 
 管线自身有 flock 防叠跑（live_model_analysis 的 .live_model_analysis.lock、
 news_brief 的增量游标）；忙碌时任务留 pending 下轮自动补跑。台账读写一律经
@@ -76,6 +78,10 @@ def _cmd_for(job: dict) -> list[str]:
     cmd = [sys.executable, str(ROOT / "scripts" / "live_model_analysis.py")]
     if names:
         cmd += ["--agents", names]
+    # 「立即分析」= 人按的按钮，**不是**决策轮的替补：越过「决策轮在岗则让位」
+    # 判据（甲5）——按钮语义是「现在给我一轮分析」，哪怕决策轮刚在同一个槽位
+    # 跑过。cron 那几条**不带** --force，让位判据对它们生效。
+    cmd.append("--force")
     return cmd
 
 

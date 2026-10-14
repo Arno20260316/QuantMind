@@ -7,11 +7,12 @@ TdxPushService - QuantMind ↔ 通达信 双向推送服务
 所有请求经 Windows 桥 (TDX_BRIDGE_URL:8550) 转发到通达信客户端。
 受 ENABLE_TDX_PUSH 开关控制, 未配置 token 时安全降级不报错。
 """
+
 import asyncio
 import logging
 import os
 import uuid
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from backend.services.live_trading.services.tdx_cancel_verify import (
     verify_cancel_terminal,
@@ -19,8 +20,13 @@ from backend.services.live_trading.services.tdx_cancel_verify import (
 from backend.services.live_trading.services.trading_session import (
     real_order_session_refusal,
 )
+from backend.shared.agent_ledger_fill import (
+    derive_cumulative_fill_key,
+    post_fill_for_order,
+)
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.order_contract import build_bridge_plan_id
+from backend.shared.trade_contract import CUMULATIVE_TRADE_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +125,77 @@ class TdxPushError(Exception):
     """通达信推送失败"""
 
 
+class _LocalOrderState(NamedTuple):
+    """预载的本地订单行快照（``_sync_orders_to_pg`` 用）。
+
+    一次查询把三样东西都带回来，而不是各写一个查询：既有状态（判「首次转
+    FILLED」，轮询刷新不许重复当新成交推）、成交增量所需的前值（已成交量/均价）、
+    分账归属（``agent``——成交回报里没有它，只能从订单行读回）。
+    """
+
+    order_id: str
+    status: Any
+    portfolio_id: Any
+    filled_quantity: float
+    average_price: float | None
+    agent: str
+
+
+class _LedgerOrderRef(NamedTuple):
+    """喂给 ``post_fill_for_order`` 的订单引用（只带它读的几个字段）。
+
+    不复用 ORM ``Order``：本模块的订单读写全走裸 SQL（表结构/列名在这条链上是
+    显式契约），把 ORM 实例混进来的话，它会是 session 身份表里一份**跟不上的**
+    副本（裸 SQL 改了库，ORM 属性还是旧的），哪天一次 autoflush 就能把旧值写回去。
+    ``post_fill_for_order`` 本来也只 ``getattr`` 这几个字段（见其 docstring）。
+    """
+
+    order_id: str
+    tenant_id: str
+    user_id: str
+    symbol: str
+    side: Any
+    agent: str
+
+
+def _marginal_fill_price(
+    *,
+    delta_qty: float,
+    prior_qty: float,
+    prior_avg: float | None,
+    cum_qty: float,
+    cum_avg: float,
+    fallback_price: float,
+) -> float:
+    """累计口径 → 本台阶的成交价（增量边际价）；取不到给 0（调用方不落该行）。
+
+    桥只给「委托级累计成交量 + 柜面累计均价」（通达信 ``CjVol``/``CjPrice``）。
+    直接拿 CjPrice 当每一档的成交价，会把前面几档的钱重复摊进后面的档
+    （Σ价×量 ≠ 柜面累计金额）⇒ 成交成本虚高、TCA 读数失真。边际价让
+    ``Σ(边际价×增量) == 累计均价×累计量``，与柜面口径**逐分对齐**：
+
+    ``p = (累计均价×累计量 − 前值均价×前值量) / 增量``
+
+    前值缺失或前值均价非正（首次见到该单）→ 前值量必为 0，两种取法本来就相等，
+    退化为直接取累计均价。推导出的价非正（桥的均价坏了）→ 退 ``fallback_price``
+    （订单限价行），再不行给 0：**宁可不落这一行**，也不落 0 元成交
+    （TCA/分账按价算金额，0 元=白记一笔，还会污染成本口径）。
+    """
+    if delta_qty <= 0:
+        return 0.0
+    prior_value = float(prior_avg or 0.0) * float(prior_qty or 0.0)
+    marginal = (float(cum_avg or 0.0) * float(cum_qty or 0.0) - prior_value) / float(
+        delta_qty
+    )
+    if marginal > 0:
+        return marginal
+    if float(cum_avg or 0.0) > 0:
+        return float(cum_avg)
+    if float(fallback_price or 0.0) > 0:
+        return float(fallback_price)
+    return 0.0
+
+
 def _batch_quantdb_last_close(symbols: list[str]) -> dict[str, float]:
     """批量从 QuantDB 本地日线读取最近交易日收盘价（与模拟撮合同源）。"""
     if not symbols:
@@ -166,6 +243,7 @@ class TdxPushService:
     async def _client_http(self):
         if self._client is None:
             import httpx
+
             self._client = httpx.AsyncClient(timeout=TIMEOUT)
         return self._client
 
@@ -175,19 +253,26 @@ class TdxPushService:
             raise TdxPushError("TDX_BRIDGE_URL/TOKEN 未配置")
         client = await self._client_http()
         resp = await client.post(
-            f"{self.bridge_url}{path}", json=payload, headers=self._headers())
+            f"{self.bridge_url}{path}", json=payload, headers=self._headers()
+        )
         if resp.status_code != 200:
             raise TdxPushError(f"桥返回 HTTP {resp.status_code}: {resp.text}")
         return resp.json()
 
     # ============ 推送 (Q→T) ============
 
-    async def push_signals_to_block(self, stocks: list, block_code: str = "",
-                                    block_name: str = "QuantMind今日选股",
-                                    show: bool = True) -> dict:
+    async def push_signals_to_block(
+        self,
+        stocks: list,
+        block_code: str = "",
+        block_name: str = "QuantMind今日选股",
+        show: bool = True,
+    ) -> dict:
         """把选股结果写入通达信自定义板块."""
-        return await self._post("/api/v1/push/block", {
-            "block_code": block_code, "stocks": stocks, "show": show})
+        return await self._post(
+            "/api/v1/push/block",
+            {"block_code": block_code, "stocks": stocks, "show": show},
+        )
 
     async def push_warnings(self, signals: list[dict]) -> dict:
         """推送买卖预警信号 (通达信支持双击闪电下单).
@@ -196,16 +281,21 @@ class TdxPushService:
         """
         stock_list = [s.get("symbol", "") for s in signals]
         bs_map = {"buy": "0", "sell": "1"}
-        return await self._post("/api/v1/push/warnings", {
-            "stock_list": stock_list,
-            "price_list": [str(s.get("price", "0")) for s in signals],
-            "close_list": [str(s.get("close", "0")) for s in signals],
-            "volum_list": [str(s.get("volume", "0")) for s in signals],
-            "bs_flag_list": [bs_map.get(str(s.get("side", "")).lower(), "2") for s in signals],
-            "warn_type_list": ["1"] * len(signals),
-            "reason_list": [s.get("reason", "")[:25] for s in signals],
-            "count": len(signals),
-        })
+        return await self._post(
+            "/api/v1/push/warnings",
+            {
+                "stock_list": stock_list,
+                "price_list": [str(s.get("price", "0")) for s in signals],
+                "close_list": [str(s.get("close", "0")) for s in signals],
+                "volum_list": [str(s.get("volume", "0")) for s in signals],
+                "bs_flag_list": [
+                    bs_map.get(str(s.get("side", "")).lower(), "2") for s in signals
+                ],
+                "warn_type_list": ["1"] * len(signals),
+                "reason_list": [s.get("reason", "")[:25] for s in signals],
+                "count": len(signals),
+            },
+        )
 
     async def push_message(self, msg: str) -> dict:
         """推送文本消息到通达信界面."""
@@ -213,13 +303,19 @@ class TdxPushService:
 
     async def push_source(self, py_code: str, handle_type: int = 0) -> dict:
         """推送策略源码到通达信云回测平台."""
-        return await self._post("/api/v1/push/source", {
-            "py_code": py_code, "handle_type": handle_type})
+        return await self._post(
+            "/api/v1/push/source", {"py_code": py_code, "handle_type": handle_type}
+        )
 
-    async def place_order(self, stock_code: str, side: str, volume: int,
-                          price: float | None = None,
-                          price_type: int | None = None,
-                          plan_id: str = "") -> dict:
+    async def place_order(
+        self,
+        stock_code: str,
+        side: str,
+        volume: int,
+        price: float | None = None,
+        price_type: int | None = None,
+        plan_id: str = "",
+    ) -> dict:
         """通过桥下单到通达信.
 
         **真单时段闸门（咽喉点）**：A 股委托只可能在交易时段有效
@@ -258,11 +354,14 @@ class TdxPushService:
             "price_type": price_type if price_type is not None else (0 if price else 1),
             "price": price,
         }
-        return await self._post("/api/v1/plans/execute", {
-            # 缺省号同样必须纳秒（秒精度会让同秒两笔单撞号 → 桥去重整单丢弃）
-            "plan_id": build_bridge_plan_id(plan_id),
-            "orders": [order],
-        })
+        return await self._post(
+            "/api/v1/plans/execute",
+            {
+                # 缺省号同样必须纳秒（秒精度会让同秒两笔单撞号 → 桥去重整单丢弃）
+                "plan_id": build_bridge_plan_id(plan_id),
+                "orders": [order],
+            },
+        )
 
     # ============ 拉取 (T→Q) ============
 
@@ -297,11 +396,13 @@ class TdxPushService:
         except Exception:
             # 桥不可达/HTTP 错 = 撤单结果未知；复核确认已撤则如实上报，否则原样重抛
             state, _ = await verify_cancel_terminal(
-                lambda: self.pull_order_status(order_id))
+                lambda: self.pull_order_status(order_id)
+            )
             if state == "cancelled":
                 logger.warning(
                     "[TdxPush] 撤单握手异常但终态复核确认已撤: %s %s",
-                    stock_code, order_id,
+                    stock_code,
+                    order_id,
                 )
                 return {
                     "success": True,
@@ -312,7 +413,8 @@ class TdxPushService:
         if resp.get("success"):
             return resp
         state, _order = await verify_cancel_terminal(
-            lambda: self.pull_order_status(order_id))
+            lambda: self.pull_order_status(order_id)
+        )
         if state == "cancelled":
             logger.info("[TdxPush] 撤单假失败纠正: %s %s", stock_code, order_id)
             return {
@@ -342,10 +444,13 @@ class TdxPushService:
 
         用于实时行情（get_market_snapshot 等）拉取。返回桥 result 字典。
         """
-        resp = await self._post("/api/v1/tdx/call", {
-            "method": method,
-            "params": params or {},
-        })
+        resp = await self._post(
+            "/api/v1/tdx/call",
+            {
+                "method": method,
+                "params": params or {},
+            },
+        )
         result = resp.get("result") if isinstance(resp, dict) else resp
         return result if isinstance(result, dict) else {"result": result}
 
@@ -372,11 +477,15 @@ class TdxPushService:
             # 成本价 x 总持仓 与 持仓市值 的差
             market_value = float(p.get("market_value", 0) or 0)
             pnl = market_value - cost * float(p.get("total_volume", 0) or 0)
-            pnl_list.append({"stock_code": p.get("stock_code", ""),
-                             "cost_price": cost,
-                             "volume": p.get("total_volume", 0),
-                             "market_value": market_value,
-                             "pnl": round(pnl, 2)})
+            pnl_list.append(
+                {
+                    "stock_code": p.get("stock_code", ""),
+                    "cost_price": cost,
+                    "volume": p.get("total_volume", 0),
+                    "market_value": market_value,
+                    "pnl": round(pnl, 2),
+                }
+            )
             total_pnl += pnl
         return {
             "total_asset": asset.get("asset", 0),
@@ -432,7 +541,9 @@ class TdxPushService:
         # 桥的 market_value 可能为 0，按持仓市值累加
         market_value = float(asset.get("market_value") or 0)
         if market_value <= 0 and positions:
-            market_value = round(sum(float(x.get("market_value") or 0) for x in positions), 2)
+            market_value = round(
+                sum(float(x.get("market_value") or 0) for x in positions), 2
+            )
 
         # 零资产守卫：桥返回空账户（开盘前后/桥未就绪）时不落库，
         # 避免 0 资产快照污染日终账本与收益计算（与 qmt 链路 is_inconsistent_zero_total_snapshot 同语义）。
@@ -617,207 +728,370 @@ class TdxPushService:
         user_id: str,
         now,
     ) -> list[dict]:
-        """把通达信当日委托同步到 orders 表（REAL 模式交易记录展示）。
+        """把通达信当日委托同步到 orders 表（REAL 模式交易记录展示）+ 成交/分账。
 
         幂等 + 增量修正：按 exchange_order_id（桥的委托编号）去重；
         已存在的行用桥的最新状态/成交回报刷新。桥是真实成交的权威来源，
         若只插不更新，订单会永远停在 SUBMITTED，随后被超时扫描器误判为
         EXPIRED（表现为"交易记录全部已过期、成交为 0"）。
 
+        **增量成交（乙2/乙3，2026-10-14 补）**：桥只回报委托级**累计**成交量与
+        柜面均价、没有逐笔成交号——累计量的每一档差额补一行 ``trades``（成交 tab /
+        TCA / 对账读它，此前这条路一笔都没写过，09-29 之后成交面全空），并按
+        ``agent_ledger_fill`` 的三条纪律把同一笔记进 ``orders.agent`` 的分账段。
+        接在这里而不是另起一个任务：订单行与成交行必须同事务（「成交在、订单状态
+        没跟上」会让对账/持仓两套数各说各话）。
+
         返回本轮**首次转 FILLED** 的成交事件（供调用方在 commit 后推 QQ；
         事件不在这里推送——事务没提交就推送=可能推一笔没落库的成交）。
+
+        **失败形态（乙4）**：桥那一侧（``pull_orders``）失败只降级——本轮没数据，
+        账户快照照落库，桥健康另有 BridgeHealthTracker 在账户通道上判；**DB/账本**
+        失败一律往外抛，调用方的事务一起回滚、下一轮 30s 轮询重投（见
+        ``agent_ledger_fill`` 纪律 3：宁可晚记，不可「成交在、账本无」）。
+        原先的裸 ``except → logger.warning → return []`` 把「成交回报落不进去」
+        伪装成「桥今天没成交」——两者在库里长得一模一样，没人能分辨。
         """
-        fills: list[dict] = []
+        from datetime import datetime
+
+        from sqlalchemy import func, select, text
+
+        from backend.services.trade_shared.models.enums import (
+            OrderSide,
+            OrderStatus,
+            OrderType,
+            PositionSide,
+            TradeAction,
+            TradingMode,
+        )
+        from backend.services.trade_shared.models.order import Order
+        from backend.services.trade_shared.models.trade import Trade
+        from backend.services.trade_shared.order_fees import fee_columns
+
         try:
-            from sqlalchemy import select, text
-
-            from backend.services.trade_shared.models.enums import (
-                OrderSide,
-                OrderStatus,
-                OrderType,
-                TradingMode,
-            )
-            from backend.services.trade_shared.models.order import Order
-
             orders = await self.pull_orders()
-            if not orders:
-                return []
-
-            # 桥委托的 order_id 是字符串（如 "160356"），映射为 exchange_order_id；
-            # 带出既有 status 供「首次转 FILLED」判定（轮询刷新不许重复当新成交推）
-            existing = {
-                str(r[0]): (str(r[1]), r[2])
-                for r in (
-                    await db.execute(
-                        select(
-                            Order.exchange_order_id,
-                            Order.order_id,
-                            Order.status,
-                        ).where(
-                            Order.exchange_order_id.is_not(None),
-                            Order.tenant_id == tenant_id,
-                            Order.user_id == str(user_id),
-                        )
-                    )
-                ).fetchall()
-            }
-
-            def _map_bridge_status(status: str) -> OrderStatus:
-                if status in ("filled",):
-                    return OrderStatus.FILLED
-                if status in ("partial", "partial_fill", "partially_filled"):
-                    return OrderStatus.PARTIALLY_FILLED
-                if status in ("cancel", "cancelled", "partial_cancelled"):
-                    return OrderStatus.CANCELLED
-                if status in ("rejected",):
-                    return OrderStatus.REJECTED
-                return OrderStatus.SUBMITTED
-
-            for o in orders:
-                exchange_id = str(o.get("order_id") or "").strip()
-                if not exchange_id:
-                    continue
-                symbol = str(o.get("stock_code") or "").strip()
-                if not symbol:
-                    continue
-                side = str(o.get("side") or "buy").strip().lower()
-                status = str(o.get("status") or "pending").strip().lower()
-                # 桥已修复方向解析: buy/sell/cancel(方向未知, 保守默认 buy)
-                order_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
-                order_status = _map_bridge_status(status)
-
-                time_hhmm = str(o.get("time") or "").strip()
-                submitted_at = now
-                if len(time_hhmm) >= 4:
-                    try:
-                        submitted_at = now.replace(
-                            hour=int(time_hhmm[:2]),
-                            minute=int(time_hhmm[2:4]),
-                            second=0,
-                            microsecond=0,
-                        )
-                    except (ValueError, TypeError):
-                        pass
-                raw_price = float(o.get("order_price") or 0)
-                is_market = (
-                    raw_price <= 0 or raw_price == MARKET_ORDER_PRICE_SENTINEL
-                )
-                order_type = OrderType.MARKET if is_market else OrderType.LIMIT
-                total_volume = float(o.get("total_volume") or 0)
-                filled_volume = float(o.get("filled_volume") or 0)
-                price = 0.0 if is_market else raw_price
-                filled_price = float(o.get("filled_price") or price)
-                filled_value = round(filled_volume * filled_price, 2)
-                fee = estimate_order_fee(filled_value, side)
-                filled_at = (
-                    submitted_at if order_status == OrderStatus.FILLED else None
-                )
-
-                prior = existing.get(exchange_id)
-                prior_status = getattr(prior[1], "value", prior[1]) if prior else None
-                became_filled = _fill_transitioned(
-                    str(prior_status or ""), order_status.value, filled_volume
-                )
-
-                if prior:
-                    # 已存在 → 用桥最新状态刷新（成交回报追平，避免被超时扫描器误标过期）
-                    await db.execute(
-                        text(
-                            """
-                            UPDATE orders SET
-                                status = :status,
-                                filled_quantity = :filled_quantity,
-                                average_price = :average_price,
-                                filled_value = :filled_value,
-                                filled_at = :filled_at,
-                                commission = :commission,
-                                remarks = '通达信桥委托'
-                            WHERE order_id = :order_id
-                            """
-                        ),
-                        {
-                            "status": order_status.value,
-                            "filled_quantity": filled_volume,
-                            "average_price": filled_price if filled_volume > 0 else None,
-                            "filled_value": filled_value,
-                            "filled_at": filled_at,
-                            "commission": fee,
-                            "order_id": prior[0],
-                        },
-                    )
-                else:
-                    result = await db.execute(
-                        text(
-                            """
-                            INSERT INTO orders (
-                                order_id, tenant_id, user_id, portfolio_id, strategy_id, symbol,
-                                side, trade_action, position_side, is_margin_trade,
-                                order_type, trading_mode, status,
-                                quantity, filled_quantity, price, average_price,
-                                order_value, filled_value, commission,
-                                submitted_at, filled_at,
-                                client_order_id, exchange_order_id, remarks
-                            ) VALUES (
-                                :order_id, :tenant_id, :user_id, :portfolio_id, NULL, :symbol,
-                                :side, :trade_action, :position_side, FALSE,
-                                :order_type, :trading_mode, :status,
-                                :quantity, :filled_quantity, :price, :average_price,
-                                :order_value, :filled_value, :commission,
-                                :submitted_at, :filled_at,
-                                :client_order_id, :exchange_order_id, :remarks
-                            )
-                            RETURNING order_id
-                            """
-                        ),
-                        {
-                            "order_id": uuid.uuid4(),
-                            "tenant_id": tenant_id,
-                            "user_id": user_id or "0",
-                            "portfolio_id": 0,
-                            "symbol": symbol,
-                            "side": order_side.value,
-                            # PG tradeaction enum: OPEN/CLOSE（与 Python 命名不同）
-                            "trade_action": "OPEN"
-                            if order_side == OrderSide.BUY
-                            else "CLOSE",
-                            # PG positionside enum: LONG/SHORT（大写）
-                            "position_side": "LONG",
-                            "order_type": order_type.value,
-                            "trading_mode": TradingMode.REAL.value,
-                            "status": order_status.value,
-                            "quantity": total_volume,
-                            "filled_quantity": filled_volume,
-                            "price": price if price > 0 else None,
-                            "average_price": filled_price if filled_volume > 0 else None,
-                            "order_value": round(total_volume * price, 2),
-                            "filled_value": filled_value,
-                            "commission": fee,
-                            "submitted_at": submitted_at,
-                            "filled_at": filled_at,
-                            "client_order_id": f"tdx-{exchange_id}",
-                            "exchange_order_id": exchange_id,
-                            "remarks": "通达信桥委托",
-                        },
-                    )
-                    new_id = result.scalar()
-                    if new_id:
-                        existing[exchange_id] = (str(new_id), order_status)
-
-                if became_filled:
-                    fills.append(
-                        {
-                            "side": side,
-                            "symbol": symbol,
-                            "filled_volume": filled_volume,
-                            "filled_price": filled_price,
-                            "exchange_order_id": exchange_id,
-                        }
-                    )
-            logger.info("[TdxSync] 通达信委托落库 %d 笔 (user=%s)", len(orders), user_id)
-            return fills
-        except Exception as exc:
-            logger.warning("[TdxSync] 通达信委托落库失败: %s", exc)
+        except Exception as exc:  # noqa: BLE001 桥侧失败=本轮没数据（见 docstring）
+            logger.warning("[TdxSync] 通达信当日委托拉取失败: %s", exc)
             return []
+        if not orders:
+            return []
+
+        fills: list[dict] = []
+        # 预载本地订单行：既有状态（判「首次转 FILLED」，轮询刷新不许重复当新成交推）
+        # + 成交增量所需的前值（已成交量/均价）+ 分账归属（agent，成交回报里没有）。
+        existing: dict[str, _LocalOrderState] = {}
+        for row in (
+            await db.execute(
+                select(
+                    Order.exchange_order_id,
+                    Order.order_id,
+                    Order.status,
+                    Order.portfolio_id,
+                    Order.filled_quantity,
+                    Order.average_price,
+                    Order.agent,
+                ).where(
+                    Order.exchange_order_id.is_not(None),
+                    Order.tenant_id == tenant_id,
+                    Order.user_id == str(user_id),
+                )
+            )
+        ).fetchall():
+            existing[str(row[0])] = _LocalOrderState(
+                order_id=str(row[1]),
+                status=row[2],
+                portfolio_id=row[3],
+                filled_quantity=float(row[4] or 0.0),
+                average_price=float(row[5]) if row[5] else None,
+                agent=str(row[6] or ""),
+            )
+        # 本轮已落的成交键：同一委托被桥重复返回时只落一次（跨轮幂等靠键本身）
+        written_fills: set[str] = set()
+        # 乙4：静默跳过必须有出口——「成交在、成交面没有」不许只留在库里没人知道
+        skipped_no_price = 0  # 台阶增量取不出价（柜面均价坏且无限价可退）
+        skipped_no_key = 0  # 台阶增量派生不出幂等键（如累计量非整数）——无键不落行
+
+        def _map_bridge_status(status: str) -> OrderStatus:
+            if status in ("filled",):
+                return OrderStatus.FILLED
+            if status in ("partial", "partial_fill", "partially_filled"):
+                return OrderStatus.PARTIALLY_FILLED
+            if status in ("cancel", "cancelled", "partial_cancelled"):
+                return OrderStatus.CANCELLED
+            if status in ("rejected",):
+                return OrderStatus.REJECTED
+            return OrderStatus.SUBMITTED
+
+        for o in orders:
+            exchange_id = str(o.get("order_id") or "").strip()
+            if not exchange_id:
+                continue
+            symbol = str(o.get("stock_code") or "").strip()
+            if not symbol:
+                continue
+            side = str(o.get("side") or "buy").strip().lower()
+            status = str(o.get("status") or "pending").strip().lower()
+            # 桥已修复方向解析: buy/sell/cancel(方向未知, 保守默认 buy)
+            order_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
+            order_status = _map_bridge_status(status)
+
+            time_hhmm = str(o.get("time") or "").strip()
+            submitted_at = now
+            # 桥报 HHMM 的北京墙钟瞬时（解析失败=None）：orders.submitted_at、
+            # trades.executed_at 与分账 filled_at 全用它——成交瞬时只取一次
+            # （成交日是账本幂等键的一半，两处各取一次 now() 会在跨零点打架）。
+            wall_time = None
+            if len(time_hhmm) >= 4:
+                try:
+                    wall_time = now.replace(
+                        hour=int(time_hhmm[:2]),
+                        minute=int(time_hhmm[2:4]),
+                        second=0,
+                        microsecond=0,
+                    )
+                    submitted_at = wall_time
+                except (ValueError, TypeError):
+                    pass
+            raw_price = float(o.get("order_price") or 0)
+            is_market = raw_price <= 0 or raw_price == MARKET_ORDER_PRICE_SENTINEL
+            order_type = OrderType.MARKET if is_market else OrderType.LIMIT
+            total_volume = float(o.get("total_volume") or 0)
+            filled_volume = float(o.get("filled_volume") or 0)
+            price = 0.0 if is_market else raw_price
+            filled_price = float(o.get("filled_price") or price)
+            filled_value = round(filled_volume * filled_price, 2)
+            fee = estimate_order_fee(filled_value, side)
+            filled_at = submitted_at if order_status == OrderStatus.FILLED else None
+
+            prior = existing.get(exchange_id)
+            prior_status = (
+                getattr(prior.status, "value", prior.status) if prior else None
+            )
+            became_filled = _fill_transitioned(
+                str(prior_status or ""), order_status.value, filled_volume
+            )
+
+            if prior:
+                order_pk = prior.order_id
+                # 已存在 → 用桥最新状态刷新（成交回报追平，避免被超时扫描器误标过期）
+                await db.execute(
+                    text(
+                        """
+                        UPDATE orders SET
+                            status = :status,
+                            filled_quantity = :filled_quantity,
+                            average_price = :average_price,
+                            filled_value = :filled_value,
+                            filled_at = :filled_at,
+                            commission = :commission,
+                            remarks = '通达信桥委托'
+                        WHERE order_id = :order_id
+                        """
+                    ),
+                    {
+                        "status": order_status.value,
+                        "filled_quantity": filled_volume,
+                        "average_price": filled_price if filled_volume > 0 else None,
+                        "filled_value": filled_value,
+                        "filled_at": filled_at,
+                        "commission": fee,
+                        "order_id": prior.order_id,
+                    },
+                )
+            else:
+                result = await db.execute(
+                    text(
+                        """
+                        INSERT INTO orders (
+                            order_id, tenant_id, user_id, portfolio_id, strategy_id, symbol,
+                            side, trade_action, position_side, is_margin_trade,
+                            order_type, trading_mode, status,
+                            quantity, filled_quantity, price, average_price,
+                            order_value, filled_value, commission,
+                            submitted_at, filled_at,
+                            client_order_id, exchange_order_id, remarks
+                        ) VALUES (
+                            :order_id, :tenant_id, :user_id, :portfolio_id, NULL, :symbol,
+                            :side, :trade_action, :position_side, FALSE,
+                            :order_type, :trading_mode, :status,
+                            :quantity, :filled_quantity, :price, :average_price,
+                            :order_value, :filled_value, :commission,
+                            :submitted_at, :filled_at,
+                            :client_order_id, :exchange_order_id, :remarks
+                        )
+                        RETURNING order_id
+                        """
+                    ),
+                    {
+                        "order_id": uuid.uuid4(),
+                        "tenant_id": tenant_id,
+                        "user_id": user_id or "0",
+                        "portfolio_id": 0,
+                        "symbol": symbol,
+                        "side": order_side.value,
+                        # PG tradeaction enum: OPEN/CLOSE（与 Python 命名不同）
+                        "trade_action": "OPEN"
+                        if order_side == OrderSide.BUY
+                        else "CLOSE",
+                        # PG positionside enum: LONG/SHORT（大写）
+                        "position_side": "LONG",
+                        "order_type": order_type.value,
+                        "trading_mode": TradingMode.REAL.value,
+                        "status": order_status.value,
+                        "quantity": total_volume,
+                        "filled_quantity": filled_volume,
+                        "price": price if price > 0 else None,
+                        "average_price": filled_price if filled_volume > 0 else None,
+                        "order_value": round(total_volume * price, 2),
+                        "filled_value": filled_value,
+                        "commission": fee,
+                        "submitted_at": submitted_at,
+                        "filled_at": filled_at,
+                        "client_order_id": f"tdx-{exchange_id}",
+                        "exchange_order_id": exchange_id,
+                        "remarks": "通达信桥委托",
+                    },
+                )
+                new_id = result.scalar()
+                order_pk = str(new_id) if new_id else None
+                if order_pk:
+                    existing[exchange_id] = _LocalOrderState(
+                        order_id=order_pk,
+                        status=order_status,
+                        portfolio_id=0,
+                        filled_quantity=filled_volume,
+                        average_price=(filled_price if filled_volume > 0 else None),
+                        agent="",
+                    )
+
+            # 乙2/乙3：累计量台阶的增量 → 一行 trades + 分账账本。
+            # 基线**从 trades 读**（本单全部 cum- 行的量），不是 orders.filled_quantity：
+            # 后者只是「最后一次刷新的累计值」，对 09-29 后没写过成交行的历史单
+            # （含今日 600338）会永远算出 0 增量，成交面永远补不上。
+            if order_pk and filled_volume > 0:
+                # 成交瞬时只取一次：trades.executed_at 与分账 filled_at 必须同一个值
+                # （成交日是账本幂等键的一半，两处各取一次 now() 会在跨零点打架）。
+                executed_at = wall_time or datetime.now()
+                baseline_qty = float(
+                    (
+                        await db.execute(
+                            select(func.coalesce(func.sum(Trade.quantity), 0.0)).where(
+                                Trade.order_id == order_pk,
+                                Trade.exchange_trade_id.startswith(
+                                    CUMULATIVE_TRADE_PREFIX
+                                ),
+                            )
+                        )
+                    ).scalar()
+                    or 0.0
+                )
+                delta_qty = filled_volume - baseline_qty
+                fill_key = (
+                    derive_cumulative_fill_key(
+                        broker_order_id=exchange_id,
+                        cumulative_volume=filled_volume,
+                        trade_date=executed_at,
+                    )
+                    if delta_qty > 0
+                    else ""
+                )
+                if delta_qty > 0 and not fill_key:
+                    # 没有唯一号就没有幂等：宁可晚记/不记，不可重投双记
+                    skipped_no_key += 1
+                elif fill_key:
+                    marginal = _marginal_fill_price(
+                        delta_qty=delta_qty,
+                        prior_qty=baseline_qty,
+                        prior_avg=prior.average_price if prior else None,
+                        cum_qty=filled_volume,
+                        cum_avg=filled_price,
+                        fallback_price=price,
+                    )
+                    if marginal <= 0:
+                        # 0 元成交比缺一行更坏（TCA/分账按价算金额，白记一笔还污染成本）
+                        skipped_no_price += 1
+                    else:
+                        duplicate = fill_key in written_fills
+                        if not duplicate:
+                            dup_rows = await db.execute(
+                                select(Trade.trade_id).where(
+                                    Trade.tenant_id == tenant_id,
+                                    Trade.user_id == str(user_id),
+                                    Trade.exchange_trade_id == fill_key,
+                                )
+                            )
+                            duplicate = dup_rows.first() is not None
+                        if not duplicate:
+                            # commit 不在本方法（sync_account_to_pg）：拿不到
+                            # IntegrityError-at-commit 回滚 ⇒ 先查后插 + 本轮集合，
+                            # DB 唯一索引（uq_trades_scope_exchange_trade_id）兜底。
+                            written_fills.add(fill_key)
+                            db.add(
+                                Trade(
+                                    order_id=order_pk,
+                                    tenant_id=tenant_id,
+                                    user_id=str(user_id),
+                                    portfolio_id=0,
+                                    symbol=symbol,
+                                    side=order_side,
+                                    trade_action=(
+                                        TradeAction.BUY_TO_OPEN
+                                        if order_side == OrderSide.BUY
+                                        else TradeAction.SELL_TO_CLOSE
+                                    ),
+                                    position_side=PositionSide.LONG,
+                                    trading_mode=TradingMode.REAL,
+                                    quantity=delta_qty,
+                                    price=marginal,
+                                    trade_value=round(delta_qty * marginal, 2),
+                                    exchange_trade_id=fill_key,
+                                    exchange_name="tdx_bridge",
+                                    executed_at=executed_at,
+                                    remarks="通达信桥成交",
+                                    **fee_columns(
+                                        symbol, delta_qty, marginal, order_side
+                                    ),
+                                )
+                            )
+                            # 分账（乙2）：无 agent 的单静默跳过（返回 None）；
+                            # 失败**不 catch**（纪律 3：与成交行同事务，写不进去
+                            # 就整轮重投——宁可晚记，不可「成交在、账本无」）。
+                            await post_fill_for_order(
+                                db,
+                                order=_LedgerOrderRef(
+                                    order_id=str(order_pk),
+                                    tenant_id=tenant_id,
+                                    user_id=str(user_id),
+                                    symbol=symbol,
+                                    side=order_side.value,
+                                    agent=prior.agent if prior else "",
+                                ),
+                                fill_key=fill_key,
+                                quantity=delta_qty,
+                                price=marginal,
+                                filled_at=executed_at,
+                                trade_date=executed_at,
+                            )
+
+            if became_filled:
+                fills.append(
+                    {
+                        "side": side,
+                        "symbol": symbol,
+                        "filled_volume": filled_volume,
+                        "filled_price": filled_price,
+                        "exchange_order_id": exchange_id,
+                    }
+                )
+        if skipped_no_key or skipped_no_price:
+            logger.warning(
+                "[TdxSync] 台阶增量未落成交面：无幂等键 %d 笔 / 取不到价 %d 笔"
+                "（下一轮轮询会自动重投；此警告每轮复发直到能落或桥不再报该档）",
+                skipped_no_key,
+                skipped_no_price,
+            )
+        logger.info("[TdxSync] 通达信委托落库 %d 笔 (user=%s)", len(orders), user_id)
+        return fills
 
     async def check_order_success(self, wtbh: str) -> dict:
         """检查下单是否成功.
@@ -846,8 +1120,14 @@ class TdxPushService:
             "cancelled": 5,
             "cancel": 5,
         }.get(str(order.get("status") or "").strip().lower(), 1)
-        status_map = {0: "无效单", 1: "未成交", 2: "部分成交", 3: "全部成交",
-                      4: "部分成交部分撤单", 5: "全部撤单"}
+        status_map = {
+            0: "无效单",
+            1: "未成交",
+            2: "部分成交",
+            3: "全部成交",
+            4: "部分成交部分撤单",
+            5: "全部撤单",
+        }
         filled = code in (2, 3)
         return {
             "wtbh": wtbh,

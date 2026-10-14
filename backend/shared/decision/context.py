@@ -25,10 +25,19 @@
 
 * 不取数、不读文件、不连 Redis——``render_prompt`` 只吃已经拿到的快照；
 * 不做预算裁剪（``plan_affordable`` 在 IO 侧调用本模块的 ``min_buy_cost`` 口径）；
-* 不拼 ``watch``（守护意图）段的提示词——那是整点轮 schema，P2.4 的事；
 * 不自己造 ``risk_block`` / ``industry_caution_block`` 的内容：QM 侧这两个数据源
   （隔壁 ``risk_block.json`` / ``industry_risk.json``）**目前不存在**，所以它们
   以「已渲染好的一段文本」入参，缺省空串即整段不出现。缺口登记在迁移计划 P2.2。
+
+两套收尾（正文共用，见 :func:`_context_body`）：
+
+* :func:`render_prompt` —— **调仓轮**（09:35/10:05/11:05），收尾是「严格 JSON」
+  + ``REBALANCE_SCHEMA_JSON``，逐字节对齐隔壁金样；
+* :func:`render_intraday_prompt` —— **盘中轮**（其余 8 个槽位），收尾是四段式
+  （前端 arena「模型对话」按段渲染，见 ``contract.ANALYSIS_SECTIONS``）
+  + ``INTRADAY_SCHEMA_JSON``（含 ``watch``/``stop_loss``/``take_profit``/``move_stop``）。
+
+调用方一律走 :func:`render_prompt_for` 按槽位 schema 分派，不要自己写 if。
 """
 
 from __future__ import annotations
@@ -39,7 +48,12 @@ from datetime import datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from backend.shared.decision.contract import REBALANCE_SCHEMA_JSON
+from backend.shared.decision.contract import (
+    ANALYSIS_SECTIONS,
+    INTRADAY_SCHEMA_JSON,
+    REBALANCE_SCHEMA_JSON,
+    SCHEMA_INTRADAY,
+)
 
 __all__ = [
     "AGENT_QUOTA_TOTAL",
@@ -56,7 +70,9 @@ __all__ = [
     "RebalanceContext",
     "budget_filter_note",
     "ledger_cost_rows",
+    "render_intraday_prompt",
     "render_prompt",
+    "render_prompt_for",
     "render_quote_block",
 ]
 
@@ -363,6 +379,17 @@ def _direction_line(d: DirectionBlock) -> str:
     return f"{d.direction}（总分 {d.total_score}/11）"
 
 
+def _pool_lines(ctx: RebalanceContext) -> list[str]:
+    if not ctx.pool:
+        return []
+    lines = list(_POOL_HEADER)
+    lines += [_pool_row_line(p) for p in ctx.pool]
+    qb = render_quote_block(ctx.quotes, ctx.quotes_stale_count)
+    if qb:
+        lines += ["", qb]
+    return lines
+
+
 def _decision_rule_lines(ctx: RebalanceContext) -> list[str]:
     return [
         "",
@@ -380,22 +407,47 @@ def _decision_rule_lines(ctx: RebalanceContext) -> list[str]:
     ]
 
 
-def _pool_lines(ctx: RebalanceContext) -> list[str]:
-    if not ctx.pool:
-        return []
-    lines = list(_POOL_HEADER)
-    lines += [_pool_row_line(p) for p in ctx.pool]
-    qb = render_quote_block(ctx.quotes, ctx.quotes_stale_count)
-    if qb:
-        lines += ["", qb]
-    return lines
+def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
+    """盘中槽位的收尾段：四段式契约 + 守护字段 schema + 执行规则。
+
+    与 :func:`_decision_rule_lines` 的差别**只是收尾**——正文两个槽位完全共用
+    （见 :func:`_context_body`）。盘中轮多了 ``watch``（条件位）一族字段，故
+    规则里要把「文字里写了价位就必须落成 watch」说死：不落盘的价位**没有**任何
+    分钟级哨兵在盯，等于没设（上游踩过这个坑，见 assets 段原话）。
+    """
+    return [
+        "",
+        *ANALYSIS_SECTIONS,
+        "",
+        "【决策块格式】",
+        INTRADAY_SCHEMA_JSON,
+        "",
+        "【决策规则】",
+        f"1. sell 的 pct = 卖出可卖量的比例（0~1，清仓=1.0）；buy 的 pct = 使用剩余额度的"
+        f"比例（每票 ≤{ctx.per_stock_pct:.0%}，当日新开仓 ≤{ctx.max_new_buys} 只；"
+        f"超出的会被闸门裁掉）。" + budget_filter_note(ctx.per_stock_pct),
+        "2. T+1：可卖量 0 的持仓不能卖。ST/*ST/退市整理股与黑名单标的**不可买入**"
+        "（闸门硬拦）。买卖/换仓依据 = 信号分数 + 大盘盘面 + 板块主线 + 新闻分子"
+        "综合判断，HOLD/BUY 侧标签一律不作为依据。",
+        "3. watch = 挂**条件位**：stop_loss=跌破此价自动减仓 pct 比例、take_profit="
+        "涨到此价自动止盈 pct（至少给一个，由分钟级价格哨兵盯，不用等下一个整点）。"
+        "move_stop 可选：价格**上触**该价后把 stop_loss 上移到该价（只用于浮盈锁利，"
+        "必须高于当前 stop_loss，填低了会被忽略；下破触发请用 stop_loss，别用 move_stop）。",
+        "4. 「③推理论证」里写了具体价位的持仓，**必须**同步落成 watch 决策"
+        "（带 code 与 reason 写明触发价与动作）——只写在文字里等于没设防。",
+        "5. buy/sell 的 reason 必填；buy 还应给出 stop_loss（或 move_stop）与 "
+        "invalidation（退出框架），三者缺一会被判为残缺决策。"
+        "逐只现有持仓都要有判断（hold / sell / watch），包括本轮不动的那几只。",
+    ]
 
 
-def render_prompt(ctx: RebalanceContext) -> str:
-    """一轮调仓的完整提示词。
+def _context_body(ctx: RebalanceContext) -> list[str]:
+    """两套提示词**逐字节共用**的正文：持仓表 → 大盘方向 → 候选池 → 风险块。
 
-    ``ctx.holdings`` 必须是**桥口径原始行**——账本改写在这里面做，不给调用方
-    漏掉的机会（漏掉的后果是模型拿着混合成本算盈亏，见 :class:`HoldingRow`）。
+    分出来只为让「盘中轮与调仓轮看到的事实完全一致」这件事在代码里是显然的——
+    两边唯一的差别是收尾段（:func:`_decision_rule_lines` /
+    :func:`_intraday_rule_lines`）。**行序与空行位置一个都不能动**：调仓轮那侧
+    逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。
     """
     display = ledger_cost_rows(ctx.holdings, ctx.ledger_positions)
     lines = [
@@ -424,5 +476,45 @@ def render_prompt(ctx: RebalanceContext) -> str:
     # 行业整体劣化：赛道级软提示，不硬拦。有前置空行。
     if ctx.industry_caution_block:
         lines += ["", ctx.industry_caution_block]
+    return lines
+
+
+def render_intraday_prompt(ctx: RebalanceContext) -> str:
+    """盘中槽位（整点）的完整提示词：同一份正文 + 四段式收尾。
+
+    盘中轮要回答的不只是「换不换股」，还有「手上的票要不要挂条件位」——所以
+    收尾段换成四段式（前端据此分节）+ ``INTRADAY_SCHEMA_JSON``（含 ``watch``/
+    ``stop_loss``/``take_profit``/``move_stop``/``invalidation``）。正文与
+    :func:`render_prompt` 完全一致，见 :func:`_context_body`。
+    """
+    lines = _context_body(ctx)
+    lines += _intraday_rule_lines(ctx)
+    return "\n".join(lines)
+
+
+def render_prompt(ctx: RebalanceContext) -> str:
+    """一轮调仓的完整提示词。
+
+    ``ctx.holdings`` 必须是**桥口径原始行**——账本改写在这里面做，不给调用方
+    漏掉的机会（漏掉的后果是模型拿着混合成本算盈亏，见 :class:`HoldingRow`）。
+    """
+    lines = _context_body(ctx)
     lines += _decision_rule_lines(ctx)
     return "\n".join(lines)
+
+
+def render_prompt_for(ctx: RebalanceContext, schema: str) -> str:
+    """按槽位 schema 选提示词——**调用方只该用这一个入口**。
+
+    ``schema`` 决定 action 白名单（``contract.SCHEMAS``），提示词必须跟着它走：
+    调仓轮（``rebalance``）的 schema 里没有 ``watch``，提示词就不该要求模型给
+    条件位；盘中轮反过来。两边混用会把「模型没按 schema 输出」变成常态——实测
+    11 个槽位全用调仓提示词时 ``watch_armed`` 每轮都是 0。
+
+    未知 schema **回退调仓轮**（最保守那份：无 ``watch``、纯 JSON），
+    与 :func:`parse_decisions` 的显式 ``ValueError`` 配合——报错在这里是
+    「白名单对不上」，在那边是「解析契约被破坏」，两回事。
+    """
+    if schema == SCHEMA_INTRADAY:
+        return render_intraday_prompt(ctx)
+    return render_prompt(ctx)

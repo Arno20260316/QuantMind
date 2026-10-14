@@ -152,7 +152,11 @@ from backend.services.trade.services.decision_round_core import (
     snap_price,
     tier_numbers,
 )
-from backend.services.trade.services.decision_round_io import maybe_write_watch
+from backend.services.trade.services.decision_round_io import (
+    maybe_write_watch,
+    record_round_dialogue,
+    record_round_position,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +217,7 @@ async def _run_once_inner(
         DEFAULT_MAX_NEW_BUYS,
         DEFAULT_PER_STOCK_PCT,
         DirectionBlock,
-        render_prompt,
+        render_prompt_for,
     )
     from backend.shared.decision.watch_map import plan_watch
     from backend.shared.decision_context_source import (
@@ -524,7 +528,7 @@ async def _run_once_inner(
         max_new_buys=max_new_buys,
     )
     # ⑧ LLM 调用（模型名与调用器同源，见 LLMBinding）：decide 同步阻塞 httpx（最长 ~120s），必须 to_thread
-    prompt = render_prompt(context)
+    prompt = render_prompt_for(context, slot.schema)
     attempt = await asyncio.to_thread(binding.decide, prompt, slot.schema)
     if not getattr(attempt, "ok", False):
         # 没出决策：**不写审计行、不置 done 键**（补跑槽还能再来一次），只留状态。
@@ -540,6 +544,11 @@ async def _run_once_inner(
             mode=mode,
             meta={"calls": int(getattr(attempt, "calls", 0) or 0)},
         )
+
+    # ⑧b 对话落盘（arena「模型对话」写侧）：**在闸门之前**写，纪律见该函数
+    record_round_dialogue(
+        agent=agent, prompt=prompt, attempt=attempt, now=now, notes=notes
+    )
 
     decisions = tuple(getattr(attempt, "decisions", ()) or ())
     stamps = build_pool_stamps(
@@ -617,6 +626,9 @@ async def _run_once_inner(
                 getattr(outcome, "outcomes", None),
                 watch_result.outcomes() if watch_result is not None else None,
             )
+            # ⑩b 持仓落盘（甲4）：arena「持仓/净值」快照（aborted 轮不写，见该函数）
+            if not aborted:
+                record_round_position(agent=agent, ledger=ledger, now=now, notes=notes)
             # 真单镜像就绪探测（P2-2，H2/M9）：与镜像链路同一实现（``RoundDeps`` 接线到
             # ``real_mirror_service.real_trading_ready``）。探测失败记 None——审计里
             # 「探不到」与「不就绪」是两件事；探测本身绝不阻断本轮落账。

@@ -294,3 +294,56 @@ def test_failed_batch_flags_the_failure() -> None:
     assert DecisionBatch.api_failed(SCHEMA_REBALANCE).failed
     assert DecisionBatch.not_configured(SCHEMA_REBALANCE).failed
     assert not DecisionBatch(status=STATUS_OK, schema=SCHEMA_REBALANCE).failed
+
+
+# ---------------------------------------------------------------------------
+# 全文通道（raw_full / display_text）：展示面要的是模型原文，不是审计额度里的截断版
+# ---------------------------------------------------------------------------
+
+
+def test_display_text_keeps_full_output_beyond_audit_limit() -> None:
+    """超 8000 字符的分析：审计 ``raw`` 截断，展示 ``display_text`` 保全文。
+
+    实测倒逼——历史 2700 条回复里 4.4% 超 8000 字符（三 agent 峰值 13958），
+    拿 ``raw`` 写 arena 对话文件会静默切掉 5% 的对话且切口在句子中间。
+    """
+    # Arrange：四段式正文在前，决策 JSON 在后（整点轮的输出形态）
+    body = "【总体总结】" + "很长的分析。" * 1400
+    content = f"{body}\n【决策】\n{OK_JSON}"
+    assert len(content) > 8000
+
+    # Act
+    attempt = decide_with_retry(_Caller(content), "提示词", schema=SCHEMA_REBALANCE)
+
+    # Assert
+    assert attempt.ok
+    assert len(attempt.raw) == 8000, "审计面应仍然截断到 RAW_LIMIT"
+    assert attempt.display_text == content, "展示面必须拿到全文"
+
+
+def test_display_text_falls_back_to_raw_when_full_missing() -> None:
+    """拿不到全文时回退截断版——消费方不必自己写 ``raw_full or raw``。"""
+    attempt = decide_with_retry(_Caller(OK_JSON), "提示词", schema=SCHEMA_REBALANCE)
+    # 假 caller 路径下 first.content 就是 OK_JSON，两路同值
+    assert attempt.display_text == attempt.raw == OK_JSON
+
+
+def test_raw_full_present_on_api_failure_but_empty() -> None:
+    """调用失败（无输出）：``raw_full`` 是空串而不是 None，消费方无需判空类型。"""
+    attempt = decide_with_retry(
+        _Caller(RuntimeError("boom")), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.status == STATUS_API_FAILED
+    assert attempt.raw_full == ""
+    assert attempt.display_text == ""
+
+
+def test_raw_full_carries_second_attempt_on_parse_failure() -> None:
+    """两次都取不出决策：全文取**第二次**的（更接近模型最终想说的），与 ``raw`` 同源。"""
+    attempt = decide_with_retry(
+        _Caller(JUNK, "第二次的散文：" + "啰嗦。" * 3000), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.status == STATUS_PARSE_FAILED
+    assert attempt.raw_full.startswith("第二次的散文：")
+    assert len(attempt.raw_full) > 8000
+    assert len(attempt.raw) == 8000

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """晚间市场研究 Agent（研究总控）：quantdb 最新数据 → 板块强度 + 明日候选池 20 只。
 
-【2026-09-29 迁入 QuantMind】大脑侧未搬迁：LLM/MCP 工具面（dsh_agent.py + BayMax 栈
-127.0.0.1:8100-8104）已停机，两条 cron 已注释（`# [待改造 2026-09-29]`）。数据路径
-已按本仓根改好（原 `ROOT.parent/projects/quantmind` 写法迁入后会指到不存在的
-`projects/projects/` 下），待改接 QM dsh 平台后启用。
+【2026-10-14 改接（戊1）】大脑 = ``call_brain()`` 直连 OpenAI 兼容端点（原 dsh CLI +
+BayMax MCP 栈 127.0.0.1:8100-8104 已退役；模型默认 glm-5.3-flash，``QM_NIGHT_POOL_MODEL``
+可覆写）。**大脑失败/输出非 JSON/池为空一律不写 `{target}_agent_picks.json`**——该后缀
+在读侧（`decision_context_source.pool_path`）优先于 `_picks.json`，空壳会遮蔽在产池
+（2026-09-15 事故：主跑失败落 0 只池 → 当天全系统无候选池）；研究纪要与对话流照写。
+两条 cron 已重新启用。
 
 输出三处：
 1. logs/night_pool/{date}.md/.json（研究纪要）
@@ -16,6 +18,7 @@
 cron：北京 02:30 周二~周六（JST 03:30）→ 等 quantdb 当日分区落盘后产「当日」池；
      另加 04:30 幂等补跑（--if-missing：目标日池已存在则跳过），覆盖同步延迟。
      数据未落（分区 < 会话日）→ 退出码 2，宁可不产也不产陈旧池。
+     大脑未产出有效池 → 退出码 3（不落空壳，等 04:30 补跑重试）。
 输出命名：池文件按**目标交易日** `{target}_agent_picks.json`（09:35 消费的就是当日池）；
          纪要 logs/night_pool/{session}.md/.json 按数据会话日。
 """
@@ -35,6 +38,15 @@ from trading_cal import (is_trading_day, next_trading_day,  # noqa: E402
 
 NIGHT_POOL_DIR = ROOT / "logs" / "night_pool"
 PICKS_DIR = ROOT / "data" / "reports" / "stock_picks"
+
+#: repo .env（与 live_model_analysis._load_env 同口径：环境变量优先，文件补缺）
+ENV_FILE = ROOT / ".env"
+
+#: 研究大脑：直连 OpenAI 兼容端点（原 dsh CLI + BayMax MCP 栈已退役，2026-10-14 改接）。
+#: 默认走 GLM 快端点（原 dsh 调用的同款选择，任务里时间盒 90~150s）；QM_NIGHT_POOL_MODEL 可覆写。
+DEFAULT_BRAIN_MODEL = "glm-5.3-flash"
+BRAIN_TIMEOUT_S = 420  # 原 dsh 调用同额，HTTP 侧留裕量
+BRAIN_MAX_TOKENS = 8000  # 20 只池 + 板块 JSON 约 2~3k tokens，留一倍余量
 
 
 def _dash8(d8: str) -> str:
@@ -308,6 +320,102 @@ def filter_risk_candidates(cands: list, risk: dict) -> tuple:
     return kept, dropped
 
 
+def _load_env() -> dict:
+    """环境变量优先，repo .env 补缺（``live_model_analysis._load_env`` 同口径）。"""
+    import os
+
+    env = dict(os.environ)
+    try:
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            if k and k not in env:
+                env[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    return env
+
+
+def _brain_endpoint(model: str, env: dict) -> tuple:
+    """(base, key)：glm* 走 GLM_* 键，其余走 OPENAI_*（DEEPSEEK_* 兜底）。"""
+    if model.startswith("glm"):
+        label = "GLM"
+        base = env.get("GLM_API_BASE", "")
+        key = env.get("GLM_API_KEY", "")
+    else:
+        label = "OPENAI"
+        base = env.get("OPENAI_API_BASE", "") or env.get("DEEPSEEK_BASE_URL", "")
+        key = env.get("OPENAI_API_KEY", "") or env.get("DEEPSEEK_API_KEY", "")
+    base = base.rstrip("/")
+    if not base or not key:
+        raise RuntimeError(f"{label}_API_BASE/KEY 缺失")
+    return base, key
+
+
+def call_brain(
+    task: str, model: str = "", timeout_s: int = BRAIN_TIMEOUT_S
+) -> tuple:
+    """直连 LLM 跑研究任务（重试 1 次；失败/截断 raise，由 run() 降级为不产池）。
+
+    ``finish_reason=length``（max_tokens 截断）即 raise：本任务输出是
+    JSON，半截正文抽不出完整对象，救捞只会把残缺池当天产出。
+    """
+    import requests
+
+    env = _load_env()
+    model = model or str(env.get("QM_NIGHT_POOL_MODEL") or "").strip() or DEFAULT_BRAIN_MODEL
+    base, key = _brain_endpoint(model, env)
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是量化投研的晚间市场研究总控（A股）。"
+                "严格按任务要求以 JSON 输出，无其他文字。",
+            },
+            {"role": "user", "content": task},
+        ],
+        "temperature": 0.2,
+        "max_tokens": BRAIN_MAX_TOKENS,
+    }
+    last_exc = None
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json=payload,
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message", {}) or {}
+            content = (
+                str(msg.get("content") or "").strip()
+                or str(msg.get("reasoning_content") or "").strip()
+            )
+            usage = data.get("usage") or None
+            if usage:
+                usage = {
+                    k: int(usage.get(k) or 0)
+                    for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                }
+            if str(choice.get("finish_reason") or "") == "length":
+                raise RuntimeError("输出被 max_tokens 截断（半截 JSON 不可救）")
+            if not content:
+                raise RuntimeError("空回复")
+            return content, usage
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 0:
+                print(f"  ⚠️ 研究大脑调用失败，重试 1 次: {exc}")
+    raise last_exc  # type: ignore[misc]
+
+
 def run(session: str, target: str, dry: bool = False) -> int:
     """session=数据会话日(YYYYMMDD)；target=该池服务的目标交易日(YYYYMMDD)。"""
     cands, d0 = build_candidates(session)
@@ -362,9 +470,9 @@ def run(session: str, target: str, dry: bool = False) -> int:
     task = f"""[晚间市场研究任务] 基于 quantdb {d0} 收盘数据已初筛出 {len(cands)} 只候选（附分数/涨跌/成交额）。
 本池将用于 {_dash8(target)} 开盘后的实盘决策（行情数据止于 {_dash8(d0)} 收盘）。
 
-要求（时间盒 {time_box} 秒，禁止逐只调工具取数）：
+要求（时间盒约 {time_box} 秒，单次调用完成，无逐只取数环节）：
 1. 初筛数据已系统算好（涨跌/成交额/复合分/名称），直接使用；
-   只有当名称缺失或分数明显异常（如 ST/涨跌停残留）时，才对单只做一次核对。
+   只有当名称缺失或分数明显异常（如 ST/涨跌停残留）时，在 reason 里标注存疑。
 2. 新闻输入只来自『新闻 agent 管线』（门卫→宏观/板块/持仓→主编），引用其结论时注明；
    不要臆测管线之外的新闻。
 3. 推进股票池**不看任何 HOLD/BUY 侧标签**（历史占位标签，无信息量）：
@@ -385,12 +493,13 @@ def run(session: str, target: str, dry: bool = False) -> int:
     if dry:
         print(task[:2500])
         return 0
-    from dsh_agent import run_agent
-
     try:
-        content = run_agent(task, timeout_s=420, model="glm")  # glm 快端点，时间盒90s
+        content, usage = call_brain(task)
+        brain_ok = True
     except Exception as exc:  # noqa: BLE001
-        content = f"（研究 agent 失败：{exc}）"
+        content, usage = f"（研究 agent 失败：{exc}）", None
+        brain_ok = False
+        print(f"❌ 研究大脑调用失败：{exc}")
     # JSON 抽取
     import re
 
@@ -400,7 +509,8 @@ def run(session: str, target: str, dry: bool = False) -> int:
             payload = json.loads(m.group(0))
         except json.JSONDecodeError:
             continue
-    if not isinstance(payload, dict):
+    payload_ok = isinstance(payload, dict)
+    if not payload_ok:
         payload = {"date": d0, "pool": [], "market_view": content[:400]}
     payload["date"] = d0
     dpath = NIGHT_POOL_DIR
@@ -413,6 +523,9 @@ def run(session: str, target: str, dry: bool = False) -> int:
     # side 恒为 HOLD 占位（无信息量）——消费端（load_pool/pool_rows/提示词）已不再展示，
     # 判断全部由各 agent 依据分数+大盘+板块+新闻综合给出。
     # 命名按**目标交易日**（2026-09-12 P1-4）：09:35 消费端按日期取最新 → 当日池自然胜出。
+    # **池空一律不落文件**：_agent_picks.json 在 pool_path 里优先于 _picks.json，
+    # 空壳会把在产池整个遮蔽成「当天无池」（2026-09-15 事故）——没有池 ≠ 没有股票。
+    produced = False
     try:
         pool = []
         for p in (payload.get("pool") or [])[:20]:
@@ -422,13 +535,19 @@ def run(session: str, target: str, dry: bool = False) -> int:
                          "side": "HOLD", "score": float(p.get("score") or 0),
                          "events": _ev,
                          "reason": str(p.get("reason") or "")[:160]})
-        out = {"date": target, "session": session,
-               "market_direction": {"direction": payload.get("market_view", "")[:80]},
-               "picks": pool}
-        PICKS_DIR.mkdir(parents=True, exist_ok=True)
-        (PICKS_DIR / f"{target}_agent_picks.json").write_text(
-            json.dumps(out, ensure_ascii=False), encoding="utf-8")
-        print(f"✅ 池文件 {target}_agent_picks.json（{len(pool)} 只，数据会话 {session}）")
+        if pool:
+            out = {"date": target, "session": session,
+                   "market_direction": {"direction": payload.get("market_view", "")[:80]},
+                   "picks": pool}
+            PICKS_DIR.mkdir(parents=True, exist_ok=True)
+            (PICKS_DIR / f"{target}_agent_picks.json").write_text(
+                json.dumps(out, ensure_ascii=False), encoding="utf-8")
+            produced = True
+            print(f"✅ 池文件 {target}_agent_picks.json（{len(pool)} 只，数据会话 {session}）")
+        else:
+            print(f"❌ 未产出有效池（大脑成功={brain_ok}，JSON 可抽={payload_ok}）"
+                  f"——不写 {target}_agent_picks.json（空壳会遮蔽在产池），"
+                  "等 04:30 幂等补跑重试")
     except OSError as exc:  # noqa: BLE001
         print(f"⚠️ 写池文件失败: {exc}")
     # 对话流：pseudo『研究总控』（归到该池服务的交易日——周一早班看得到周一的池）
@@ -441,12 +560,16 @@ def run(session: str, target: str, dry: bool = False) -> int:
                    {"role": "user", "content": f"【晚间市场研究任务】{d0} 收盘数据 → {_dash8(target)} 板块+候选池"},
                    {"role": "assistant", "content": content},
                ]}
+        if usage:
+            row["usage"] = usage  # /token-usage 只看带 usage 的行（与对话轮同口径）
         with lf.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:  # noqa: BLE001
         print(f"⚠️ 写对话流失败: {exc}")
-    print(f"✅ 晚间研究完成 → logs/night_pool/{session}.md/.json（服务 {target}）")
-    return 0
+    if produced:
+        print(f"✅ 晚间研究完成 → logs/night_pool/{session}.md/.json（服务 {target}）")
+        return 0
+    return 3
 
 
 def main(argv: list | None = None) -> int:
@@ -472,13 +595,14 @@ def main(argv: list | None = None) -> int:
     bj = now_cn()
     session, target = session_and_target(bj)
     if a.if_missing and (PICKS_DIR / f"{target}_agent_picks.json").is_file():
-        # 空池 = 研究 agent 失败（如 dsh STREAM_CLOSED 半途断流）落下的空壳，
+        # 空池 = 研究 agent 失败（如大脑端点半途断流）落下的空壳，
         # 不是「已产出」——2026-09-15 实录：02:30 主跑失败落 0 只池，
         # 03:30 补跑因文件存在直接跳过，当天全系统无候选池。此处按非空才算完成。
+        # （2026-10-14 起失败端根本不落池文件，此处是存量空壳的兼容分支）
         pool_n = -1
         try:
-            pool_n = len((json.loads((PICKS_DIR / f"{target}_agent_picks.json")
-                                     .read_text(encoding="utf-8")).get("picks") or []))
+            pool_n = len(json.loads((PICKS_DIR / f"{target}_agent_picks.json")
+                                     .read_text(encoding="utf-8")).get("picks") or [])
         except (OSError, ValueError, AttributeError):
             pool_n = -1
         if pool_n > 0:

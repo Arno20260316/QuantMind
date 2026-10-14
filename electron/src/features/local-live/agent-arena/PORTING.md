@@ -132,7 +132,7 @@
 - pages/Live.tsx：富途恢复（2026-10-08）：实盘账户区块注释（hk 已恢复、us 仍下线）
 - pages/Live.tsx：下单面板（QM 本地新增 2026-10-08）：import HkOrderPanel（生成物外的本地组件，勿由 arena 覆盖）
 - pages/Live.tsx：下单面板：实盘 tab 港股分支在账户双卡后追加最小下单/撤单面板
-- pages/Live.tsx：对话 tab「立即分析」按钮提示语改 QM 口径（复活后只出观点，不下单）
+- pages/Live.tsx：对话 tab「立即分析」按钮提示语改 QM 口径（该按钮走 analysis 链，只出观点、不下单；盘中**包含下单**的轮次不由此按钮触发，而是决策轮常规写入「模型对话」tab——2026-10-14 起）
 - pages/Live.tsx：T6-3：宿主 timeBeijing 导入（实盘账户 ts 可能是 aware UTC）
 - pages/Live.tsx：T6-3：持仓 tab 快照时刻从裸 slice(0,16) 改 fmtBeijingDateTime
 - pages/ModelDetail.tsx：详情页由路由参数改为宿主传入的 props（栏内下钻，不再注册路由）
@@ -201,8 +201,10 @@
    404 噪声），面板保留并显示「通道已下线」。
    「立即分析」两枚按钮**已复活**：改走 QM 原生 `/api/v1/agent-arena/analysis/*`
    （任务台账 `/data/logs/analysis_jobs.jsonl` + 宿主 cron
-   `scripts/analysis_trigger_worker.py` 消费）；对话按钮提示语改为
-   「只出观点，不下单」。行情回测的转写/对话/写库端点（runPineBacktest、
+   `scripts/analysis_trigger_worker.py` 消费）；对话按钮提示语为
+   「只出观点，不下单」——该口径仍准确（按钮只触发分析链），但别把它误读成
+   「arena 里的分析都不下单」：盘中**真下单**的决策轮自 2026-10-14 起就是
+   「模型对话」tab 的常规写者（甲3/甲5），下单与对话出自同一个回路。行情回测的转写/对话/写库端点（runPineBacktest、
    savePineSource、sendChat、apply/revert 等）**已全量迁移（同批 2026-10-08）**：
    客户端函数恢复为上游原样（不再有「直接失败」补丁），API 面已挂
    `market_lab_family` 写端点；执行在宿主——cron 跑

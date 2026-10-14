@@ -11,7 +11,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from backend.services.trade_shared.utils.stock_lookup import lookup_symbol_name
-from backend.shared.order_contract import normalize_agent
+from backend.shared.order_contract import normalize_agent, normalize_source
 
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -263,6 +263,9 @@ class OrderService:
             # P2.7 分账：归属随订单落库（成交回报只带订单，不带决策上下文）。
             # 截断口径只此一处（``normalize_agent``）：与契约列同宽。
             agent=normalize_agent(order_data.agent) or None,
+            # T-P1-03 来源分类（乙1，2026-10-14）：调用方给什么落什么，缺省 NULL——
+            # **不在这里编默认值**（那会把「不知道从哪来」写成某一种来源）。
+            source=normalize_source(order_data.source) or None,
             # P1.6 TCA 基准价：决策时点的参考价（与 price 是两回事，见契约列注释）。
             # 缺省 None 是**如实缺省**：老腿/前端直单没有这个价，报告按"不可定价"计。
             ref_price=order_data.ref_price,

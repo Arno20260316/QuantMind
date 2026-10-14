@@ -95,6 +95,25 @@ def normalize_agent(value: Any) -> str:
     return str(value or "").strip()[:AGENT_LEN]
 
 
+#: ``source`` 列宽（两张订单表同 32）。语义见 :func:`normalize_source`。
+SOURCE_LEN = 32
+
+
+def normalize_source(value: Any) -> str:
+    """source 分类 → 入库形态（去空白 + 按列宽截断）；空 → 空串。
+
+    与 :func:`normalize_agent` 同一处分、同一理由：``source`` 也是**两张表共用的
+    分类列**（``sim_orders.source`` 与 ``orders.source`` 同宽 32），而写入点分散在
+    模拟台账、真单派发、镜像载荷三处。截断口径写三遍迟早有一处写错宽度，而**两边
+    宽度不同 = 同一条腿在两张表里是两个来源**，对账/下钻时查不出原因。
+
+    空串**不做默认填充**：默认值属于「谁产生这个意图」那一层（模拟台账缺省
+    ``SOURCE_MANUAL``、真单镜像从模拟单继承），本函数只负责形态归一——schema 的
+    ``max_length`` 是兜底而非防线（它**抛校验错**，整笔单发不出去），这里只是截断。
+    """
+    return str(value or "").strip()[:SOURCE_LEN]
+
+
 _ensured = False
 
 

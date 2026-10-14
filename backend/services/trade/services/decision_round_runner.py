@@ -179,6 +179,35 @@ async def _stall_watch() -> None:
             logger.warning("[DecisionRound] 停滞检查回执失败: %s", exc)
 
 
+#: 在岗标记的**本进程**告警去重（见 :func:`_mark_on_duty`）：标记写不出去时每
+#: ``POLL_S`` 一条会刷爆日志，写不出去本身又不影响决策——只在**状态翻转**时各报一次。
+_MARK_WARNED = False
+
+
+def _mark_on_duty() -> None:
+    """把「决策轮在岗」写进宿主可见的标记文件——宿主对话轮（cron）据此让位（甲5）。
+
+    为什么写在**循环体**里而不是启动时写一次：判据是「**现在**有没有人在岗」。
+    启动时写一次 = 进程死了标记还新鲜 = 对话轮整天不跑（展示面静默变空，正是本次
+    要消灭的那类故障）。与 ``_sched_heartbeat`` 并排，两者语义一致：一个给调度注册表
+    看，一个给宿主脚本看。
+
+    失败**不影响决策**（写不出去 = 回到「两边同跑」的老行为，不是决策轮停摆），
+    故只告警；告警按状态翻转去重，见 :data:`_MARK_WARNED`。
+    """
+    global _MARK_WARNED
+    try:
+        from backend.shared.decision_round_onduty import write_on_duty
+
+        ok = write_on_duty(slot.hhmm for slot in SLOTS)
+    except Exception as exc:  # noqa: BLE001 标记写不出去不许影响决策
+        logger.warning("[DecisionRound] 在岗标记写入异常: %s", exc)
+        ok = False
+    if ok and _MARK_WARNED:
+        logger.info("[DecisionRound] 在岗标记恢复正常（宿主对话轮重新让位）")
+    _MARK_WARNED = not ok
+
+
 async def run_decision_round_worker() -> None:
     """常驻：每 ``QM_DECISION_ROUND_POLL_S`` 秒查一次到点槽位。
 
@@ -204,6 +233,7 @@ async def run_decision_round_worker() -> None:
             _sched_heartbeat("decision_round")
         except Exception:  # noqa: BLE001
             pass
+        _mark_on_duty()
         try:
             results = await round_tick(grace_min=_grace_min())
             for r in results:

@@ -92,12 +92,15 @@ class SimOrderService:
             SOURCE_MANUAL,
             ensure_order_contract_columns_async,
             normalize_agent,
+            normalize_source,
         )
 
         client_order_id = str(data.client_order_id or "").strip() or None
         trigger_source = str(kwargs.get("trigger_source") or "").strip()
         order.client_order_id = client_order_id
-        order.source = (trigger_source or SOURCE_MANUAL)[:32]
+        # 缺省 SOURCE_MANUAL（「谁产生意图」这一层的默认），形态归一仍走共享实现
+        # （``normalize_source``）——两张订单表的 source 同宽，截断口径不许各写一份。
+        order.source = normalize_source(trigger_source or SOURCE_MANUAL)
         # P2.7 分账归属：模拟台账是意图的源头，镜像真单从这一列继承。非 LLM 腿为空。
         order.agent = normalize_agent(data.agent) or None
         await ensure_order_contract_columns_async()

@@ -132,12 +132,24 @@ class DecisionAttempt:
     ``batch`` 与 :class:`~backend.shared.decision.contract.DecisionBatch` 同形，
     ``usage``/``calls``/``errors`` 是本层补的**过程**信息——审计要回答的不只是
     「模型说了什么」，还有「问了几次、花了多少、中间错在哪」。
+
+    ``raw_full`` 与 ``raw`` **不是一回事，别混用**：
+
+    * ``raw``（= ``batch.raw``）是**审计额度**内的文本，被 ``RAW_LIMIT`` 截到 8000
+      字符——审计表不该跟着模型吐的散文一起爆；
+    * ``raw_full`` 是模型**原文全文**，只给**展示面**用（arena「模型对话」落盘）。
+
+    分两路是实测倒逼的：历史 2700 条回复里有 4.4% 超 8000 字符（三 agent 峰值
+    13958），在 ``raw`` 上写对话文件会**静默切掉 5% 的对话**且切口在句子中间，
+    前端看起来只是一段戛然而止的分析。
     """
 
     batch: DecisionBatch
     usage: dict[str, int] | None = None
     calls: int = 0
     errors: tuple[str, ...] = ()
+    #: 模型原文全文（展示面用）；取不到时为空串，消费方回退 ``raw``
+    raw_full: str = ""
 
     @property
     def status(self) -> str:
@@ -159,6 +171,14 @@ class DecisionAttempt:
     @property
     def raw(self) -> str:
         return self.batch.raw
+
+    @property
+    def display_text(self) -> str:
+        """展示面取文本的**唯一读法**：优先全文，缺失回退截断版。
+
+        调用点不要自己写 ``raw_full or raw``——两处各写一次就是两种行为。
+        """
+        return self.raw_full or self.batch.raw
 
     def error_text(self) -> str:
         """全部错误的单行摘要（写事件/告警用）。"""
@@ -233,11 +253,14 @@ def decide_with_retry(
             first.usage,
             calls,
             errors,
+            raw_full=first.content,
         )
 
     batch = parse_decisions(first.content, schema=schema)
     if batch.ok or batch.status == STATUS_EMPTY_OUTPUT:
-        return DecisionAttempt(batch, first.usage, calls, errors)
+        return DecisionAttempt(
+            batch, first.usage, calls, errors, raw_full=first.content
+        )
 
     second = _one_call(call, prompt + JSON_ONLY_HINT)
     calls += 1
@@ -248,7 +271,7 @@ def decide_with_retry(
     if second.ok:
         last = parse_decisions(second.content, schema=schema)
         if last.ok:
-            return DecisionAttempt(last, usage, calls, errors)
+            return DecisionAttempt(last, usage, calls, errors, raw_full=second.content)
         # 与相邻系统同形（`content2 or content`）：第二次的原文更近，空则退回第一次
         raw = second.content or first.content
     else:
@@ -264,4 +287,5 @@ def decide_with_retry(
         usage,
         calls,
         errors,
+        raw_full=raw,
     )

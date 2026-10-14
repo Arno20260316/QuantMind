@@ -9,6 +9,16 @@
 所以这里默认把可用内存钉成「宽裕」，让容量断言只反映**配置**。要测收敛行为
 本身的用例，自行 ``monkeypatch.setattr(hw_lock, "probe_available_memory_gb", ...)``
 覆盖这个替身（用例级 patch 在 autouse fixture 之后生效）。
+
+**arena 文件面落点隔离**（2026-10-14）：决策轮现在会把每轮的提示词/模型原文
+append 进 ``<arena 根>/agent_data_astock/{agent}/log/{日}/log.jsonl``（见
+``agent_arena/arena_files.py``）。单测里的 agent 名是 ``fake-model`` 之类的替身，
+不隔离就会在**真数据根**里长出一批幽灵 agent，且 arena 前端会当真显示它们。
+所以整个会话默认把根指到临时目录。
+
+要往真根上写点东西的用例（不该有）自己设 ``QM_ARENA_DATA_ROOT``——用例级
+``monkeypatch.setenv`` 在 autouse 之后生效，能覆盖这条；``test_arena_files.py``
+的 ``arena_root`` 夹具就是这么换根的。
 """
 
 from __future__ import annotations
@@ -26,3 +36,9 @@ def _stub_available_memory(monkeypatch):
     monkeypatch.setattr(
         hw_lock, "probe_available_memory_gb", lambda: _PLENTIFUL_MEMORY_GB
     )
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_arena_data_root(tmp_path, monkeypatch):
+    """把 arena 数据根钉到本用例的临时目录（理由见模块 docstring）。"""
+    monkeypatch.setenv("QM_ARENA_DATA_ROOT", str(tmp_path))

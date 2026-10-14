@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from pathlib import Path
 
 import pytest
 
@@ -1457,6 +1459,298 @@ async def test_unexpected_orchestration_error_is_error_status_not_a_crash():
     assert result.note.startswith("RuntimeError:")  # 异常类型与原因原样带上
     assert "档位存储炸了" in result.note
     assert result.round_id == "rnd-20260924-0935"  # 状态键里仍能对上号
+
+
+# ══ E2. arena 文件面写侧（决策轮 → 前端「模型对话」tab）═══════════════
+@pytest.fixture()
+def arena_root() -> Path:
+    """本用例的 arena 数据根。
+
+    **读环境变量**而不是另取 ``tmp_path``：换根入口只有 ``QM_ARENA_DATA_ROOT`` 一个。
+    拿不到就 ``KeyError``——``conftest._sandbox_arena_data_root`` 被摘掉时这些用例当场
+    炸，而不是悄悄写进真数据根。这不是假想的谨慎：2026-10-14 实测过一次，接线当天
+    就有测试把 ``fake-model`` / ``flash`` / ``pro`` 三个幽灵 agent 连同 78 万字节对话
+    写进了 ``data/agent_data_astock/``，并往两个真 agent 的当日对话日志尾部追加了 4 行。
+    """
+    # arena 包是本机独有的（.gitignore）：公开仓没有它，这些用例整组 skip 而不是
+    # 报错——公开仓里 arena 栏本身也不存在，没有可断言的面。
+    pytest.importorskip("backend.services.agent_arena.arena_files")
+    return Path(os.environ["QM_ARENA_DATA_ROOT"])
+
+
+def _dialogue_rows(arena_root: Path, agent: str, day: str = "2026-09-24") -> list[dict]:
+    """该家该日的 ``log.jsonl`` 逐行（缺文件 = 空表）。"""
+    path = arena_root / "agent_data_astock" / agent / "log" / day / "log.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(x)
+        for x in path.read_text(encoding="utf-8").splitlines()
+        if x.strip()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_round_appends_one_dialogue_row(arena_root):
+    """跑成的一轮 = ``log.jsonl`` 恰好多一行，且落的是**真发出去的那条提示词**。
+
+    「恰好多一行」是判据不是形式：一轮多次调用（解析重试）只在 ``calls`` 里计数，
+    落盘一次——首行提示词与重问的提示词差一个后缀，两条都写会让前端显示两轮。
+    """
+    text = decisions_json({"action": "hold", "code": "600036.SH", "reason": "趋势未破"})
+    h = make_harness(decision_text=text)
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    rows = _dialogue_rows(arena_root, "fake-model")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["signature"] == "fake-model"
+    assert row["new_messages"][0]["content"] == h.log["llm"][0]["prompt"]
+    assert row["new_messages"][1]["content"] == text
+    # ``/token-usage`` 端点只统计带 usage 的行：缺了这键这一轮不进 token 账
+    assert row["usage"] == {"prompt_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_dialogue_lands_in_the_round_day_not_today(arena_root):
+    """目录日**取自本轮时钟**：补跑历史槽时要落到那一天，取「今天」会让它出现在错的日子。"""
+    h = make_harness()
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)  # NOW = 2026-09-24 09:35
+
+    assert len(_dialogue_rows(arena_root, "fake-model", "2026-09-24")) == 1
+    row = _dialogue_rows(arena_root, "fake-model")[0]
+    # 墙钟 + ``+08:00``：前端 fmtDateTime 是字符串切片不做时区换算，写 UTC ``Z`` 会差 8 小时
+    assert row["timestamp"] == "2026-09-24T09:35:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_keeps_text_beyond_the_audit_truncation(arena_root):
+    """展示面落**全文**：审计用的 ``attempt.raw`` 被 ``RAW_LIMIT`` 截到 8000 字符。
+
+    实测历史 2700 条回复里 4.4% 超 8000（三 agent 峰值 13958）：拿被截的 ``raw`` 落盘
+    会静默切掉近 5% 的对话，且切口在句子中间——界面上只表现为一段戛然而止的分析。
+    """
+    text = decisions_json(
+        {"action": "hold", "code": "600036.SH", "reason": "趋势未破，" * 2000}
+    )
+    assert len(text) > 8000  # 前提：这条回复确实超了审计额度
+    h = make_harness(decision_text=text)
+    assert (await run_once(SLOT_0935, deps=h.deps, now=NOW)).status == R.STATUS_OK
+
+    row = _dialogue_rows(arena_root, "fake-model")[0]
+    assert row["new_messages"][1]["content"] == text
+    assert len(row["new_messages"][1]["content"]) > 8000
+
+
+@pytest.mark.asyncio
+async def test_failed_round_writes_no_dialogue(arena_root):
+    """失败轮不落对话——补跑槽会再来一次，先写一条会在同一槽位留下半截重复。
+
+    失败本身另有可见面（``decision_round_alerts`` 走 QQ + 状态键），不需要靠这个文件。
+    """
+    h = make_harness(decision_text="今天没什么好说的")  # 无 JSON → parse_failed
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_LLM_FAILED
+    assert _dialogue_rows(arena_root, "fake-model") == []
+
+
+@pytest.mark.asyncio
+async def test_dialogue_write_failure_is_noted_but_does_not_sink_the_round(
+    arena_root, monkeypatch
+):
+    """落盘失败不改轮次状态（真钱链路照走），但审计行必须留痕。
+
+    展示面可以坏，**不可以在没人知道的情况下坏**：一行日志没人看，所以同一句话也
+    进审计行的 ``context_meta.notes``（那一列是要被复盘的）。
+    """
+    from backend.services.agent_arena import arena_files
+
+    monkeypatch.setattr(arena_files, "_write_line", lambda path, record: False)
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        )
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK  # 落盘坏了不动状态
+    assert h.log["exec"] and h.log["ledger"]  # 执行段与审计段照走
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("arena 对话落盘未完成" in n for n in notes), notes
+    assert _dialogue_rows(arena_root, "fake-model") == []
+
+
+@pytest.mark.asyncio
+async def test_dialogue_write_exception_does_not_take_the_round_down(
+    arena_root, monkeypatch
+):
+    """写侧**抛**异常（不是返回 False）也要被收住：一次磁盘满不该打断真钱回路。"""
+    from backend.services.agent_arena import arena_files
+
+    def boom(**_kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(arena_files, "append_round_dialogue", boom)
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        )
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    assert h.log["exec"] and h.log["ledger"]
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("arena 对话落盘未完成" in n for n in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_round_runs_when_the_arena_package_is_absent(monkeypatch):
+    """公开仓没有 arena 包（``.gitignore``）：轮次必须照跑，且**不留 notes**。
+
+    不留 notes 是判据而不是省事：那种部署里 arena 栏本身也不存在（路由未注册），
+    「这一轮没落对话」不是异常，每轮记一条只会把审计行的 notes 淹掉。这条用例在
+    两种仓里都跑——本机仓靠强行置 ``None`` 走同一条分支。
+    """
+    monkeypatch.setattr(IO, "arena_files", None)
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        )
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    assert h.log["exec"] and h.log["ledger"]  # 执行段与审计段照走
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert not any("arena" in n for n in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_roster_round_gives_every_agent_its_own_dialogue_file(arena_root):
+    """一槽多家：各家落各家的文件。混写一处的后果是**只有一家看得见**，另一家整天空白。"""
+    h = _roster_harness("deepseek-v4-pro", "deepseek-v4-flash")
+    results = await round_tick(deps=h.deps, native=FakeNative(), now=TICK_NOW)
+
+    assert [r.status for r in results] == [R.STATUS_OK, R.STATUS_OK]
+    for agent in ("deepseek-v4-pro", "deepseek-v4-flash"):
+        rows = _dialogue_rows(arena_root, agent)
+        assert len(rows) == 1, agent
+        assert rows[0]["signature"] == agent
+
+
+# ══ E3. arena 文件面写侧（决策轮 → 前端「持仓/净值」tab，甲4）═══════════
+
+
+def _position_rows(arena_root: Path, agent: str) -> list[dict]:
+    """该家 ``position.jsonl`` 逐行（缺文件 = 空表）。"""
+    path = arena_root / "agent_data_astock" / agent / "position" / "position.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(x)
+        for x in path.read_text(encoding="utf-8").splitlines()
+        if x.strip()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_round_appends_one_position_snapshot(arena_root):
+    """跑成的一轮 = ``position.jsonl`` 恰好多一行快照：账本持仓（后缀码）+ CASH。
+
+    快照行**不带** ``this_action``：那个键是成交行标记（``load_trades`` 靠它筛成交），
+    而决策时刻成交还没发生（桥回询异步入账）——此刻落成交行 = 把「打算」写成「已成」。
+    """
+    from backend.shared.decision.agent_ledger import DEFAULT_AGENT_QUOTA
+
+    h = make_harness()
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    rows = _position_rows(arena_root, "fake-model")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["date"] == "2026-09-24"
+    assert row["id"] == 1
+    assert "this_action" not in row
+    # 账本段 1000 股（前缀码 SH600036 归一到后缀式）+ 默认子账户现金
+    assert row["positions"] == {"600036.SH": 1000.0, "CASH": DEFAULT_AGENT_QUOTA}
+
+
+@pytest.mark.asyncio
+async def test_position_snapshot_ids_keep_growing(arena_root):
+    """两轮 = 两行，``id`` 读尾行 + 1 单调自增（前端按它排序去重）。"""
+    h = make_harness()
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    rows = _position_rows(arena_root, "fake-model")
+    assert [r["id"] for r in rows] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_failed_round_writes_no_position_snapshot(arena_root):
+    """失败轮不落快照——补跑槽会再来一次，先写一条会在净值序列里插出重复点。"""
+    h = make_harness(decision_text="今天没什么好说的")  # 无 JSON → parse_failed
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_LLM_FAILED
+    assert _position_rows(arena_root, "fake-model") == []
+
+
+@pytest.mark.asyncio
+async def test_position_write_failure_is_noted_but_does_not_sink_the_round(
+    arena_root, monkeypatch
+):
+    """落盘失败不改轮次状态（真钱链路照走），但审计行必须留痕（同对话落盘纪律）。
+
+    展示面可以坏，**不可以在没人知道的情况下坏**。
+    """
+    from backend.services.agent_arena import arena_files
+
+    monkeypatch.setattr(arena_files, "_write_line", lambda path, record: False)
+    h = make_harness()
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    assert h.log["exec"] and h.log["ledger"]  # 执行段与审计段照走
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("arena 持仓落盘未完成" in n for n in notes), notes
+    assert _position_rows(arena_root, "fake-model") == []
+
+
+@pytest.mark.asyncio
+async def test_position_write_exception_does_not_take_the_round_down(
+    arena_root, monkeypatch
+):
+    """写侧**抛**异常（不是返回 False）也要被收住：一次磁盘满不该打断真钱回路。"""
+    from backend.services.agent_arena import arena_files
+
+    def boom(**_kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(arena_files, "append_position", boom)
+    h = make_harness()
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("arena 持仓落盘未完成" in n for n in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_roster_round_gives_every_agent_its_own_position_file(arena_root):
+    """一槽多家：快照落各家的 ``position.jsonl``（混写一处会让别家持仓显示成这家）。"""
+    h = _roster_harness("deepseek-v4-pro", "deepseek-v4-flash")
+    results = await round_tick(deps=h.deps, native=FakeNative(), now=TICK_NOW)
+
+    assert [r.status for r in results] == [R.STATUS_OK, R.STATUS_OK]
+    for agent in ("deepseek-v4-pro", "deepseek-v4-flash"):
+        rows = _position_rows(arena_root, agent)
+        assert len(rows) == 1, agent
+        assert "600036.SH" in rows[0]["positions"], agent
 
 
 # ══ F. tick：认领 → 跑 → 置键 → 状态 ════════════════════════════════

@@ -7,7 +7,11 @@
 * 隔壁 `logs/decision_pool.jsonl` 只留 **每天第一条**（`make_id(agent|日|code|动作)`
   去重）——同一天 10:00 与 14:00 对同一只票的两次决策，只有第一条留得下来，
   可「模型盘中改了主意」恰恰是最该被审计的一件事；
-* 三只 agent 的原始 `log.jsonl` 是**另一套系统**的私有格式，随它一起下线。
+* 三只 agent 的原始 `log.jsonl`（以及 `position.jsonl`）曾是上游量化系统的私有格式——
+  2026-10-14 起**不再下线**：arena 文件面是总控的**唯一展示面**，由决策轮写入
+  （对话与持仓快照，见 `agent_arena/arena_files.py` 与 `decision_round_io.
+  record_round_dialogue/record_round_position`）。本表与文件面职责不同：文件面是
+  **展示**（模型原文/持仓快照），本表是**审计账**（逐决策、写入即不可改）。
 
 本表是 QuantMind 决策的**唯一持久面**：一行 = 一轮里的一条决策（含被拒的），
 审计字段写入即不可改（见 `decision_ledger_store.update_cols` 的说明）。

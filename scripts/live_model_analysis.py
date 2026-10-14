@@ -8,8 +8,23 @@
 直接可读（复用 news_brief.append_log 的同一结构）。
 
 安全边界：**只读查询 + LLM 调用，绝不下单**——本脚本不 import 任何交易执行
-代码；QM 的下单走决策轮/信号链，与对话轮解耦（上游「时段内可真下单」语义
-不在此恢复）。
+代码。真在拍板下单的是**决策轮**（容器内 trade 服务的 P2.8 槽位回路，开关
+``QM_DECISION_ROUND_ENABLED`` 在 ``config/runtime.env`` 里）——上游「一个回路
+同时产分析与决策」的形状，QM 侧已由它补回（2026-10-14 起它也写 ``log.jsonl``）。
+
+与决策轮的关系（2026-10-14，甲5）：**盘中让位**
+------------------------------------------------
+两边槽位几乎逐一对上（本脚本 08:30 + 整点 + 14:45；决策轮 11 槽含同样这些点），
+且写的是同一份 ``log.jsonl``：都跑 = 同一个小时往同一段追加两张卡片（一张拍板
+落单、一张明令不下单），token 用量还各记一份。故：
+
+* 决策轮**在岗到点**时本脚本**让位**——判据是标记文件
+  ``config/decision_round.onduty.json``（决策轮 worker 心跳式重写，
+  ``backend/shared/decision_round_onduty.py`` 是唯一读法）；
+* 决策轮**没开 / 停了 / 标记过期**（>10 分钟）→ 本脚本**照跑**：OSS 默认部署
+  与老行为完全一致，**展示面不会静默变空**（这是判据故意选的方向）；
+* ``--mode review``（15:30 复盘轮）与 ``--force``（「立即分析」按钮走这条路）
+  **永不让位**。
 
 真话纪律（T3-2，审计 C5/H13）：
 * **桥挂 = 无账户模板**：没有账户数据时提示词**禁止要求点评持仓**（也不许模型
@@ -29,11 +44,13 @@
     python3 scripts/live_model_analysis.py                 # 盘中轮：全部模型（名册）
     python3 scripts/live_model_analysis.py --agents deepseek-v4-flash
     python3 scripts/live_model_analysis.py --mode review   # 盘后复盘轮（北京 15:30 档）
+    python3 scripts/live_model_analysis.py --force         # 无视「让位决策轮」强跑一轮
 
 开关（``.env``，缺省全开；写 ``0/false/no/off`` 关，词表同 switch_enabled）：
     QM_DIALOGUE_ALERTS=off        # 桥失联/恢复 + 轮次不满员 两类提醒
     QM_DIALOGUE_REVIEW_PUSH=off   # 收盘复盘 QQ 卡片
     QM_DIALOGUE_MAX_TOKENS=8000   # 输出上限覆盖（默认 8000）
+    QM_DIALOGUE_YIELD_TO_DECISION_ROUND=off  # 关掉「决策轮在岗就让位」（回到双写）
 """
 
 from __future__ import annotations
@@ -570,6 +587,33 @@ def _flag_on(env: dict[str, str], key: str, default: bool = True) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _yield_to_decision_round(env: dict[str, str], now: datetime) -> tuple[bool, str]:
+    """盘中轮让位判据：决策轮在岗到点 → 本轮对话由它产出（甲5）。``(让位?, 理由)``。
+
+    判据本体在 ``backend.shared.decision_round_onduty``（读决策轮 worker 心跳式重写
+    的标记文件）。**三处失败都 fail-open 到「照跑」**：
+
+    * ``QM_DIALOGUE_YIELD_TO_DECISION_ROUND=off``（运维显式关掉归并）；
+    * 模块 import 不到（宿主装的是老码 / 公开仓缺包）；
+    * 判据本身抛异常（标记坏了、路径不可达……）。
+
+    方向是**故意**的：判据失灵时回到「两边同跑 + 双写」的老行为——展示面宁可重复
+    也不能**静默变空**（「模型对话没有总结」正是那类故障的投诉）。
+    """
+    if not _flag_on(env, "QM_DIALOGUE_YIELD_TO_DECISION_ROUND", default=True):
+        return False, ""
+    try:
+        from backend.shared.decision_round_onduty import on_duty_for
+    except Exception as exc:  # noqa: BLE001 缺包=老行为，照跑
+        print(f"⚠️ 让位判据不可用（{type(exc).__name__}: {exc}），本轮照跑")
+        return False, ""
+    try:
+        return on_duty_for(now)
+    except Exception as exc:  # noqa: BLE001 判据异常一律照跑
+        print(f"⚠️ 让位判据异常（{type(exc).__name__}: {exc}），本轮照跑")
+        return False, ""
+
+
 def _load_alert_state() -> dict:
     try:
         data = json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
@@ -652,6 +696,11 @@ def main() -> int:
         choices=["intraday", "review"],
         help="intraday=盘中轮（缺省）；review=盘后复盘轮（北京 15:30 档）",
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="无视「决策轮在岗则让位」判据强跑一轮（「立即分析」按钮走这条路）",
+    )
     args = ap.parse_args()
 
     LOCK.parent.mkdir(parents=True, exist_ok=True)
@@ -670,6 +719,13 @@ def main() -> int:
         mode = args.mode
         alerts_on = _flag_on(env, "QM_DIALOGUE_ALERTS", default=True)
         now = datetime.now(CN_TZ)
+        # 甲5：决策轮在岗到点 → 本让位（同槽同文件的对话由决策轮落，见模块头）。
+        # 复盘轮是收盘语义、--force 是人按的按钮，两者都不过这道闸。
+        if mode != "review" and not args.force:
+            yielded, why = _yield_to_decision_round(env, now)
+            if yielded:
+                print(f"[让位] {why} → 本轮不跑（要强跑用 --force）")
+                return 0
         unknown = [t for t in targets if t not in ROSTER]
         for u in unknown:
             print(f"⚠️ 跳过 {u}：不在模型名册（{', '.join(ROSTER)}）")

@@ -447,3 +447,106 @@ def test_broker_reject_envelope_carries_the_reason_at_top_level():
     assert "废单" in str(result.get("message") or ""), (
         f"拒因没有抬到顶层，告警面只能念字典: {result}"
     )
+
+
+def test_real_dispatch_threads_source_into_the_order_schema():
+    """乙1：派发载荷里的 ``source`` 必须落进 ``OrderCreate.source``（真单台账列）。
+
+    此前它只活在 remarks 的 ``mirror:`` 前缀里，``orders.source`` 恒 NULL——交易台
+    「按来源下钻」（llm_decision / sltp / internal_dispatcher:*）就断在这一跳。
+    """
+    db = FakeDb(results=[None, None])
+    redis = SimpleNamespace()
+    captured: dict[str, Any] = {}
+
+    def _fake_order_service(db_arg, redis_arg):
+        svc = FakeOrderService(db_arg, redis_arg)
+        captured["svc"] = svc
+        return svc
+
+    with patch.object(d, "_fetch_active_portfolio_snapshot", AsyncMock(return_value=None)), \
+            patch.object(d, "OrderService", _fake_order_service), \
+            patch.object(d, "TradingEngine", FakeEngine):
+        _run(
+            d.dispatch_internal_strategy_order(
+                order_data={
+                    "symbol": "600338.SH",
+                    "side": "BUY",
+                    "quantity": 800,
+                    "price": 11.83,
+                    "order_type": "LIMIT",
+                    "trading_mode": "REAL",
+                    "client_order_id": "lld-rnd-20261014-1300-flash-600338.SH-buy",
+                    "source": "llm_decision",
+                    "agent": "deepseek-v4-flash",
+                },
+                user_id="1",
+                tenant_id="default",
+                redis=redis,
+                db=db,
+            )
+        )
+
+    order_data = captured["svc"].calls[0]["order_data"]
+    assert order_data.source == "llm_decision"
+    assert order_data.agent == "deepseek-v4-flash"
+
+
+def test_real_dispatch_source_is_truncated_not_dropped_and_absent_stays_null():
+    """两条纪律：① 超宽来源先过 ``normalize_source`` 截断（schema 的 max_length 兜底
+    会**抛校验错**，代价是整笔真单发不出去；截断只是少个尾巴字符）；
+    ② 载荷没带 source 时**不编默认值**——NULL 是「不知道从哪来」的如实记录。
+    """
+    db = FakeDb(results=[None, None])
+    redis = SimpleNamespace()
+    # 每次派发都新建一个 OrderService 假体（派发器内部构造），按顺序收集。
+    svcs: list[FakeOrderService] = []
+
+    def _fake_order_service(db_arg, redis_arg):
+        svc = FakeOrderService(db_arg, redis_arg)
+        svcs.append(svc)
+        return svc
+
+    with patch.object(d, "_fetch_active_portfolio_snapshot", AsyncMock(return_value=None)), \
+            patch.object(d, "OrderService", _fake_order_service), \
+            patch.object(d, "TradingEngine", FakeEngine):
+        _run(
+            d.dispatch_internal_strategy_order(
+                order_data={
+                    "symbol": "600338.SH",
+                    "side": "BUY",
+                    "quantity": 800,
+                    "price": 11.83,
+                    "order_type": "LIMIT",
+                    "trading_mode": "REAL",
+                    "client_order_id": "src-long-1",
+                    "source": "s" * 80,
+                },
+                user_id="1",
+                tenant_id="default",
+                redis=redis,
+                db=db,
+            )
+        )
+        first = svcs[-1].calls[0]["order_data"]
+        assert first.source == "s" * 32
+
+        _run(
+            d.dispatch_internal_strategy_order(
+                order_data={
+                    "symbol": "600338.SH",
+                    "side": "BUY",
+                    "quantity": 800,
+                    "price": 11.83,
+                    "order_type": "LIMIT",
+                    "trading_mode": "REAL",
+                    "client_order_id": "src-absent-1",
+                },
+                user_id="1",
+                tenant_id="default",
+                redis=redis,
+                db=db,
+            )
+        )
+        second = svcs[-1].calls[0]["order_data"]
+        assert second.source is None

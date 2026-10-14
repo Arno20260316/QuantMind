@@ -6,9 +6,11 @@
    键列与 OHLCV 锚列（锚列与 base h5 的 $open 等重名，混入即 $ 引用错位），
    输出字母序（parquet 物理列序随日漂移，历史教训）。测试一律用 tmp 夹具，
    列数不写死。
-2. **分块左连接不改行数**：200+ 列按 ``_L2_FETCH_CHUNK`` 分块，任一块失败
-   只跳过该块；l2 重复键（HK daily_forward 双来源同型坑）→ 整块跳过，绝不
-   把错行写进 GB 级共享缓存。
+2. **分块按键定位直写预分配大块**（2026-10-14 OOM 修复后契约）：200+ 列按
+   ``_L2_FETCH_CHUNK`` 分块，每块 ``get_indexer`` 按键定位写入 (nrows×ncols)
+   float32 大块；行序与 df 一一对应、未覆盖行 NaN；任一块失败只跳过该块；
+   l2 重复键（HK daily_forward 双来源同型坑）→ 整块跳过（等价旧版按行数
+   膨胀的判据），绝不把错行写进 GB 级共享缓存。
 3. **正名**：LLM 提示面（``_l2_referenceable_columns``）与数据面同一列清单
    单源；种子模板以 ``MicroSeed_`` 前缀与 L2 实列区分。
 """
@@ -113,7 +115,7 @@ def test_l2_factor_columns_latest_partition_wins_and_empty_falls_back(
     assert rw.l2_factor_columns(str(tmp_path)) == ["flow_x", "micro_new"]
 
 
-# ── 2. 分块左连接 ────────────────────────────────────────────────────
+# ── 2. 分块按键定位直写大块 ──────────────────────────────────────────
 
 
 def _l2_frame(dates: list[str], symbols: list[str], cols: list[str]) -> pd.DataFrame:
@@ -127,7 +129,7 @@ def _l2_frame(dates: list[str], symbols: list[str], cols: list[str]) -> pd.DataF
     return frame
 
 
-def test_merge_l2_factors_chunked_left_join_float32(
+def test_merge_l2_factors_chunked_block_alignment_float32(
     tmp_path: Path, monkeypatch
 ) -> None:
     cols = [f"micro_f{i:03d}" for i in range(60)]  # > _L2_FETCH_CHUNK 强制分块
@@ -142,15 +144,16 @@ def test_merge_l2_factors_chunked_left_join_float32(
             "close": [1.0, 2.0, 3.0, 4.0],
         }
     )
-    # l2 只覆盖部分 (symbol, date)：未覆盖行必须留 NaN（左连接语义）
+    # l2 只覆盖部分 (symbol, date)：未覆盖行必须留 NaN（左对齐语义）
     hub = _FakeHub(_l2_frame(["2026-01-01", "2026-01-02"], ["600036.SH"], cols))
 
-    out, merged = _bare_wrapper()._merge_l2_factors(
+    block, merged = _bare_wrapper()._merge_l2_factors(
         df, hub, str(tmp_path), None, None, None
     )
 
-    assert len(out) == len(df), "左连接不得改变行数"
-    assert merged == cols
+    assert block is not None and merged == cols
+    assert block.shape == (len(df), len(cols)), "行序与 df 一一对应，列序同 merged"
+    assert block.dtype == np.float32
     assert [len(c) for c in hub.calls] == [
         rw._L2_FETCH_CHUNK,
         len(cols) - rw._L2_FETCH_CHUNK,
@@ -158,10 +161,10 @@ def test_merge_l2_factors_chunked_left_join_float32(
     assert [c for call in hub.calls for c in call] == cols, (
         "分块并集 = 全量清单，序稳定"
     )
-    for c in cols:
-        assert out[c].dtype == np.float32
-    assert out.loc[1, "micro_f000"] == 1.0  # 600036.SH 2026-01-02 有数据
-    assert np.isnan(out.loc[2, "micro_f000"]), "未覆盖行留 NaN"
+    # 值 = sub 行序 + 列序（_l2_frame 口径）：600036.SH 01-02 是 sub 行 1
+    assert block[0, 0] == 0.0 and block[1, 0] == 1.0
+    assert block[1, 50] == 51.0, "第二块列也须定位正确"
+    assert np.isnan(block[2, 0]) and np.isnan(block[3, 50]), "未覆盖行留 NaN"
 
 
 def test_merge_l2_factors_chunk_failure_skips_chunk(
@@ -177,14 +180,17 @@ def test_merge_l2_factors_chunk_failure_skips_chunk(
     )
     hub = _FakeHub(_l2_frame(["2026-01-01"], ["600036.SH"], cols), fail_from_call=1)
 
-    out, merged = _bare_wrapper()._merge_l2_factors(
+    block, merged = _bare_wrapper()._merge_l2_factors(
         df, hub, str(tmp_path), None, None, None
     )
 
     assert len(hub.calls) == 1, "第二块抛异常被吞，仅第一块成功"
+    assert block is not None
     assert merged == cols[: rw._L2_FETCH_CHUNK], "失败块不并入，成功块保留"
-    assert "micro_f000" in out.columns
-    assert cols[-1] not in out.columns
+    assert block.shape == (1, rw._L2_FETCH_CHUNK), "整宽块按实际并入列收窄"
+    assert block[0, 0] == 0.0 and block[0, rw._L2_FETCH_CHUNK - 1] == (
+        rw._L2_FETCH_CHUNK - 1
+    ), "并入列的值定位不受跳块影响"
 
 
 def test_merge_l2_factors_duplicate_keys_skip_chunk(
@@ -201,24 +207,59 @@ def test_merge_l2_factors_duplicate_keys_skip_chunk(
     dup = _l2_frame(["2026-01-01", "2026-01-01"], ["600036.SH"], cols)  # 同日两行
     hub = _FakeHub(dup)
 
-    out, merged = _bare_wrapper()._merge_l2_factors(
+    block, merged = _bare_wrapper()._merge_l2_factors(
         df, hub, str(tmp_path), None, None, None
     )
 
-    assert len(out) == len(df), "重复键块整块跳过，行数不变"
-    assert "micro_dup" not in out.columns
-    assert merged == []
+    assert merged == [] and block is None, (
+        "重复键块整块跳过（get_indexer 非唯一报错，等价旧版行数膨胀判据）"
+    )
 
 
-def test_merge_l2_factors_empty_column_list_returns_unchanged(
+def test_merge_l2_factors_empty_column_list_returns_none(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(rw, "l2_factor_columns", lambda _d: [])
     df = pd.DataFrame({"symbol": ["a"], "trade_date": pd.to_datetime(["2026-01-01"])})
-    out, merged = _bare_wrapper()._merge_l2_factors(
+    block, merged = _bare_wrapper()._merge_l2_factors(
         df, _FakeHub(df), str(tmp_path), None, None, None
     )
-    assert merged == [] and out is df
+    assert merged == [] and block is None
+
+
+def test_merge_l2_factors_maps_by_keys_not_row_position(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """df 行序与 sub 行序相反时按键定位：行序跟随 df，绝不按位置取值。"""
+    cols = ["micro_x"]
+    monkeypatch.setattr(rw, "l2_factor_columns", lambda _d: list(cols))
+    # df 行序：000001.SZ 在前——与 sub（600036.SH 在前）不同
+    df = pd.DataFrame(
+        {
+            "symbol": ["000001.SZ", "600036.SH", "000001.SZ", "600036.SH"],
+            "trade_date": pd.to_datetime(
+                ["2026-01-02", "2026-01-02", "2026-01-01", "2026-01-01"]
+            ),
+        }
+    )
+    # sub 行序：600036(01-01→0, 01-02→1), 000001(01-01→2, 01-02→3)
+    hub = _FakeHub(
+        _l2_frame(["2026-01-01", "2026-01-02"], ["600036.SH", "000001.SZ"], cols)
+    )
+
+    block, merged = _bare_wrapper()._merge_l2_factors(
+        df, hub, str(tmp_path), None, None, None
+    )
+
+    assert merged == cols and block is not None
+    assert block[:, 0].tolist() == [3.0, 1.0, 2.0, 0.0], (
+        "000001 01-02=3, 600036 01-02=1, 000001 01-01=2, 600036 01-01=0"
+    )
+
+
+def test_malloc_trim_never_raises() -> None:
+    """驻留优化助手：非 glibc/无符号环境静默通过（不影响正确性）。"""
+    rw._malloc_trim()
 
 
 # ── 3. 缓存失效随 L2 更新 ────────────────────────────────────────────
@@ -350,3 +391,167 @@ def test_seed_templates_are_not_l2_columns() -> None:
     assert all(k.startswith("MicroSeed_") for k in seeds), (
         "T-MV-07 正名：种子模板不得再以 L2_ 前缀冒充 L2 实列"
     )
+
+
+# ── 5. 端到端组装行序（2026-10-14 OOM 修复）──────────────────────────
+#
+# 修复把组装末尾的整表 sort_index 换成「上游预排 + 组装即有序」。行序口径
+# 必须与 sort_index 逐位一致：二级键是 qlib 形 instrument 的字典序
+# （bj… < sh… < sz…），而非原始后缀码（000001.SZ < 430047.BJ < 600036.SH，
+# 跨交易所会错序）。下列测试用乱序输入 + 跨交易所样本钉死这条口径，并覆盖
+# 预排失效时的兜底排序路径。
+
+
+class _OrderHub:
+    """跨交易所标的 + 乱序输入的端到端 hub 替身（K线/富化/L2 全走真构建路径）。"""
+
+    _L2_VAL = {"600036.SH": 1.0, "000001.SZ": 2.0, "430047.BJ": 3.0}
+
+    def __init__(self, dates: list[str], *, nan_symbol_row: bool = False) -> None:
+        self.available = True
+        self.dates = dates
+        self.nan_symbol_row = nan_symbol_row
+
+    def fetch_stock_list(self):  # noqa: ANN201
+        return pd.DataFrame({"Symbol": ["600036.SH", "000001.SZ", "430047.BJ"]})
+
+    def _base_cols(self) -> list[str]:
+        return ["open", "high", "low", "close", "volume", "amount"]
+
+    def fetch_daily_kline_batch(self, symbols, start, end, adjust="qfq"):  # noqa: ANN001
+        if adjust != "qfq":
+            return pd.DataFrame()  # 不复权缺失 → factor = 1.0（本测不关心）
+        rows = [
+            {
+                "symbol": s,
+                "trade_date": pd.Timestamp(d),
+                **dict.fromkeys(self._base_cols(), 1.0),
+            }
+            for s in symbols
+            for d in self.dates
+        ]
+        if self.nan_symbol_row:
+            rows.append(
+                {
+                    "symbol": np.nan,
+                    "trade_date": pd.Timestamp(self.dates[0]),
+                    **dict.fromkeys(self._base_cols(), 1.0),
+                }
+            )
+        return pd.DataFrame(rows[::-1])  # 故意逆序：行序必须由构建器排序键决定
+
+    def fetch_ml_columns(self, dataset, columns, start, end, symbols=None):  # noqa: ANN001
+        if dataset == "l2_factors":
+            rows = [
+                {
+                    "symbol": s,
+                    "trade_date": pd.Timestamp(d),
+                    **dict.fromkeys(columns, self._L2_VAL[s]),
+                }
+                for s in (symbols or list(self._L2_VAL))
+                for d in self.dates
+            ]
+            return pd.DataFrame(rows)
+        if dataset == "features_daily":
+            rows = [
+                {
+                    "symbol": s,
+                    "trade_date": pd.Timestamp(d),
+                    **dict.fromkeys(columns, 1.0),
+                }
+                for s in (symbols or list(self._L2_VAL))
+                for d in self.dates
+            ]
+            return pd.DataFrame(rows[::-1])  # 富化 merge 也不得打乱左表行序
+        return pd.DataFrame()  # l1_factors：走空表跳过分支
+
+
+def _clear_mining_env(monkeypatch) -> None:  # noqa: ANN001
+    for name in (
+        "QM_MINING_WINDOW_START",
+        "QM_MINING_WINDOW_END",
+        "QM_VALIDATION_WINDOW_START",
+        "QM_VALIDATION_WINDOW_END",
+        "QM_MINING_DATASETS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _patch_gen_hub(monkeypatch, hub: _OrderHub) -> None:  # noqa: ANN001
+    from backend.services.engine.data_platform import quantdb_hub as hub_mod
+
+    monkeypatch.setattr(hub_mod, "QuantDBDataHub", lambda _dir: hub)
+
+
+def test_generate_h5_instrument_ordering_matches_sort_index(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _clear_mining_env(monkeypatch)
+    _write_l2_partition(tmp_path, "20260102", ["micro_x"])
+    _patch_gen_hub(monkeypatch, _OrderHub(["2026-01-02", "2026-01-01"]))
+    out = tmp_path / "daily_pv.h5"
+
+    ok = _bare_wrapper()._generate_h5_from_parquet(
+        str(tmp_path), str(out), use_cache=False
+    )
+
+    assert ok is True
+    frame = pd.read_hdf(out, key="data")
+    assert frame.index.is_monotonic_increasing
+    idx = list(frame.index)
+    # 与 sort_index 逐位一致：时刻升序，同时刻按 qlib instrument 字典序
+    assert idx == sorted(idx, key=lambda t: (t[0], t[1])), (
+        "预排/免排序路径的行序必须与 sort_index 逐位一致"
+    )
+    assert {(t[0].date().isoformat(), t[1]) for t in idx} == {
+        (d, inst)
+        for d in ("2026-01-01", "2026-01-02")
+        for inst in ("bj430047", "sh600036", "sz000001")
+    }, "跨交易所样本必须按 qlib 名排序（bj<sh<sz），不得按原始后缀码"
+    # 直写块行序与 index 一一对应：每行 L2 值 = 该行标的的常量
+    expect = {
+        rw.RDLoopWrapper._to_qlib_symbol(k): v for k, v in _OrderHub._L2_VAL.items()
+    }
+    vals = frame["$micro_x"].to_numpy()
+    assert all(v == expect[t[1]] for v, t in zip(vals, idx, strict=True)), (
+        "按键直写块与行序错位"
+    )
+    assert frame["$close"].dtype == np.float64
+    # 富化列经 merge 后仍在、f32 口径不变（行序断言已覆盖 merge 保序）
+    from backend.services.engine.rd_agent.mining_datasets import ENRICH_BY_DATASET
+
+    fd_out = sorted(set(ENRICH_BY_DATASET["features_daily"].values()))
+    assert f"${fd_out[0]}" in frame.columns
+    assert frame[f"${fd_out[0]}"].dtype == np.float32
+
+
+def test_generate_h5_fallback_sort_when_symbols_not_presortable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """NaN 符号行令预排失效 → 兜底 sort_index 仍须保证行序正确。"""
+    _clear_mining_env(monkeypatch)
+    _write_l2_partition(tmp_path, "20260102", ["micro_x"])
+    _patch_gen_hub(
+        monkeypatch, _OrderHub(["2026-01-02", "2026-01-01"], nan_symbol_row=True)
+    )
+    out = tmp_path / "daily_pv.h5"
+
+    ok = _bare_wrapper()._generate_h5_from_parquet(
+        str(tmp_path), str(out), use_cache=False
+    )
+
+    assert ok is True
+    frame = pd.read_hdf(out, key="data")
+    idx = list(frame.index)
+    # 注：fixed 格式 h5 会把 instrument 层的 'nan' 字符串往返成 float NaN
+    # （pytables 对 object 列的固有损耗，真实数据无此符号形态），故读回帧的
+    # is_monotonic_increasing 不可用；按「字符串行保序 + NaN 行计数」断言。
+    real = [t for t in idx if isinstance(t[1], str)]
+    assert real == sorted(real, key=lambda t: (t[0], t[1])), (
+        "兜底 sort_index 仍须保证真实行序与 sort_index 一致"
+    )
+    nan_rows = [t for t in idx if not isinstance(t[1], str)]
+    assert len(nan_rows) == 1 and nan_rows[0][0].date().isoformat() == "2026-01-02", (
+        "NaN 符号行在预排失效时按兜底路径保留"
+    )
+    assert len(idx) == 7

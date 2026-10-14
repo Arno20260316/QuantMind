@@ -153,6 +153,26 @@ def l2_factor_columns(quantdb_dir: str) -> list[str]:
     return []
 
 
+def _l2_symbol_keys(series: pd.Series) -> pd.Series:
+    """symbol 列 → str 键（仅非 object dtype 时转换；值相等即可跨表匹配）。"""
+    return series if series.dtype == object else series.astype(str)
+
+
+def _malloc_trim() -> None:
+    """把 glibc 空闲堆页归还 OS（大块分配/释放 churn 后 RSS 虚高的对治）。
+
+    2026-10-14 h5 构建 OOM 复盘：L2 分块大分配/释放留下的空闲 arena 计入
+    RSS，41GB 采样里数 GB 是无法自然回收的空堆。仅 Linux/glibc 生效，任何
+    异常静默跳过——纯驻留优化，与正确性无关。
+    """
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 #: 各市场 → ``shared.qlib_paths`` 的 provider key（回测日历所在目录）
 _QLIB_PROVIDER_KEY_BY_MARKET: dict[str, str] = {
     "a_share": "CN",
@@ -1262,6 +1282,51 @@ class RDLoopWrapper:
             else:
                 factor = np.ones(len(df))
 
+            # ── 行序预排（2026-10-14 OOM 修复）──────────────────────────
+            # 终帧 index=(datetime, qlib-instrument) 必须有序。旧实现在组装
+            # 末尾 sort_index()——对 L2 全量后 ~8GB 的整表再复制一份。改为在
+            # K 线小表阶段（enrich/L2 并入前，~1.5GB）按同一排序键排一次：
+            # merge/直写块都保持左表行序，组装即有序、免排序。排序键必须与
+            # sort_index 语义逐位一致：instrument 是 qlib 形（bj… < sh… <
+            # sz…，不能按原始后缀码排——跨交易所会错序），故二级键 = qlib 名
+            # 全市场字典序位次；一级键 = trade_date 的 int64 纳秒。折算失败
+            # （异常 dtype/NaN 符号）回退旧路径：组装末尾兜底 sort_index，
+            # 正确性优先，只损失内存优化。
+            if "_close_unadj" in df.columns:
+                df = df.drop(columns=["_close_unadj"])
+            sym_series = df["symbol"]
+            if sym_series.dtype != object:
+                sym_series = sym_series.astype(str)
+            sym_codes, sym_uniq = pd.factorize(sym_series)
+            qlib_sorted = np.array(
+                sorted(self._to_qlib_symbol(str(s)) for s in sym_uniq), dtype=object
+            )
+            presorted = bool((sym_codes >= 0).all())
+            if presorted:
+                qlib_rank_of = {s: r for r, s in enumerate(qlib_sorted)}
+                rank_by_code = np.fromiter(
+                    (qlib_rank_of[self._to_qlib_symbol(str(s))] for s in sym_uniq),
+                    dtype=np.int64,
+                    count=len(sym_uniq),
+                )
+                row_sym_rank = rank_by_code[sym_codes]
+                try:
+                    date_i8 = (
+                        pd.to_datetime(df["trade_date"]).astype("int64").to_numpy()
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "[%s] trade_date 无法折算 int64，组装回退 sort_index: %s",
+                        self.market,
+                        exc,
+                    )
+                    presorted = False
+            if presorted:
+                order = np.lexsort((row_sym_rank, date_i8))
+                df = df.take(order).reset_index(drop=True)
+                factor = factor[order]
+                row_sym_rank = row_sym_rank[order]
+
             # 合并 QuantDB 富化列（技术指标/估值/资金流/筹码等），供因子直接引用
             # （子集模式=debug 或探测抽样：只拉这批标的的富化数据）
             enrich_symbols = symbols if (debug or symbols_limit is not None) else None
@@ -1269,44 +1334,59 @@ class RDLoopWrapper:
                 df, hub, start_d, end_d, enrich_symbols, datasets=datasets
             )
 
-            # L2 微观结构因子全量接入（T-MV-07）：列清单现场读盘，分块左连接；
-            # 数据集选择不含 L2 时整段跳过（选择必须真正控制喂给 LLM 的列）
+            # L2 微观结构因子全量接入（T-MV-07）：列清单现场读盘，分块 fetch →
+            # 按键定位直写预分配 float32 大块（2026-10-14 起不再逐块 merge——
+            # 整表级中间拷贝是 41GB 峰值的主源）；数据集选择不含 L2 时整段跳过
+            # （选择必须真正控制喂给 LLM 的列）
             if L2_DATASET in datasets:
-                df, l2_cols = self._merge_l2_factors(
+                l2_block, l2_cols = self._merge_l2_factors(
                     df, hub, quantdb_dir, start_d, end_d, enrich_symbols
                 )
             else:
-                l2_cols = []
+                l2_block, l2_cols = None, []
                 logger.info(
                     "[%s] 数据集选择不含 %s，跳过 L2 接入", self.market, L2_DATASET
                 )
 
-            instruments = [self._to_qlib_symbol(str(s)) for s in df["symbol"]]
-            data: dict[str, Any] = {
-                "$open": df["open"].to_numpy(dtype="float64"),
-                "$high": df["high"].to_numpy(dtype="float64"),
-                "$low": df["low"].to_numpy(dtype="float64"),
-                "$close": df["close"].to_numpy(dtype="float64"),
-                "$volume": df["volume"].to_numpy(dtype="float64"),
-                "$factor": factor,
-            }
-            if "amount" in df.columns:
-                data["$amount"] = df["amount"].to_numpy(dtype="float64")
-            for out_col in (*_ENRICH_OUTPUT_COLUMNS, *l2_cols):
-                if out_col in df.columns:
-                    data[f"${out_col}"] = df[out_col].to_numpy(dtype="float32")
-
-            combined = pd.DataFrame(
-                data,
-                index=pd.MultiIndex.from_arrays(
-                    [pd.to_datetime(df["trade_date"]), instruments],
-                    names=["datetime", "instrument"],
-                ),
+            # ── 组装（2026-10-14 OOM 修复）──────────────────────────────
+            # 旧实现：data dict（逐列 to_numpy 拷贝）→ pd.DataFrame(dict)（同
+            # dtype 列再合并成单 block，第二份整表）→ sort_index（第三份）。
+            # 新实现：L2 大块零拷贝包成首块帧，其余列逐列插入（追加不复制已
+            # 有列）；行序已预排则 index 即有序，不再 sort_index；未预排
+            # （罕见回退）时保留兜底排序——正确性优先于内存。
+            if presorted:
+                instruments = qlib_sorted[row_sym_rank]
+            else:
+                instruments = [self._to_qlib_symbol(str(s)) for s in df["symbol"]]
+            mi = pd.MultiIndex.from_arrays(
+                [pd.to_datetime(df["trade_date"]), instruments],
+                names=["datetime", "instrument"],
             )
-            # sort_index 会整表复制；combined 与 df 共享列内存（CoW），先释放
-            # df/instruments 再排序，峰值内存省一份全表（L2 全量后 ~10GB 级）
+            if l2_block is not None:
+                combined = pd.DataFrame(
+                    l2_block,
+                    index=mi,
+                    columns=[f"${c}" for c in l2_cols],
+                    copy=False,
+                )
+            else:
+                combined = pd.DataFrame(index=mi)
+            combined["$open"] = df["open"].to_numpy(dtype="float64")
+            combined["$high"] = df["high"].to_numpy(dtype="float64")
+            combined["$low"] = df["low"].to_numpy(dtype="float64")
+            combined["$close"] = df["close"].to_numpy(dtype="float64")
+            combined["$volume"] = df["volume"].to_numpy(dtype="float64")
+            if "amount" in df.columns:
+                combined["$amount"] = df["amount"].to_numpy(dtype="float64")
+            combined["$factor"] = factor
+            for out_col in _ENRICH_OUTPUT_COLUMNS:
+                if out_col in df.columns:
+                    combined[f"${out_col}"] = df[out_col].to_numpy(dtype="float32")
+            # combined 与 df 列内存共享（CoW），先释放 df 再（必要时）排序，
+            # 未预排分支的兜底 sort_index 峰值省一份全表
             del df, instruments
-            combined = combined.sort_index()
+            if not mi.is_monotonic_increasing:
+                combined = combined.sort_index()
 
             if use_cache:
                 target = cache_path
@@ -1317,6 +1397,8 @@ class RDLoopWrapper:
                 os.makedirs(
                     os.path.dirname(os.path.abspath(target)) or ".", exist_ok=True
                 )
+            # 写盘前把组装期释放的空堆归还 OS——to_hdf 序列化还需一份块级峰值
+            _malloc_trim()
             tmp_path = target + ".tmp"
             combined.to_hdf(tmp_path, key="data", mode="w")
             os.replace(tmp_path, target)
@@ -1394,18 +1476,37 @@ class RDLoopWrapper:
         start: date,
         end: date,
         symbols: list[str] | None,
-    ) -> tuple[pd.DataFrame, list[str]]:
-        """把 l2_factors 全量因子列按 (symbol, trade_date) 左连接进 K 线表（T-MV-07）。
+    ) -> tuple[Any, list[str]]:
+        """把 l2_factors 全量因子列按 (symbol, trade_date) 左对齐进预分配大块（T-MV-07）。
 
-        与 ``_merge_enrich`` 的差异：列清单现场读盘（``l2_factor_columns`` 单源）；
-        按 ``_L2_FETCH_CHUNK`` 分块 fetch+merge（200+ 列一次拉取峰值内存 ~8GB）；
-        每块先转 float32 再 merge（终态本就是 float32，先降再并峰值减半）。任一
-        块失败只跳过该块——宁可少几列，不炸整个 h5 生成。返回 (df, 并入的列名)。
+        2026-10-14 OOM 事故后重写：旧版逐块 ``df.merge``——每块都把**已累计的
+        整表**复制一份（全量后 df ~9GB，尾块瞬时 ×2），叠加组装阶段两份整表拷贝，
+        实测把 h5 构建峰值顶到 41GB+（45GiB 容器两次 -9）。新版改为
+        ``Index.get_indexer`` 按键定位：每块 fetch 后只做一次键查找，把列值花式
+        索引直写进一次预分配的 (nrows × ncols) float32 大块——全流程无整表级
+        中间拷贝（峰值 ≈ 大块 6.7GB + df ~1.5GB + 单块 ~0.6GB）。
+
+        语义与原左连接逐位等价：以 df 行为准、未覆盖行 NaN；重复右键（HK
+        daily_forward 双来源旧坑同型）令 get_indexer 抛 InvalidIndexError →
+        整块跳过（等价旧版按行数膨胀的判据）；任一块失败只跳过该块，跳过的列
+        不出现在返回清单（= 不进缓存）。
+
+        Returns:
+            (block, merged)：block 行序与 df 一一对应、列序同 merged，dtype
+            float32；无列可并时 (None, [])。
         """
+        import numpy as np
+
         cols = l2_factor_columns(quantdb_dir)
         if not cols:
             logger.warning("[%s] l2_factors 列清单为空，跳过 L2 接入", self.market)
-            return df, []
+            return None, []
+        n_rows = len(df)
+        block = np.full((n_rows, len(cols)), np.nan, dtype="float32")
+        keys_df = pd.MultiIndex.from_arrays(
+            [pd.to_datetime(df["trade_date"]), _l2_symbol_keys(df["symbol"])]
+        )
+        kept: list[int] = []
         merged: list[str] = []
         for i in range(0, len(cols), _L2_FETCH_CHUNK):
             chunk = cols[i : i + _L2_FETCH_CHUNK]
@@ -1432,37 +1533,47 @@ class RDLoopWrapper:
                 continue
             sub["trade_date"] = pd.to_datetime(sub["trade_date"])
             present = [c for c in chunk if c in sub.columns]
-            for c in present:
-                if sub[c].dtype != "float32":
-                    sub[c] = sub[c].astype("float32")
-            n_before = len(df)
-            joined = df.merge(
-                sub[["symbol", "trade_date", *present]],
-                on=["symbol", "trade_date"],
-                how="left",
-            )
-            # 左连接不得改变行数；行数变了 = l2 有重复键分区（HK daily_forward
-            # 双来源旧坑同型），整块跳过也不把错行写进 GB 级共享缓存
-            if len(joined) != n_before:
+            try:
+                idx = pd.MultiIndex.from_arrays(
+                    [sub["trade_date"], _l2_symbol_keys(sub["symbol"])]
+                ).get_indexer(keys_df)
+            except Exception as exc:  # InvalidIndexError（右键重复）等
                 logger.error(
-                    "[%s] %s chunk %d changed row count %d->%d (dup keys?); skipped",
+                    "[%s] %s chunk %d key lookup failed (dup keys?); skipped: %s",
                     self.market,
                     _L2_LIBRARY,
                     i,
-                    n_before,
-                    len(joined),
+                    exc,
                 )
                 continue
-            df = joined
-            merged.extend(present)
-        if merged:
-            logger.info(
-                "[%s] Enriched h5 with %d L2 factor cols from %s",
-                self.market,
-                len(merged),
-                _L2_LIBRARY,
-            )
-        return df, merged
+            missing = idx < 0
+            for c in present:
+                # 花式索引总产出可写新数组；-1（查无）先回绕写入错值再整段置 NaN
+                vals = sub[c].to_numpy(dtype="float32")[idx]
+                if missing.any():
+                    vals[missing] = np.nan
+                j = i + chunk.index(c)
+                block[:, j] = vals
+                kept.append(j)
+                merged.append(c)
+            del sub, idx
+            _malloc_trim()
+        if not merged:
+            return None, []
+        if len(kept) == len(cols):
+            slim = block
+        else:
+            # 有块被跳过：整宽块裁成实际并入列（罕见路径，一次拷贝可接受）
+            slim = block[:, kept]
+            del block
+        _malloc_trim()
+        logger.info(
+            "[%s] Enriched h5 with %d L2 factor cols from %s",
+            self.market,
+            len(merged),
+            _L2_LIBRARY,
+        )
+        return slim, merged
 
     @staticmethod
     def _latest_partition_mtime(quantdb_dir: str, rel_path: str) -> float:

@@ -1596,6 +1596,10 @@ class AlphaAgentLauncher:
         env = {
             **os.environ,
             "PYTHONPATH": os.getenv("PYTHONPATH") or "/app",
+            # glibc 分配器 arena 上限：大块 churn 场景把空闲堆滞留压到最低
+            # （2026-10-14 h5 构建 41GB 峰值复盘，与 rd_loop_wrapper 的
+            # malloc_trim 双保险）；显式设置过则不覆盖
+            "MALLOC_ARENA_MAX": os.getenv("MALLOC_ARENA_MAX", "2"),
             "LOG_TRACE_PATH": str(task_log_dir),
             "QLIB_PROVIDER_URI": provider_uri,
             "QLIB_FACTOR_UNIVERSE": task.universe,

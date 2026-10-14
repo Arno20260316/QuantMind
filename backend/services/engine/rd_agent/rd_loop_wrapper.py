@@ -86,6 +86,11 @@ _L2_SKIP_COLUMNS: frozenset[str] = frozenset(
 # 48 列/块把单块峰值压到 ~2GB 以内，逐块 merge 后立即释放
 _L2_FETCH_CHUNK = 48
 
+# L2 取数再按 symbol 分片（2026-10-14 二修，与连接释放配套）：整市场单查询
+# 48 列 = 结果 ~3GB + DuckDB 在途瞬态 ~6GB；分片后单查询行域 1/4，在途瞬态
+# 与连接驻留同比例缩小，键定位（get_indexer）语义与分片无关。
+_L2_SYMBOL_SHARD = 1400
+
 # 无自定义窗口（QM_MINING_WINDOW_* 未设）时 h5 数据面的旧默认跨度，保持迁移前
 # 行为逐位不变（含共享缓存文件名）。
 _H5_DEFAULT_START = date(2020, 1, 1)
@@ -171,6 +176,54 @@ def _malloc_trim() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _frame_from_two_blocks(
+    f64_vals: Any,
+    f64_names: list[str],
+    f32_vals: Any,
+    f32_names: list[str],
+    mi: pd.MultiIndex,
+) -> pd.DataFrame:
+    """pandas internals 直构「恰好两块」帧（f64 + f32），零增拷贝。
+
+    2026-10-15 写盘侧峰值复盘：逐列插入的末帧有 ~40 个块，
+    ``BlockManagerFixed.write`` 写盘前对非 consolidated 帧做 ``consolidate()``
+    ——整表再拷一份（全量 ~7GB）；且末帧的块多为 df 列的视图，``del df`` 后
+    列内存被末帧间接钉住（不释放）。直构恰好两种 dtype 各一块使
+    ``is_consolidated() → True``，写盘免合并；块值传 (n, k) C 序存储的 ``.T``
+    视图 → block.values 为 F 序，``write_array`` 的 ``.T`` 恰回连续 buffer
+    （无拷贝，实测写 4.1GB 仅 +9MB RSS）。
+
+    口径（pandas 2.3.x 实测）：block.values 形状 (k, n) 列主序；
+    ``new_block_2d`` 的 placement 必须包 ``BlockPlacement``。任一环节与版本
+    行为不符即抛异常——由调用方回退逐列组装（正确性优先，只损失内存优化）。
+
+    返回帧与传入存储共享内存（零拷贝）：帧存续期间调用方不得改写存储，且
+    存储须保持存活引用（帧的块只持视图）。
+    """
+    import numpy as np
+
+    from pandas._libs.internals import BlockPlacement
+    from pandas.core.internals import BlockManager
+    from pandas.core.internals.blocks import new_block_2d
+
+    names = list(f64_names) + list(f32_names)
+    blocks = [
+        new_block_2d(
+            f64_vals.T, placement=BlockPlacement(np.arange(0, len(f64_names)))
+        )
+    ]
+    if f32_names:
+        base = len(f64_names)
+        blocks.append(
+            new_block_2d(
+                f32_vals.T,
+                placement=BlockPlacement(np.arange(base, base + len(f32_names))),
+            )
+        )
+    mgr = BlockManager(blocks, axes=[pd.Index(names), mi])
+    return pd.DataFrame._from_mgr(mgr, axes=mgr.axes)
 
 
 #: 各市场 → ``shared.qlib_paths`` 的 provider key（回测日历所在目录）
@@ -1164,8 +1217,9 @@ class RDLoopWrapper:
         - Key: "data"
         - Index: MultiIndex [datetime, instrument]
         - Columns: ["$open", "$high", "$low", "$close", "$volume", "$amount",
-          "$factor", <QuantDB 富化列 ...>, <L2 微观结构因子列 ...>]
-          （L2 全量列见 ``l2_factor_columns``，T-MV-07 起并入）
+          "$factor", <L2 微观结构因子列 ...>, <QuantDB 富化列 ...>]
+          （L2 全量列见 ``l2_factor_columns``，T-MV-07 起并入；读取方
+          一律按列名取数，两块的列序/块序不是契约）
         - instrument 格式: Qlib 格式 sh600036
 
         常规模式（``use_cache=True``，默认）：生成的富化文件先写入共享缓存
@@ -1243,12 +1297,14 @@ class RDLoopWrapper:
             # 批量读取：一次查全部 symbol，避免逐股票 N 次分区扫描
             # （早期实现对 ~5400 只股票各查 2 次，单次生成需 40 分钟以上）
             df = hub.fetch_daily_kline_batch(symbols, start_d, end_d, adjust="qfq")
+            hub.release_resources()  # DuckDB 连接保活最后一次结果（~GB 级）
             if df is None or df.empty:
                 logger.error("[%s] No K-line data read from QuantDB", self.market)
                 return self._use_stale_cache(cache_path, output_path, allow=use_cache)
             df_unadj = hub.fetch_daily_kline_batch(
                 symbols, start_d, end_d, adjust="none"
             )
+            hub.release_resources()
 
             # 前复权价可能为负（高分红股票多年除权后 qfq 价转负），会污染 Qlib 因子
             # 计算，这里整体剔除这些行。
@@ -1336,24 +1392,50 @@ class RDLoopWrapper:
 
             # L2 微观结构因子全量接入（T-MV-07）：列清单现场读盘，分块 fetch →
             # 按键定位直写预分配 float32 大块（2026-10-14 起不再逐块 merge——
-            # 整表级中间拷贝是 41GB 峰值的主源）；数据集选择不含 L2 时整段跳过
-            # （选择必须真正控制喂给 LLM 的列）
+            # 整表级中间拷贝是 41GB 峰值的主源）；另按 symbol 分片 + 每片释放
+            # 连接（二修：整市场单查询的在途瞬态与连接驻留合计 ~10GB）。数据集
+            # 选择不含 L2 时整段跳过（选择必须真正控制喂给 LLM 的列）
+            #
+            # 组装侧 v4（2026-10-15）：f32 存储提前到此分配（宽度 = L2 现读
+            # 列数 + 富化列数），L2 直写其前段、富化列补尾段——L2 值落进终帧
+            # 存储零搬运；无 L2（未选/清单空）时宽度退化为富化列数，直构路径
+            # 不受影响。清单竞态/跳块致 L2 未落存储 → 弃用（整体回退组装）。
+            enrich_cols = [c for c in _ENRICH_OUTPUT_COLUMNS if c in df.columns]
             if L2_DATASET in datasets:
-                l2_block, l2_cols = self._merge_l2_factors(
-                    df, hub, quantdb_dir, start_d, end_d, enrich_symbols
-                )
+                planned = l2_factor_columns(quantdb_dir)
+                if not planned:
+                    logger.info(
+                        "[%s] l2_factors 列清单为空，跳过 L2 接入", self.market
+                    )
             else:
-                l2_block, l2_cols = None, []
+                planned = []
                 logger.info(
                     "[%s] 数据集选择不含 %s，跳过 L2 接入", self.market, L2_DATASET
                 )
+            f32_vals = np.full(  # (n, l2+enrich) float32 终帧存储（预分配直写）
+                (len(df), len(planned) + len(enrich_cols)), np.nan, dtype="float32"
+            )
+            l2_block, l2_cols = None, []
+            if planned:
+                l2_view = f32_vals[:, : len(planned)]
+                l2_block, l2_cols = self._merge_l2_factors(
+                    df, hub, quantdb_dir, start_d, end_d, symbols, block=l2_view
+                )
+                if l2_block is not l2_view:
+                    # L2 值未落预分配存储 → 弃用；整体回退逐列组装
+                    f32_vals = None
+                    l2_view = None
 
-            # ── 组装（2026-10-14 OOM 修复）──────────────────────────────
-            # 旧实现：data dict（逐列 to_numpy 拷贝）→ pd.DataFrame(dict)（同
-            # dtype 列再合并成单 block，第二份整表）→ sort_index（第三份）。
-            # 新实现：L2 大块零拷贝包成首块帧，其余列逐列插入（追加不复制已
-            # 有列）；行序已预排则 index 即有序，不再 sort_index；未预排
-            # （罕见回退）时保留兜底排序——正确性优先于内存。
+            # ── 组装 v4（2026-10-15）────────────────────────────────────
+            # v3 教训（微探针实测）：逐列插入的末帧 ~40 块 → to_hdf 前
+            # consolidate() 把整表再拷一份（~7GB）；且末帧块多为 df 列的
+            # 视图、del df 不解钉（「CoW 让 del df 省一份」的旧注释不成立：
+            # pandas 2.3 该开关默认关，列是真拷贝/视图钉住）。v4：f64/f32
+            # 两块存储前置预分配（L2 直写前段 + 富化补尾段），再经 internals
+            # 直构恰好两块帧——is_consolidated()=True 写盘免合并，块值为
+            # (n,k) 存储的 .T 视图（F 序）写盘零拷贝；df 只被读取、真释放。
+            # internals 私有 API 失配时回退逐列插入——正确性优先，损失内存
+            # 优化不损失语义。
             if presorted:
                 instruments = qlib_sorted[row_sym_rank]
             else:
@@ -1362,28 +1444,54 @@ class RDLoopWrapper:
                 [pd.to_datetime(df["trade_date"]), instruments],
                 names=["datetime", "instrument"],
             )
-            if l2_block is not None:
-                combined = pd.DataFrame(
-                    l2_block,
-                    index=mi,
-                    columns=[f"${c}" for c in l2_cols],
-                    copy=False,
-                )
-            else:
-                combined = pd.DataFrame(index=mi)
-            combined["$open"] = df["open"].to_numpy(dtype="float64")
-            combined["$high"] = df["high"].to_numpy(dtype="float64")
-            combined["$low"] = df["low"].to_numpy(dtype="float64")
-            combined["$close"] = df["close"].to_numpy(dtype="float64")
-            combined["$volume"] = df["volume"].to_numpy(dtype="float64")
+            f64_names = ["$open", "$high", "$low", "$close", "$volume"]
+            f64_src = ["open", "high", "low", "close", "volume"]
             if "amount" in df.columns:
-                combined["$amount"] = df["amount"].to_numpy(dtype="float64")
-            combined["$factor"] = factor
-            for out_col in _ENRICH_OUTPUT_COLUMNS:
-                if out_col in df.columns:
-                    combined[f"${out_col}"] = df[out_col].to_numpy(dtype="float32")
-            # combined 与 df 列内存共享（CoW），先释放 df 再（必要时）排序，
-            # 未预排分支的兜底 sort_index 峰值省一份全表
+                f64_names.append("$amount")
+                f64_src.append("amount")
+            f64_names.append("$factor")
+            f64_vals = np.empty((len(df), len(f64_names)), dtype="float64")
+            for j, c in enumerate(f64_src):
+                f64_vals[:, j] = df[c].to_numpy(dtype="float64")
+            f64_vals[:, -1] = factor
+
+            combined = None
+            if f32_vals is not None:
+                # 快路径：L2 已直写 f32_vals 前段，这里只补富化尾段
+                for i, c in enumerate(enrich_cols):
+                    f32_vals[:, len(l2_cols) + i] = df[c].to_numpy(
+                        dtype="float32"
+                    )
+                try:
+                    combined = _frame_from_two_blocks(
+                        f64_vals,
+                        f64_names,
+                        f32_vals,
+                        [f"${c}" for c in l2_cols] + [f"${c}" for c in enrich_cols],
+                        mi,
+                    )
+                except Exception as exc:  # noqa: BLE001 私有 API 失配即回退
+                    logger.warning(
+                        "[%s] pandas internals 直构失败，回退逐列组装: %s",
+                        self.market,
+                        exc,
+                    )
+                    combined = None
+            if combined is None:
+                # 回退：逐列插入（与 v3 同形；罕见路径，内存贵）
+                if l2_block is not None:
+                    combined = pd.DataFrame(
+                        l2_block,
+                        index=mi,
+                        columns=[f"${c}" for c in l2_cols],
+                        copy=False,
+                    )
+                else:
+                    combined = pd.DataFrame(index=mi)
+                for j, name in enumerate(f64_names):
+                    combined[name] = f64_vals[:, j]
+                for c in enrich_cols:
+                    combined[f"${c}"] = df[c].to_numpy(dtype="float32")
             del df, instruments
             if not mi.is_monotonic_increasing:
                 combined = combined.sort_index()
@@ -1397,7 +1505,8 @@ class RDLoopWrapper:
                 os.makedirs(
                     os.path.dirname(os.path.abspath(target)) or ".", exist_ok=True
                 )
-            # 写盘前把组装期释放的空堆归还 OS——to_hdf 序列化还需一份块级峰值
+            # 写盘前把组装期释放的空堆归还 OS（v4 直构后写盘本身零拷贝，
+            # 这里回收的是 L2 分块 fetch/回退路径留下的空闲 arena）
             _malloc_trim()
             tmp_path = target + ".tmp"
             combined.to_hdf(tmp_path, key="data", mode="w")
@@ -1444,6 +1553,7 @@ class RDLoopWrapper:
                 sub = hub.fetch_ml_columns(
                     dataset, list(mapping.keys()), start, end, symbols=symbols
                 )
+                hub.release_resources()  # 连接保活查询结果 ~GB 级，取完即还
             except Exception as exc:
                 logger.warning(
                     "[%s] Enrich from %s failed: %s", self.market, dataset, exc
@@ -1476,6 +1586,7 @@ class RDLoopWrapper:
         start: date,
         end: date,
         symbols: list[str] | None,
+        block: Any = None,
     ) -> tuple[Any, list[str]]:
         """把 l2_factors 全量因子列按 (symbol, trade_date) 左对齐进预分配大块（T-MV-07）。
 
@@ -1485,6 +1596,19 @@ class RDLoopWrapper:
         ``Index.get_indexer`` 按键定位：每块 fetch 后只做一次键查找，把列值花式
         索引直写进一次预分配的 (nrows × ncols) float32 大块——全流程无整表级
         中间拷贝（峰值 ≈ 大块 6.7GB + df ~1.5GB + 单块 ~0.6GB）。
+
+        2026-10-14 二修（连接驻留 + 在途瞬态）：实测整市场单查询的 DuckDB
+        fetchdf 会在连接里驻留结果 ~4.4GB（del/gc/malloc_trim 均不还），且
+        查询在途另有 ~6GB 瞬态——两者叠加会把构建峰值重新顶高。修法：按
+        ``_L2_SYMBOL_SHARD`` 分片取数（在途瞬态 ÷ 分片数），每片 fetch 后立即
+        ``hub.release_resources()`` 关闭连接（驻留归零）；`symbols` 传全市场
+        清单（None 时不带 WHERE，兼容旧调用）。
+
+        2026-10-15 三修（组装侧直写，v4）：``block`` 传入调用方预分配存储的
+        前段视图（形状必须 =(nrows, 现场列数)、float32），L2 值直接落终帧
+        f32 存储、组装零搬运。命中时返回块 **is** 传入视图；形状不符（列清单
+        竞态）或分块有跳过（收窄拷贝）时改用内部块——调用方以
+        ``返回块 is 传入视图`` 判预分配路径是否成立，不成立即回退。
 
         语义与原左连接逐位等价：以 df 行为准、未覆盖行 NaN；重复右键（HK
         daily_forward 双来源旧坑同型）令 get_indexer 抛 InvalidIndexError →
@@ -1502,62 +1626,87 @@ class RDLoopWrapper:
             logger.warning("[%s] l2_factors 列清单为空，跳过 L2 接入", self.market)
             return None, []
         n_rows = len(df)
-        block = np.full((n_rows, len(cols)), np.nan, dtype="float32")
+        if (
+            block is None
+            or getattr(block, "shape", None) != (n_rows, len(cols))
+            or getattr(block, "dtype", None) != np.dtype("float32")
+        ):
+            # 未给存储 / 宽度按调用方清单预留但现场列数已变（竞态）→ 自分配；
+            # 身份判据（返回块 is 视图）由此自然失效，调用方走回退组装
+            block = np.full((n_rows, len(cols)), np.nan, dtype="float32")
         keys_df = pd.MultiIndex.from_arrays(
             [pd.to_datetime(df["trade_date"]), _l2_symbol_keys(df["symbol"])]
         )
+        shards: list[list[str] | None]
+        if symbols:
+            shards = [
+                list(symbols[i : i + _L2_SYMBOL_SHARD])
+                for i in range(0, len(symbols), _L2_SYMBOL_SHARD)
+            ]
+        else:
+            shards = [None]
         kept: list[int] = []
+        kept_seen: set[int] = set()
         merged: list[str] = []
         for i in range(0, len(cols), _L2_FETCH_CHUNK):
             chunk = cols[i : i + _L2_FETCH_CHUNK]
-            try:
-                sub = hub.fetch_ml_columns(
-                    _L2_LIBRARY, chunk, start, end, symbols=symbols
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Enrich from %s failed (chunk %d): %s",
-                    self.market,
-                    _L2_LIBRARY,
-                    i,
-                    exc,
-                )
-                continue
-            if sub is None or sub.empty:
-                logger.warning(
-                    "[%s] No enrich data from %s (chunk %d)",
-                    self.market,
-                    _L2_LIBRARY,
-                    i,
-                )
-                continue
-            sub["trade_date"] = pd.to_datetime(sub["trade_date"])
-            present = [c for c in chunk if c in sub.columns]
-            try:
-                idx = pd.MultiIndex.from_arrays(
-                    [sub["trade_date"], _l2_symbol_keys(sub["symbol"])]
-                ).get_indexer(keys_df)
-            except Exception as exc:  # InvalidIndexError（右键重复）等
-                logger.error(
-                    "[%s] %s chunk %d key lookup failed (dup keys?); skipped: %s",
-                    self.market,
-                    _L2_LIBRARY,
-                    i,
-                    exc,
-                )
-                continue
-            missing = idx < 0
-            for c in present:
-                # 花式索引总产出可写新数组；-1（查无）先回绕写入错值再整段置 NaN
-                vals = sub[c].to_numpy(dtype="float32")[idx]
-                if missing.any():
-                    vals[missing] = np.nan
-                j = i + chunk.index(c)
-                block[:, j] = vals
-                kept.append(j)
-                merged.append(c)
-            del sub, idx
-            _malloc_trim()
+            for shard in shards:
+                try:
+                    sub = hub.fetch_ml_columns(
+                        _L2_LIBRARY, chunk, start, end, symbols=shard
+                    )
+                    hub.release_resources()  # 连接保活查询结果 ~GB 级，取完即还
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Enrich from %s failed (chunk %d): %s",
+                        self.market,
+                        _L2_LIBRARY,
+                        i,
+                        exc,
+                    )
+                    continue
+                if sub is None or sub.empty:
+                    logger.warning(
+                        "[%s] No enrich data from %s (chunk %d)",
+                        self.market,
+                        _L2_LIBRARY,
+                        i,
+                    )
+                    continue
+                sub["trade_date"] = pd.to_datetime(sub["trade_date"])
+                present = [c for c in chunk if c in sub.columns]
+                try:
+                    idx = pd.MultiIndex.from_arrays(
+                        [sub["trade_date"], _l2_symbol_keys(sub["symbol"])]
+                    ).get_indexer(keys_df)
+                except Exception as exc:  # InvalidIndexError（右键重复）等
+                    logger.error(
+                        "[%s] %s chunk %d key lookup failed (dup keys?); skipped: %s",
+                        self.market,
+                        _L2_LIBRARY,
+                        i,
+                        exc,
+                    )
+                    continue
+                missing = idx < 0
+                hit = ~missing
+                for c in present:
+                    # 花式索引总产出可写新数组；-1（查无）先回绕写入错值再整段置 NaN
+                    vals = sub[c].to_numpy(dtype="float32")[idx]
+                    j = i + chunk.index(c)
+                    if missing.any():
+                        vals[missing] = np.nan
+                        # 分片取数：片外行（本片查无）由其它片供给——只写本片
+                        # 命中行；整列覆写会把前一片已写入的结果抹回 NaN
+                        block[hit, j] = vals[hit]
+                    else:
+                        block[:, j] = vals
+                    if j not in kept_seen:  # 同一列可能出现在多个分片
+                        kept_seen.add(j)
+                        kept.append(j)
+                        merged.append(c)
+                del sub, idx
+                _malloc_trim()
         if not merged:
             return None, []
         if len(kept) == len(cols):

@@ -192,6 +192,9 @@ class _EnrichHub:
         ]
         return pd.DataFrame(rows)
 
+    def release_resources(self) -> None:
+        pass
+
 
 def _kline_df() -> pd.DataFrame:
     return pd.DataFrame(
@@ -250,6 +253,7 @@ class _GenHub:
         self.dates = dates
         self.kline_spans: list[tuple[date, date]] = []
         self.ml_calls: list[tuple[str, list[str]]] = []
+        self.release_calls = 0
 
     def fetch_stock_list(self):  # noqa: ANN201
         return pd.DataFrame({"Symbol": ["600036.SH"]})
@@ -271,6 +275,9 @@ class _GenHub:
         self.ml_calls.append((dataset, list(columns)))
         return pd.DataFrame(self._rows(symbols or ["600036.SH"], start, end, list(columns)))
 
+    def release_resources(self) -> None:
+        self.release_calls += 1
+
 
 def _patch_hub(monkeypatch, hub: _GenHub) -> None:
     from backend.services.engine.data_platform import quantdb_hub as hub_mod
@@ -285,6 +292,15 @@ def test_generate_h5_default_combo_is_unchanged(monkeypatch, tmp_path: Path):
     _patch_hub(monkeypatch, hub)
     out = tmp_path / "daily_pv.h5"
 
+    fast_calls: list[int] = []
+    orig_two_blocks = rw._frame_from_two_blocks
+
+    def _counting(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        fast_calls.append(1)
+        return orig_two_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(rw, "_frame_from_two_blocks", _counting)
+
     ok = _bare_wrapper()._generate_h5_from_parquet(str(tmp_path), str(out))
 
     assert ok is True
@@ -293,6 +309,11 @@ def test_generate_h5_default_combo_is_unchanged(monkeypatch, tmp_path: Path):
     cache = tmp_path / ".h5_cache" / "daily_pv_all.h5"
     assert cache.exists(), "默认组合必须沿用旧缓存文件名"
     assert out.exists()
+    # 每个 fetch 后释放连接：K线×2 + features + l1（无 L2 分区 → 不取） = 4
+    assert hub.release_calls == 4, "每个 fetch 后都必须释放 DuckDB 连接"
+    assert fast_calls == [1], (
+        "无 L2 时富化列也须走 internals 直构快路径（f32 存储宽度退化为富化列数）"
+    )
 
 
 def test_generate_h5_custom_window_and_dataset(monkeypatch, tmp_path: Path):

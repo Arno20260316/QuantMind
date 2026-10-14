@@ -339,6 +339,32 @@ class QuantDBDataHub:
             self._local.exact_conn = conn
         return conn
 
+    def release_resources(self) -> None:
+        """关闭本线程缓存的 DuckDB 连接，归还其保活的内存。
+
+        DuckDB 连接会**保活最后一次查询的结果**：实测单份 48 列 × 780 万行的
+        fetchdf 在 DataFrame 已 del 后仍驻留 ~4.4GB，直到连接关闭或被下次
+        查询顶替；gc / malloc_trim / MALLOC_CONF 均无法回收。逐块取数的大
+        构建（如挖掘 h5 全量重建）应在每次 fetch 后调用本方法，下次取数会懒
+        重建连接（代价 = 重扫 parquet 元数据，秒级）。
+        """
+        conn = getattr(self._local, "exact_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.exact_conn = None
+        vconn = getattr(self._local, "duck_conn", None)
+        if vconn is not None:
+            try:
+                vconn.close()
+            except Exception:
+                pass
+            self._views_mounted_per_conn.discard(id(vconn))
+            self._local.duck_conn = None
+            self._local.conn_gen = -1
+
     def _partition_dates(
         self,
         rel_path: str,

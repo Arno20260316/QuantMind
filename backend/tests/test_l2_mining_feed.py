@@ -55,7 +55,7 @@ def _write_l2_partition(
 
 
 class _FakeHub:
-    """记录分块请求并返回可定制 frame 的 duck-type hub。"""
+    """记录分块/分片请求并返回可定制 frame 的 duck-type hub。"""
 
     def __init__(
         self, frame: pd.DataFrame, *, fail_from_call: int | None = None
@@ -63,13 +63,22 @@ class _FakeHub:
         self.frame = frame
         self.fail_from_call = fail_from_call
         self.calls: list[list[str]] = []
+        self.symbol_calls: list[list[str] | None] = []
+        self.release_calls = 0
 
     def fetch_ml_columns(self, dataset, columns, start, end, symbols=None):  # noqa: ANN001
         if self.fail_from_call is not None and len(self.calls) >= self.fail_from_call:
             raise RuntimeError("boom")
         self.calls.append(list(columns))
-        cols = [c for c in columns if c in self.frame.columns]
-        return self.frame[["symbol", "trade_date", *cols]].copy()
+        self.symbol_calls.append(symbols)
+        frame = self.frame
+        if symbols is not None:
+            frame = frame[frame["symbol"].isin(symbols)]
+        cols = [c for c in columns if c in frame.columns]
+        return frame[["symbol", "trade_date", *cols]].copy()
+
+    def release_resources(self) -> None:
+        self.release_calls += 1
 
 
 def _bare_wrapper() -> rw.RDLoopWrapper:
@@ -257,9 +266,87 @@ def test_merge_l2_factors_maps_by_keys_not_row_position(
     )
 
 
+def test_merge_l2_factors_shards_by_symbol_and_releases_connection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """symbols 传入时按 _L2_SYMBOL_SHARD 分片取数：分片请求可断言、值仍按键
+    定位；且每片 fetch 后必须调用 release_resources（DuckDB 连接会驻留最后
+    一次查询结果 ~GB 级，不释放会把构建峰值重新顶高）。"""
+    cols = ["micro_s"]
+    monkeypatch.setattr(rw, "l2_factor_columns", lambda _d: list(cols))
+    monkeypatch.setattr(rw, "_L2_SYMBOL_SHARD", 2)
+    syms = ["600036.SH", "000001.SZ", "430047.BJ", "600519.SH", "000002.SZ"]
+    df = pd.DataFrame(
+        {"symbol": syms, "trade_date": pd.to_datetime(["2026-01-01"] * len(syms))}
+    )
+    hub = _FakeHub(_l2_frame(["2026-01-01"], syms, cols))
+
+    block, merged = _bare_wrapper()._merge_l2_factors(
+        df, hub, str(tmp_path), None, None, syms
+    )
+
+    assert hub.symbol_calls == [syms[0:2], syms[2:4], syms[4:5]], (
+        "5 只按 2 只一片切成 3 片，分片序稳定"
+    )
+    assert hub.release_calls == len(hub.symbol_calls) == 3, "每片取数后释放连接"
+    assert merged == cols and block is not None
+    assert block.shape == (len(syms), 1)
+    # _l2_frame 值 = 该只标的在全表行号；分片过滤不重编号 → 按键映射后
+    # 每行值 = 该行标的的原始行号（0..4），全行有值且与 df 行序对齐
+    assert block[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0], (
+        "分片取数后仍按键定位，不许按行位置取值"
+    )
+
+
 def test_malloc_trim_never_raises() -> None:
     """驻留优化助手：非 glibc/无符号环境静默通过（不影响正确性）。"""
     rw._malloc_trim()
+
+
+def test_frame_from_two_blocks_shares_storage_two_blocks() -> None:
+    """internals 直构口径（v4）：恰好两块（f64+f32）、与存储共享内存、
+    列名/行序/dtype 正确。此谓词若被 pandas 升级破坏，构建仍走回退路径
+    （正确性不受损），但 7GB consolidate 拷贝回归——这里钉死报警。"""
+    n = 6
+    mi = pd.MultiIndex.from_arrays(
+        [pd.to_datetime(["2026-01-01"] * n), [f"sh60000{i}" for i in range(n)]],
+        names=["datetime", "instrument"],
+    )
+    f64 = np.arange(n * 7, dtype="float64").reshape(n, 7)
+    f32 = np.arange(n * 3, dtype="float32").reshape(n, 3)
+    names64 = ["$open", "$high", "$low", "$close", "$volume", "$amount", "$factor"]
+    names32 = ["$micro_x", "$micro_y", "$rsi_14"]
+
+    frame = rw._frame_from_two_blocks(f64, names64, f32, names32, mi)
+
+    assert list(frame.columns) == names64 + names32
+    assert frame.index.equals(mi)
+    assert frame.dtypes.iloc[0] == np.float64 and frame.dtypes.iloc[7] == np.float32
+    mgr = frame._mgr  # noqa: SLF001 —— 本函数契约就是 mgr 层面的
+    assert len(mgr.blocks) == 2 and mgr.is_consolidated(), (
+        "恰好两块（同 dtype 各一）才能免 to_hdf 前 consolidate 全表拷贝"
+    )
+    assert np.shares_memory(mgr.blocks[0].values, f64), "块值须是存储的 .T 视图"
+    assert np.shares_memory(mgr.blocks[1].values, f32)
+    # 值一一对应（列序 = 名字序，行序 = mi）
+    assert frame["$factor"].tolist() == f64[:, -1].tolist()
+    assert frame["$rsi_14"].tolist() == f32[:, -1].tolist()
+
+
+def test_frame_from_two_blocks_f64_only_when_no_f32() -> None:
+    """无富化/无 L2 的退化形态：单 f64 块也须成立（列数正确）。"""
+    mi = pd.MultiIndex.from_arrays(
+        [pd.to_datetime(["2026-01-01"]), ["sh600036"]],
+        names=["datetime", "instrument"],
+    )
+    f64 = np.arange(7, dtype="float64").reshape(1, 7)
+    names64 = ["$open", "$high", "$low", "$close", "$volume", "$amount", "$factor"]
+
+    frame = rw._frame_from_two_blocks(f64, names64, None, [], mi)
+
+    assert list(frame.columns) == names64
+    assert len(frame._mgr.blocks) == 1  # noqa: SLF001
+    assert frame["$close"].iloc[0] == 3.0
 
 
 # ── 3. 缓存失效随 L2 更新 ────────────────────────────────────────────
@@ -411,6 +498,7 @@ class _OrderHub:
         self.available = True
         self.dates = dates
         self.nan_symbol_row = nan_symbol_row
+        self.release_calls = 0
 
     def fetch_stock_list(self):  # noqa: ANN201
         return pd.DataFrame({"Symbol": ["600036.SH", "000001.SZ", "430047.BJ"]})
@@ -465,6 +553,9 @@ class _OrderHub:
             return pd.DataFrame(rows[::-1])  # 富化 merge 也不得打乱左表行序
         return pd.DataFrame()  # l1_factors：走空表跳过分支
 
+    def release_resources(self) -> None:
+        self.release_calls += 1
+
 
 def _clear_mining_env(monkeypatch) -> None:  # noqa: ANN001
     for name in (
@@ -488,8 +579,18 @@ def test_generate_h5_instrument_ordering_matches_sort_index(
 ) -> None:
     _clear_mining_env(monkeypatch)
     _write_l2_partition(tmp_path, "20260102", ["micro_x"])
-    _patch_gen_hub(monkeypatch, _OrderHub(["2026-01-02", "2026-01-01"]))
+    hub = _OrderHub(["2026-01-02", "2026-01-01"])
+    _patch_gen_hub(monkeypatch, hub)
     out = tmp_path / "daily_pv.h5"
+
+    fast_calls: list[int] = []
+    orig_two_blocks = rw._frame_from_two_blocks
+
+    def _counting(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        fast_calls.append(1)
+        return orig_two_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(rw, "_frame_from_two_blocks", _counting)
 
     ok = _bare_wrapper()._generate_h5_from_parquet(
         str(tmp_path), str(out), use_cache=False
@@ -523,6 +624,11 @@ def test_generate_h5_instrument_ordering_matches_sort_index(
     fd_out = sorted(set(ENRICH_BY_DATASET["features_daily"].values()))
     assert f"${fd_out[0]}" in frame.columns
     assert frame[f"${fd_out[0]}"].dtype == np.float32
+    # 每个 fetch 后释放连接：K线×2 + features + l1 + l2(1 块 × 1 片) = 5
+    assert hub.release_calls == 5, "每个 fetch 后都必须释放 DuckDB 连接"
+    assert fast_calls == [1], (
+        "L2 值直写预分配存储 + internals 直构必须走快路径（回退=consolidate 拷贝回归）"
+    )
 
 
 def test_generate_h5_fallback_sort_when_symbols_not_presortable(

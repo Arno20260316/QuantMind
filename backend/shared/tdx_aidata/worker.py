@@ -36,6 +36,9 @@ from backend.shared.tdx_aidata import config, protocol
 
 logger = logging.getLogger("tdx_aidata.worker")
 
+#: 写侧指向内置公共免费行情服只警告一次（该源对写入是只读账号，必然 NOPERM）。
+_warned_public_write_target = False
+
 _SDK_ERROR_RE = re.compile(
     r"错误码\s*(\d+)|code=(\d+)|Token\s*Insufficient", re.IGNORECASE
 )
@@ -178,14 +181,28 @@ class AidataWorker:
 
     def _redis_factory(self):
         """订阅写侧 Redis（远端行情实例——与消费方同一事实源）。"""
+        global _warned_public_write_target
         import redis as _redis
 
-        from backend.shared.remote_quote_config import resolve_remote_quote_redis
+        from backend.shared.remote_quote_config import (
+            FREE_FEED_HOST,
+            resolve_remote_quote_redis,
+        )
 
         resolved = resolve_remote_quote_redis()
         if resolved is None:
             raise RuntimeError("远端行情 Redis 未配置/已禁用（REMOTE_QUOTE_DISABLED）")
         host, port, password, db = resolved
+        # 写侧落到内置公共免费行情服 = 每次 HSET 必被拒（该源 default 账号只读）。
+        # 消费方读它没问题，但写侧必须指向可写的私有行情 Redis，否则行情快照静默不更新。
+        if host == FREE_FEED_HOST and not _warned_public_write_target:
+            _warned_public_write_target = True
+            logger.error(
+                "订阅写侧仍指向内置公共免费行情服(%s)：该源对写入是只读账号，"
+                "后续 HSET 会持续被拒(NOPERM)、行情快照不会更新。请在 .env 配置 "
+                "REMOTE_QUOTE_REDIS_HOST/PASSWORD 指向可写的私有行情 Redis。",
+                FREE_FEED_HOST,
+            )
         return _redis.Redis(
             host=host,
             port=port,
@@ -286,6 +303,7 @@ class AidataWorker:
             sync_interval_s=float(os.getenv("QM_HOT_SET_SYNC_S", "15")),
             shard_id=shard_id,
             shard_count=shard_count,
+            max_queue_records=int(os.getenv("QM_SUB_QUEUE_MAX", "50000")),
         )
         self.subscription = engine
         self._sub_task = asyncio.get_running_loop().create_task(

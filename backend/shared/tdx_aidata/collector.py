@@ -19,8 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import queue
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -198,6 +198,19 @@ SDK_SUBSCRIBE_MAX = 100
 # 否则会污染当日分区为「迟到的一天」（如 09-16 分区只有 65 只收盘重放行）。
 ARCHIVE_MAX_AGE_S = 300.0
 
+# 每批排空条数（单次 Redis pipeline 规模：每条约 5 条命令）
+DRAIN_BATCH_SIZE = 500
+
+# 单 tick 追赶排空的批数上限与时间预算（积压时连续排空；正常态一趟见底）
+DRAIN_MAX_BATCHES_PER_TICK = 64
+DRAIN_BUDGET_S = 10.0
+
+# 订阅队列硬上限（条）：有界背压，满则逐出最旧（实时行情=保新弃旧）。
+# 2026-10-14 夜间事故：旧实现无界 SimpleQueue + 每 15s 只排一批 500 条（隐性节流
+# ≈33 条/s），而入帧 ≈235 条/s/worker（服务端夜间仍以 ~2.8 帧/s 重推全量快照）
+# → 8 个 worker 6 小时攒 38GB → 容器 memcg OOM 杀掉同容器因子挖掘任务。
+DEFAULT_QUEUE_MAX_RECORDS = 50_000
+
 
 def shard_symbols(
     symbols: set[str] | list[str], shard_id: int, shard_count: int
@@ -239,6 +252,8 @@ class SubscriptionEngine:
         resubscribe_min_gap_s: float = 60.0,
         shard_id: int = 0,
         shard_count: int = 1,
+        max_queue_records: int = DEFAULT_QUEUE_MAX_RECORDS,
+        max_record_age_s: float | None = ARCHIVE_MAX_AGE_S,
     ) -> None:
         self._sdk_subscribe = sdk_subscribe
         self._sdk_unsubscribe = sdk_unsubscribe
@@ -256,8 +271,14 @@ class SubscriptionEngine:
         self.resubscribe_min_gap_s = float(resubscribe_min_gap_s)
         self.shard_count = max(1, int(shard_count))
         self.shard_id = int(shard_id) % self.shard_count
+        self.max_record_age_s = (
+            float(max_record_age_s) if max_record_age_s is not None else None
+        )
+        self._queue_maxlen = max(1, int(max_queue_records))
 
-        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        # 有界队列：满时 append 自动逐出最旧（deque 的 append/popleft 在 GIL 下
+        # 原子，回调线程入队与排空线程出战互不干扰）——实时行情背压=保新弃旧。
+        self._queue: deque = deque(maxlen=self._queue_maxlen)
         self._current: set[str] = set()  # 原生码（后缀式）
         self.last_frame_ts: float | None = None
         self._last_resubscribe_ts = 0.0
@@ -276,6 +297,9 @@ class SubscriptionEngine:
             "hot_set_size": 0,  # 全量热集规模（分片前）
             "over_cap": False,  # 本片超 SDK 上限被截断（显式降级，绝不静默）
             "archived_stale_skipped": 0,  # 陈旧重放帧未落盘计数（ARCHIVE_MAX_AGE_S 闸门）
+            # 队列背压（2026-10-14 事故新增；深度见 snapshot().queue_depth）
+            "enqueue_stale_dropped": 0,  # 陈旧重放帧入队前丢（与归档同口径闸门）
+            "queue_dropped": 0,  # 队列满逐出最旧（保新弃旧）
             "last_error": None,
         }
 
@@ -303,9 +327,37 @@ class SubscriptionEngine:
             # 元帧（ColDes 全列、Content 空行——订阅 ACK/心跳型），无数据内容
             self.counters["frames_meta"] = self.counters.get("frames_meta", 0) + 1
         self.last_frame_ts = time.time()
-        for record in records:
-            self._queue.put(record)
+        self._enqueue_records(records)
         return 1
+
+    def _enqueue_records(self, records: list[dict]) -> None:
+        """入队（SDK 回调线程）：先过时效闸门，再有界背压（保新弃旧）。
+
+        时效闸门与 L0.5 归档同一口径（ARCHIVE_MAX_AGE_S）：夜间/停牌陈旧重放帧
+        （收盘后服务端仍以 ~2.8 帧/s 重推全量快照，age 数小时）不再入队——它们既
+        进不了归档（既有闸门）也无实时价值，只会把队列顶爆（2026-10-14 事故）。
+        """
+        now = datetime.now(CST)
+        now_ts = now.timestamp()
+        for record in records:
+            if self.max_record_age_s is not None:
+                age = now_ts - record_ts(record, now)
+                if age > self.max_record_age_s:
+                    self.counters["enqueue_stale_dropped"] += 1
+                    continue
+            if len(self._queue) >= self._queue_maxlen:
+                self.counters["queue_dropped"] += 1
+                if (
+                    self.counters["queue_dropped"] == 1
+                    or self.counters["queue_dropped"] % 10000 == 0
+                ):
+                    logger.warning(
+                        "订阅队列达上限 %d，逐出最旧（累计丢 %d 条）：排空追不上"
+                        "入帧，请查写侧 Redis 是否变慢/不可达",
+                        self._queue_maxlen,
+                        self.counters["queue_dropped"],
+                    )
+            self._queue.append(record)
 
     # ── redis 写侧 ──────────────────────────────────────────────────
 
@@ -316,10 +368,10 @@ class SubscriptionEngine:
         归档/打点失败只计数（各自内部吞错），不阻断实时链。
         """
         batch: list[dict] = []
-        while len(batch) < 500:
+        while len(batch) < DRAIN_BATCH_SIZE:
             try:
-                batch.append(self._queue.get_nowait())
-            except queue.Empty:
+                batch.append(self._queue.popleft())
+            except IndexError:
                 break
         if not batch:
             return 0
@@ -391,6 +443,23 @@ class SubscriptionEngine:
                 self._archiver.append(record)
             self.counters["archived"] += len(fresh_records)
         return written
+
+    def _drain_backlog(self) -> bool:
+        """连续排空直至见底（≤64 批 / 10s 预算）。返回是否已见底。
+
+        2026-10-14 事故修复：run() 旧实现每 tick 只调一次 _drain_and_write（≤500
+        条），折合 500/15s = 33 条/秒的隐性节流；入帧超速时队列只涨不消。现每
+        tick 连续排空——正常态一趟见底（成本同旧），积压态在批上限/时间预算内
+        全速追赶；返回 False（未清）时 run 不睡间隔、立即续追。
+        """
+        deadline = time.monotonic() + DRAIN_BUDGET_S
+        batches = 0
+        while batches < DRAIN_MAX_BATCHES_PER_TICK and time.monotonic() < deadline:
+            self._drain_and_write()
+            batches += 1
+            if not self._queue:
+                return True
+        return not self._queue
 
     # ── 热集同步 ────────────────────────────────────────────────────
 
@@ -522,8 +591,9 @@ class SubscriptionEngine:
             self.silence_s,
         )
         while not self._stop.is_set():
+            drained = True
             try:
-                await asyncio.to_thread(self._drain_and_write)
+                drained = await asyncio.to_thread(self._drain_backlog)
                 await asyncio.to_thread(self.sync_hot_set_once)
                 # 静默断流 → 强制重订阅（带最小间隔防抖动）
                 now = time.time()
@@ -541,6 +611,9 @@ class SubscriptionEngine:
             except Exception as exc:  # noqa: BLE001 - 循环永不退出
                 self.counters["last_error"] = f"engine loop: {exc}"
                 logger.error("订阅引擎循环异常: %s", exc, exc_info=True)
+            if not drained:
+                # 积压未清：不睡间隔，立即续追（停止信号由下轮循环顶检查）
+                continue
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.sync_interval_s)
             except asyncio.TimeoutError:
@@ -561,6 +634,8 @@ class SubscriptionEngine:
                 round(now - self.last_frame_ts, 1) if self.last_frame_ts else None
             ),
             "silent": is_silent(self.last_frame_ts, now, self.silence_s),
+            "queue_depth": len(self._queue),
+            "queue_max": self._queue_maxlen,
             "counters": dict(self.counters),
         }
         if self._archiver is not None:

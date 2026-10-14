@@ -278,8 +278,9 @@ def test_engine_archiver_skips_stale_replay_frames(tmp_path):
     )
     now = int(time.time())
     base = {"symbol": "600036.SH", "price": 40.0, "pre_close": 39.9, "open": 40.0}
-    engine._queue.put({**base, "ts": now})          # 实时帧 → 落盘
-    engine._queue.put({**base, "ts": now - 3600})   # 1h 前重放帧 → 闸门拦下
+    # 直插队列（绕过入队闸门）——本测专测归档闸门；入队闸门由 collector 测试覆盖
+    engine._queue.append({**base, "ts": now})  # 实时帧 → 落盘
+    engine._queue.append({**base, "ts": now - 3600})  # 1h 前重放帧 → 闸门拦下
     engine._drain_and_write()
     assert engine.counters["archived"] == 1
     assert engine.counters["archived_stale_skipped"] == 1

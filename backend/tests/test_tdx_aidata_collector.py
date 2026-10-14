@@ -6,7 +6,9 @@
 2. refresh_time(HHMMSS) → epoch 秒换算（CST）+ 跨日守卫；
 3. 热集差分（增量 subscribe/unsubscribe 计划 + 上限截断）；
 4. 静默判定（断流重订阅心跳）；
-5. 非 A 股/非法符号跳过敏感统计。
+5. 非 A 股/非法符号跳过敏感统计；
+6. 夜间重放积压修复（2026-10-14 OOM 事故）：有界队列保新弃旧 / 入队时效闸门 /
+   单 tick 连续排空追平。
 """
 
 from __future__ import annotations
@@ -233,3 +235,132 @@ def test_on_push_error_envelope_counted_and_kept_as_evidence():
     engine.on_push("not-json")
     assert engine.counters["parse_error_codes"]["non_json"] == 1
     assert engine.counters["parse_errors"] == 2
+
+
+# ── 6. 夜间重放积压修复（2026-10-14 OOM 事故）────────────────────────
+#
+# 事故链条：服务端夜间仍以 ~2.8 帧/s 重推全量快照（≈235 条/s/worker），旧实现
+# 无界 SimpleQueue + 每 15s 只排一批 500 条（≈33 条/s 隐性节流）→ 队列只涨不消
+# → 8 个 worker 6 小时攒 38GB → 容器 memcg OOM 杀掉同容器因子挖掘任务。
+
+
+class _CapturingPipe:
+    """记录 hset 键的假 pipeline（只验证「哪些键被写」；值与 TTL 不在本测范围）。"""
+
+    def __init__(self, sink: list[str]) -> None:
+        self._sink = sink
+
+    def hset(self, key, mapping=None):
+        self._sink.append(key)
+
+    def expire(self, key, ttl):
+        pass
+
+    def zadd(self, key, mapping):
+        pass
+
+    def zremrangebyrank(self, key, start, end):
+        pass
+
+    def execute(self):
+        pass
+
+
+class _CapturingRedis:
+    def __init__(self, sink: list[str]) -> None:
+        self._sink = sink
+
+    def pipeline(self, transaction=False):
+        return _CapturingPipe(self._sink)
+
+    def close(self):
+        pass
+
+
+def _frame_json(records: list[dict]) -> str:
+    """记录列表 → 真机形态推送帧（ColDes/Content 列对齐）。"""
+    import json
+
+    cols = sorted({k for r in records for k in r})
+    return json.dumps(
+        {
+            "ErrorId": 0,
+            "ResultSets": [
+                {
+                    "ColDes": cols,
+                    "Content": [[r.get(c) for c in cols] for r in records],
+                }
+            ],
+        }
+    )
+
+
+def _make_engine(**overrides):
+    from backend.shared.tdx_aidata.collector import SubscriptionEngine
+
+    kwargs = {
+        "sdk_subscribe": lambda codes, cb: None,
+        "sdk_unsubscribe": lambda: None,
+        "budget_gate": None,
+        "redis_factory": None,
+    }
+    kwargs.update(overrides)
+    return SubscriptionEngine(**kwargs)
+
+
+@pytest.mark.unit
+def test_queue_bounded_drops_oldest_when_full():
+    """队列有界背压：满时保新弃旧（旧无界队列 6h 攒 38GB 的根治面）。"""
+    engine = _make_engine(max_queue_records=3, max_record_age_s=None)
+    codes = [f"60000{i}.SH" for i in range(1, 6)]
+    engine.on_push(
+        _frame_json([{"code": c, "price": "10.0", "pre_close": "9.9"} for c in codes])
+    )
+
+    assert len(engine._queue) == 3  # 硬上限
+    assert [r["code"] for r in engine._queue] == codes[2:]  # 保新弃旧
+    assert engine.counters["queue_dropped"] == 2
+    snap = engine.snapshot()
+    assert snap["queue_depth"] == 3
+    assert snap["queue_max"] == 3
+
+
+@pytest.mark.unit
+def test_enqueue_age_gate_drops_stale_replay():
+    """入队时效闸门（与归档同口径 300s）：陈旧重放帧不进队列，实时帧照常入队。"""
+    engine = _make_engine()
+    now_cst = datetime.now(_CST)
+    stale_rt = (now_cst - timedelta(hours=3)).strftime("%H%M%S")  # 夜间重放形态
+    fresh_rt = now_cst.strftime("%H%M%S")
+    row = {"code": "600036.SH", "price": "40.92", "pre_close": "41.10"}
+
+    engine.on_push(_frame_json([{**row, "refresh_time": stale_rt}]))
+    assert len(engine._queue) == 0
+    assert engine.counters["enqueue_stale_dropped"] == 1
+    # 帧到达仍计数（服务端活着）——静默判定不受丢弃影响
+    assert engine.counters["frames"] == 1
+    assert engine.last_frame_ts is not None
+
+    engine.on_push(_frame_json([{**row, "refresh_time": fresh_rt}]))
+    assert len(engine._queue) == 1
+    assert engine.counters["enqueue_stale_dropped"] == 1  # 未增加
+
+
+@pytest.mark.unit
+def test_drain_backlog_catches_up_across_batches():
+    """连续排空：单 tick 跨多批追平积压（旧实现每 tick 一批 500 条=33 条/s 节流）。"""
+    written_keys: list[str] = []
+    engine = _make_engine(
+        redis_factory=lambda: _CapturingRedis(written_keys),
+        max_record_age_s=None,
+    )
+    codes = [f"60{i:04d}.SH" for i in range(1200)]
+    engine.on_push(
+        _frame_json([{"code": c, "price": "10.0", "pre_close": "9.9"} for c in codes])
+    )
+    assert engine.snapshot()["queue_depth"] == 1200  # 远超单批 500
+
+    assert engine._drain_backlog() is True  # 一趟见底
+    assert len(engine._queue) == 0
+    assert engine.counters["written"] == 1200
+    assert len(written_keys) == 1200  # 全部经 hset 落库

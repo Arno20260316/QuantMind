@@ -408,7 +408,13 @@ def test_engine_latency_sink_observes_frames():
         redis_factory=None,
         latency=recorder,
     )
-    engine.on_push(_PUSH_SAMPLE)
+    # 动态水印：样本 refresh_time 固定 15:30:53——入队时效闸门（>300s 丢）生效后
+    # 须改为「当前时刻」才能走通引擎链路（陈旧帧拒收由 collector 专项测试覆盖）
+    from datetime import datetime, timedelta, timezone
+
+    _CST = timezone(timedelta(hours=8))
+    fresh_sample = _PUSH_SAMPLE.replace("153053", datetime.now(_CST).strftime("%H%M%S"))
+    engine.on_push(fresh_sample)
     engine._drain_and_write()
     assert recorder.counters["observed"] == 1
     snap = engine.snapshot()

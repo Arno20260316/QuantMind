@@ -23,15 +23,26 @@ from backend.services.api.routers.admin import admin_router
 from backend.services.api.routers.ai_ide_proxy import router as ai_ide_proxy_router
 from backend.services.api.routers.community.router import router as community_router
 from backend.services.api.routers.data_dashboard import router as data_dashboard_router
-from backend.services.api.routers.data_gateway_proxy import router as data_gateway_proxy_router
+from backend.services.api.routers.data_gateway_proxy import (
+    router as data_gateway_proxy_router,
+)
 from backend.services.api.routers.hub_proxy import router as hub_proxy_router
 from backend.services.api.routers.qwenpaw_proxy import router as qwenpaw_proxy_router
-from backend.services.api.routers.qwenpaw_ui_proxy import router as qwenpaw_ui_proxy_router
+from backend.services.api.routers.qwenpaw_ui_proxy import (
+    router as qwenpaw_ui_proxy_router,
+)
 from backend.services.api.routers.engine_proxy import router as engine_proxy_router
 from backend.services.api.routers.files import router as files_router
 from backend.services.api.market_analysis.router import router as market_analysis_router
-from backend.services.api.market_analysis_hk.router import router as market_analysis_hk_router
-from backend.services.api.market_analysis_us.router import router as market_analysis_us_router
+from backend.services.api.market_analysis_hk.router import (
+    router as market_analysis_hk_router,
+)
+from backend.services.api.market_analysis_us.router import (
+    router as market_analysis_us_router,
+)
+from backend.services.api.market_analysis_futures.router import (
+    router as market_analysis_futures_router,
+)
 from backend.services.api.routers.market_kline import router as market_kline_router
 from backend.services.api.routers.model_training import router as model_training_router
 from backend.services.api.routers.model_rollouts import router as model_rollouts_router
@@ -47,13 +58,19 @@ from backend.services.api.routers.desk import router as desk_router
 from backend.services.api.routers.eval_scores import router as eval_router
 from backend.services.api.routers.sentinel import router as sentinel_router
 from backend.services.api.routers.copilot import router as copilot_router
-from backend.services.api.routers.internal_rolling import router as internal_rolling_router
+from backend.services.api.routers.internal_rolling import (
+    router as internal_rolling_router,
+)
 from backend.services.api.routers.holding_alerts import router as holding_alerts_router
 from backend.services.api.routers.stocks_search import router as stocks_search_router
-from backend.services.api.routers.exclusion_admin import router as exclusion_admin_router
+from backend.services.api.routers.exclusion_admin import (
+    router as exclusion_admin_router,
+)
 from backend.services.api.routers.stock_terminal import router as stock_terminal_router
 from backend.services.api.routers.push_orders import router as push_orders_router
-from backend.services.api.stock_terminal_us.router import router as stock_terminal_us_router
+from backend.services.api.stock_terminal_us.router import (
+    router as stock_terminal_us_router,
+)
 from backend.services.api.routers.system import router as system_router
 from backend.services.api.routers.trade_proxy import router as trade_proxy_router
 from backend.services.api.routers.external.router import router as external_router
@@ -64,6 +81,7 @@ from backend.services.api.user_app.api.v1.api_keys import router as api_keys_rou
 from backend.services.api.user_app.api.v1.subscriptions import (
     router as subscriptions_router,
 )
+
 # 本机 arena（quant-Trader）数据面——2026-09-29 起为 QuantMind **原生**实现
 # （上游退役后由代理改直连，见 docs/local/arena-ui-native-migration-plan.md）。
 # 模块随「实盘交易」栏一起本地独有、不进公开仓（electron/src/features/local-live/
@@ -122,13 +140,19 @@ async def lifespan(app: FastAPI):
         )
 
         await model_inference_batch_persistence.ensure_tables()
-        from backend.shared.rolling_campaigns import ensure_tables as ensure_rolling_campaign_tables
+        from backend.shared.rolling_campaigns import (
+            ensure_tables as ensure_rolling_campaign_tables,
+        )
 
         await ensure_rolling_campaign_tables()
-        from backend.shared.model_rollout_store import ensure_tables as ensure_rollout_tables
+        from backend.shared.model_rollout_store import (
+            ensure_tables as ensure_rollout_tables,
+        )
 
         await ensure_rollout_tables()
-        from backend.shared.regime_daily_store import ensure_tables as ensure_regime_tables
+        from backend.shared.regime_daily_store import (
+            ensure_tables as ensure_regime_tables,
+        )
 
         await ensure_regime_tables()
         # from backend.services.api.routers.research import ensure_research_tables
@@ -170,7 +194,9 @@ async def lifespan(app: FastAPI):
             level="info" if ok else "error",
             source="quantmind-api",
             title="API 服务启动完成" if ok else "API 服务启动异常",
-            message="QuantMind API 启动完成" if ok else "API 启动存在初始化失败，请检查日志",
+            message="QuantMind API 启动完成"
+            if ok
+            else "API 启动存在初始化失败，请检查日志",
         )
     except Exception:  # noqa: BLE001 - 事件记录非关键路径
         pass
@@ -222,13 +248,20 @@ install_live_trading_gate_middleware(app, service_name="quantmind-api")
 
 # 2. 注册具体业务路由 (高优先级)
 # 使用环境变量或默认路径，Docker 容器中 /data/uploads，本地开发 data/uploads
-uploads_dir = os.environ.get("UPLOADS_DIR", "/data/uploads" if os.path.exists("/data/uploads") else "data/uploads")
+uploads_dir = os.environ.get(
+    "UPLOADS_DIR",
+    "/data/uploads" if os.path.exists("/data/uploads") else "data/uploads",
+)
 os.makedirs(uploads_dir, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
 
 # 便携版/一体化部署：设置 QM_WEB_DIST_DIR 后由 API 服务直接伺服前端构建产物，
 # 不依赖独立的 nginx/web 容器。未设置时行为与原来完全一致。
-_WEB_DIST_DIR = Path(os.getenv("QM_WEB_DIST_DIR", "")).resolve() if os.getenv("QM_WEB_DIST_DIR") else None
+_WEB_DIST_DIR = (
+    Path(os.getenv("QM_WEB_DIST_DIR", "")).resolve()
+    if os.getenv("QM_WEB_DIST_DIR")
+    else None
+)
 
 # SPA 静态资源挂载注册在业务路由之前：/assets 必须优先于 qwenpaw_ui_proxy
 # 等路由中的 /assets 通配代理（后者上游在便携部署中不存在，会 502）
@@ -241,8 +274,12 @@ if _WEB_DIST_DIR and (_WEB_DIST_DIR / "assets").is_dir():
 
 # 文档静态资源（供管理后台"打开部署指南"等链接使用）
 # 容器内 /app/docs（由 docker bind mount 挂入），本地开发用仓库根 docs/
-_docs_dir = "/app/docs" if os.path.exists("/app/docs") else os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "docs")
+_docs_dir = (
+    "/app/docs"
+    if os.path.exists("/app/docs")
+    else os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "docs")
+    )
 )
 if os.path.isdir(_docs_dir):
     app.mount("/static/docs", StaticFiles(directory=_docs_dir), name="docs")
@@ -286,7 +323,11 @@ if os.path.isdir(_docs_dir):
                 if all(re.match(r"^[-:]+$", c) for c in cells):
                     continue
                 tag = "th" if not in_table else "td"
-                out.append("<tr>" + "".join(f"<{tag}>{_md_to_inline(c)}</{tag}>" for c in cells) + "</tr>")
+                out.append(
+                    "<tr>"
+                    + "".join(f"<{tag}>{_md_to_inline(c)}</{tag}>" for c in cells)
+                    + "</tr>"
+                )
                 in_table = True
                 continue
             else:
@@ -315,7 +356,12 @@ if os.path.isdir(_docs_dir):
                 out.append(f"<blockquote>{_md_to_inline(content)}</blockquote>")
                 continue
             if not line.strip():
-                if out and out[-1] not in ("</ul>", "</ol>", "</table>", "</blockquote>"):
+                if out and out[-1] not in (
+                    "</ul>",
+                    "</ol>",
+                    "</table>",
+                    "</blockquote>",
+                ):
                     out.append("")
                 continue
             out.append(f"<p>{_md_to_inline(line)}</p>")
@@ -325,7 +371,12 @@ if os.path.isdir(_docs_dir):
         html_out = "\n".join(out)
         html_out = re.sub(r"(<ul>\s*</ul>)", "", html_out)
         # 包裹表格
-        html_out = re.sub(r"(<tr>.*?</tr>(?:\s*<tr>.*?</tr>)*)", r"<table>\1</table>", html_out, flags=re.S)
+        html_out = re.sub(
+            r"(<tr>.*?</tr>(?:\s*<tr>.*?</tr>)*)",
+            r"<table>\1</table>",
+            html_out,
+            flags=re.S,
+        )
         return html_out
 
     def _md_to_inline(s: str) -> str:
@@ -336,11 +387,18 @@ if os.path.isdir(_docs_dir):
         s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
         s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
         # 链接 [txt](url)
-        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+        s = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            r'<a href="\2" target="_blank" rel="noopener">\1</a>',
+            s,
+        )
         return s
 
     @app.get("/api/v1/docs/render", response_class=HTMLResponse)
-    def render_doc(name: str = Query(..., description="docs 下的 markdown 文件名"), title: str | None = None):
+    def render_doc(
+        name: str = Query(..., description="docs 下的 markdown 文件名"),
+        title: str | None = None,
+    ):
         """渲染 docs/*.md 为带样式的 HTML 页面，供管理后台"打开部署指南"使用。"""
         p = _resolve_doc(name)
         try:
@@ -419,6 +477,8 @@ if os.path.isdir(_docs_dir):
 </div>
 </body></html>"""
         )
+
+
 app.include_router(auth.router, prefix="/api/v1", tags=["Auth"])
 app.include_router(community_router)
 app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
@@ -435,7 +495,9 @@ app.include_router(admin_router, prefix="/api/v1/admin")
 # 先注册会把 `/api/v1/models/rollouts` 当成 model_id="rollouts" → 404 "Model not found"
 # （2026-10-09 修：晋升流程列表被遮蔽，FastAPI 按注册顺序先中先赢）
 app.include_router(model_rollouts_router)  # 晋升流程（/api/v1/models/rollouts/*）
-app.include_router(model_rolling_router)  # 滚动训练用户态（/api/v1/models/rolling/*，P1）
+app.include_router(
+    model_rolling_router
+)  # 滚动训练用户态（/api/v1/models/rolling/*，P1）
 app.include_router(
     model_training_router, prefix="/api/v1/models", tags=["ModelTraining"]
 )
@@ -447,7 +509,9 @@ app.include_router(
 app.include_router(research_router)
 app.include_router(stocks_search_router)
 app.include_router(stock_terminal_router)
-app.include_router(push_orders_router)  # 候选信号多选一键推送（/api/v1/stock-terminal/push-orders*）
+app.include_router(
+    push_orders_router
+)  # 候选信号多选一键推送（/api/v1/stock-terminal/push-orders*）
 app.include_router(stock_terminal_us_router)
 app.include_router(exclusion_admin_router)
 app.include_router(trading_calendar.router)
@@ -458,6 +522,7 @@ app.include_router(market_kline_router)
 app.include_router(market_analysis_router)
 app.include_router(market_analysis_hk_router)
 app.include_router(market_analysis_us_router)
+app.include_router(market_analysis_futures_router)
 app.include_router(
     subscriptions_router, prefix="/api/v1/subscription", tags=["Subscriptions"]
 )
@@ -468,7 +533,9 @@ if agent_arena_router is not None:
 
 # 3. 注册代理路由 (低优先级，兜底捕获)
 app.include_router(ws_proxy_router)  # WebSocket 代理，优先级最高
-app.include_router(qwenpaw_ui_proxy_router)  # QwenPaw UI 代理（必须优先于 engine_proxy）
+app.include_router(
+    qwenpaw_ui_proxy_router
+)  # QwenPaw UI 代理（必须优先于 engine_proxy）
 app.include_router(engine_proxy_router)
 app.include_router(trade_proxy_router)
 app.include_router(ai_ide_proxy_router)
@@ -483,8 +550,12 @@ app.include_router(desk_router)  # T-P1-05 今日交易台（/api/v1/desk/today�
 app.include_router(eval_router)  # FE-E 评估读 API（/api/v1/eval/*，评分卡/体检档案）
 app.include_router(sentinel_router)  # 哨兵告警 API（/api/v1/sentinel/*，T-P6-15）
 app.include_router(copilot_router)  # 副驾驶 API（/api/v1/copilot/*，T-P6-16）
-app.include_router(internal_rolling_router)  # 滚动重训内部端点（/api/v1/internal/rolling/*，P1）
-app.include_router(holding_alerts_router)  # 持仓预警（/api/v1/trading/holding-alerts/*）
+app.include_router(
+    internal_rolling_router
+)  # 滚动重训内部端点（/api/v1/internal/rolling/*，P1）
+app.include_router(
+    holding_alerts_router
+)  # 持仓预警（/api/v1/trading/holding-alerts/*）
 
 # CORS
 app.add_middleware(

@@ -47,12 +47,14 @@ const StrategyComparisonPage = lazy(() => import('./features/strategy-comparison
 const MarketAnalysisPage = lazy(() => import('./features/market-analysis/pages/MarketAnalysisPage').then(m => ({ default: m.MarketAnalysisPage })));
 const MarketAnalysisHkPage = lazy(() => import('./features/market-analysis-hk/pages/MarketAnalysisHkPage').then(m => ({ default: m.MarketAnalysisHkPage })));
 const MarketAnalysisUsPage = lazy(() => import('./features/market-analysis-us/pages/MarketAnalysisUsPage').then(m => ({ default: m.MarketAnalysisUsPage })));
+const MarketAnalysisFuturesPage = lazy(() => import('./features/market-analysis-futures/pages/MarketAnalysisFuturesPage').then(m => ({ default: m.MarketAnalysisFuturesPage })));
 
-/** 市场分析路由包装：跟随大盘分析顶部市场切换器（选 A股 → A股版，选 港股 → 港股版） */
+/** 市场分析路由包装：跟随大盘分析顶部市场切换器（A股/港股/美股/期货各渲染对应版本） */
 const MarketAnalysisByMarket: React.FC = () => {
   const market = useSelector(selectCurrentMarket);
   if (market === 'HK') return <MarketAnalysisHkPage />;
   if (market === 'US') return <MarketAnalysisUsPage />;
+  if (market === 'FUTURES') return <MarketAnalysisFuturesPage />;
   return <MarketAnalysisPage />;
 };
 const QuantBotPage = lazy(() => import('./features/quantbot/pages/QuantBotPage'));

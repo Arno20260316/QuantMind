@@ -58,82 +58,19 @@ _FUTURES_DEFAULT_DIRS = [
 
 KLINE_COLS = [
     "symbol", "time", "open", "high", "low", "close",
-    "volume", "amount", "release_id", "published_at",
+    "volume", "amount", "position", "settlement",
+    "release_id", "published_at",
 ]
 
-# 国际期货品种: (akshare 代码, 名称)
-# 池子 = 新浪外盘订阅清单全集（futures_foreign_commodity_subscribe_exchange_symbol，2026-08 共 30 种），
-# 全部经实时 + 日K 双接口实测可用。旧池中的 WTI/BRENT/PL/PA/AL/CU/ZN/NI/SN 已被新浪移除，
-# 实时/日K 双双报错，由替代代码覆盖（原油→CL/OIL、贵金属→GC/SI/XAU/XAG/XPT/XPD、铜→HG/CAD），已剔除。
-FOREIGN_SYMBOLS = {
-    # 能源
-    "CL": "NYMEX原油",
-    "OIL": "布伦特原油(II)",
-    "NG": "NYMEX天然气",
-    # 贵金属 (COMEX 期货 + 伦敦现货)
-    "GC": "COMEX黄金",
-    "SI": "COMEX白银",
-    "XAU": "伦敦金现货",
-    "XAG": "伦敦银现货",
-    "XPT": "伦敦铂现货",
-    "XPD": "伦敦钯现货",
-    # 基本金属 (COMEX + LME + LME迷你)
-    "HG": "COMEX铜",
-    "AHD": "LME铝迷你",
-    "CAD": "LME铜迷你",
-    "ZSD": "LME锌迷你",
-    "NID": "LME镍迷你",
-    "SND": "LME锡迷你",
-    "PBD": "LME铅迷你",
-    # 农产品/软商品
-    "S": "美大豆",
-    "W": "美小麦",
-    "C": "美玉米",
-    "BO": "美豆油",
-    "SM": "美豆粕",
-    "LHC": "美活牛",
-    "CT": "ICE棉花",
-    "FCPO": "马来棕榈油",
-    "RSS3": "日胶RSS3",
-    "RS": "国际菜籽",
-    "TRB": "国际废钢",
-    # 金融/其他
-    "FEF": "欧元外汇期货",
-    "EUA": "欧盟碳配额",
-    "BTC": "比特币期货",
-}
-
-# 国内主力连续: (新浪代码, 品种名) — 由 futures_display_main_sina 全量生成(2026-08, 82品种) + CFFEX T0/TL0
-CN_MAIN = {
-    # 大商所 dce
-    "V0": "PVC", "P0": "棕榈油", "B0": "豆二", "M0": "豆粕", "I0": "铁矿石",
-    "JD0": "鸡蛋", "L0": "塑料", "PP0": "聚丙烯", "FB0": "纤维板", "Y0": "豆油",
-    "C0": "玉米", "A0": "豆一", "J0": "焦炭", "JM0": "焦煤", "CS0": "淀粉",
-    "EG0": "乙二醇", "RR0": "粳米", "EB0": "苯乙烯", "PG0": "液化石油气",
-    "LH0": "生猪", "LG0": "原木", "BZ0": "纯苯",
-    # 郑商所 czce
-    "TA0": "PTA", "OI0": "菜油", "RS0": "菜籽", "RM0": "菜粕", "WH0": "强麦",
-    "JR0": "粳稻", "SR0": "白糖", "CF0": "棉花", "RI0": "早籼稻", "MA0": "甲醇",
-    "FG0": "玻璃", "LR0": "晚籼稻", "SF0": "硅铁", "SM0": "锰硅", "CY0": "棉纱",
-    "AP0": "苹果", "CJ0": "红枣", "UR0": "尿素", "SA0": "纯碱", "PF0": "短纤",
-    "PK0": "花生", "SH0": "烧碱", "PX0": "对二甲苯", "PR0": "瓶片", "PL0": "丙烯",
-    # 上期所 shfe / 能源中心 ine
-    "FU0": "燃料油", "SC0": "上海原油", "AL0": "沪铝", "RU0": "天然橡胶",
-    "ZN0": "沪锌", "CU0": "沪铜", "AU0": "沪金", "RB0": "螺纹钢", "PB0": "沪铅",
-    "AG0": "沪银", "BU0": "沥青", "HC0": "热轧卷板", "SN0": "沪锡", "NI0": "沪镍",
-    "SP0": "纸浆", "NR0": "20号胶", "SS0": "不锈钢", "LU0": "低硫燃料油",
-    "BC0": "国际铜", "AO0": "氧化铝", "BR0": "丁二烯橡胶", "EC0": "集运指数欧线",
-    "AD0": "铸造铝合金", "OP0": "胶版印刷纸",
-    # 中金所 cffex
-    "IF0": "沪深300指数", "IH0": "上证50指数", "IC0": "中证500指数",
-    "IM0": "中证1000指数", "TF0": "5年期国债", "TS0": "2年期国债",
-    "T0": "10年期国债", "TL0": "30年期国债",
-    # 广期所 gfex
-    "SI0": "工业硅", "LC0": "碳酸锂", "PS0": "多晶硅", "PT0": "铂", "PD0": "钯",
-}
-
-# 上金所贵金属现货
-SGE_SYMBOLS = ["Au99.99", "Au99.95", "Au100g", "Au(T+D)", "Ag(T+D)", "mAu(T+D)", "Ag99.99", "Pt99.95"]
+# 品种宇宙（中文名/板块/交易所/合约乘数）统一出处：
+# backend/shared/futures_universe.py（2026-10-15 迁出）。
+# 此处 re-export 三张清单，保持既有引用（如
+# `from akshare_futures_sync import CN_MAIN`）兼容。
+from backend.shared.futures_universe import (  # noqa: E402
+    CN_MAIN,
+    FOREIGN_SYMBOLS,
+    SGE_SYMBOLS,
+)
 
 
 def _data_dir() -> Path:
@@ -180,6 +117,7 @@ _COL_MAP = {
     "收盘价": "close", "close": "close",
     "成交量": "volume", "volume": "volume",
     "持仓量": "position", "position": "position",
+    "动态结算价": "settlement", "settlement": "settlement",
 }
 
 
@@ -213,6 +151,16 @@ def _normalise_daily(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
             df["volume"] = 0
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
     df["amount"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    # 持仓量 / 动态结算价（机构分析口径：持仓增减、沉淀资金）：
+    # 源不提供（全空或恒 0——实测新浪外盘 futures_foreign_hist 与上金所 spot_hist_sge
+    # 即如此）→ 落 NULL 保持诚实空缺，绝不落 0（0 会被下游误读为「持仓归零」）。
+    for c in ("position", "settlement"):
+        if c not in df.columns:
+            df[c] = None
+        col = pd.to_numeric(df[c], errors="coerce")
+        if col.notna().sum() == 0 or (col.fillna(0.0) == 0).all():
+            col = pd.Series([None] * len(df), index=df.index, dtype="float64")
+        df[c] = col
     df["release_id"] = "akshare"
     df["published_at"] = datetime.now().isoformat(timespec="seconds")
     return df[KLINE_COLS].dropna(subset=["close"])

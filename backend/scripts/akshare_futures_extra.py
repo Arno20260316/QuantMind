@@ -15,6 +15,7 @@
   python backend/scripts/akshare_futures_extra.py --task cftc
   python backend/scripts/akshare_futures_extra.py --task fx
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,15 +32,32 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("futures_extra")
 
-FUT_DATA_DIR = Path(os.getenv("QM_QUANTFUTURES_DATA_DIR", str(PROJECT_ROOT / "data" / "quantfutures")))
+FUT_DATA_DIR = Path(
+    os.getenv("QM_QUANTFUTURES_DATA_DIR", str(PROJECT_ROOT / "data" / "quantfutures"))
+)
 BASE_DIR = FUT_DATA_DIR / "2_base_sector"
 
 from backend.scripts.akshare_futures_sync import CN_MAIN  # noqa: E402
 
-KLINE_BASE_COLS = ["symbol", "time", "open", "high", "low", "close", "volume", "amount", "release_id", "published_at"]
+KLINE_BASE_COLS = [
+    "symbol",
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "release_id",
+    "published_at",
+]
 
 
 def _recent_trading_days(days: int) -> list[str]:
@@ -49,6 +67,7 @@ def _recent_trading_days(days: int) -> list[str]:
 
 
 # ---------------- receipts ----------------
+
 
 def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
@@ -90,10 +109,15 @@ def _norm_receipt_df(df: pd.DataFrame, venue: str, d: str) -> pd.DataFrame:
 
 def task_receipts(days: int) -> dict:
     import akshare as ak
+
     out_dir = BASE_DIR / "warehouse_receipts"
     interfaces = []
-    for name, venue in [("futures_shfe_warehouse_receipt", "SHFE"), ("futures_warehouse_receipt_dce", "DCE"),
-                        ("futures_warehouse_receipt_czce", "CZCE"), ("futures_gfex_warehouse_receipt", "GFEX")]:
+    for name, venue in [
+        ("futures_shfe_warehouse_receipt", "SHFE"),
+        ("futures_warehouse_receipt_dce", "DCE"),
+        ("futures_warehouse_receipt_czce", "CZCE"),
+        ("futures_gfex_warehouse_receipt", "GFEX"),
+    ]:
         fn = getattr(ak, name, None)
         if fn is None:
             log.warning("akshare 缺少 %s, 跳过", name)
@@ -148,6 +172,7 @@ def task_receipts(days: int) -> dict:
 
 # ---------------- member_positions ----------------
 
+
 def _norm_rank_frames(res: dict | pd.DataFrame, venue: str, d: str) -> pd.DataFrame:
     if isinstance(res, pd.DataFrame):
         res = {"ALL": res}
@@ -182,9 +207,13 @@ def _norm_rank_frames(res: dict | pd.DataFrame, venue: str, d: str) -> pd.DataFr
 
 def task_member_positions(days: int) -> dict:
     import akshare as ak
+
     out_dir = BASE_DIR / "member_positions"
     fns = []
-    for name, venue in [("futures_dce_position_rank", "DCE"), ("futures_gfex_position_rank", "GFEX")]:
+    for name, venue in [
+        ("futures_dce_position_rank", "DCE"),
+        ("futures_gfex_position_rank", "GFEX"),
+    ]:
         fn = getattr(ak, name, None)
         if fn is not None:
             fns.append((venue, fn))
@@ -211,7 +240,9 @@ def task_member_positions(days: int) -> dict:
         if frames:
             pdir = out_dir / f"dt={d}"
             pdir.mkdir(parents=True, exist_ok=True)
-            pd.concat(frames, ignore_index=True).to_parquet(pdir / "data.parquet", index=False)
+            pd.concat(frames, ignore_index=True).to_parquet(
+                pdir / "data.parquet", index=False
+            )
             ok += 1
         time.sleep(0.4)
     return {"task": "member_positions", "days": len(dates), "written": ok}
@@ -225,9 +256,29 @@ _CN_MAIN_STEMS = sorted({k[:-1] for k in CN_MAIN})
 
 
 def _norm_contract_kline(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    colmap = {"日期": "time", "开盘价": "open", "最高价": "high", "最低价": "low", "收盘价": "close",
-              "成交量": "volume", "持仓量": "open_interest", "动态结算价": "settlement",
-              "date": "time", "open": "open", "high": "high", "low": "low", "close": "close"}
+    # 2026-10-15 修：akshare futures_zh_daily_sina 返回英文列
+    # （hold=持仓量 / settle=动态结算价），旧 colmap 只映射了中文列名与英文
+    # OHLC，导致持仓量/结算价从未落盘（期限结构、主力判定因此无数据可用）。
+    colmap = {
+        "日期": "time",
+        "开盘价": "open",
+        "最高价": "high",
+        "最低价": "low",
+        "收盘价": "close",
+        "成交量": "volume",
+        "持仓量": "open_interest",
+        "动态结算价": "settlement",
+        "date": "time",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+        "hold": "open_interest",
+        "settle": "settlement",
+        "position": "open_interest",
+        "settlement": "settlement",
+    }
     df = df.rename(columns=colmap)
     for c in ("open", "high", "low", "close", "volume", "open_interest", "settlement"):
         if c in df.columns:
@@ -236,13 +287,15 @@ def _norm_contract_kline(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df["amount"] = df.get("close") * df.get("volume")
     df["release_id"] = "akshare"
     df["published_at"] = pd.Timestamp.now().isoformat()
-    cols = [c for c in KLINE_BASE_COLS if c in df.columns] + \
-           [c for c in ("settlement", "open_interest") if c in df.columns]
+    cols = [c for c in KLINE_BASE_COLS if c in df.columns] + [
+        c for c in ("settlement", "open_interest") if c in df.columns
+    ]
     return df[cols].dropna(subset=["close"])
 
 
 def task_contracts_daily() -> dict:
     import akshare as ak
+
     out_dir = BASE_DIR / "contracts_daily"
     out_dir.mkdir(parents=True, exist_ok=True)
     today = date.today()
@@ -274,12 +327,17 @@ def task_contracts_daily() -> dict:
 
 # ---------------- cftc ----------------
 
+
 def task_cftc() -> dict:
     import akshare as ak
+
     out_dir = BASE_DIR / "cftc"
     out_dir.mkdir(parents=True, exist_ok=True)
     results = {}
-    for kind, fn_name in [("c", "macro_usa_cftc_c_holding"), ("merchant_goods", "macro_usa_cftc_merchant_goods_holding")]:
+    for kind, fn_name in [
+        ("c", "macro_usa_cftc_c_holding"),
+        ("merchant_goods", "macro_usa_cftc_merchant_goods_holding"),
+    ]:
         fn = getattr(ak, fn_name, None)
         if fn is None:
             continue
@@ -297,27 +355,49 @@ def task_cftc() -> dict:
 
 # 中行外汇牌价(每100外币兑人民币) — akshare currency_boc_sina 支持的币种子集
 _FX_CURRENCIES = {
-    "美元": "USD", "英镑": "GBP", "欧元": "EUR", "港币": "HKD", "日元": "JPY",
-    "澳大利亚元": "AUD", "加拿大元": "CAD", "瑞士法郎": "CHF", "新加坡元": "SGD",
-    "新西兰元": "NZD", "瑞典克朗": "SEK", "挪威克朗": "NOK", "丹麦克朗": "DKK", "澳门元": "MOP",
+    "美元": "USD",
+    "英镑": "GBP",
+    "欧元": "EUR",
+    "港币": "HKD",
+    "日元": "JPY",
+    "澳大利亚元": "AUD",
+    "加拿大元": "CAD",
+    "瑞士法郎": "CHF",
+    "新加坡元": "SGD",
+    "新西兰元": "NZD",
+    "瑞典克朗": "SEK",
+    "挪威克朗": "NOK",
+    "丹麦克朗": "DKK",
+    "澳门元": "MOP",
 }
 
 
 def task_fx() -> dict:
     import akshare as ak
+
     out_dir = BASE_DIR / "fx_daily"
     out_dir.mkdir(parents=True, exist_ok=True)
     results = {}
     for cn, code in _FX_CURRENCIES.items():
         try:
             df = ak.currency_boc_sina(
-                symbol=cn, start_date="20000101", end_date=date.today().strftime("%Y%m%d")
+                symbol=cn,
+                start_date="20000101",
+                end_date=date.today().strftime("%Y%m%d"),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("汇率 %s 失败: %s", cn, str(exc)[:50])
             continue
-        df = df.rename(columns={"日期": "time", "中行汇买价": "bid", "中行钞买价": "bid_cash",
-                                "中行钞卖价/汇卖价": "sell", "央行中间价": "pbc_mid", "中行折算价": "mid"})
+        df = df.rename(
+            columns={
+                "日期": "time",
+                "中行汇买价": "bid",
+                "中行钞买价": "bid_cash",
+                "中行钞卖价/汇卖价": "sell",
+                "央行中间价": "pbc_mid",
+                "中行折算价": "mid",
+            }
+        )
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
         df = df.dropna(subset=["time"])
         for c in ("bid", "bid_cash", "sell", "pbc_mid", "mid"):
@@ -329,15 +409,28 @@ def task_fx() -> dict:
         df["release_id"] = "akshare"
         df["published_at"] = pd.Timestamp.now().isoformat()
         df.to_parquet(out_dir / f"{code}.parquet", index=False)
-        results[code] = (len(df), str(df["time"].min().date()), str(df["time"].max().date()))
-        log.info("fx %sCNY: %d 行 %s ~ %s", code, len(df), df["time"].min().date(), df["time"].max().date())
+        results[code] = (
+            len(df),
+            str(df["time"].min().date()),
+            str(df["time"].max().date()),
+        )
+        log.info(
+            "fx %sCNY: %d 行 %s ~ %s",
+            code,
+            len(df),
+            df["time"].min().date(),
+            df["time"].max().date(),
+        )
     return {"task": "fx", "pairs": results}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="QuantFutures 扩展数据集")
-    ap.add_argument("--task", required=True,
-                    choices=["receipts", "member_positions", "contracts_daily", "cftc", "fx"])
+    ap.add_argument(
+        "--task",
+        required=True,
+        choices=["receipts", "member_positions", "contracts_daily", "cftc", "fx"],
+    )
     ap.add_argument("--days", type=int, default=90)
     args = ap.parse_args()
     if args.task == "receipts":

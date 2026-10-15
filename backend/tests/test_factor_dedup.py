@@ -193,7 +193,7 @@ def test_store_dedup_corr_classic_uses_corr_table(monkeypatch):
     table = pd.DataFrame(
         {"factor_a": ["x", "y"], "factor_b": ["y", "z"], "corr": [0.91, -0.3]}
     )
-    monkeypatch.setattr(store, "corr_table", lambda: table)
+    monkeypatch.setattr(store, "corr_table", lambda *a, **k: table)
 
     names, m = store.dedup_corr("classic")
 
@@ -202,13 +202,13 @@ def test_store_dedup_corr_classic_uses_corr_table(monkeypatch):
 
 
 def test_store_dedup_corr_classic_missing_returns_none(monkeypatch):
-    monkeypatch.setattr(store, "corr_table", lambda: None)
+    monkeypatch.setattr(store, "corr_table", lambda *a, **k: None)
     assert store.dedup_corr("classic") is None
 
 
 def test_store_dedup_corr_private_npz_roundtrip_and_missing(tmp_path, monkeypatch):
     """npz 往返：**长因子名不得截断**（>64 字符；截断即静默改名→永不匹配→永不去重）。"""
-    monkeypatch.setattr(store, "artifact_dir", lambda dataset="classic": tmp_path)
+    monkeypatch.setattr(store, "artifact_dir", lambda *a, **k: tmp_path)
     long_name = "(" + "close - ts_mean(close, 20)" * 4 + ")"
     assert len(long_name) > 64
     p = tmp_path / "cross_corr.npz"
@@ -290,9 +290,9 @@ def _tiny_ic() -> pd.DataFrame:
 def env(monkeypatch):
     service._ctx_cache.clear()
     service._derived_cache.clear()
-    monkeypatch.setattr(service.store, "panel", lambda dataset="classic": _tiny_panel())
+    monkeypatch.setattr(service.store, "panel", lambda *a, **k: _tiny_panel())
     monkeypatch.setattr(
-        service.store, "panel_stamp", lambda dataset="classic": "snap-dedup-test"
+        service.store, "panel_stamp", lambda *a, **k: "snap-dedup-test"
     )
     monkeypatch.setattr(service.store, "benchmark_table", lambda *a, **k: None)
     monkeypatch.setattr(service.store, "ic_table", lambda *a, **k: _tiny_ic())
@@ -300,7 +300,7 @@ def env(monkeypatch):
     monkeypatch.setattr(
         service.store,
         "metrics",
-        lambda dataset="classic": {"leaderboard": [], "metrics": {}, "meta": {}},
+        lambda *a, **k: {"leaderboard": [], "metrics": {}, "meta": {}},
     )
     yield
     service._ctx_cache.clear()
@@ -317,7 +317,7 @@ def test_leaderboard_dedup_keeps_earlier_and_renumbers(env, monkeypatch):
     monkeypatch.setattr(
         store,
         "dedup_corr",
-        lambda dataset="classic": (
+        lambda *a, **k: (
             ["A", "B", "C"],
             _pair_matrix(["A", "B", "C"], {("A", "B"): 0.95}),
         ),
@@ -361,7 +361,7 @@ def test_leaderboard_dedup_coverage_fallback(env, monkeypatch):
     monkeypatch.setattr(
         store,
         "dedup_corr",
-        lambda dataset="classic": (
+        lambda *a, **k: (
             ["A", "B"],
             _pair_matrix(["A", "B"], {("A", "B"): 0.99}),
         ),
@@ -376,7 +376,7 @@ def test_leaderboard_dedup_coverage_fallback(env, monkeypatch):
 
 
 def test_leaderboard_dedup_matrix_missing_raises(env, monkeypatch):
-    monkeypatch.setattr(store, "dedup_corr", lambda dataset="classic": None)
+    monkeypatch.setattr(store, "dedup_corr", lambda *a, **k: None)
 
     with pytest.raises(DedupMatrixMissing):
         service.leaderboard(None, None, 30, "classic", 0.9)

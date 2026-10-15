@@ -169,7 +169,9 @@ def _mk_panel(factor_data: dict) -> pd.DataFrame:
                         "rank": rk,
                         "symbol": s,
                         "score": d["score"][s][mi],
-                        "raw": (d.get("raw") or {}).get(s, [0.0] * len(PANEL_MONTHS))[mi],
+                        "raw": (d.get("raw") or {}).get(s, [0.0] * len(PANEL_MONTHS))[
+                            mi
+                        ],
                         "fwd_ret": d["fwd"][s][mi],
                     }
                 )
@@ -307,7 +309,10 @@ def _legacy_holdings_profile(p, fi: int, n: int, snap_idx):
     return (
         med,
         style,
-        [{"name": k, "count": v} for k, v in sorted(inds.items(), key=lambda kv: -kv[1])[:3]],
+        [
+            {"name": k, "count": v}
+            for k, v in sorted(inds.items(), key=lambda kv: -kv[1])[:3]
+        ],
     )
 
 
@@ -328,7 +333,9 @@ def test_holdings_profile_matches_legacy_loc_path():
     assert snap_mv["A"] == 620.0
     assert np.isnan(snap_mv["B"]), "NaN 市值要原样保留，由 _holdings_profile 过滤"
     assert snap_ind["A"] == "银行"
-    assert not isinstance(snap_ind["B"], str), "缺行业不能落成字符串，否则会被计进行业分布"
+    assert not isinstance(snap_ind["B"], str), (
+        "缺行业不能落成字符串，否则会被计进行业分布"
+    )
 
     got = service._holdings_profile(p, p.index("X"), 3, snap_mv, snap_ind)
     ref = _legacy_holdings_profile(p, p.index("X"), 3, snap_idx)
@@ -396,8 +403,22 @@ def test_nscan_orders_by_n():
 def test_composite_scores_direction():
     df = pd.DataFrame(
         [
-            {"ic_mean": 0.08, "ic_ir": 0.5, "annual_return": 0.25, "sharpe": 1.5, "max_drawdown": 0.15, "win_rate": 0.6},
-            {"ic_mean": -0.05, "ic_ir": -0.3, "annual_return": -0.15, "sharpe": -0.8, "max_drawdown": 0.45, "win_rate": 0.4},
+            {
+                "ic_mean": 0.08,
+                "ic_ir": 0.5,
+                "annual_return": 0.25,
+                "sharpe": 1.5,
+                "max_drawdown": 0.15,
+                "win_rate": 0.6,
+            },
+            {
+                "ic_mean": -0.05,
+                "ic_ir": -0.3,
+                "annual_return": -0.15,
+                "sharpe": -0.8,
+                "max_drawdown": 0.45,
+                "win_rate": 0.4,
+            },
         ]
     )
     out = scorecard.composite_scores(df)
@@ -419,8 +440,12 @@ def test_time_tags_recent_shift():
     dates = pd.date_range("2024-01-31", periods=24, freq="ME")
     rows = []
     for i, d in enumerate(dates):
-        rows.append({"trade_date": d, "factor_code": "UP", "ic": 0.02 if i < 12 else 0.05})
-        rows.append({"trade_date": d, "factor_code": "DOWN", "ic": 0.05 if i < 12 else 0.02})
+        rows.append(
+            {"trade_date": d, "factor_code": "UP", "ic": 0.02 if i < 12 else 0.05}
+        )
+        rows.append(
+            {"trade_date": d, "factor_code": "DOWN", "ic": 0.05 if i < 12 else 0.02}
+        )
         rows.append({"trade_date": d, "factor_code": "IDLE", "ic": 0.004})
     df = pd.DataFrame(rows)
     tags = scorecard.time_tags(df, ["UP", "DOWN", "IDLE"], dates.to_numpy())
@@ -501,9 +526,24 @@ def test_holdings_profile_uses_factor_own_last_month():
 def _fake_private_meta() -> dict:
     return {
         "factors": [
-            {"code": "f13_0001", "name_cn": "f13_0001", "l1": "因子清单1300", "l2": "factor1300"},
-            {"code": "gtja_042", "name_cn": "gtja_042", "l1": "Alpha 因子库", "l2": "alpha_library"},
-            {"code": "真实名", "name_cn": "已有真名", "l1": "因子清单1300", "l2": "factor1300"},
+            {
+                "code": "f13_0001",
+                "name_cn": "f13_0001",
+                "l1": "因子清单1300",
+                "l2": "factor1300",
+            },
+            {
+                "code": "gtja_042",
+                "name_cn": "gtja_042",
+                "l1": "Alpha 因子库",
+                "l2": "alpha_library",
+            },
+            {
+                "code": "真实名",
+                "name_cn": "已有真名",
+                "l1": "因子清单1300",
+                "l2": "factor1300",
+            },
         ],
         "l1_order": ["因子清单1300", "Alpha 因子库"],
         "l2_order": {},
@@ -514,7 +554,7 @@ def test_catalog_private_富化类别与中文名(monkeypatch):
     """catalog('private')：category/category_name 由 taxonomy 下发；
     name_cn 等于代码的（私人库构建脚本的历史口径）回填词表中文名。"""
     fake = _fake_private_meta()
-    monkeypatch.setattr(service.store, "factors_meta", lambda: fake)
+    monkeypatch.setattr(service.store, "factors_meta", lambda *a, **k: fake)
 
     out = service.catalog("private")
     by = {x["code"]: x for x in out["factors"]}
@@ -530,7 +570,7 @@ def test_meta_map_private_富化且不污染缓存对象(monkeypatch):
     """_meta_map('private') 的 category 供 leaderboard/detail/compare/compose 全链使用；
     enrich 返回新 dict，store 缓存对象不得被写入 category。"""
     fake = _fake_private_meta()
-    monkeypatch.setattr(service.store, "factors_meta", lambda: fake)
+    monkeypatch.setattr(service.store, "factors_meta", lambda *a, **k: fake)
 
     m = service._meta_map("private")
 

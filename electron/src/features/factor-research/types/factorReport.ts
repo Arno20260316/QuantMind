@@ -1,5 +1,7 @@
 /** 因子报告（Alphalens 式）类型定义 —— 与 backend/services/engine/factor_report 对齐 */
 
+import type { ResearchMarket } from './factorResearch';
+
 export interface FactorSummary {
   name: string;
   /** 因子库：alpha158 / alpha101 / gtja191 / L1 / L2 */
@@ -69,6 +71,8 @@ export interface FactorDatasetInfo {
 }
 
 export interface FactorDatasetList {
+  /** 本响应所属市场（后端回执；CN 缺省也回传） */
+  market?: ResearchMarket;
   default: string;
   items: FactorDatasetInfo[];
 }
@@ -569,7 +573,7 @@ export interface FactorDetailParams {
   shortGroup?: number;
   /** 双边成本（bps） */
   costBps?: number;
-  /** 主基准指数代码，如 000300.SH；缺省沪深300 */
+  /** 基准指数代码（本市场基准表内的代码，如 CN 的 000300.SH）；缺省=本市场主基准 */
   bench?: string;
 }
 

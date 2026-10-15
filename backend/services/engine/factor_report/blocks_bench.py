@@ -10,7 +10,8 @@
 被替换、一半没被替换，测试随即变成「看着通过、其实没测到」的那种。二者必须
 共享同一个模块命名空间。
 
-本文件是全层唯一**有 IO** 的地方（QuantDB ``index_daily``），因此带进程内 TTL 缓存。
+本文件是全层唯一**有 IO** 的地方（各市场根的 ``1_kline_data/index_daily``），
+因此带进程内 TTL 缓存（键 = ``市场:符号``）。
 """
 
 from __future__ import annotations
@@ -30,8 +31,11 @@ _BENCH_CACHE: dict[str, tuple[float, Any]] = {}
 _BENCH_TTL = 600.0
 
 
-def bench_daily_returns(symbol: str, dates: list[str]) -> np.ndarray | None:
+def bench_daily_returns(symbol: str, dates: list[str], market: str = "CN") -> np.ndarray | None:
     """基准日收益，按报告日期对齐（缺的日期留 NaN，**不前向填充**）。
+
+    ``market`` 决定去哪个数据根取指数——**缓存键必须含市场**：HK/CN/US 的指数
+    符号格式偶有重叠，只按 symbol 做键会在市场间串数据。
 
     ⚠️ 与 :mod:`blocks` 的 ``excess_block`` 同属一个替换接缝（见模块 docstring）：
     测试用 ``monkeypatch.setattr(blocks, "bench_daily_returns", ...)`` 时才拦得住。
@@ -40,24 +44,25 @@ def bench_daily_returns(symbol: str, dates: list[str]) -> np.ndarray | None:
 
     import pandas as pd
 
-    hit = _BENCH_CACHE.get(symbol)
+    key = f"{str(market or 'CN').upper().strip()}:{symbol}"
+    hit = _BENCH_CACHE.get(key)
     if hit and time.time() - hit[0] < _BENCH_TTL:
         series = hit[1]
     else:
         try:
             from backend.shared.benchmark import load_index_frame
 
-            frame = load_index_frame(columns=("close",), symbols=[symbol])
+            frame = load_index_frame(columns=("close",), symbols=[symbol], market=market)
             frame = frame.sort_values("time")
             series = pd.Series(
                 frame["close"].astype(float).to_numpy(),
                 index=pd.to_datetime(frame["time"]).dt.strftime("%Y-%m-%d"),
             )
         except Exception as e:  # noqa: BLE001 — 单个指数取不到只影响它自己
-            log.warning("基准取数失败 %s：%s", symbol, e)
-            _BENCH_CACHE[symbol] = (time.time(), None)
+            log.warning("基准取数失败 %s（%s）：%s", symbol, market, e)
+            _BENCH_CACHE[key] = (time.time(), None)
             return None
-        _BENCH_CACHE[symbol] = (time.time(), series)
+        _BENCH_CACHE[key] = (time.time(), series)
     if series is None:
         return None
     ret = series.pct_change()

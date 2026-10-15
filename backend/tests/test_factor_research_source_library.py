@@ -69,16 +69,16 @@ def env(monkeypatch):
     service._ctx_cache.clear()
     service._derived_cache.clear()
     p = _panel()
-    monkeypatch.setattr(service.store, "panel", lambda dataset="classic": p)
+    monkeypatch.setattr(service.store, "panel", lambda *a, **k: p)
     monkeypatch.setattr(
-        service.store, "panel_stamp", lambda dataset="classic": "snap-1"
+        service.store, "panel_stamp", lambda *a, **k: "snap-1"
     )
     monkeypatch.setattr(service.store, "benchmark_table", lambda *a, **k: None)
     monkeypatch.setattr(service.store, "ic_table", lambda *a, **k: None)
     monkeypatch.setattr(
         service.store,
         "factors_meta",
-        lambda dataset="private": {
+        lambda *a, **k: {
             "factors": [
                 _factor_meta(_PREFIXED, "QuantDB 6_ml_datasets/l1_factors"),
                 _factor_meta(_WIND, "AShareEODPrices.S_DQ_ADJCLOSE"),
@@ -100,7 +100,7 @@ def env(monkeypatch):
             for idx, sym in enumerate(_SYMS)
         ]
     )
-    monkeypatch.setattr(service.store, "stock_snapshot", lambda: snap)
+    monkeypatch.setattr(service.store, "stock_snapshot", lambda *a, **k: snap)
     yield
     service._ctx_cache.clear()
     service._derived_cache.clear()

@@ -30,7 +30,7 @@ def _write_snapshot(d: Path, meta: dict) -> None:
 
 
 def test_build_status_reports_missing_snapshot(monkeypatch, tmp_path):
-    monkeypatch.setattr(service, "report_dir", lambda _ds: tmp_path / "report")
+    monkeypatch.setattr(service, "report_dir", lambda _ds, *_a: tmp_path / "report")
 
     st = service.build_status("pytest_missing")
 
@@ -49,7 +49,7 @@ def test_build_status_reads_snapshot_meta_and_log_step(monkeypatch, tmp_path):
         "2026-10-09 10:00:00,000 [INFO] [pytest] 因子 80 个；跳过非数值列 []\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(service, "report_dir", lambda _ds: d)
+    monkeypatch.setattr(service, "report_dir", lambda _ds, *_a: d)
 
     st = service.build_status("pytest_done")
 
@@ -71,8 +71,8 @@ def test_start_build_passes_registry_build_start(monkeypatch, tmp_path):
         calls["cmd"] = list(cmd)
         return FakeProc()
 
-    monkeypatch.setattr(service, "report_dir", lambda _ds: tmp_path / "report")
-    monkeypatch.setattr(service, "build_running", lambda _ds: None)
+    monkeypatch.setattr(service, "report_dir", lambda _ds, *_a: tmp_path / "report")
+    monkeypatch.setattr(service, "build_running", lambda _ds, *_a: None)
     monkeypatch.setattr(service.subprocess, "Popen", fake_popen)
     monkeypatch.setitem(ds.DATASETS, "pytest_build", {
         "label": "t", "dir_parts": ("pytest", "t"), "label_mode": "close_fwd_donor",
@@ -94,8 +94,8 @@ def test_start_build_short_circuits_when_already_running(monkeypatch, tmp_path):
     def no_popen(*a, **k):
         raise AssertionError("已在构建时不得再启动第二个子进程")
 
-    monkeypatch.setattr(service, "report_dir", lambda _ds: tmp_path / "report")
-    monkeypatch.setattr(service, "build_running", lambda _ds: 777)
+    monkeypatch.setattr(service, "report_dir", lambda _ds, *_a: tmp_path / "report")
+    monkeypatch.setattr(service, "build_running", lambda _ds, *_a: 777)
     monkeypatch.setattr(service.subprocess, "Popen", no_popen)
 
     out = service.start_build("alpha_library")
@@ -108,9 +108,9 @@ def test_start_build_short_circuits_when_already_running(monkeypatch, tmp_path):
 def test_freshness_flags_new_disk_factors(monkeypatch):
     """用户的原始现场：盘上 102 个、快照 80 个 → 必须自曝「新增 22」。"""
     monkeypatch.setattr(service, "disk_state",
-                        lambda _ds: {"n_factors": 102, "first_dt": "20200102", "last_dt": "20261008"})
+                        lambda _ds, *_a: {"n_factors": 102, "first_dt": "20200102", "last_dt": "20261008"})
     monkeypatch.setattr(service, "load_snapshot",
-                        lambda _ds: {"meta": {"n_factors": 80, "end": "20261008"}})
+                        lambda _ds, *_a: {"meta": {"n_factors": 80, "end": "20261008"}})
 
     fr = service.dataset_freshness("rd_mined")
 
@@ -121,9 +121,9 @@ def test_freshness_flags_new_disk_factors(monkeypatch):
 
 def test_freshness_flags_new_dates(monkeypatch):
     monkeypatch.setattr(service, "disk_state",
-                        lambda _ds: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261009"})
+                        lambda _ds, *_a: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261009"})
     monkeypatch.setattr(service, "load_snapshot",
-                        lambda _ds: {"meta": {"n_factors": 80, "end": "20261008"}})
+                        lambda _ds, *_a: {"meta": {"n_factors": 80, "end": "20261008"}})
 
     fr = service.dataset_freshness("rd_mined")
 
@@ -133,9 +133,9 @@ def test_freshness_flags_new_dates(monkeypatch):
 
 def test_freshness_is_quiet_when_snapshot_current(monkeypatch):
     monkeypatch.setattr(service, "disk_state",
-                        lambda _ds: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261008"})
+                        lambda _ds, *_a: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261008"})
     monkeypatch.setattr(service, "load_snapshot",
-                        lambda _ds: {"meta": {"n_factors": 80, "end": "20261008"}})
+                        lambda _ds, *_a: {"meta": {"n_factors": 80, "end": "20261008"}})
 
     fr = service.dataset_freshness("rd_mined")
 
@@ -146,8 +146,8 @@ def test_freshness_is_quiet_when_snapshot_current(monkeypatch):
 def test_freshness_is_quiet_when_snapshot_missing(monkeypatch):
     """快照都没有时 available=False 已足够 —— 不能再叠一层「落后」噪声。"""
     monkeypatch.setattr(service, "disk_state",
-                        lambda _ds: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261008"})
-    monkeypatch.setattr(service, "load_snapshot", lambda _ds: None)
+                        lambda _ds, *_a: {"n_factors": 80, "first_dt": "20200102", "last_dt": "20261008"})
+    monkeypatch.setattr(service, "load_snapshot", lambda _ds, *_a: None)
 
     fr = service.dataset_freshness("rd_mined")
 
@@ -177,7 +177,7 @@ def test_disk_state_counts_numeric_factor_columns_only(monkeypatch, tmp_path):
         "meta_cols": ("symbol", "date", "time", "dt"),
         "library_rule": "fixed:t", "universe": "t",
     })
-    monkeypatch.setattr(ds, "dataset_dir", lambda _ds: root)
+    monkeypatch.setattr(ds, "dataset_dir", lambda _ds, *_a: root)
 
     st = ds.disk_state("pytest_disk")
 

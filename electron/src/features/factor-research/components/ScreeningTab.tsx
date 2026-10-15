@@ -18,6 +18,10 @@
  *    按自己的清单生成的，`factor_research` 子库在那边压根不存在。
  * 3. **找不到落点的行照常显示**，只是不可点、置灰并说明原因——它们确实通过了
  *    筛选，平白消失会让人以为筛选结果少算了。
+ *
+ * 市场分层（2026-10）：联合筛选是**A 股口径产物**（七库筛选），后端对非 CN 回
+ * `available=false + reason`。这里据此渲染诚实阻断面 —— 不是「暂无筛选结果」
+ * （那会让人等一个永远不会跑的构建），更不拿别的市场的筛选结果来填。
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import {
@@ -33,7 +37,8 @@ import {
 import { getScreening } from '../services/factorResearchService';
 import { getFactorDatasets } from '../services/factorReportService';
 import type { FactorDataset } from '../services/factorResearchService';
-import type { ScreeningResponse } from '../types/factorResearch';
+import type { ResearchMarket, ScreeningResponse } from '../types/factorResearch';
+import { getMarketConfig } from '../../../config/marketConfig';
 import { Card, fmtNum } from './common';
 
 /** 筛选清单里的名字在快照目录里的落点。 */
@@ -55,6 +60,8 @@ interface Props {
   onOpenSingle: (code: string, dataset: FactorDataset) => void;
   /** 点「报告」进因子报告页签。 */
   onOpenReport: (reportDataset: string, code: string) => void;
+  /** 本页当前市场：筛选按市场取数；非 CN 后端诚实缺席 → 阻断面（见文件头） */
+  market: ResearchMarket;
   /** 是否具备注册能力（管理员）。行是否可勾还要看它自己落在哪个数据集。 */
   canRegisterToTraining: boolean;
   onRegister: () => void;
@@ -111,6 +118,7 @@ export const ScreeningTab: React.FC<Props> = ({
   onToggleMany,
   onOpenSingle,
   onOpenReport,
+  market,
   canRegisterToTraining,
   onRegister,
   catalogStatus,
@@ -126,25 +134,33 @@ export const ScreeningTab: React.FC<Props> = ({
 
   useEffect(() => {
     let alive = true;
-    getScreening()
+    // 换市场要回到加载态：否则会先闪一屏上一市场的结果（或上一市场的缺席说明）
+    setLoading(true);
+    setData(null);
+    setError(null);
+    getScreening(market)
       .then((d) => { if (alive) setData(d); })
       .catch((e: unknown) => { if (alive) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, []);
+  }, [market]);
+
+  /** 后端说本市场没有联合筛选（available 缺省=有，见类型注释）。 */
+  const unavailable = data != null && data.available === false;
 
   // 报告数据集清单。失败就当作「没有」——少几个跳转按钮，好过渲染一个点了会
-  // 落到别的因子上的入口。
+  // 落到别的因子上的入口。缺席市场不必问：这页整体是阻断面，用不上跳转清单。
   useEffect(() => {
+    if (data == null || unavailable) return;
     let alive = true;
-    getFactorDatasets()
+    getFactorDatasets(market)
       .then((res) => {
         if (!alive) return;
         setReportDatasets(new Set((res.items || []).filter((d) => d.available).map((d) => d.dataset)));
       })
       .catch(() => undefined);
     return () => { alive = false; };
-  }, []);
+  }, [market, data, unavailable]);
 
   const libOptions = useMemo(() => {
     const s = new Set((data?.kept || []).map((k) => k.library));
@@ -184,6 +200,32 @@ export const ScreeningTab: React.FC<Props> = ({
 
   if (loading) return <div className="flex-1 rounded-2xl bg-slate-50 animate-pulse" />;
   if (error) return <div className="flex-1 flex items-center justify-center text-xs text-rose-500">{error}</div>;
+  // 非 CN 诚实阻断面。必须挡在下面「暂无筛选结果」之前：那条空态让人去跑
+  // screen_factors.py（A 股脚本）——对缺席市场是把人指向一条永远不通的路。
+  if (data && data.available === false) {
+    const label = getMarketConfig(market).label;
+    return (
+      <div className="flex-1 flex items-center justify-center p-6" data-testid="screening-market-blocked">
+        <div className="max-w-md w-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="flex items-center gap-2.5 mb-3">
+            <div className="w-9 h-9 rounded-xl bg-slate-100 flex items-center justify-center">
+              <Filter className="w-4 h-4 text-slate-400" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-slate-800">因子筛选未接入{label}市场</div>
+              <div className="text-[11px] text-slate-400">联合筛选（质量门槛 + 同源去重）是 A 股口径产物</div>
+            </div>
+          </div>
+          <p className="text-xs leading-relaxed text-slate-500">
+            {data.reason || '该市场暂未接入联合筛选。'}
+          </p>
+          <p className="mt-3 text-[11px] text-slate-400">
+            这里不会展示任何数据，也不会用其它市场的筛选结果代填；同类过滤可回「排行榜」按 IC_IR / 覆盖率等列自行筛选。
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (!data || !data.counts?.total_considered) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-2 text-slate-400">

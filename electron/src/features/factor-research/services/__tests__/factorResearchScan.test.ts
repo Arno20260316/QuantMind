@@ -48,14 +48,14 @@ const DIFF = {
 };
 
 describe('getScanSources', () => {
-  test('GET 到 /factor-research/scan，带 dataset=private，无请求体', async () => {
+  test('GET 到 /factor-research/scan，带 dataset=private 与 market，无请求体', async () => {
     const calls = stubFetch(200, DIFF);
 
-    const out = await getScanSources();
+    const out = await getScanSources('private', 'US');
 
     expect(calls).toHaveLength(1);
     expect(calls[0].method).toBe('GET');
-    expect(calls[0].url).toBe(`${SERVICE_ENDPOINTS.USER_SERVICE}/factor-research/scan?dataset=private`);
+    expect(calls[0].url).toBe(`${SERVICE_ENDPOINTS.USER_SERVICE}/factor-research/scan?dataset=private&market=US`);
     expect(out.new.map((x) => x.code)).toEqual(['new1']);
     expect(out.discovered_count).toBe(5);
   });

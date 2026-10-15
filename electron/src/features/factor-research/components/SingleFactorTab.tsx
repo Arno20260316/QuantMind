@@ -1,19 +1,25 @@
 /**
  * 因子研究 —— 单因子页签：定义 + 多档持仓数（top-N）净值/KPI 叠加对比 +
  * 期末净值 vs 持仓数扫描 + 月频 IC + 最新截面个股表（含行业/市值分布）。
+ *
+ * 基准面市场化（2026-10）：基准候选清单与名称一律取详情响应的 `benchmarks`
+ * （后端按市场下发，CN 三码 / HK 恒生系 / US 标普系 / 期货为空表）；
+ * 超额列默认对**本市场主基准**（清单首位），用户可多选叠加。
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowUpRight, LineChart, Plus, X } from 'lucide-react';
 import { getFactorDetail } from '../services/factorResearchService';
 import type { FactorDataset, RangeParams } from '../services/factorResearchService';
 import { getFactorDatasets } from '../services/factorReportService';
-import type { FactorDetail, FactorKpi } from '../types/factorResearch';
+import type { FactorDetail, FactorKpi, ResearchMarket } from '../types/factorResearch';
 import { Card, DistBars, fmtNum, fmtPct, IcChart, NScanChart, NavChart, TagChip } from './common';
 
 interface Props {
   code: string | null;
   range: RangeParams;
   dataset: FactorDataset;
+  /** 本页当前市场（详情/报告清单按市场） */
+  market: ResearchMarket;
   /**
    * 「因子报告」跳转：父级切到因子报告页签并按 (报告数据集, 因子名) 深链
    * —— 与筛选页的「报告」按钮同一入口（openReport）。不传则不渲染按钮。
@@ -22,14 +28,19 @@ interface Props {
 }
 
 const N_PRESETS = [5, 10, 30, 50];
+/** CN 三码基准的线色（历史固定映射，保持 A 股观感不变） */
 const BENCH_COLOR: Record<string, string> = {
   '000300.SH': '#94a3b8',
   '000906.SH': '#cbd5e1',
   '000905.SH': '#a8a29e',
 };
+/** 非 CN 基准（HSI/HSCEI/SPX…代码随市场）按候选顺序取同一灰阶家族：
+ *  全落同一个灰等于两条虚线分不开，而基准是叠着看的。 */
+const BENCH_FALLBACK_SEQ = ['#94a3b8', '#cbd5e1', '#a8a29e', '#64748b'];
+const BENCH_COLOR_FALLBACK = '#94a3b8';
 
-function KpiRow({ label, kpi, color, excess300 }: {
-  label: string; kpi: FactorKpi; color?: string; excess300?: number | null;
+function KpiRow({ label, kpi, color, excess, excessNone }: {
+  label: string; kpi: FactorKpi; color?: string; excess?: number | null; excessNone?: boolean;
 }) {
   return (
     <tr className="border-t border-slate-100">
@@ -43,20 +54,21 @@ function KpiRow({ label, kpi, color, excess300 }: {
       <td className="py-1 text-right font-mono text-slate-600">{fmtNum(kpi.sharpe)}</td>
       <td className="py-1 text-right font-mono text-slate-500">{fmtPct(kpi.max_drawdown)}</td>
       <td className="py-1 text-right font-mono text-slate-500">{fmtPct(kpi.win_rate)}</td>
-      <td className={`py-1 text-right font-mono ${(excess300 || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-        {excess300 === undefined ? '—' : fmtPct(excess300)}
+      <td className={`py-1 text-right font-mono ${(excess || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
+        {excessNone || excess === undefined ? '—' : fmtPct(excess)}
       </td>
     </tr>
   );
 }
 
-export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenReport }) => {
+export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, market, onOpenReport }) => {
   const [detail, setDetail] = useState<FactorDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [nsList, setNsList] = useState<number[]>([10, 30]);
   const [addN, setAddN] = useState('');
-  const [benchOn, setBenchOn] = useState<string[]>(['000300.SH']);
+  /** null = 用户未手动选过 → 用本市场主基准（清单首位）；[] = 用户主动全部取消 */
+  const [benchOn, setBenchOn] = useState<string[] | null>(null);
   /**
    * 因子报告那边**有快照**的数据集（dataset → label）。只有它才能证明
    * 「因子报告」入口点了会落到这个因子上：报告快照是另一个脚本按自己的清单
@@ -69,19 +81,26 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
   useEffect(() => {
     setNsList([10, 30]);
     setAddN('');
-  }, [code]);
+    setBenchOn(null); // 换因子/换市场：基准选择复位到新清单的主基准
+  }, [code, market]);
+
+  // 报告数据集清单按市场下发（各市场可用的数据集不同），换市场必须作废重取 ——
+  // 不清的话下面「已拿到就不再问」的闸门会把上一市场的地图锁死一整个会话。
+  useEffect(() => {
+    setReportDatasets(null);
+  }, [market]);
 
   useEffect(() => {
     if (!code) return;
     let alive = true;
     setLoading(true);
     setError(null);
-    getFactorDetail(code, nsList, range, 30, dataset)
+    getFactorDetail(code, nsList, range, 30, dataset, market)
       .then((d) => { if (alive) setDetail(d); })
       .catch((e: unknown) => { if (alive) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [code, nsList.join(','), range.start, range.end, dataset]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [code, nsList.join(','), range.start, range.end, dataset, market]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 报告数据集可用性：只有该因子确有来源库时才去问（经典库连请求都不发）。
   // 清单一次成功即服务所有库（dataset → label 是全局面，与当前库无关）——
@@ -92,7 +111,7 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
     const lib = detail?.source_library;
     if (!lib || reportDatasets) return;
     let alive = true;
-    getFactorDatasets()
+    getFactorDatasets(market)
       .then((res) => {
         if (!alive) return;
         const m = new Map<string, string>();
@@ -101,7 +120,7 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
       })
       .catch(() => undefined); // 取不到 = 不渲染入口（不是错误面，因子页本身完好）
     return () => { alive = false; };
-  }, [detail?.source_library, code, reportDatasets]);
+  }, [detail?.source_library, code, reportDatasets, market]);
 
   const colors = useMemo(() => {
     const base = ['#2563eb', '#e11d48', '#059669', '#d97706', '#7c3aed', '#0891b2'];
@@ -127,6 +146,30 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
     setNsList([...nsList, n].sort((a, b) => a - b));
     setAddN('');
   };
+
+  /**
+   * 已选基准代码。用户未手动设置（null）→ 默认本市场主基准（详情清单首位，
+   * 后端按 bench_order 下发）；无基准市场（期货）→ 空数组，不给菜单也不叠线。
+   */
+  const activeBenches = useMemo(() => {
+    if (benchOn !== null) return benchOn;
+    const first = detail?.benchmarks?.[0]?.code;
+    return first ? [first] : [];
+  }, [benchOn, detail]);
+  /** 超额列口径基准 = 已选首位（取消全部时无口径，列显示「—」） */
+  const excessBench = useMemo(
+    () => detail?.benchmarks.find((b) => b.code === activeBenches[0]) ?? null,
+    [detail, activeBenches],
+  );
+
+  /** 基准线色（CN 走固定映射，其余市场按候选顺序取灰阶序列） */
+  const benchColors = useMemo(() => {
+    const m = new Map<string, string>();
+    (detail?.benchmarks ?? []).forEach((b, i) => {
+      m.set(b.code, BENCH_COLOR[b.code] ?? BENCH_FALLBACK_SEQ[i % BENCH_FALLBACK_SEQ.length]);
+    });
+    return m;
+  }, [detail]);
 
   if (!code) {
     return <div className="flex-1 flex items-center justify-center text-xs text-slate-400">← 从左侧目录选择因子</div>;
@@ -250,22 +293,28 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
               </span>
             ))}
             <div className="flex-1" />
-            <span className="text-[10px] font-bold text-slate-400">基准</span>
-            {['000300.SH', '000906.SH', '000905.SH'].map((c) => {
-              const on = benchOn.includes(c);
-              const names: Record<string, string> = { '000300.SH': '沪深300', '000906.SH': '中证800', '000905.SH': '中证500' };
-              return (
-                <button
-                  key={c}
-                  onClick={() => setBenchOn(on ? benchOn.filter((x) => x !== c) : [...benchOn, c])}
-                  className={`rounded-full border px-2 py-0.5 text-[10px] font-bold ${
-                    on ? 'border-slate-300 bg-slate-100 text-slate-600' : 'border-slate-200 bg-white text-slate-400 hover:bg-slate-50'
-                  }`}
-                >
-                  {names[c]}
-                </button>
-              );
-            })}
+            {/* 基准候选 = 本市场清单（后端下发）；期货无基准表 → 整段不渲染 */}
+            {benchRows.length > 0 && (
+              <>
+                <span className="text-[10px] font-bold text-slate-400">基准</span>
+                {benchRows.map((b) => {
+                  const on = activeBenches.includes(b.code);
+                  return (
+                    <button
+                      key={b.code}
+                      onClick={() =>
+                        setBenchOn(on ? activeBenches.filter((x) => x !== b.code) : [...activeBenches, b.code])
+                      }
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-bold ${
+                        on ? 'border-slate-300 bg-slate-100 text-slate-600' : 'border-slate-200 bg-white text-slate-400 hover:bg-slate-50'
+                      }`}
+                    >
+                      {b.name}
+                    </button>
+                  );
+                })}
+              </>
+            )}
           </div>
 
           {/* 净值 + KPI */}
@@ -282,8 +331,8 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
                     color: colors.get(v.n),
                   })),
                   ...benchRows
-                    .filter((b) => benchOn.includes(b.code))
-                    .map((b) => ({ name: b.name, data: b.nav, color: BENCH_COLOR[b.code], dashed: true })),
+                    .filter((b) => activeBenches.includes(b.code))
+                    .map((b) => ({ name: b.name, data: b.nav, color: benchColors.get(b.code) ?? BENCH_COLOR_FALLBACK, dashed: true })),
                 ]}
                 height={210}
               />
@@ -299,7 +348,7 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
                         <th className="text-right py-1">夏普</th>
                         <th className="text-right py-1">最大回撤</th>
                         <th className="text-right py-1">月度胜率</th>
-                        <th className="text-right py-1">超额 vs 沪深300</th>
+                        <th className="text-right py-1">{excessBench ? `超额 vs ${excessBench.name}` : '超额 vs 基准'}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -309,7 +358,8 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
                           label={`top${v.n}`}
                           kpi={v.kpi}
                           color={colors.get(v.n)}
-                          excess300={v.excess['000300.SH']}
+                          excess={excessBench ? v.excess[excessBench.code] : null}
+                          excessNone={!excessBench}
                         />
                       ))}
                       {benchRows.map((b) => (
@@ -363,7 +413,8 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
                       <th className="text-left py-1 w-6">#</th>
                       <th className="text-left py-1 w-14">代码</th>
                       <th className="text-left py-1">名称</th>
-                      <th className="text-left py-1 w-20">申万行业</th>
+                      {/* 行业口径随市场：CN=申万（instrument_detail）；非 CN=该市场板块维度 */}
+                      <th className="text-left py-1 w-20">{market === 'CN' ? '申万行业' : '行业'}</th>
                       <th className="text-right py-1 w-16">市值(亿)</th>
                       <th className="text-right py-1 w-14">PE</th>
                       <th className="text-right py-1 w-10">PB</th>
@@ -399,7 +450,7 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
               </div>
             </Card>
             <div className="flex flex-col gap-2 min-h-0">
-              <Card title="选出股票的行业分布（申万二级）">
+              <Card title={market === 'CN' ? '选出股票的行业分布（申万二级）' : '选出股票的行业分布'}>
                 <DistBars rows={detail.industry_dist.slice(0, 12)} color="#6366f1" height={128} />
               </Card>
               <Card title="市值分布（按总市值分档）">
@@ -408,8 +459,10 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenR
             </div>
           </div>
           <div className="shrink-0 text-[10px] text-slate-300 pb-1">
-            月末收盘调仓、Top-N 等权、剔除 ST/退市、双边成本 0.2%（按换手计）·「Top 30 股票」始终为该因子最近可用截面 ·
-            快照由 build_factor_research.py 构建
+            {/* ST/退市口径是 A 股专属（instrument_detail）；非 CN 只做历史有效数据过滤 */}
+            月末收盘调仓、Top-N 等权、{market === 'CN' ? '剔除 ST/退市、' : '仅按历史有效数据过滤（ST/退市口径为 A 股专属）、'}
+            双边成本 0.2%（按换手计）·「Top 30 股票」始终为该因子最近可用截面 ·
+            快照由 {dataset === 'classic' ? 'build_factor_research.py' : 'build_factor_panel_private.py'} 构建
           </div>
         </>
       ) : null}

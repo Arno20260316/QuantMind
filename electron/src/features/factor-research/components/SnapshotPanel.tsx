@@ -8,15 +8,18 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Database, Play, RefreshCw } from 'lucide-react';
 import { getSnapshotStatus, postBuildSnapshot } from '../services/factorResearchService';
 import type { FactorDataset, SnapshotStatus } from '../services/factorResearchService';
+import type { ResearchMarket } from '../types/factorResearch';
 import { Card } from './common';
 
 interface Props {
   dataset: FactorDataset;
+  /** 本页当前市场（快照按市场独立构建/存放） */
+  market: ResearchMarket;
   /** 快照就绪（存在且不再构建中）时回调（防重复触发） */
   onReady: () => void;
 }
 
-export const SnapshotPanel: React.FC<Props> = ({ dataset, onReady }) => {
+export const SnapshotPanel: React.FC<Props> = ({ dataset, market, onReady }) => {
   const [st, setSt] = useState<SnapshotStatus | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -25,7 +28,7 @@ export const SnapshotPanel: React.FC<Props> = ({ dataset, onReady }) => {
   useEffect(() => {
     let alive = true;
     const tick = () => {
-      getSnapshotStatus(dataset)
+      getSnapshotStatus(dataset, market)
         .then((s) => {
           if (!alive) return;
           setSt(s);
@@ -46,15 +49,15 @@ export const SnapshotPanel: React.FC<Props> = ({ dataset, onReady }) => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [dataset, onReady]);
+  }, [dataset, market, onReady]);
 
   const start = async () => {
     setStarting(true);
     setErr(null);
     try {
-      await postBuildSnapshot(dataset);
+      await postBuildSnapshot(dataset, market);
       notified.current = false;
-      const s = await getSnapshotStatus(dataset);
+      const s = await getSnapshotStatus(dataset, market);
       setSt(s);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -100,10 +103,10 @@ export const SnapshotPanel: React.FC<Props> = ({ dataset, onReady }) => {
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-500 leading-relaxed">
                   榜单/单因子/对比/合成依赖一份本地快照（月末打分索引）。
-                  点击下方按钮将**自动扫描本机 quantdb 的 6_ml_datasets**（L1/L2、Alpha 库、
+                  点击下方按钮将**自动扫描本机该市场的 6_ml_datasets**（L1/L2、Alpha 库、
                   量价/技术指标等已计算好的因子数据）并生成索引 —— 只读取、不重算因子本身，
-                  全程本地运行、不上传任何数据。私人因子库约 5~15 分钟，经典因子集约 25 分钟。
-                  若 QuantDB 尚未同步，请先在「数据管理」里同步 A 股数据。
+                  全程本地运行、不上传任何数据。私人因子库约 5~15 分钟，经典因子集（仅 A 股）约 25 分钟。
+                  若市场数据尚未同步，请先在「数据管理」里同步对应市场的数据。
                 </div>
                 <div className="mt-2 flex items-center gap-2">
                   <button

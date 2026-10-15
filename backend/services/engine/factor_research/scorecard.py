@@ -12,7 +12,8 @@
 
 口径（与 demo 对齐，全站统一）：
 - 月末收盘调仓、Top-N 等权、双边成本 0.2%×换手、区间内重建净值（首月全额计费）；
-- 基准：沪深300（超额同时给中证800/中证500）；
+- 基准：按市场取（``benches_for_market``；CN = 沪深300/中证800/中证500，
+  非 CN 引用报告链注册表；FUTURES 无指数基准 → 空表）；
 - 区间语义：区间内相邻月末的持有期收益逐月复利，区间首月末为净值 1.0。
 """
 
@@ -27,8 +28,51 @@ from backend.shared.benchmark import BENCHMARK_NAME, BENCHMARK_SYMBOL
 COST_RATE = analysis.COST_RATE
 BENCH_PRIMARY = BENCHMARK_SYMBOL
 BENCH_ORDER = (BENCHMARK_SYMBOL, "000906.SH", "000905.SH")
-BENCH_NAMES = {BENCHMARK_SYMBOL: BENCHMARK_NAME, "000906.SH": "中证800", "000905.SH": "中证500"}
+BENCH_NAMES = {
+    BENCHMARK_SYMBOL: BENCHMARK_NAME,
+    "000906.SH": "中证800",
+    "000905.SH": "中证500",
+}
 MAX_SCAN_N = 100
+
+
+def benches_for_market(market: str = "CN") -> tuple[tuple[str, str], ...]:
+    """该市场工作台基准表 ``((代码, 名), ...)``，**首位 = 主基准**（FUTURES 无 → 空表）。
+
+    CN 返回工作台存量三码（沪深300/中证800/中证500）——与报告链注册表的
+    (300/905/852) 是**两组不同的码**（榜单字段 excess_300/800/500 已发布），
+    不许合并；非 CN 直接引用报告链注册表 ``factor_report.blocks_common``
+    （唯一出处，与私有面板构建器写 benchmarks.parquet 的清单同源，两边不许
+    各自维护一份）。市场未接入基准表（如 CRYPTO）→ ``MarketUnsupported``
+    （路由译 422），绝不静默回退 CN 指数。
+    """
+    from backend.shared.feature_source import validate_market
+
+    mk = validate_market(market)
+    if mk == "CN":
+        return tuple((c, BENCH_NAMES[c]) for c in BENCH_ORDER)
+    from backend.services.engine.factor_report.blocks_common import (
+        benchmarks_for_market,
+    )
+    from backend.services.engine.factor_research.store import MarketUnsupported
+
+    try:
+        return benchmarks_for_market(mk)
+    except ValueError as e:
+        raise MarketUnsupported(
+            f"因子研究工作台未接入市场 {mk}（基准表无此市场）: {e}"
+        ) from e
+
+
+def bench_order_for_market(market: str = "CN") -> tuple[str, ...]:
+    """该市场基准代码表（首位 = 主基准；无基准市场 → 空元组）。"""
+    return tuple(c for c, _ in benches_for_market(market))
+
+
+def bench_names_for_market(market: str = "CN") -> dict[str, str]:
+    """该市场基准代码 → 展示名（catalog/榜单/单因子共用的唯一出处）。"""
+    return dict(benches_for_market(market))
+
 
 # 环境标签阈值（demo 口径）
 ENV_BULL, ENV_BEAR = 0.05, -0.05
@@ -199,11 +243,18 @@ def topn_series(panel: Panel, fi: int, n: int, mask: np.ndarray) -> dict:
 
 
 def bench_series(
-    bench: pd.DataFrame, mask: np.ndarray, dates: np.ndarray
+    bench: pd.DataFrame,
+    mask: np.ndarray,
+    dates: np.ndarray,
+    order: tuple[str, ...] = BENCH_ORDER,
 ) -> dict[str, dict]:
-    """区间内各基准的净值（首点 1.0）与 KPI。bench: (trade_date, nav, index_code)。"""
+    """区间内各基准的净值（首点 1.0）与 KPI。bench: (trade_date, nav, index_code)。
+
+    ``order`` 缺省 CN 存量三码（零行为变化）；非 CN 传 ``bench_order_for_market``
+    的结果 —— 表里没有的码（跨市场误配）自然不产出，不会拿 CN 指数冒充。
+    """
     out: dict[str, dict] = {}
-    for code in BENCH_ORDER:
+    for code in order:
         sub = bench[bench["index_code"] == code].set_index("trade_date")["nav"]
         if sub.empty:
             continue
@@ -225,10 +276,12 @@ def bench_series(
     return out
 
 
-def excess_vs(bench_kpis: dict[str, dict], kpi: dict) -> dict:
-    """年化超额（组合年化 − 基准年化，demo 口径）。"""
+def excess_vs(
+    bench_kpis: dict[str, dict], kpi: dict, order: tuple[str, ...] = BENCH_ORDER
+) -> dict:
+    """年化超额（组合年化 − 基准年化，demo 口径）。``order`` 同 ``bench_series``。"""
     out = {}
-    for code in BENCH_ORDER:
+    for code in order:
         b = bench_kpis.get(code, {}).get("kpi", {})
         a, c = kpi.get("annual_return"), b.get("annual_return")
         out[code] = round(a - c, 4) if a is not None and c is not None else None
@@ -306,7 +359,9 @@ def env_tags(
     rets_by_factor: dict[str, np.ndarray],
     bench_ret: np.ndarray,
 ) -> dict[str, str]:
-    """环境标签：滚动 3 月沪深300 分牛/熊/震荡，因子月均超额 z 取最高者。
+    """环境标签：滚动 3 月**主基准**（CN=沪深300；非 CN=本市场首个基准）分
+    牛/熊/震荡，因子月均超额 z 取最高者。无基准市场（FUTURES）由调用方传空 →
+    全部「全天候型」（不造假基准）。
 
     rets_by_factor: {code: 区间月收益数组}；bench_ret: 区间基准月收益（同长度）。
     """

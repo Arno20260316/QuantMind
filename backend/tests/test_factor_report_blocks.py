@@ -175,7 +175,7 @@ def test_累计曲线走全窗口_日频统计走请求窗口(monkeypatch):
     # 这条 patch 会**只拦到 build_blocks 那一路**，excess_block 静默用真基准 ——
     # 下面关于 annual / excess_hist 的断言会变成「看着通过、其实没测到」。
     monkeypatch.setattr(B, "bench_daily_returns",
-                        lambda sym, dates: np.full(len(dates), 0.0003))
+                        lambda sym, dates, market="CN": np.full(len(dates), 0.0003))
     kw = {"factor": "a158_ROC20", "horizon": "fwd_ret_5", "long_group": 3,
           "short_group": 9, "cost_bps": 20.0, "snapshot": None, "bench_symbol": "000300.SH"}
     blk = B.build_blocks(df, lookback=30, **kw)

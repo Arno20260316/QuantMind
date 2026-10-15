@@ -1,8 +1,17 @@
-"""因子研究模块 —— QuantDB 数据加载层。
+"""因子研究模块 —— QuantDB 数据加载层（支持多市场）。
 
 本层只负责把 QuantDB parquet 读成宽表面板（index=交易日, columns=symbol），
 供 engine / financials 计算因子；不做任何因子语义。
-所有路径经 ``backend.shared.quantdb_paths`` 解析（禁硬编码）。
+所有路径经 ``feature_source.resolve_market_root`` 解析（CN 即原
+``quantdb_paths`` 候选表，零行为变化；禁硬编码）。
+
+市场分层（2026-10-16）：全部读取函数带 ``market``（缺省 ``"CN"``）。各市场
+盘上口径差异在本层收口（上层不必感知）：
+- ``time`` 列：CN 是 ``YYYYMMDD`` 串，非 CN 是 timestamp → 统一转 DatetimeIndex；
+- ``amount`` 单位：CN 万元，非 CN 元（20261016 实测 amount/(close×volume)
+  ≈1e-4 vs 1.0）→ ``amount_yi_factor()`` 唯一换算入口；
+- ``instrument_detail``（ST/退市/申万）为 A 股专属；非 CN 的名称/行业来自
+  ``security_master`` / ``sector/``（``load_security_master``/``load_sector_map``）。
 """
 
 from __future__ import annotations
@@ -12,15 +21,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from backend.shared.quantdb_paths import resolve_quantdb_subdir
-
 logger = logging.getLogger(__name__)
 
-# 数据目录（相对 QuantDB 根）
+# 数据目录（相对**市场根**）
 DAILY_PARTS = ("1_kline_data", "daily_forward")
 INDEX_PARTS = ("1_kline_data", "index_daily")
 VALUATION_PARTS = ("5_technical_derived", "valuation")
 INSTRUMENT_PARTS = ("2_base_sector", "instrument_detail")
+SECURITY_MASTER_PARTS = ("2_base_sector", "security_master", "data.parquet")
+SECTOR_PARTS = ("2_base_sector", "sector")
 INCOME_PARTS = ("3_financial_data", "income")
 BALANCE_PARTS = ("3_financial_data", "balance")
 CASHFLOW_PARTS = ("3_financial_data", "cashflow")
@@ -30,12 +39,47 @@ HOLDER_PARTS = ("3_financial_data", "holder_num")
 # 基准指数（demo 口径用中证500；回归市场组合同样用它做基准）
 BENCHMARK_SYMBOL = "000905.SH"
 
+# stock_snapshot 估值列（市值/PE/PB）的供给市场注册表：**加市场 = 加条目**。
+# 判据是数据质量实测（20261016）：US valuation 550 分区可用；HK 仅 7 分区且
+# close=0 脏行、FUT 无目录 → 置空（诚实 '—'，绝不拿脏数当市值）。
+VALUATION_SNAPSHOT_MARKETS = {"US"}
+
+
+def _market_root(market: str) -> Path:
+    from backend.shared.feature_source import resolve_market_root, validate_market
+
+    return resolve_market_root(validate_market(market))
+
+
+def amount_yi_factor(market: str) -> float:
+    """成交额(列值) → 亿元 的换算系数：CN 万元→亿 = 1e-4；非 CN 元→亿 = 1e-8。
+
+    单位是实测口径（见模块 docstring），不是猜的：两处都不许各写各的除数。
+    """
+    from backend.shared.feature_source import validate_market
+
+    return 1e-4 if validate_market(market) == "CN" else 1e-8
+
+
+def _to_trade_dates(idx: pd.Index) -> pd.DatetimeIndex:
+    """分区 time 列 → 交易日索引（CN 为 YYYYMMDD 串/整数，非 CN 为 timestamp）。"""
+    if pd.api.types.is_datetime64_any_dtype(idx):
+        return pd.DatetimeIndex(idx).normalize()
+    try:
+        return pd.to_datetime(idx.astype(str), format="%Y%m%d")
+    except (ValueError, TypeError):
+        # 分区 time 格式不齐（如 object 里混着 Timestamp）时的通用兜底
+        return pd.DatetimeIndex(pd.to_datetime(idx)).normalize()
+
 
 def _partition_files(
-    dir_parts: tuple[str, ...], start: str | None, end: str | None
+    dir_parts: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    market: str = "CN",
 ) -> list[Path]:
     """列出 dt=YYYYMMDD 分区目录（按 dt 过滤，升序）。"""
-    root = resolve_quantdb_subdir(*dir_parts)
+    root = _market_root(market).joinpath(*dir_parts)
     out = []
     for p in sorted(root.glob("dt=*")):
         if not p.is_dir():
@@ -62,16 +106,29 @@ def _read_files(files: list[Path], columns: list[str] | None = None) -> pd.DataF
         parts.append(df)
     if not parts:
         return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True)
+    out = pd.concat(parts, ignore_index=True)
+    # 跨分区 ``time`` 列 dtype 实测不齐：HK daily_forward 在 20260508→20260511 之间
+    # 由 date32[day]（→ datetime.date）改为 timestamp[ns]（→ Timestamp），拼起来是
+    # object 列。不归一的话下游 pivot_table 的 groupby("last") 要对键排序比较，
+    # Timestamp 与 datetime.date 比较直接 TypeError（2026-10-16 实机构建所踩）。
+    # 只碰 object 列：CN/US/FUT 的分区恒 timestamp[ns]（datetime64，原样通过），
+    # 整数/字符串 YYYYMMDD 的遗留列也不进此分支（仍由 ``_to_trade_dates`` 收口）。
+    if "time" in out.columns and out["time"].dtype == object:
+        out["time"] = pd.to_datetime(out["time"])
+    return out
 
 
 def load_daily_panel(
     start: str,
     end: str,
     fields: tuple[str, ...] = ("open", "high", "low", "close", "volume", "amount"),
+    market: str = "CN",
 ) -> dict[str, pd.DataFrame]:
-    """读取 daily_forward → {字段: 宽表(交易日 × symbol)}。前复权价格 + 股/万元。"""
-    files = _partition_files(DAILY_PARTS, start, end)
+    """读取 daily_forward → {字段: 宽表(交易日 × symbol)}。前复权价格 + 股/成交额。
+
+    成交额单位随市场（CN 万元 / 非 CN 元）——用 ``amount_yi_factor(market)`` 换算。
+    """
+    files = _partition_files(DAILY_PARTS, start, end, market)
     if not files:
         raise FileNotFoundError(f"daily_forward 无分区: {start}~{end}")
     cols = ["time", "symbol", *fields]
@@ -83,7 +140,7 @@ def load_daily_panel(
             index="time", columns="symbol", values=fld, aggfunc="last"
         )
     for fld, df_ in list(out.items()):
-        df_.index = pd.to_datetime(df_.index, format="%Y%m%d")
+        df_.index = _to_trade_dates(df_.index)
         df_.sort_index(inplace=True)
         if df_.index.has_duplicates:  # 分区 time 格式不一致时 to_datetime 可能撞出重复
             logger.warning("daily_forward 索引存在重复日期，已去重（keep=last）")
@@ -115,9 +172,10 @@ def load_valuation_panel(
         "ps_ttm",
         "dividend_rate",
     ),
+    market: str = "CN",
 ) -> dict[str, pd.DataFrame]:
     """读取 valuation → {字段: 宽表}。total_mv/float_mv 单位元。"""
-    files = _partition_files(VALUATION_PARTS, start, end)
+    files = _partition_files(VALUATION_PARTS, start, end, market)
     if not files:
         raise FileNotFoundError(f"valuation 无分区: {start}~{end}")
     cols = ["time", "symbol", *fields]
@@ -129,7 +187,7 @@ def load_valuation_panel(
             index="time", columns="symbol", values=fld, aggfunc="last"
         )
     for fld, df_ in list(out.items()):
-        df_.index = pd.to_datetime(df_.index, format="%Y%m%d")
+        df_.index = _to_trade_dates(df_.index)
         df_.sort_index(inplace=True)
         if df_.index.has_duplicates:  # 同上：防御分区 time 格式不一致
             logger.warning("valuation 索引存在重复日期，已去重（keep=last）")
@@ -137,21 +195,31 @@ def load_valuation_panel(
     return out
 
 
-def load_index_close(start: str, end: str, symbol: str = BENCHMARK_SYMBOL) -> pd.Series:
-    """读取指数收盘价序列（默认中证500）。"""
-    files = _partition_files(INDEX_PARTS, start, end)
+def load_index_close(
+    start: str, end: str, symbol: str = BENCHMARK_SYMBOL, market: str = "CN"
+) -> pd.Series:
+    """读取指数收盘价序列（默认中证500；非 CN 传本市场指数代码）。"""
+    files = _partition_files(INDEX_PARTS, start, end, market)
     df = _read_files(files, columns=["time", "symbol", "close"])
     if df.empty:
         return pd.Series(dtype=float)
     df = df[df["symbol"] == symbol]
     s = df.set_index("time")["close"].sort_index()
-    s.index = pd.to_datetime(s.index, format="%Y%m%d")
+    s.index = _to_trade_dates(s.index)
     return s.astype(float)
 
 
-def load_instrument() -> pd.DataFrame:
-    """读取证券主表快照（ST/退市/行业/名称）。"""
-    root = resolve_quantdb_subdir(*INSTRUMENT_PARTS)
+def load_instrument(market: str = "CN") -> pd.DataFrame:
+    """读取证券主表快照（ST/退市/行业/名称）。**A 股专属**（instrument_detail）。"""
+    from backend.shared.feature_source import validate_market
+
+    mk = validate_market(market)
+    if mk != "CN":
+        raise FileNotFoundError(
+            f"instrument_detail（ST/退市/申万口径）为 A 股专属，{mk} 市场不供给；"
+            "非 CN 股票池请以 instr=None 走 build_universe 的全池近似"
+        )
+    root = _market_root(mk).joinpath(*INSTRUMENT_PARTS)
     f = root / "instrument_detail.parquet"
     df = pd.read_parquet(
         f,
@@ -170,6 +238,65 @@ def load_instrument() -> pd.DataFrame:
     return df
 
 
+def load_security_master(market: str = "CN") -> pd.DataFrame | None:
+    """证券主表（``2_base_sector/security_master/data.parquet``：名称）。
+
+    非 CN 的名称来源（HK/US 有；FUTURES 无此目录 → None，调用方回退 symbol）。
+    CN 的对应物是 instrument_detail（本函数不服务 CN 名称面）。
+    """
+    p = _market_root(market).joinpath(*SECURITY_MASTER_PARTS)
+    if not p.exists():
+        return None
+    df = pd.read_parquet(p)
+    if "cn_name" not in df.columns:
+        df["cn_name"] = None
+    if "en_name" not in df.columns:
+        df["en_name"] = None
+    return df[["symbol", "cn_name", "en_name"]]
+
+
+def load_sector_map(market: str = "CN") -> pd.DataFrame | None:
+    """行业映射（``2_base_sector/sector/<symbol>.parquet`` → symbol/industry/sector）。
+
+    目录缺失或全空 → None（调用方把行业列置空，绝不编造）。逐文件 schema 有漂移
+    （HK 实测 industry/sector 全为空串、US 两类都有），故用 DuckDB ``union_by_name``
+    一次扫全目录，返回**实际存在的**列（调用方 industry 缺则回退 sector）。
+    """
+    d = _market_root(market).joinpath(*SECTOR_PARTS)
+    if not d.is_dir() or not any(d.glob("*.parquet")):
+        return None
+    import duckdb
+
+    out = duckdb.sql(
+        f"SELECT * FROM read_parquet('{d}/*.parquet', union_by_name=true)"
+    ).to_df()
+    keep = [c for c in ("symbol", "industry", "sector") if c in out.columns]
+    if "symbol" not in keep:
+        return None
+    return out[keep]
+
+
+def load_valuation_snapshot(market: str = "CN") -> pd.DataFrame | None:
+    """最新一期 valuation 截面（symbol/total_mv/pe_ttm/pb）；无分区 → None。
+
+    只读**最新一个分区**（stock_snapshot 是最新截面，不需要全历史）；供给与否
+    由 ``VALUATION_SNAPSHOT_MARKETS`` 注册表裁决（HK 脏行 / FUT 无目录 → 不供给）。
+    """
+    from backend.shared.feature_source import validate_market
+
+    mk = validate_market(market)
+    if mk not in VALUATION_SNAPSHOT_MARKETS:
+        return None
+    files = _partition_files(VALUATION_PARTS, None, None, mk)
+    if not files:
+        return None
+    df = pd.read_parquet(files[-1])
+    cols = [c for c in ("symbol", "total_mv", "pe_ttm", "pb") if c in df.columns]
+    if "symbol" not in cols:
+        return None
+    return df[cols]
+
+
 def month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
     """月度调仓采样日 = 每月最后交易日；末尾追加最新交易日（当期快照）。"""
     s = pd.Series(index, index=index)
@@ -181,20 +308,25 @@ def month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
 
 
 def build_universe(
-    instr: pd.DataFrame, close: pd.DataFrame, min_hist: int = 120
+    instr: pd.DataFrame | None, close: pd.DataFrame, min_hist: int = 120
 ) -> pd.DataFrame:
     """股票池布尔掩码（交易日 × symbol）。
 
-    规则：非 ST、非退市（instrument 快照，非 PIT——demo 同口径）；
-    当日有价格、近 min_hist 日有效历史 ≥ min_hist*0.6（滤新股/长停）。
+    CN：非 ST、非退市（instrument 快照，非 PIT——demo 同口径）；
+    非 CN 传 ``instr=None``：ST/退市口径是 A 股专属（instrument_detail），本市场
+    无对应物 → 只做历史过滤（缺哪层过滤的事实由构建器写入快照 meta，绝不冒充）。
+    通用规则：当日有价格、近 min_hist 日有效历史 ≥ min_hist*0.6（滤新股/长停）。
     """
     syms = close.columns
-    meta = instr.set_index("symbol").reindex(syms)
-    base_ok = (
-        ((meta["is_st"].astype(str) == "0") & (meta["is_quit"].astype(str) == "0"))
-        .reindex(syms)
-        .fillna(False)
-    )
+    if instr is None:
+        base_ok = pd.Series(True, index=syms)
+    else:
+        meta = instr.set_index("symbol").reindex(syms)
+        base_ok = (
+            ((meta["is_st"].astype(str) == "0") & (meta["is_quit"].astype(str) == "0"))
+            .reindex(syms)
+            .fillna(False)
+        )
     valid = close.notna()
     hist = valid.rolling(min_hist, min_periods=min_hist).sum() >= int(min_hist * 0.6)
     mask = hist.copy()

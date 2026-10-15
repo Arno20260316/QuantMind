@@ -5,11 +5,14 @@ import { Modal, message } from 'antd';
 import { Copy, Layers, RefreshCw } from 'lucide-react';
 import { getFactorClusters } from '../../services/factorReportService';
 import type { FactorCluster, FactorClusterResponse } from '../../types/factorReport';
+import type { ResearchMarket } from '../../types/factorResearch';
 
 interface Props {
   open: boolean;
   dataset: string;
   datasetLabel: string;
+  /** 本页当前市场（同源簇按市场快照计算） */
+  market: ResearchMarket;
   onClose: () => void;
   onPick: (factor: string) => void;
 }
@@ -43,7 +46,7 @@ function toMarkdown(res: FactorClusterResponse, datasetLabel: string): string {
   return lines.join('\n');
 }
 
-export const FactorClusterModal: React.FC<Props> = ({ open, dataset, datasetLabel, onClose, onPick }) => {
+export const FactorClusterModal: React.FC<Props> = ({ open, dataset, datasetLabel, market, onClose, onPick }) => {
   const [threshold, setThreshold] = useState(0.9);
   const [data, setData] = useState<FactorClusterResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -51,12 +54,12 @@ export const FactorClusterModal: React.FC<Props> = ({ open, dataset, datasetLabe
   const load = useMemo(
     () => () => {
       setLoading(true);
-      getFactorClusters(dataset, threshold)
+      getFactorClusters(dataset, threshold, 'icir', market)
         .then((res) => setData(res))
         .catch(() => setData(null))
         .finally(() => setLoading(false));
     },
-    [dataset, threshold],
+    [dataset, threshold, market],
   );
 
   useEffect(() => {

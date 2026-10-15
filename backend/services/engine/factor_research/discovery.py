@@ -1,4 +1,13 @@
-"""因子来源扫描 —— 从 ``<quantdb>/6_ml_datasets`` 发现可用因子库。
+"""因子来源扫描 —— 从 ``<market_root>/6_ml_datasets`` 发现可用因子库（支持多市场）。
+
+市场分层（2026-10-16）：全部函数带 ``market``（缺省 ``"CN"``，零行为变化），
+根解析走 ``feature_source.resolve_market_root``（CN 即原 ``resolve_quantdb_dir()``）。
+非 CN 两条口径差异：
+- ``numeric_factor_names`` 额外剔除 10 个原始行情/估值列（``RAW_MARKET_COLS``，
+  非 CN 的库首混入复权/换手/PE/市值列——它们是编码输入不是因子，名单唯一出处
+  在 ``factor_report.datasets``，报告链同款）；
+- ``kept``/``l1l2`` 两种来源为 A 股口径产物（七库筛选 / L2 逐笔），非 CN
+  **诚实抛错**（不静默空集），本市场请用 ``auto`` 扫描。
 
 **为什么单独成模块**：这套扫描有两个消费者，它们的口径必须**逐字一致**：
 
@@ -48,6 +57,9 @@ LIB_LABELS = {
     "jq110": "聚宽 JQ110",
     "tdxgs": "通达信指标",
     "features_daily": "每日特征（技术+估值）",
+    # 多市场库（港股专属；市场由扫描根决定，与标签表无冲突）
+    "ccass_factors": "CCASS 中央结算持股因子",
+    "south_factors": "港股通南向持股因子",
     "factor_research": "经典因子（demo 复刻）",
     "gap_mined": "空档挖掘因子",  # GAP_MINED_MARK
     "rd_mined": "RD-Agent 挖掘因子",  # RD_MINED_MARK：缺条目时分类直接显示原始目录名
@@ -94,26 +106,47 @@ def source_of(wind_source: str) -> str:
     return ws[len(SOURCE_PREFIX) :] if ws.startswith(SOURCE_PREFIX) else ""
 
 
-def numeric_factor_names(path: Path) -> list[str]:
-    """分区内的数值型因子列（排除标识/行情列与字符串列）。"""
+def numeric_factor_names(path: Path, market: str = "CN") -> list[str]:
+    """分区内的数值型因子列（排除标识/行情列、市场原始列与字符串列）。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    drop = DROP_COLS
+    if _market_key(market) != "CN":
+        # 非 CN 库首混入的原始行情/估值列（复权/换手/PE/PB/市值…）不是因子：
+        # 不剔除会让「市值本身」进因子轴，把真因子全压出榜单。名单唯一出处在
+        # factor_report.datasets（报告链同款），此处只做引用。
+        from backend.services.engine.factor_report.datasets import RAW_MARKET_COLS
+
+        drop = DROP_COLS | set(RAW_MARKET_COLS)
+
     out = []
     for field in pq.ParquetFile(path).schema_arrow:
-        if field.name in DROP_COLS:
+        if field.name in drop:
             continue
         if pa.types.is_integer(field.type) or pa.types.is_floating(field.type):
             out.append(field.name)
     return out
 
 
-def load_kept() -> tuple[dict[str, list[dict]], list[dict]]:
-    """五库联合筛选保留清单 → (外部库分组, factor_research 组)。"""
-    from backend.shared.quantdb_paths import resolve_quantdb_dir
+def _market_key(market: str) -> str:
+    from backend.shared.feature_source import validate_market
 
+    return validate_market(market)
+
+
+def load_kept(market: str = "CN") -> tuple[dict[str, list[dict]], list[dict]]:
+    """五库联合筛选保留清单 → (外部库分组, factor_research 组)。"""
+    from backend.shared.feature_source import resolve_market_root
+
+    mk = _market_key(market)
+    if mk != "CN":
+        raise FileNotFoundError(
+            f"联合筛选保留清单为 A 股口径产物（七库筛选），{mk} 市场不供给；"
+            "本市场请用 --source auto（扫描 6_ml_datasets）"
+        )
     p = (
-        resolve_quantdb_dir()
+        resolve_market_root(mk)
         / "factor_research"
         / "screening"
         / "factor_selection.json"
@@ -133,8 +166,16 @@ def load_kept() -> tuple[dict[str, list[dict]], list[dict]]:
     return external, fr_kept
 
 
-def load_l1l2(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
+def load_l1l2(
+    qroot: Path, market: str = "CN"
+) -> tuple[dict[str, list[dict]], list[dict]]:
     """本地 L1/L2 因子数据的因子列清单 → (L1/L2 分组, 空)。"""
+    mk = _market_key(market)
+    if mk != "CN":
+        raise FileNotFoundError(
+            f"L1/L2 联合因子源为 A 股口径（L2 逐笔微观结构仅 A 股供给），"
+            f"{mk} 市场不供给；本市场请用 --source auto（含本市场 l1_factors）"
+        )
     external: dict[str, list[dict]] = {}
     for ds in L1L2_SOURCES:
         root = qroot / "6_ml_datasets" / ds
@@ -143,13 +184,16 @@ def load_l1l2(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
             raise FileNotFoundError(
                 f"{ds} 数据集缺失（先运行特征管线生成 {ds}）: {root}"
             )
-        names = numeric_factor_names(parts[-1])
+        names = numeric_factor_names(parts[-1], mk)
         external[ds] = [{"name": c, "display_name": c} for c in names]
     return external, []
 
 
-def load_auto(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
+def load_auto(
+    qroot: Path, market: str = "CN"
+) -> tuple[dict[str, list[dict]], list[dict]]:
     """自动扫描 6_ml_datasets：全部含分区的因子数据集（按优先序去重）。"""
+    mk = _market_key(market)
     root = qroot / "6_ml_datasets"
     if not root.exists():
         raise FileNotFoundError(f"6_ml_datasets 目录缺失: {root}")
@@ -171,7 +215,7 @@ def load_auto(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
     seen: set[str] = set()
     for ds in order:
         parts = sorted((root / ds).glob("dt=*/data.parquet"))
-        names = [c for c in numeric_factor_names(parts[-1]) if c not in seen]
+        names = [c for c in numeric_factor_names(parts[-1], mk) if c not in seen]
         if len(names) < MIN_FACTOR_COLUMNS:  # 非因子目录（记录/元数据）跳过
             continue
         seen.update(names)
@@ -179,24 +223,29 @@ def load_auto(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
     return external, []
 
 
-def load_sources(source: str, qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
+def load_sources(
+    source: str, qroot: Path, market: str = "CN"
+) -> tuple[dict[str, list[dict]], list[dict]]:
     if source == "kept":
-        return load_kept()
+        return load_kept(market)
     if source == "l1l2":
-        return load_l1l2(qroot)
-    return load_auto(qroot)
+        return load_l1l2(qroot, market)
+    return load_auto(qroot, market)
 
 
-def scan_libraries(qroot: Path | None = None) -> dict[str, list[str]]:
+def scan_libraries(
+    qroot: Path | None = None, market: str = "CN"
+) -> dict[str, list[str]]:
     """``auto`` 扫描 → 有序 ``{库: [因子名]}``（已跨库去重）。
 
     只读 parquet schema（每库仅取最新一个分区），秒级返回。
     """
+    mk = _market_key(market)
     if qroot is None:
-        from backend.shared.quantdb_paths import resolve_quantdb_dir
+        from backend.shared.feature_source import resolve_market_root
 
-        qroot = resolve_quantdb_dir()
-    external, _ = load_auto(qroot)
+        qroot = resolve_market_root(mk)
+    external, _ = load_auto(qroot, mk)
     return {lib: [it["name"] for it in items] for lib, items in external.items()}
 
 

@@ -5,6 +5,12 @@
 - 月末打分长表（store.scores_for）→ 合成回测在线现算（与旧版一致，周初到周末毫秒级）；
 - 序列与元数据（ic.parquet / benchmarks.parquet / stock_snapshot.parquet）。
 
+市场分层（2026-10-16）：全部对外函数带 ``market``（缺省 ``"CN"``，零行为变化），
+透传到 store.*（按市场根解析产物目录）与 scorecard 基准表。非 CN 的三处口径差异
+在各取数点收口：基准表按市场（``scorecard.benches_for_market``，FUTURES 空表 →
+无超额）、个股名称/行业走 ``_instrument_names`` 的市场分支（CN=instrument_detail，
+非 CN=私人快照截面）、毕业管道（CUSTOM→CN）为 CN 专属（非 CN 面置 None）。
+
 区间语义：区间内相邻月末的持有期收益逐月复利，首月末净值 1.0；首月换手 100% 全额计费。
 
 快照管理：全部在本地 QuantDB 上计算（不上传任何数据）；未计算时前端提供
@@ -44,8 +50,39 @@ def _points(dates, values) -> list[dict]:
     ]
 
 
-def _instrument_names() -> dict[str, dict]:
-    """symbol → {name, industry}（证券主表快照，缺失时优雅降级）。"""
+def _market_key(market: str) -> str:
+    """市场键规范化（"hk" → "HK"）；未知市场抛 ValueError，绝不落 CN。
+
+    深层的 store/scorecard 也各自校验（fail-closed 双保险），此处只负责让
+    对外响应里带的是**规范键**（前端按它比对市场，别让 "hk"/"HK" 两副面孔）。
+    """
+    from backend.shared.feature_source import validate_market
+
+    return validate_market(market)
+
+
+def _instrument_names(market: str = "CN") -> dict[str, dict]:
+    """symbol → {name, industry}（缺失时优雅降级为空表，前端回退 symbol）。
+
+    CN：instrument_detail（含申万行业）；非 CN：私人快照截面（stock_snapshot）——
+    构建器已按 security_master/sector 组装名称与行业（HK 行业实测全空、FUTURES
+    两者皆无 → 相应字段为空串），正是排行榜/单因子看的同一份数据，不另拼一套。
+    """
+    from backend.shared.feature_source import validate_market
+
+    if validate_market(market) != "CN":
+        snap = store.stock_snapshot(market)
+        if snap is None or "symbol" not in snap.columns:
+            return {}
+        out: dict[str, dict] = {}
+        for _, r in snap.iterrows():
+            name = r.get("name")
+            ind = r.get("industry")
+            out[str(r["symbol"])] = {
+                "name": name if isinstance(name, str) and name else str(r["symbol"]),
+                "industry": ind if isinstance(ind, str) else "",
+            }
+        return out
     try:
         from backend.services.engine.factor_research import data as frdata
 
@@ -61,9 +98,12 @@ def _instrument_names() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # 目录
 # ---------------------------------------------------------------------------
-def catalog(dataset: str = "classic") -> dict:
+def catalog(dataset: str = "classic", market: str = "CN") -> dict:
+    """因子目录 + 快照元信息 + **本市场**基准清单（前端基准控件的数据源）。"""
+    mk = _market_key(market)
+    benches = [{"symbol": c, "name": n} for c, n in scorecard.benches_for_market(mk)]
     if dataset == "private":
-        f = store.factors_meta()
+        f = store.factors_meta("private", mk)
         if f is None:
             raise store.SnapshotMissing(
                 "私人因子库快照缺失（请先一键计算，产物 factor_research_private/factors.json）"
@@ -78,13 +118,11 @@ def catalog(dataset: str = "classic") -> dict:
             "factors": items,
             "l1_order": f.get("l1_order", []),
             "l2_order": f.get("l2_order", {}),
-            "benchmarks": [
-                {"symbol": c, "name": scorecard.BENCH_NAMES[c]}
-                for c in scorecard.BENCH_ORDER
-            ],
+            "benchmarks": benches,
+            "market": mk,
             "meta": f.get("meta", {}),
         }
-    m = store.metrics()
+    m = store.metrics(dataset, mk)
     meta = m.get("meta", {})
     computed = set(m.get("metrics", {}).keys())
     items = []
@@ -114,10 +152,8 @@ def catalog(dataset: str = "classic") -> dict:
         "factors": items,
         "l1_order": L1_ORDER,
         "l2_order": l2_order,
-        "benchmarks": [
-            {"symbol": c, "name": scorecard.BENCH_NAMES[c]}
-            for c in scorecard.BENCH_ORDER
-        ],
+        "benchmarks": benches,
+        "market": mk,
         "meta": meta,
     }
 
@@ -140,28 +176,40 @@ _derived_lock = threading.Lock()
 _MAX_CTX = 4  # 面板本体在 store 里另有共享缓存，这里每份只几十 MB，留几份够切数据集
 
 
-def _range_key(start: str | None, end: str | None, dataset: str) -> tuple:
-    return (start or "", end or "", dataset, store.panel_stamp(dataset))
+def _range_key(start: str | None, end: str | None, dataset: str, market: str) -> tuple:
+    # market 必须进键：否则先构建的市场会被另一市场按 (区间, 数据集) 命中缓存，
+    # 港股页面戴 A 股面板 —— 全程不报错（store 侧面板缓存已按市场分键，
+    # 这里漏了等于把上面一层防住了、这一层又漏出去）。
+    return (start or "", end or "", dataset, market, store.panel_stamp(dataset, market))
 
 
-def _build_ctx(key: tuple, start: str | None, end: str | None, dataset: str) -> dict:
-    p = store.panel(dataset)
+def _build_ctx(
+    key: tuple, start: str | None, end: str | None, dataset: str, market: str
+) -> dict:
+    p = store.panel(dataset, market)
     if p is None:
         raise store.SnapshotMissing(
             f"factor_panel.parquet 缺失（数据集 {dataset}；请先跑构建或点「快照-一键计算」）"
         )
-    bench = store.benchmark_table(dataset)
-    ic = store.ic_table(dataset)
+    bench = store.benchmark_table(dataset, market)
+    ic = store.ic_table(dataset, market)
     mask = scorecard.month_mask(p.dates, start, end)
-    benches = scorecard.bench_series(bench, mask, p.dates) if bench is not None else {}
+    order = scorecard.bench_order_for_market(market)
+    benches = (
+        scorecard.bench_series(bench, mask, p.dates, order) if bench is not None else {}
+    )
     rdates = p.dates[mask]
     bench_ret = None
-    prim = benches.get(scorecard.BENCH_PRIMARY)
+    primary = order[0] if order else None
+    prim = benches.get(primary) if primary is not None else None
     if prim is not None and len(prim["nav"]) > 1:
         nav = prim["nav"]
         bench_ret = nav[1:] / nav[:-1] - 1
     return {
         "_key": key,
+        "market": market,
+        "bench_order": order,
+        "bench_names": scorecard.bench_names_for_market(market),
         "panel": p,
         "mask": mask,
         "rdates": rdates,
@@ -172,11 +220,17 @@ def _build_ctx(key: tuple, start: str | None, end: str | None, dataset: str) -> 
     }
 
 
-def _range_ctx(start: str | None, end: str | None, dataset: str = "classic") -> dict:
+def _range_ctx(
+    start: str | None,
+    end: str | None,
+    dataset: str = "classic",
+    market: str = "CN",
+) -> dict:
     """区间轻上下文。冷构建持 _ctx_lock 单飞 —— 并发请求各建一份会把内存与 GIL
     一起打满：2026-09-19 实测因子研究页并发 6 个请求把引擎顶到健康检查 3/3 失败、
     被看门狗当作「无响应」重启。"""
-    key = _range_key(start, end, dataset)
+    mk = _market_key(market)
+    key = _range_key(start, end, dataset, mk)
     hit = _ctx_cache.get(key)
     if hit is not None:
         return hit
@@ -184,7 +238,7 @@ def _range_ctx(start: str | None, end: str | None, dataset: str = "classic") -> 
         hit = _ctx_cache.get(key)  # 等锁期间可能已被别的请求建好
         if hit is not None:
             return hit
-        ctx = _build_ctx(key, start, end, dataset)
+        ctx = _build_ctx(key, start, end, dataset, mk)
         while len(_ctx_cache) >= _MAX_CTX:
             _ctx_cache.pop(next(iter(_ctx_cache)))  # 插入序 → 最旧的一份
         _ctx_cache[key] = ctx
@@ -207,14 +261,17 @@ def _build_derived(ctx: dict) -> dict:
 
 
 def _range_ctx_full(
-    start: str | None, end: str | None, dataset: str = "classic"
+    start: str | None,
+    end: str | None,
+    dataset: str = "classic",
+    market: str = "CN",
 ) -> dict:
     """轻上下文 + 派生量（排行榜 / 单因子详情专用）。
 
     派生量单独一把锁：它与轻上下文互不阻塞 —— 否则一次排行榜冷启动会把
     对比/合成这类秒级端点也堵上几十秒。
     """
-    ctx = _range_ctx(start, end, dataset)
+    ctx = _range_ctx(start, end, dataset, market)
     key = ctx["_key"]
     d = _derived_cache.get(key)
     if d is None:
@@ -233,6 +290,7 @@ def _range_meta(ctx: dict) -> dict:
         "start": str(pd.Timestamp(rdates[0]).date()) if len(rdates) else None,
         "end": str(pd.Timestamp(rdates[-1]).date()) if len(rdates) else None,
         "n_months": int(len(rdates)),
+        "market": ctx["market"],
     }
 
 
@@ -291,10 +349,10 @@ def _holdings_profile(
     return med, style, top_ind
 
 
-def _meta_map(dataset: str) -> dict[str, dict]:
+def _meta_map(dataset: str, market: str = "CN") -> dict[str, dict]:
     """code → 元数据（经典：catalog.py；私人：factors.json，读取时经 taxonomy 富化）。"""
     if dataset == "private":
-        f = store.factors_meta() or {}
+        f = store.factors_meta("private", market) or {}
         # 富化后 → leaderboard / factor_detail / compare / compose 全链带
         # category/category_name（enrich 返回新 dict，不改 store 缓存对象）
         return {e["code"]: taxonomy.enrich(e) for e in f.get("factors", [])}
@@ -307,6 +365,7 @@ def leaderboard(
     n: int = 30,
     dataset: str = "classic",
     dedup: float = 0.0,
+    market: str = "CN",
 ) -> dict:
     """排行榜。n=业绩 KPI 的持仓数（默认 30；标签恒按 top-30 基准自动判定）。
 
@@ -314,9 +373,10 @@ def leaderboard(
     剔除后重新编号 rank 1..N（composite 原值不动）；相关矩阵缺失抛
     ``store.DedupMatrixMissing``（路由译 409）。
     """
-    ctx = _range_ctx_full(start, end, dataset)  # 用到 series30/env_tags/time_tags
+    mk = _market_key(market)
+    ctx = _range_ctx_full(start, end, dataset, mk)  # 用到 series30/env_tags/time_tags
     p, ic = ctx["panel"], ctx["ic"]
-    fmeta = _meta_map(dataset)
+    fmeta = _meta_map(dataset, mk)
     rdates = ctx["rdates"]
     n = max(1, min(int(n or 30), scorecard.MAX_SCAN_N))
     series = (
@@ -324,7 +384,7 @@ def leaderboard(
         if n == 30
         else {c: scorecard.topn_series(p, p.index(c), n, ctx["mask"]) for c in p.codes}
     )
-    snap_mv, snap_ind = _snapshot_maps(store.stock_snapshot())
+    snap_mv, snap_ind = _snapshot_maps(store.stock_snapshot(mk))
     rows = []
     ic_index = ctx["ic_index"]  # 全表分好组再逐因子取，别在循环里全表扫（22s → 秒级）
     for code in p.codes:
@@ -333,23 +393,35 @@ def leaderboard(
         kpi = scorecard.gate_kpi(dict(s["kpi"]))
         if ic is not None:
             kpi.update(scorecard.ic_stats_from(ic_index.get(code), rdates))
-        ex = scorecard.excess_vs(ctx["benches"], kpi)
+        ex = scorecard.excess_vs(ctx["benches"], kpi, ctx["bench_order"])
         med_mv, mv_style, top_ind = _holdings_profile(
             p, p.index(code), n, snap_mv, snap_ind
         )
+        row = {
+            "code": code,
+            "name_cn": meta.get("name_cn", code),
+            "l1": meta.get("l1", ""),
+            "l2": meta.get("l2", ""),
+            # 经典库无 category（前端回退 l2 分组）；private 行带语义类别供点选过滤
+            "category": meta.get("category", ""),
+            "category_name": meta.get("category_name", ""),
+            **kpi,
+            # 按基准代码映射的超额（前端统一读它；CN 三码 = 300/800/500）
+            "excess_by_bench": ex,
+        }
+        if mk == "CN":
+            # 旧键一期兼容（CN 榜单列已发布）；非 CN 不发这三个键 ——
+            # "excess_300" 挂在恒生基准上是一句假话，宁可整列不存在。
+            row.update(
+                {
+                    "excess_300": ex.get("000300.SH"),
+                    "excess_800": ex.get("000906.SH"),
+                    "excess_500": ex.get("000905.SH"),
+                }
+            )
         rows.append(
             {
-                "code": code,
-                "name_cn": meta.get("name_cn", code),
-                "l1": meta.get("l1", ""),
-                "l2": meta.get("l2", ""),
-                # 经典库无 category（前端回退 l2 分组）；private 行带语义类别供点选过滤
-                "category": meta.get("category", ""),
-                "category_name": meta.get("category_name", ""),
-                **kpi,
-                "excess_300": ex.get("000300.SH"),
-                "excess_800": ex.get("000906.SH"),
-                "excess_500": ex.get("000905.SH"),
+                **row,
                 "median_mv_yi": med_mv,
                 "mv_style": mv_style,
                 "top_industries": top_ind,
@@ -369,7 +441,7 @@ def leaderboard(
     dedup_info: dict[str, object] = {"applied": False}
     if dedup and float(dedup) > 0:
         threshold = float(dedup)
-        bundle = store.dedup_corr(dataset)
+        bundle = store.dedup_corr(dataset, mk)
         if bundle is None:
             raise store.DedupMatrixMissing(
                 f"去重相关矩阵缺失（dataset={dataset}）：private 请先运行 "
@@ -394,7 +466,11 @@ def leaderboard(
         }
     df["rank"] = np.arange(1, len(df) + 1)
     out = store._sanitize(df.to_dict("records"))
-    m = store.factors_meta() if dataset == "private" else store.metrics()
+    m = (
+        store.factors_meta("private", mk)
+        if dataset == "private"
+        else store.metrics(dataset, mk)
+    )
     meta_out = (m or {}).get("meta", {})
     return {
         "leaderboard": out,
@@ -403,6 +479,13 @@ def leaderboard(
             "range": _range_meta(ctx),
             "top_n": n,
             "dataset": dataset,
+            "market": mk,
+            # 本市场基准清单（代码+名）——前端榜单超额列按它渲染，与结果里的
+            # excess_by_bench 键一一对应（无基准市场为空表）。
+            "benchmarks": [
+                {"code": c, "name": ctx["bench_names"].get(c, c)}
+                for c in ctx["bench_order"]
+            ],
             "dedup": dedup_info,
         },
     }
@@ -418,11 +501,13 @@ def factor_detail(
     end: str | None = None,
     stocks_n: int = 30,
     dataset: str = "classic",
+    market: str = "CN",
 ) -> dict | None:
-    meta = _meta_map(dataset).get(code)
+    mk = _market_key(market)
+    meta = _meta_map(dataset, mk).get(code)
     if meta is None:
         return None
-    ctx = _range_ctx_full(start, end, dataset)  # 用到 env_tags/time_tags
+    ctx = _range_ctx_full(start, end, dataset, mk)  # 用到 env_tags/time_tags
     p, ic = ctx["panel"], ctx["ic"]
     if code not in p.ci:
         return None
@@ -439,7 +524,11 @@ def factor_detail(
             {
                 "n": n,
                 "kpi": scorecard.gate_kpi(dict(s["kpi"])),
-                "excess": scorecard.excess_vs(ctx["benches"], s["kpi"]),
+                # bench_order 必须传：缺省是 CN 三码，非 CN 市场下 excess 全体
+                # 按键错位 → 全 None，前端按本市场基准码取数取空（看着像没数据）。
+                "excess": scorecard.excess_vs(
+                    ctx["benches"], s["kpi"], ctx["bench_order"]
+                ),
                 "nav": _points(s["dates"], s["nav"]),
             }
         )
@@ -447,7 +536,7 @@ def factor_detail(
     benches = [
         {
             "code": c,
-            "name": scorecard.BENCH_NAMES[c],
+            "name": ctx["bench_names"].get(c, c),
             "kpi": b["kpi"],
             "nav": _points(b["dates"], b["nav"]),
         }
@@ -470,7 +559,7 @@ def factor_detail(
     # 有数据的截面；stocks_stale 供前端提示「数据未更新到最新截面」。
     last = scorecard.latest_data_month(p, fi)
     stocks_stale = last is not None and last < len(p.dates) - 1
-    snap = store.stock_snapshot()
+    snap = store.stock_snapshot(mk)
     snap_idx = snap.set_index("symbol") if snap is not None else None
     kk = min(int(stocks_n), p.fwd.shape[2])
     stocks: list[dict] = []
@@ -572,10 +661,12 @@ def compare(
     start: str | None = None,
     end: str | None = None,
     dataset: str = "classic",
+    market: str = "CN",
 ) -> dict:
-    ctx = _range_ctx(start, end, dataset)
+    mk = _market_key(market)
+    ctx = _range_ctx(start, end, dataset, mk)
     p = ctx["panel"]
-    fmeta = _meta_map(dataset)
+    fmeta = _meta_map(dataset, mk)
     norm: list[dict] = []
     for it in items[:12]:
         if isinstance(it, str):
@@ -609,14 +700,16 @@ def compare(
                 }
                 if ctx["ic"] is not None
                 else s["kpi"],
-                "excess": scorecard.excess_vs(ctx["benches"], s["kpi"]),
+                "excess": scorecard.excess_vs(
+                    ctx["benches"], s["kpi"], ctx["bench_order"]
+                ),
                 "nav": _points(s["dates"], s["nav"]),
                 "ic": ic_points,
             }
         )
 
     corr = (
-        store.corr_table() if dataset != "private" else None
+        store.corr_table("classic", mk) if dataset != "private" else None
     )  # 私人库暂不构建全量相关矩阵
     corr_sub = None
     codes = [x["code"] for x in out]
@@ -634,7 +727,7 @@ def compare(
     benches = [
         {
             "code": c,
-            "name": scorecard.BENCH_NAMES[c],
+            "name": ctx["bench_names"].get(c, c),
             "nav": _points(b["dates"], b["nav"]),
         }
         for c, b in ctx["benches"].items()
@@ -647,8 +740,12 @@ def compare(
     }
 
 
-def correlation(codes: list[str] | None = None) -> dict:
-    corr = store.corr_table()
+def correlation(codes: list[str] | None = None, market: str = "CN") -> dict:
+    """全量因子相关对（classic 快照产物）。非 CN 无 classic 相关系数表 → 422
+    （``MarketUnsupported``），不拿 A 股相关矩阵冒充 —— 私人库的相关矩阵是
+    ``cross_corr.npz``（去重专用，不走本端点）。"""
+    mk = _market_key(market)
+    corr = store.corr_table("classic", mk)
     if corr is None or corr.empty:
         return {"pairs": []}
     if codes:
@@ -666,9 +763,13 @@ def correlation(codes: list[str] | None = None) -> dict:
     }
 
 
-def screening() -> dict:
-    """因子筛选清单（质量门槛 + 同源去重，含剔除原因）。"""
-    return store.screening()
+def screening(market: str = "CN") -> dict:
+    """因子筛选清单（质量门槛 + 同源去重，含剔除原因）。
+
+    非 CN 诚实缺席：store 返回同构空结构 + ``available:false`` + reason（该产品
+    是 A 股口径的七库筛选），前端据 reason 渲染阻断面而不是空表。
+    """
+    return store.screening(_market_key(market))
 
 
 # ---------------------------------------------------------------------------
@@ -678,8 +779,8 @@ _BUILD_LOG = "build.log"
 _BUILD_PID = "build.pid"
 
 
-def scan_sources(dataset: str = "private") -> dict:
-    """扫描 quantdb 目录 → 与快照目录的差异（新增/消失）。**只读**，绝不触发重算。
+def scan_sources(dataset: str = "private", market: str = "CN") -> dict:
+    """扫描本市场数据目录 → 与快照目录的差异（新增/消失）。**只读**，绝不触发重算。
 
     为什么需要：目录（``factors.json``）是**快照产物**，不是每次读盘现算的。
     新挖到的因子写进 ``6_ml_datasets`` 后，不重算就看不见；而重算一次私人库要
@@ -697,14 +798,15 @@ def scan_sources(dataset: str = "private") -> dict:
             f"扫描仅支持 private 数据集（classic 的目录来自静态 catalog.py，"
             f"没有「盘上有什么」可对），收到 {dataset!r}"
         )
-    f = store.factors_meta()
+    mk = _market_key(market)
+    f = store.factors_meta("private", mk)
     if f is None:
         raise store.SnapshotMissing(
             "私人因子库快照缺失（请先一键计算，产物 factor_research_private/factors.json）"
         )
     factors = [e for e in f.get("factors", []) if e.get("code")]
     out = discovery.diff_catalog(
-        discovery.scan_libraries(),
+        discovery.scan_libraries(market=mk),
         {e["code"] for e in factors},
         catalog_library={
             e["code"]: discovery.source_of(e.get("wind_source", "")) for e in factors
@@ -712,11 +814,14 @@ def scan_sources(dataset: str = "private") -> dict:
     )
     meta = f.get("meta", {})
     out["dataset"] = dataset
+    out["market"] = mk
     out["snapshot_at"] = meta.get("built_at")
     out["snapshot_source"] = meta.get("source")
     # 毕业管道状态（CUSTOM → CN 镜像差）：新挖的因子若卡在桥前，扫描面板要指出来，
     # 否则用户只看到「快照差异」却不知道差异的源头在哪一站。
-    out["pipeline"] = pipeline_state()
+    # **CN 专属**（毕业桥的目标是 CN rd_mined 目录）：非 CN 面返回 None，
+    # 不把 A 股管道的实况戴到港股页面上（前端据 None 隐藏该段）。
+    out["pipeline"] = pipeline_state() if mk == "CN" else None
     return out
 
 
@@ -739,9 +844,10 @@ def _build_running(d: Path) -> int | None:
     return pid
 
 
-def snapshot_status(dataset: str = "classic") -> dict:
+def snapshot_status(dataset: str = "classic", market: str = "CN") -> dict:
     """快照状态：是否已生成 / 构建中 / 日志进度。供前端「一键计算」入口。"""
-    d = store.artifact_dir(dataset)
+    mk = _market_key(market)
+    d = store.artifact_dir(dataset, mk)
     meta: dict = {}
     mf = d / "metrics.json"  # 构建元信息内嵌在 metrics.json 的 meta 字段
     if mf.exists():
@@ -773,6 +879,7 @@ def snapshot_status(dataset: str = "classic") -> dict:
         "step": step,
         "log_tail": log_tail,
         "dataset": dataset,
+        "market": mk,
     }
 
 
@@ -782,9 +889,10 @@ _BUILD_SCRIPTS = {
 }
 
 
-def start_build(dataset: str = "classic") -> dict:
+def start_build(dataset: str = "classic", market: str = "CN") -> dict:
     """启动快照构建（后台子进程；已在构建则直接返回运行中）。全部本地计算。"""
-    d = store.artifact_dir(dataset)
+    mk = _market_key(market)
+    d = store.artifact_dir(dataset, mk)
     if (pid := _build_running(d)) is not None:
         return {"started": False, "running": True, "pid": pid}
     d.mkdir(parents=True, exist_ok=True)
@@ -799,19 +907,31 @@ def start_build(dataset: str = "classic") -> dict:
     )
     if not script.exists():
         return {"error": f"构建脚本缺失: {script}"}
+    cmd = [sys.executable, str(script)]
+    if dataset == "private":
+        # 私有面板构建器带 --market（classic 构建脚本没有该参数、也不服务非 CN）。
+        # 显式传规范键：脚本缺省是 CN，漏传的后果是「港股页点了计算，默默建了 A 股」。
+        cmd += ["--market", mk]
     log = open(d / _BUILD_LOG, "a", encoding="utf-8")  # noqa: SIM115 - 交给子进程持有
     log.write(
-        f"\n===== build started {pd.Timestamp.now().isoformat(timespec='seconds')} =====\n"
+        f"\n===== build started {pd.Timestamp.now().isoformat(timespec='seconds')}"
+        f" market={mk} =====\n"
     )
     proc = subprocess.Popen(  # noqa: S603 - 固定脚本路径，无用户输入
-        [sys.executable, str(script)],
+        cmd,
         cwd=str(root),
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     (d / _BUILD_PID).write_text(str(proc.pid), encoding="utf-8")
-    return {"started": True, "running": True, "pid": proc.pid, "dataset": dataset}
+    return {
+        "started": True,
+        "running": True,
+        "pid": proc.pid,
+        "dataset": dataset,
+        "market": mk,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +969,11 @@ def pipeline_state() -> dict | None:
     脚本不可用（部署形态变动）返回 None —— 前端隐藏该段，不报假状态。
     """
     try:
-        from backend.scripts.promote_rd_mined import plan_sync, resolve_roots, scan_partitions
+        from backend.scripts.promote_rd_mined import (
+            plan_sync,
+            resolve_roots,
+            scan_partitions,
+        )
     except Exception:  # noqa: BLE001
         return None
     src_root, dst_root = resolve_roots()
@@ -859,14 +983,16 @@ def pipeline_state() -> dict | None:
     src_cols = _numeric_cols_of_latest(src_root, src)
     dst_cols = _numeric_cols_of_latest(dst_root, dst)
     pending_factors = (
-        sorted(src_cols - dst_cols) if src_cols is not None and dst_cols is not None else []
+        sorted(src_cols - dst_cols)
+        if src_cols is not None and dst_cols is not None
+        else []
     )
     if not src:
-        state = "empty"       # CUSTOM 还没有产出（未启用挖掘 / 挖掘线程空闲）
+        state = "empty"  # CUSTOM 还没有产出（未启用挖掘 / 挖掘线程空闲）
     elif pending_factors or plan.to_copy:
-        state = "pending"     # 有新的没毕业
+        state = "pending"  # 有新的没毕业
     else:
-        state = "synced"      # 已毕业（快照收没收是另一件事，由扫描差异告诉用户）
+        state = "synced"  # 已毕业（快照收没收是另一件事，由扫描差异告诉用户）
     return {
         "state": state,
         "custom_n_factors": len(src_cols) if src_cols is not None else None,
@@ -900,7 +1026,11 @@ def _promote_running(d: Path) -> int | None:
 
 
 def promote_status() -> dict:
-    """毕业桥状态：是否运行中 / 日志最新一行（跑完看最后一行就知道结果）。"""
+    """毕业桥状态：是否运行中 / 日志最新一行（跑完看最后一行就知道结果）。
+
+    **CN 专属**（毕业桥目标 = CN rd_mined 目录，与 market 参数无关；
+    非 CN 前端隐藏该入口，见 scan_sources 里 pipeline=None 的同款理由）。
+    """
     d = store.artifact_dir("private")
     pid = _promote_running(d)
     log_tail: list[str] = []
@@ -909,7 +1039,9 @@ def promote_status() -> dict:
     if lf.exists():
         try:
             lines = [
-                ln for ln in lf.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
+                ln
+                for ln in lf.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if ln.strip()
             ]
             log_tail = lines[-12:]
             step = lines[-1][:160] if lines else ""
@@ -970,6 +1102,7 @@ def compose(
     start: str | None = None,
     end: str | None = None,
     dataset: str = "classic",
+    market: str = "CN",
 ) -> dict:
     """自定义权重合成 +（可选）阈值过滤 → 实时回测。
 
@@ -977,12 +1110,13 @@ def compose(
     threshold: 合成打分的过滤下限（全局，z 刻度；None=不过滤）
     thresholds: 每因子过滤下限 {code: z}（选股前先按各因子阈值筛股）
     """
-    fmeta = _meta_map(dataset)
+    mk = _market_key(market)
+    fmeta = _meta_map(dataset, mk)
     weights = {c: float(w) for c, w in (weights or {}).items() if c in fmeta and w != 0}
     if not weights:
         return {"error": "weights 为空"}
     codes = list(weights)
-    scores = store.scores_for(codes, dataset)
+    scores = store.scores_for(codes, dataset, mk)
     if scores is None or scores.empty:
         return {"error": "快照缺失（请在「快照」中一键计算）"}
     scores = _scores_in_range(scores, start, end)
@@ -1017,7 +1151,7 @@ def compose(
     wide.index = pd.to_datetime(wide.index)
     wide = wide.sort_index()
 
-    fwd = store.fwd_returns(dataset)
+    fwd = store.fwd_returns(dataset, mk)
     fwd_wide = fwd.pivot(index="trade_date", columns="symbol", values="fwd_ret")
     fwd_wide.index = pd.to_datetime(fwd_wide.index)
     common = wide.index.intersection(fwd_wide.index)
@@ -1032,10 +1166,10 @@ def compose(
         cost_rate=cost_rate or analysis.COST_RATE,
     )
     k = analysis.kpi(bt["ret"], bt["nav"])
-    ctx = _range_ctx(start, end, dataset)
-    k_ex = scorecard.excess_vs(ctx["benches"], k)
+    ctx = _range_ctx(start, end, dataset, mk)
+    k_ex = scorecard.excess_vs(ctx["benches"], k, ctx["bench_order"])
 
-    names = _instrument_names()
+    names = _instrument_names(mk)
     last_date = max(bt["holdings"]) if bt["holdings"] else None
     latest = (
         wide.loc[last_date].dropna().sort_values(ascending=False)
@@ -1054,7 +1188,7 @@ def compose(
     benches = [
         {
             "code": c,
-            "name": scorecard.BENCH_NAMES[c],
+            "name": ctx["bench_names"].get(c, c),
             "nav": _points(b["dates"], b["nav"]),
         }
         for c, b in ctx["benches"].items()
@@ -1113,14 +1247,17 @@ def optimal_weights(
     start: str | None = None,
     end: str | None = None,
     dataset: str = "classic",
+    market: str = "CN",
 ) -> dict:
     """在所选因子上网格搜索（非负、和为 1），夏普/年化/超额各给一组最优权重。
 
     候选池 = 各因子月末 top-150 的并集（面板限制），组合内缺失因子记 0 分（与 compose 同口径）；
-    展示口径以 compose 全样本精确回测为准。
+    展示口径以 compose 全样本精确回测为准。「超额」目标 = 本市场主基准（FUTURES 无
+    基准 → 该目标恒为 None，前端隐藏）。
     """
     t0 = time.time()
-    ctx = _range_ctx(start, end, dataset)
+    mk = _market_key(market)
+    ctx = _range_ctx(start, end, dataset, mk)
     p = ctx["panel"]
     codes = [c for c in codes if c in p.ci][:10]
     if len(codes) < 1:
@@ -1188,7 +1325,8 @@ def optimal_weights(
     peak = np.maximum.accumulate(nav_path, axis=0)
     mdd = (1 - nav_path / peak).max(axis=0)
     win = np.nanmean(rets > 0, axis=0)
-    prim = ctx["benches"].get(scorecard.BENCH_PRIMARY, {}).get("kpi", {})
+    primary = ctx["bench_order"][0] if ctx["bench_order"] else None
+    prim = ctx["benches"].get(primary, {}).get("kpi", {}) if primary else {}
     bench_ann = prim.get("annual_return")
     excess = annual - bench_ann if bench_ann is not None else np.full(C, np.nan)
 
@@ -1196,7 +1334,8 @@ def optimal_weights(
         if not np.isfinite(values).any():
             return None
         i = int(np.nanargmax(values))
-        return {
+        ex = round(float(excess[i]), 4) if np.isfinite(excess[i]) else None
+        out = {
             "weights": {
                 c: round(float(w), 3) for c, w in zip(codes, W[:, i], strict=False)
             },
@@ -1204,17 +1343,27 @@ def optimal_weights(
             "annual_return": round(float(annual[i]), 4),
             "max_drawdown": round(float(mdd[i]), 4),
             "win_rate": round(float(win[i]), 4),
-            "excess_300": round(float(excess[i]), 4)
-            if np.isfinite(excess[i])
-            else None,
+            # 新键（按市场口径）：前端统一读它；CN 另带旧键 excess_300 一期兼容
+            "excess_primary": ex,
         }
+        if mk == "CN":
+            out["excess_300"] = ex
+        return out
 
+    objectives = {
+        "sharpe": _winner(sharpe),
+        "annual_return": _winner(annual),
+        "excess_primary": _winner(excess),
+    }
+    if mk == "CN":
+        objectives["excess_300"] = objectives["excess_primary"]  # 旧键一期兼容
     out = {
-        "objectives": {
-            "sharpe": _winner(sharpe),
-            "annual_return": _winner(annual),
-            "excess_300": _winner(excess),
-        },
+        "objectives": objectives,
+        "bench_primary": (
+            {"code": primary, "name": ctx["bench_names"].get(primary, primary)}
+            if primary
+            else None
+        ),
         "n_combos": int(C),
         "n_months": int(T),
         "codes": codes,

@@ -33,7 +33,11 @@ vi.mock('../../services/factorResearchService', async () => {
   return { ...actual, getCatalog: catalogMock, getLeaderboard: leaderboardMock };
 });
 
-vi.mock('../../../../store', () => ({ useAppSelector: () => isAdminRef.value }));
+// 选择器对假 state 求值：市场恒 CN（本文件与分层无关），is_admin 由 isAdminRef 控制
+vi.mock('../../../../store', () => ({
+  useAppSelector: (sel: (s: unknown) => unknown) =>
+    sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: isAdminRef.value } } }),
+}));
 
 // 子组件桩：把页面传下去的 props 摊在 DOM 上，本文件测的就是这些 props
 vi.mock('../../components/CatalogSidebar', () => ({ CatalogSidebar: () => <div data-testid="sidebar" /> }));
@@ -122,12 +126,12 @@ beforeEach(() => {
 describe('FactorResearchPage：筛选页签的目录索引', () => {
   test('进页面只拉当前数据集，进筛选页签才补另一个', async () => {
     renderPage();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private'));
-    expect(catalogMock).not.toHaveBeenCalledWith('classic');
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private', 'CN'));
+    expect(catalogMock).not.toHaveBeenCalledWith('classic', 'CN');
 
     await gotoScreening();
 
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic', 'CN'));
   });
 
   test('索引键是目录的 code（不是 name_cn），两个数据集都在里面', async () => {
@@ -147,10 +151,10 @@ describe('FactorResearchPage：筛选页签的目录索引', () => {
     );
 
     renderPage();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private', 'CN'));
 
     await gotoScreening();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic', 'CN'));
     // 私人库那条还在途，补缺的路必须跳过它：1.1 MB 拉两遍是白烧引擎（它被并发压垮过）
     expect(catalogMock.mock.calls.filter((c) => c[0] === 'private')).toHaveLength(1);
 
@@ -235,7 +239,7 @@ describe('FactorResearchPage：从筛选页注册到训练目录', () => {
 
   test('页面停在经典库上时，注册目标也不跟着走', async () => {
     renderPage();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private', 'CN'));
 
     fireEvent.click(await screen.findByRole('button', { name: '经典因子' }));
     await gotoScreening();

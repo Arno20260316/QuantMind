@@ -7,8 +7,9 @@
  *   切换排序键时方向跟键走（换手、名称天生升序，其余降序找最强）；
  * - **质量门槛**：|ICIR| ≥、|IC| ≥（正反不限——强反向因子也是好因子） 、换手 ≤；
  * - **方向**：全部 / 正向 IC>0 / 反向 IC<0；
- * - **★ 自选**：localStorage 按数据集持久化（`qm:factor-report:favs:${dataset}`），
- *   可「只看自选」——几百个因子里挑出来的那十几个不再每次重找；
+ * - **★ 自选**：localStorage 按**市场 × 数据集**持久化
+ *   （`qm:factor-report:favs:${market}:${dataset}`），可「只看自选」——几百个因子里
+ *   挑出来的那十几个不再每次重找；
  * - **选中项被筛掉**时给提示 + 一键恢复显示，避免「报告在右、左栏找不到人」。
  *
  * 空值（null/NaN）一律**沉底**（升降序都不翻），与站内「缺失 ≠ 0」口径一致。
@@ -17,14 +18,17 @@
 import React, { useMemo, useState } from 'react';
 import { Search, Star } from 'lucide-react';
 import type { FactorSummary } from '../../types/factorReport';
-import { loadFavs, saveFavs, toggleInFavs } from '../favorites';
+import type { ResearchMarket } from '../../types/factorResearch';
+import { loadScopedFavs, saveFavs, scopedFavKey, toggleInFavs } from '../favorites';
 
 interface FactorRankListProps {
   factors: FactorSummary[];
   selected: string | null;
   onSelect: (name: string) => void;
-  /** 数据集名：自选收藏按数据集隔离存储（不同库的因子重名不互串） */
+  /** 数据集名：自选收藏按市场 × 数据集隔离存储（不同库/市场的因子重名不互串） */
   dataset: string;
+  /** 本页当前市场：自选键含市场段（各市场代码空间不同，共用键会虚高） */
+  market: ResearchMarket;
   loading?: boolean;
 }
 
@@ -62,7 +66,8 @@ const MIN_ICIR_OPTS = ['', '0.3', '0.5', '1'];
 const MIN_IC_OPTS = ['', '0.01', '0.02', '0.03', '0.04', '0.05'];
 const MAX_TURNOVER_OPTS = ['', '20', '30', '50', '80'];
 
-const favKey = (ds: string): string => `qm:factor-report:favs:${ds}`;
+/** 因子报告左栏自选的键前缀（与排行榜的自选是两套集合；见 favorites.loadScopedFavs） */
+const FAVS_PREFIX = 'qm:factor-report:favs';
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
@@ -83,7 +88,7 @@ function valueOf(f: FactorSummary, key: SortKey): number | string | null {
   }
 }
 
-export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selected, onSelect, dataset, loading }) => {
+export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selected, onSelect, dataset, market, loading }) => {
   const [keyword, setKeyword] = useState('');
   const [library, setLibrary] = useState<string>('all');
   const [category, setCategory] = useState<string>('all');
@@ -95,18 +100,19 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
   const [dir, setDir] = useState<'all' | 'pos' | 'neg'>('all');
   const [favsOnly, setFavsOnly] = useState(false);
 
-  // 收藏按数据集隔离：切换数据集时同步换库（render 期调整派生状态，官方推荐模式）
-  const [favs, setFavs] = useState<string[]>(() => loadFavs(favKey(dataset)));
-  const [favsDs, setFavsDs] = useState(dataset);
-  if (favsDs !== dataset) {
-    setFavsDs(dataset);
-    setFavs(loadFavs(favKey(dataset)));
+  // 收藏按市场 × 数据集隔离：换市场/数据集时同步换库（render 期调整派生状态，官方推荐模式）
+  const [favs, setFavs] = useState<string[]>(() => loadScopedFavs(FAVS_PREFIX, market, dataset));
+  const [favsKeyState, setFavsKeyState] = useState(scopedFavKey(FAVS_PREFIX, market, dataset));
+  const favsKey = scopedFavKey(FAVS_PREFIX, market, dataset);
+  if (favsKeyState !== favsKey) {
+    setFavsKeyState(favsKey);
+    setFavs(loadScopedFavs(FAVS_PREFIX, market, dataset));
   }
 
   const toggleFav = (name: string) => {
     const next = toggleInFavs(favs, name);
     setFavs(next);
-    saveFavs(favKey(dataset), next);
+    saveFavs(favsKey, next);
   };
 
   const onSortKeyChange = (k: SortKey) => {

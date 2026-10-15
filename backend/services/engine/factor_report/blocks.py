@@ -38,9 +38,9 @@ import numpy as np
 from . import metrics as M
 from .blocks_bench import bench_daily_returns, _annual, _excess_stats
 from .blocks_common import (
-    BENCHMARKS,
     CAPACITY_NOTE_SCOPE,
     N_QUANTILES,
+    benchmarks_for_market,
     _col,
     _col_mean,
     _episodes,
@@ -273,18 +273,22 @@ def _holding_sweep(df: Any, turnover: float | None, cost_bps: float) -> list[dic
 # ─────────────────────────── 5. 成本与容量 ───────────────────────────
 
 
-def _universe_median_amount(dt_int: int) -> float | None:
+def _universe_median_amount(dt_int: int, market: str = "CN") -> float | None:
     """全市场当日成交额中位数（**元**）。
 
     单位口径不硬编码：走 ``DailyBar.amount``（CN 由 ``_detect_amount_scale`` 逐日
     自动识别后归一到元）。已实测核对：QuantDB parquet 的 ``amount`` 是**万元**
     （600036.SH 20260918：close×volume/amount ≈ 1e4），与 ``skills/quantdb-fields``
     的结论一致，而 ``DailyBar`` 把它乘 1e4 归一到元 —— 两处不冲突，是「原始 vs 归一」。
+
+    ``market`` 决定取数市场（缓存键含市场：同一天不同市场的成交额中位数不同币种
+    不同量级，只按日期做键会串市场）。
     """
     import time
     from datetime import date as _date
 
-    hit = _AMOUNT_CACHE.get(int(dt_int))
+    mk = str(market or "CN").upper().strip()
+    hit = _AMOUNT_CACHE.get((mk, int(dt_int)))
     if hit and time.time() - hit[0] < _AMOUNT_TTL:
         return hit[1]
     val: float | None = None
@@ -295,7 +299,7 @@ def _universe_median_amount(dt_int: int) -> float | None:
         )
 
         s = str(int(dt_int))
-        mkt = get_local_market_data(Market.CN)
+        mkt = get_local_market_data(Market(mk))
         # 报告末日未必是交易日（快照构建到某天，次日起停更）→ 先回退到最近一个有行情的交易日，
         # 否则 load_date 返回空表、容量块会因为「取不到数」而永远降级。
         session = mkt.latest_trade_date(on_or_before=_date(int(s[:4]), int(s[4:6]), int(s[6:8])))
@@ -303,13 +307,13 @@ def _universe_median_amount(dt_int: int) -> float | None:
         amts = np.asarray([b.amount for b in bars.values() if b.amount > 0], dtype=np.float64)
         val = float(np.median(amts)) if amts.size else None
     except Exception as e:  # noqa: BLE001 — 容量是附加信息，取不到不该拖垮详情接口
-        log.warning("全市场成交额中位数取数失败(dt=%s)：%s", dt_int, e)
-    _AMOUNT_CACHE[int(dt_int)] = (time.time(), val)
+        log.warning("全市场成交额中位数取数失败(dt=%s, market=%s)：%s", dt_int, mk, e)
+    _AMOUNT_CACHE[(mk, int(dt_int))] = (time.time(), val)
     return val
 
 
 def cost_block(df: Any, ls_daily: np.ndarray, end_dt: int, turnover: float | None,
-               n_valid_mean: float | None) -> dict[str, Any]:
+               n_valid_mean: float | None, market: str = "CN") -> dict[str, Any]:
     """成本敏感性 + 盈亏平衡成本 + 简化容量估算。"""
     t_series = np.full(ls_daily.size, turnover or 0.0)
     out: dict[str, Any] = {
@@ -318,7 +322,7 @@ def cost_block(df: Any, ls_daily: np.ndarray, end_dt: int, turnover: float | Non
     }
     if not out["available"]:
         out["reason"] = "缺换手序列（逐组换手 gt1..gt10 未生成，需重跑构建）"
-    med = _universe_median_amount(end_dt) if end_dt else None
+    med = _universe_median_amount(end_dt, market) if end_dt else None
     # 持仓数用当日有效样本数 / 10 组 —— 真实参与数，不是拍的常数
     n_pos = int(round(n_valid_mean / N_QUANTILES)) if n_valid_mean else None
     cap = M.capacity_estimate(turnover, med, n_pos)
@@ -331,7 +335,8 @@ def cost_block(df: Any, ls_daily: np.ndarray, end_dt: int, turnover: float | Non
 
 
 def excess_block(dates: list[str], long_daily: np.ndarray, ls_daily: np.ndarray,
-                 bench_symbol: str | None, tail: int | None = None) -> dict[str, Any]:
+                 bench_symbol: str | None, tail: int | None = None,
+                 market: str = "CN") -> dict[str, Any]:
     """多头超额：多基准累计超额、超额回撤、分年度、超额统计量。
 
     ``dates`` / ``long_daily`` / ``ls_daily`` 一律传**全窗口**：本块的主体（累计超额、
@@ -339,22 +344,32 @@ def excess_block(dates: list[str], long_daily: np.ndarray, ls_daily: np.ndarray,
     累计曲线从窗口起点重新起算。仅 ``ls_dates`` / ``ls_daily`` 这对**噪声型**输出按
     ``tail`` 截尾（它们与 :class:`GroupBlock` 的 ``ls_daily`` 同源，同属窗口口径）。
 
+    ``market`` 决定基准表（:data:`blocks_common.BENCHMARKS_BY_MARKET`）与取数数据根；
+    FUTURES 无指数基准 → 整块诚实降级（reason 说明是「该市场暂无指数基准数据」，
+    不是「同步缺失」——两者对运维的含义完全不同）。
+
     ⚠️ 本函数与 ``bench_daily_returns``（:mod:`blocks_bench`）必须留在同一命名空间：
     它是测试替换基准取数的唯一接缝，分居两处会导致「一半被替换、一半没有」。
     """
+    refs = benchmarks_for_market(market)
+    if not refs and not bench_symbol:
+        return _missing_block(
+            f"[{str(market or 'CN').upper().strip()}] 该市场暂无指数基准数据"
+            "（无 index_daily 或不设基准），超额类指标不可用"
+        )
     order = [bench_symbol] if bench_symbol else []
-    order += [s for s, _ in BENCHMARKS if s != bench_symbol]
+    order += [s for s, _ in refs if s != bench_symbol]
     items: list[dict[str, Any]] = []
     primary: dict[str, Any] | None = None
     # 描述「日序列」的量（直方图 / 尾部）服从窗口，与同页的多空日收益序列同口径 ——
     # 否则直方图的 n 会比它旁边那条时间序列长一个数量级，两个数看着都合理却不同源。
     w = slice(None) if tail is None else slice(max(0, len(dates) - tail), len(dates))
     for sym in order:
-        name = dict(BENCHMARKS).get(sym, sym)
-        b = bench_daily_returns(sym, dates)
+        name = dict(refs).get(sym, sym)
+        b = bench_daily_returns(sym, dates, market)
         if b is None or not np.isfinite(b).any():
             items.append({"symbol": sym, "name": name, "available": False,
-                          "reason": "该指数取不到数据（QuantDB index_daily 缺该代码或同步未覆盖）"})
+                          "reason": "该指数取不到数据（该市场指数日线缺该代码或同步未覆盖）"})
             continue
         exc = long_daily - b
         exc_cum = M.cum_curve(exc)
@@ -378,7 +393,9 @@ def excess_block(dates: list[str], long_daily: np.ndarray, ls_daily: np.ndarray,
             primary = entry
     if primary is None:
         return _missing_block(
-            "所有基准指数都取不到（QuantDB index_daily 缺失或未同步）", benchmarks=items
+            f"[{str(market or 'CN').upper().strip()}] 所有基准指数都取不到"
+            "（该市场指数日线目录缺失或未同步）",
+            benchmarks=items,
         )
     return {
         "available": True,
@@ -405,10 +422,21 @@ def excess_block(dates: list[str], long_daily: np.ndarray, ls_daily: np.ndarray,
 
 
 def style_block(df: Any, dates_all: list[str], ls_daily: np.ndarray,
-                long_excess: np.ndarray | None, horizon: int) -> dict[str, Any]:
-    """Barra 风格（自算 CNE5 式口径）：均值相关表 + 日序列 + 纯因子收益归因回归。"""
+                long_excess: np.ndarray | None, horizon: int,
+                market: str = "CN") -> dict[str, Any]:
+    """Barra 风格（自算 CNE5 式口径）：均值相关表 + 日序列 + 纯因子收益归因回归。
+
+    风格模型是 **CN（CNE5）口径**（暴露由 A 股估值表族供给）：非 CN 市场整块
+    诚实拒绝 —— 不能让 HK/US 的报告显示「先跑 build_style_factors.py」这种
+    对它们永远不适用的修复指引。
+    """
     from .style_model import STYLE_LABELS, STYLE_NAMES, load_pure_returns
 
+    if str(market or "CN").upper().strip() != "CN":
+        return _missing_block(
+            f"非 CN 市场（{str(market or '').upper().strip()}）不构建 Barra 风格归因"
+            "（风格模型为 CNE5/A 股口径，仅 CN 供给）"
+        )
     cols = {s: _col(df, f"sc_{s}") for s in STYLE_NAMES}
     if all(c is None for c in cols.values()):
         return _missing_block(
@@ -484,7 +512,7 @@ def style_block(df: Any, dates_all: list[str], ls_daily: np.ndarray,
 
 
 def robust_block(df: Any, dates_all: list[str], ic: np.ndarray, ls_daily: np.ndarray,
-                 turnover: float | None) -> dict[str, Any]:
+                 turnover: float | None, market: str = "CN") -> dict[str, Any]:
     """稳健性分段 + 拥挤度 + 样本外衰减 + 市场状态分段。"""
     segs = M.sub_period_stats(ic, k=4)
     for s in segs:
@@ -504,7 +532,7 @@ def robust_block(df: Any, dates_all: list[str], ic: np.ndarray, ls_daily: np.nda
             "note": "前一半为样本内、后一半为样本外（等分，非滚动）；衰减为负说明近期有效性下滑。",
         },
         "crowding": M.crowding_score(ic, t_s if t_s is not None else np.array([])),
-        "regime": _regime_block(dates_all, ls_daily),
+        "regime": _regime_block(dates_all, ls_daily, market),
     }
 
 
@@ -516,26 +544,38 @@ def _stability(segs: list[dict[str, Any]]) -> float | None:
     return float(abs(v.mean()) / v.std(ddof=1))
 
 
-def _regime_block(dates_all: list[str], ls_daily: np.ndarray) -> list[dict[str, Any]] | None:
+def _regime_block(dates_all: list[str], ls_daily: np.ndarray,
+                  market: str = "CN") -> list[dict[str, Any]] | None:
     """按市场状态（牛/熊/震荡）分段的因子表现。
 
     状态口径取 ``shared/market_regime`` 的唯一谓词（与全平台同源），
     **只喂 close**（``volumes=None``）→ 只用 ret/vol 主分支，
     成交量分支不参与，避免拿 1.0 的常数序列算出一个假的量比。
+
+    regime 指数取 ``market_regime.REGIME_INDEX_BY_MARKET`` 的**唯一口径**
+    （CN=沪深300 / HK=恒生 / US=标普500）；表外市场（FUTURES 等）无指数口径 →
+    返回 None（诚实缺席，不拿跨市场指数冒充）。
     """
+    regime_index: str | None = None  # 先绑定：except 里要引用（import 失败也走那条路）
     try:
         from backend.shared.benchmark import load_index_frame
-        from backend.shared.market_regime import DEFAULT_REGIME_INDEX, build_state_series
+        from backend.shared.market_regime import REGIME_INDEX_BY_MARKET, build_state_series
+
+        regime_index = REGIME_INDEX_BY_MARKET.get(str(market or "CN").upper().strip())
+        if regime_index is None:
+            return None
 
         # 状态判定要的是指数**点位**（滚动收益/波动/量比），不是日收益序列，
         # 故这里直接取点位；日期须与 ``dates_all`` 同为 ISO 格式，否则状态映射全 miss。
         frame = load_index_frame(
-            columns=("close",), symbols=[DEFAULT_REGIME_INDEX]
+            columns=("close",), symbols=[regime_index], market=market
         ).sort_values("time")
+        if frame.empty:
+            return None
         idx_dates = frame["time"].dt.strftime("%Y-%m-%d").tolist()
         idx_close = [float(v) for v in frame["close"].astype(float)]
     except Exception as e:  # noqa: BLE001 — 状态分段是附加信息，取不到不该拖垮详情
-        log.warning("市场状态取数失败：%s", e)
+        log.warning("市场状态取数失败（%s/%s）：%s", market, regime_index, e)
         return None
     states = build_state_series(idx_close, None, idx_dates)
     if not states:
@@ -578,11 +618,13 @@ def build_blocks(
     cost_bps: float,
     snapshot: dict[str, Any] | None,
     bench_symbol: str | None = None,
+    market: str = "CN",
 ) -> dict[str, Any]:
     """把该因子的**全窗口**逐日序列装配成九个块。
 
     Args:
         df: 全窗口序列（未按 lookback 截断）——累计型指标要全窗口才有意义。
+        market: 数据根市场（缺省 CN）——基准表/指数取数/regime/风格/容量按它分派。
         lookback: 噪声型序列（日 IC / 日收益）保留的点数；**7 指标环同此窗口**
             （它与 IC/ICIR 是一组要一起读的数）。传 ``<= 0`` 表示整段全窗口。
             累计型曲线（净值、累计 IC、超额累计）不受影响，一律走全窗口。
@@ -622,12 +664,12 @@ def build_blocks(
     # 截断到请求窗口会让「分年度超额收益」只剩两根柱子、累计曲线从窗口起点重新起算，
     # 而同一页签的历史含义就没了。日频序列（HEADLINE / 分组）仍按窗口。
     # ⚠️ 与 style_block 的对齐：下面用**全窗口** excess_full 再 `[cut]`，两者必须同源。
-    exc = excess_block(dates_all, long_full, ls_full, bench_symbol, tail=n_tail)
+    exc = excess_block(dates_all, long_full, ls_full, bench_symbol, tail=n_tail, market=market)
     # 风格归因用的超额序列按下标与 dates_all / ls_full 对齐 —— 先在全窗口上算出来，
     # 下游与这三者一起切同一段（长度不一致会错位，不是报错而是静默算错）
     excess_full = None
     if exc.get("available") and exc.get("bench_symbol"):
-        b_full = bench_daily_returns(exc["bench_symbol"], dates_all)
+        b_full = bench_daily_returns(exc["bench_symbol"], dates_all, market)
         if b_full is not None:
             excess_full = long_full - b_full
     return {
@@ -636,14 +678,14 @@ def build_blocks(
         "ic_block": icb,
         "group_block": grp,
         "cost_block": cost_block(df[cut].reset_index(drop=True), ls_full[cut], dt_ints[-1],
-                                 head["turnover"], _col_mean(df[cut], "n_valid")),
+                                 head["turnover"], _col_mean(df[cut], "n_valid"), market),
         "excess_block": exc,
         # 风格块同样走请求窗口：df / dates_all / ls / excess 必须**同切**，否则
         # 归因回归里日期索引与收益序列会错位（这四者是按下标对齐的）
         "style_block": style_block(df[cut].reset_index(drop=True), dates_all[cut], ls_full[cut],
-                                   None if excess_full is None else excess_full[cut], k),
+                                   None if excess_full is None else excess_full[cut], k, market),
         "robust_block": robust_block(df[cut].reset_index(drop=True), dates_all[cut],
-                                     ic_all[cut], ls_full[cut], head["turnover"]),
+                                     ic_all[cut], ls_full[cut], head["turnover"], market),
         "definitions": definitions(),
     }
 

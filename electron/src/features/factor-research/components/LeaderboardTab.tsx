@@ -11,10 +11,15 @@
  *
  * 分类限定：左侧目录点 L1/L2 后，这里只排那一类（榜单内的名次/综合分本就是
  * 全库截面口径，分类只是过滤视图）；顶部徽章可一键清除。
+ *
+ * 市场分层（2026-10）：超额列、口径文案、自选存储键都按市场。
+ * 超额列 = CN 存量两列（excess_300/800，键已发布）或非 CN 的**本市场基准表**逐条一列
+ * （值走 `excess_by_bench`，名来自 meta.benchmarks）；无基准市场（期货）整段不渲染——
+ * 挂两列全「—」的 A 股超额是假话。环境标签口径的基准同理取本市场主基准。
  */
 import React, { useMemo, useState } from 'react';
 import { ArrowRightLeft, CheckSquare, Combine, Filter, Layers, Loader2, PackagePlus, Search, Square, Star, X } from 'lucide-react';
-import type { CategoryFilter, LeaderboardDedupMeta, LeaderboardRow } from '../types/factorResearch';
+import type { BenchMeta, CategoryFilter, LeaderboardDedupMeta, LeaderboardRow, ResearchMarket } from '../types/factorResearch';
 import { Card, ENV_TAGS, TIME_TAGS, TagChip, fmtNum, fmtPct } from './common';
 import {
   COL_FILTERS,
@@ -25,7 +30,7 @@ import {
 import type { LeaderboardFilters } from './leaderboardFilters';
 import { ColumnFilterPopover } from './ColumnFilterPopover';
 import type { ColFilterValue } from './ColumnFilterPopover';
-import { loadFavs, saveFavs, toggleInFavs } from './favorites';
+import { loadScopedFavs, saveFavs, scopedFavKey, toggleInFavs } from './favorites';
 
 interface Props {
   rows: LeaderboardRow[];
@@ -44,6 +49,8 @@ interface Props {
   onClearTagFilter?: () => void;
   /** 当前数据集（private / classic）：自选收藏按数据集隔离存储 */
   dataset: string;
+  /** 本页当前市场：超额列与口径文案按它分派（见文件头） */
+  market: ResearchMarket;
   onSendCompare: () => void;
   onSendCompose: () => void;
   onOpenSingle: (code: string) => void;
@@ -56,7 +63,8 @@ interface Props {
 }
 
 type Col = {
-  key: keyof LeaderboardRow | 'name';
+  /** 静态列 = LeaderboardRow 字段名；动态超额列 = `bench:{基准代码}`（见 cellValue） */
+  key: string;
   label: string;
   width?: string;
   align?: 'left' | 'right';
@@ -64,7 +72,12 @@ type Col = {
   hint?: string;
 };
 
-const COLS: Col[] = [
+/**
+ * 列清单三段拼：基础列（各市场同）→ 超额列（按市场生成）→ 后置列（各市场同）。
+ * 超额列见文件头；`CN_EXCESS_COLS` 的键是已发布的存量字段，非 CN 的键来自
+ * meta.benchmarks（本市场基准表，无基准市场为空 → 整段不渲染）。
+ */
+const BASE_COLS: Col[] = [
   { key: 'rank', label: '#', width: 'w-8', align: 'left' },
   // 因子列必须**定宽**。此前它没有宽度，在 `table-layout: auto` 下由内容决定：
   // 私人库每个因子都要渲染 name_cn + code + l1/l2（外加两个可能的徽章），
@@ -75,19 +88,35 @@ const COLS: Col[] = [
   { key: 'sharpe', label: '夏普', width: 'w-12', align: 'right', fmt: (v) => fmtNum(v as number) },
   { key: 'max_drawdown', label: '最大回撤', width: 'w-16', align: 'right', fmt: (v) => fmtPct(v as number) },
   { key: 'win_rate', label: '月胜率', width: 'w-14', align: 'right', fmt: (v) => fmtPct(v as number) },
+];
+const CN_EXCESS_COLS: Col[] = [
   { key: 'excess_300', label: '超额300', width: 'w-16', align: 'right', fmt: (v) => fmtPct(v as number) },
   { key: 'excess_800', label: '超额800', width: 'w-16', align: 'right', fmt: (v) => fmtPct(v as number) },
+];
+const TAIL_COLS: Col[] = [
   { key: 'ic_mean', label: 'RankIC', width: 'w-14', align: 'right', fmt: (v) => fmtNum(v as number, 3) },
   { key: 'ic_ir', label: 'IC_IR', width: 'w-12', align: 'right', fmt: (v) => fmtNum(v as number) },
   { key: 'median_mv_yi', label: '中位市值(亿)', width: 'w-20', align: 'right', fmt: (v) => fmtNum(v as number, 0) },
 ];
 
-/** 排行榜自选的存储键（按数据集隔离；与因子报告左栏的收藏是两套集合） */
-const favKeyOf = (ds: string): string => `qm:factor-research:lb-favs:${ds}`;
+/** 动态超额列（非 CN）的键前缀：`bench:{基准代码}` */
+const BENCH_COL_PREFIX = 'bench:';
 
-/** 列 key → 人话标签（浮层标题用；mv_style / industry 不在 COLS 里） */
+/** 排序/展示取值：动态超额列读 excess_by_bench，其余读行字段。 */
+const cellValue = (r: LeaderboardRow, key: string): number | null | undefined => {
+  if (key.startsWith(BENCH_COL_PREFIX)) {
+    return r.excess_by_bench?.[key.slice(BENCH_COL_PREFIX.length)] ?? null;
+  }
+  return r[key as keyof LeaderboardRow] as number | null | undefined;
+};
+
+/** 排行榜自选的键前缀（与因子报告左栏的收藏是两套集合，互不串；
+ *  市场/数据集隔离与旧键迁移口径见 favorites.loadScopedFavs）。 */
+const FAVS_PREFIX = 'qm:factor-research:lb-favs';
+
+/** 列 key → 人话标签（浮层标题用；mv_style / industry 不在列清单里，动态超额列由列自带的 label 走） */
 const LABELS: Record<string, string> = {
-  ...Object.fromEntries(COLS.map((c) => [String(c.key), c.label])),
+  ...Object.fromEntries([...BASE_COLS, ...CN_EXCESS_COLS, ...TAIL_COLS].map((c) => [String(c.key), c.label])),
   mv_style: '市值风格',
   industry: '前三行业',
 };
@@ -109,7 +138,7 @@ const TagToggle: React.FC<{ tag: string; count: number; on: boolean; onClick: ()
 
 export const LeaderboardTab: React.FC<Props> = ({
   rows, loading, error, selected, tagFilter, n, onNChange, onToggle, onToggleTag,
-  categoryFilter, onClearCategoryFilter, onClearTagFilter, dataset,
+  categoryFilter, onClearCategoryFilter, onClearTagFilter, dataset, market,
   onSendCompare, onSendCompose, onOpenSingle, meta, dedup, onToggleDedup,
   onRegisterToTraining,
 }) => {
@@ -120,18 +149,45 @@ export const LeaderboardTab: React.FC<Props> = ({
   const [filters, setFilters] = useState<LeaderboardFilters>(EMPTY_LEADERBOARD_FILTERS);
   const [filterOpen, setFilterOpen] = useState<{ key: string; x: number; y: number } | null>(null);
   const [favsOnly, setFavsOnly] = useState(false);
-  // 自选按数据集隔离：切换数据集时同步换库（render 期调整派生状态的官方模式）
-  const [favs, setFavs] = useState<string[]>(() => loadFavs(favKeyOf(dataset)));
-  const [favsDs, setFavsDs] = useState(dataset);
-  if (favsDs !== dataset) {
-    setFavsDs(dataset);
-    setFavs(loadFavs(favKeyOf(dataset)));
+  // 自选按市场 × 数据集隔离：切换任一维时同步换库（render 期调整派生状态的官方模式）
+  const favsKey = scopedFavKey(FAVS_PREFIX, market, dataset);
+  const [favs, setFavs] = useState<string[]>(() => loadScopedFavs(FAVS_PREFIX, market, dataset));
+  const [favsKeyState, setFavsKeyState] = useState(favsKey);
+  if (favsKeyState !== favsKey) {
+    setFavsKeyState(favsKey);
+    setFavs(loadScopedFavs(FAVS_PREFIX, market, dataset));
   }
   const toggleFav = (code: string) => {
     const next = toggleInFavs(favs, code);
     setFavs(next);
-    saveFavs(favKeyOf(dataset), next);
+    saveFavs(favsKey, next);
   };
+
+  /** 本市场基准清单（meta 下发；CN 的列不读它，走存量键） */
+  const benchList = useMemo(() => (meta.benchmarks as BenchMeta[] | undefined) ?? [], [meta]);
+  /** 环境标签口径里的基准名（后端 env_tags 取本市场主基准）：CN 存量=沪深300；无基准市场=null */
+  const benchPrimaryName = market === 'CN' ? '沪深300' : (benchList[0]?.name ?? null);
+  /** 股票池事实：私人库构建器把它写进 factors.json 的 meta.universe（CN=ST/退市口径，
+   *  非 CN 明说无该口径）。拿不到时非 CN 不编口径；CN 回退存量文案。 */
+  const universeNote = useMemo(() => {
+    const u = meta.universe;
+    if (market !== 'CN') {
+      return typeof u === 'string' && u ? `股票池：${u}` : '股票池为该市场因子面板内的标的';
+    }
+    return '股票池为全 A 非 ST/退市、前复权价';
+  }, [meta, market]);
+  /** 超额列：CN 存量两列；非 CN 逐基准一列；无基准市场为空 → 不渲染（见文件头） */
+  const excessCols = useMemo<Col[]>(() => {
+    if (market === 'CN') return CN_EXCESS_COLS;
+    return benchList.map((b) => ({
+      key: `${BENCH_COL_PREFIX}${b.code}`,
+      label: `超额${b.name}`,
+      width: 'w-24',
+      align: 'right' as const,
+      fmt: (v: unknown) => fmtPct(v as number),
+    }));
+  }, [market, benchList]);
+  const cols = useMemo(() => [...BASE_COLS, ...excessCols, ...TAIL_COLS], [excessCols]);
 
   const view = useMemo(() => {
     const scoped = favsOnly ? rows.filter((r) => favs.includes(r.code)) : rows;
@@ -141,8 +197,8 @@ export const LeaderboardTab: React.FC<Props> = ({
       if (sortKey === 'name') {
         return asc ? a.name_cn.localeCompare(b.name_cn) : b.name_cn.localeCompare(a.name_cn);
       }
-      const av = a[sortKey as keyof LeaderboardRow] as number | null | undefined;
-      const bv = b[sortKey as keyof LeaderboardRow] as number | null | undefined;
+      const av = cellValue(a, sortKey);
+      const bv = cellValue(b, sortKey);
       const na = av === null || av === undefined || Number.isNaN(av) ? -Infinity : Number(av);
       const nb = bv === null || bv === undefined || Number.isNaN(bv) ? -Infinity : Number(bv);
       return asc ? na - nb : nb - na;
@@ -224,16 +280,18 @@ export const LeaderboardTab: React.FC<Props> = ({
         ? '该分类下没有因子——点上方「分类」徽章清除限定'
         : '没有符合当前筛选的因子——点「清除筛选」回到全量';
 
-  /** 表头单元格：点文字排序 + 漏斗筛选（无配置的列只有排序） */
-  const headCell = (key: string, width: string, align: 'left' | 'right', sortable = true) => {
+  /** 表头单元格：点文字排序 + 漏斗筛选（无配置的列只有排序）。
+   *  label 缺省查 LABELS；动态超额列的标签不在表里，由列自带传入。 */
+  const headCell = (key: string, width: string, align: 'left' | 'right', sortable = true, label?: string) => {
     const cfg = COL_FILTERS[key];
     const active = colActive(key);
+    const text = label ?? LABELS[key];
     return (
       <th key={key} className={`group/th py-1 ${width} ${align === 'right' ? 'text-right' : 'text-left'}`}>
         <div className={`flex items-center gap-0.5 ${align === 'right' ? 'justify-end' : ''}`}>
           {sortable ? (
             <button onClick={() => clickSort(key)} title="点击排序" className="hover:text-slate-600">
-              {LABELS[key]}
+              {text}
               {sortKey === key ? (
                 <span className="ml-0.5 text-indigo-500">{asc ? '↑' : '↓'}</span>
               ) : (
@@ -241,14 +299,14 @@ export const LeaderboardTab: React.FC<Props> = ({
               )}
             </button>
           ) : (
-            <span>{LABELS[key]}</span>
+            <span>{text}</span>
           )}
           {cfg && (
             <button
               data-lb-funnel
               onClick={(e) => openFilter(e, key)}
-              aria-label={`筛选 ${LABELS[key]}`}
-              title={`筛选「${LABELS[key]}」`}
+              aria-label={`筛选 ${text}`}
+              title={`筛选「${text}」`}
               className={
                 active
                   ? 'text-indigo-500'
@@ -417,13 +475,20 @@ export const LeaderboardTab: React.FC<Props> = ({
             所有因子按综合得分排名。综合分 = 因子有效性(50%) + 实战业绩(50%)：分项指标在**全因子截面**标准化
             (z-score) 后加权，方向已统一（数值越大越好）。有效性 = RankIC 均值与 IC_IR；业绩 = 年化 / 夏普 /
             −最大回撤 / 月度胜率。业绩口径：top-N 等权（持仓数可切换）、月末调仓、0.2% 双边成本（按换手计）；
-            区间选择会整体重算。中位市值 / 市值风格（大盘≥500亿 · 中盘100-500亿 · 小盘&lt;100亿）与前三行业
-            按最新截面的 Top-N 持仓统计。股票池为全 A 非 ST/退市、前复权价。
+            区间选择会整体重算。中位市值 / 市值风格与前三行业按最新截面的 Top-N 持仓统计
+            （市值风格阈值：大盘≥500亿 · 中盘100-500亿 · 小盘&lt;100亿{market === 'CN' ? '' : '，单位随该市场估值快照'}；
+            没有估值快照的市场该列显示「—」，不代填）。{universeNote}。
           </p>
           <p>
-            标签（每个因子 2 个，按当前区间自动判定，基准 top-30）：市场环境——沪深300 滚动 3 月涨跌 &gt;+5% 记牛、&lt;−5% 记熊、其余震荡，
-            因子在三环境的月均超额（组合−沪深300）在因子间 z-score，取最高者 → 牛市进攻型 / 熊市防御型 / 震荡占优型，
-            三项 z 均 &lt; 0.5 → 全天候型；时效——近 12 月 RankIC 均值与区间全样本之差：&gt;+0.012 近期转强、
+            标签（每个因子 2 个，按当前区间自动判定，基准 top-30）：
+            {benchPrimaryName ? (
+              <>市场环境——{benchPrimaryName} 滚动 3 月涨跌 &gt;+5% 记牛、&lt;−5% 记熊、其余震荡，
+              因子在三环境的月均超额（组合−{benchPrimaryName}）在因子间 z-score，取最高者 → 牛市进攻型 / 熊市防御型 / 震荡占优型，
+              三项 z 均 &lt; 0.5 → 全天候型；</>
+            ) : (
+              <>市场环境——本市场没有指数基准（基准表为空），环境标签恒为「全天候型」；</>
+            )}
+            时效——近 12 月 RankIC 均值与区间全样本之差：&gt;+0.012 近期转强、
             &lt;−0.012 近期失效、两者 |RankIC| 都 &lt; 0.01 持续低效、其余长期稳定型。
             环境标签为**因子报告口径**（离线按当前区间计算）；与平台 regime 时间线（20 日量价三态）是两套口径，
             不并入、不可互比。
@@ -482,7 +547,7 @@ export const LeaderboardTab: React.FC<Props> = ({
                 <tr className="text-slate-400 font-bold">
                   <th className="w-6 py-1" aria-label="自选"></th>
                   <th className="text-left py-1 pl-1 w-8"></th>
-                  {COLS.map((c) => headCell(String(c.key), c.width || '', c.align || 'left'))}
+                  {cols.map((c) => headCell(c.key, c.width || '', c.align || 'left', true, c.label))}
                   {headCell('mv_style', 'w-16', 'right', false)}
                   <th className="text-left py-1 pl-1">标签</th>
                   {headCell('industry', '', 'left', false)}
@@ -491,7 +556,7 @@ export const LeaderboardTab: React.FC<Props> = ({
               <tbody>
                 {view.length === 0 && (
                   <tr>
-                    <td colSpan={17} className="py-6 text-center text-[11px] text-slate-400">
+                    <td colSpan={cols.length + 5} className="py-6 text-center text-[11px] text-slate-400">
                       {emptyHint}
                     </td>
                   </tr>
@@ -530,7 +595,14 @@ export const LeaderboardTab: React.FC<Props> = ({
                         {/* flex-wrap：正常一行放得下；带徽章的少数行让徽章折到第二行，
                             而不是把徽章裁掉（它们是数据质量告警，被裁等于没告警）。 */}
                         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 min-w-0">
-                          <span className="font-bold text-slate-700 max-w-[7rem] truncate" title={r.name_cn}>
+                          {/* data-testid：e2e 探针的行点击落点。收藏星/勾选/标签格
+                              都 stopPropagation，点它们**不会**进单因子分析 —— 探针
+                              必须点这枚不拦截冒泡的名字格（冒泡到 tr 的 onOpenSingle）。 */}
+                          <span
+                            data-testid={`lb-name-${r.code}`}
+                            className="font-bold text-slate-700 max-w-[7rem] truncate"
+                            title={r.name_cn}
+                          >
                             {r.name_cn}
                           </span>
                           {/* 私人因子库 2754/2754 的 name_cn 与 code 是**同一个字符串**（实测），
@@ -566,12 +638,15 @@ export const LeaderboardTab: React.FC<Props> = ({
                       <td className="py-1 text-right font-mono text-slate-600">{fmtNum(r.sharpe)}</td>
                       <td className="py-1 text-right font-mono text-slate-500">{fmtPct(r.max_drawdown)}</td>
                       <td className="py-1 text-right font-mono text-slate-500">{fmtPct(r.win_rate)}</td>
-                      <td className={`py-1 text-right font-mono ${(r.excess_300 || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                        {fmtPct(r.excess_300)}
-                      </td>
-                      <td className={`py-1 text-right font-mono ${(r.excess_800 || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                        {fmtPct(r.excess_800)}
-                      </td>
+                      {/* 超额列按市场渲染（CN 两列 / 非 CN 逐基准一列 / 无基准市场无此段） */}
+                      {excessCols.map((ec) => {
+                        const v = cellValue(r, ec.key);
+                        return (
+                          <td key={ec.key} className={`py-1 text-right font-mono ${(v || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
+                            {fmtPct(v)}
+                          </td>
+                        );
+                      })}
                       <td className={`py-1 text-right font-mono ${(r.ic_mean || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
                         {fmtNum(r.ic_mean, 3)}
                       </td>

@@ -3,7 +3,10 @@
 挂载：backend/services/engine/main.py 中 include_router；
 网关放行：backend/services/api/routers/engine_proxy.py 白名单前缀。
 
-数据集：dataset=classic（demo 复刻 82 因子，默认）| private（筛选最终保留的私人因子库，当前 292）。
+数据集：dataset=classic（demo 复刻 82 因子，**A 股专属**，默认）| private
+（筛选最终保留的私人因子库，当前 292）。
+市场：全部端点带 ``market``（缺省 ``"CN"``，存量调用零变化）；非法市场在本层
+即 4xx 拒绝（绝不静默落 CN —— 要查港股却读到 A 股数据是数据污染）。
 """
 
 from __future__ import annotations
@@ -18,11 +21,26 @@ from backend.services.engine.factor_research import service
 from backend.services.engine.factor_research.store import (
     DedupMatrixMissing,
     FactorDataset,
+    MarketUnsupported,
     SnapshotMissing,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/factor-research", tags=["Factor Research"])
+
+
+def _market(market: str) -> str:
+    """市场参数收口：规范化 + 非法值**请求级 422**。
+
+    不把校验留给服务深处：深层 ``validate_market`` 抛的裸 ``ValueError`` 会一路
+    冒泡成 500（文案对，状态码错，前端还得按错误正文猜是参数问题还是服务坏了）。
+    """
+    from backend.shared.feature_source import validate_market
+
+    try:
+        return validate_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 def _snapshot_guard(exc: FileNotFoundError) -> None:
@@ -43,6 +61,10 @@ def _snapshot_guard(exc: FileNotFoundError) -> None:
 async def _run(fn, *args):
     try:
         return await asyncio.to_thread(fn, *args)
+    except MarketUnsupported as e:
+        # 422：请求本身合法，但「市场 × 数据集」组合不供给（如 classic 经典库
+        # 为 A 股专属）—— 与「未知数据集」（400）、「快照缺失」（503）指引互不串门。
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except FileNotFoundError as e:
         _snapshot_guard(e)
         raise  # pragma: no cover - _snapshot_guard 必然抛出
@@ -52,9 +74,9 @@ async def _run(fn, *args):
 
 
 @router.get("/catalog")
-async def get_catalog(dataset: FactorDataset = "classic"):
-    """因子目录（大类/小类/方向/公式/数据源/可用性）+ 快照元信息 + 基准。"""
-    return await _run(service.catalog, dataset)
+async def get_catalog(dataset: FactorDataset = "classic", market: str = "CN"):
+    """因子目录（大类/小类/方向/公式/数据源/可用性）+ 快照元信息 + 本市场基准清单。"""
+    return await _run(service.catalog, dataset, _market(market))
 
 
 @router.get("/leaderboard")
@@ -64,14 +86,18 @@ async def get_leaderboard(
     n: int = 30,
     dataset: FactorDataset = "classic",
     dedup: float = 0.0,
+    market: str = "CN",
 ):
     """排行榜：区间内重算 KPI/超额/RankIC + 持仓画像 + 双标签 + 综合分。
 
     n = 业绩 KPI 的持仓数（默认 30）；标签恒按 top-30 判定；全列返回，前端排序。
     dedup > 0：同源去重（|ρ| ≥ dedup 只留榜单更靠前者，口径同筛选页）+ rank 重编号；
     相关矩阵缺失 → 409（先去运行 build_factor_panel_corr.py）。
+    超额按本市场基准映射返回（``excess_by_bench``；CN 另带 excess_300/800/500 旧键）。
     """
-    return await _run(service.leaderboard, start, end, n, dataset, dedup)
+    return await _run(
+        service.leaderboard, start, end, n, dataset, dedup, _market(market)
+    )
 
 
 @router.get("/factor/{code}")
@@ -82,13 +108,23 @@ async def get_factor(
     end: str | None = None,
     stocks_n: int = 30,
     dataset: FactorDataset = "classic",
+    market: str = "CN",
 ):
     """单因子：区间内多档持仓数（ns=5,10,30）净值/KPI/超额 + N 扫描 + 个股表 + 分布。"""
     try:
         wanted = [int(x) for x in str(ns).split(",") if x.strip()]
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"ns 需为逗号分隔整数: {e}") from e
-    d = await _run(service.factor_detail, code, wanted, start, end, stocks_n, dataset)
+    d = await _run(
+        service.factor_detail,
+        code,
+        wanted,
+        start,
+        end,
+        stocks_n,
+        dataset,
+        _market(market),
+    )
     if d is None:
         raise HTTPException(status_code=404, detail=f"未知因子: {code}")
     return d
@@ -104,6 +140,7 @@ class CompareRequest(BaseModel):
     start: str | None = None
     end: str | None = None
     dataset: FactorDataset = "classic"
+    market: str = "CN"
 
 
 @router.get("/compare")
@@ -112,12 +149,13 @@ async def get_compare(
     start: str | None = None,
     end: str | None = None,
     dataset: FactorDataset = "classic",
+    market: str = "CN",
 ):
     """多因子对比（GET 兼容形态：codes=逗号分隔，每因子 Top-30）。"""
     lst = [c.strip() for c in codes.split(",") if c.strip()]
     if not lst:
         raise HTTPException(status_code=422, detail="codes 不能为空")
-    return await _run(service.compare, lst, start, end, dataset)
+    return await _run(service.compare, lst, start, end, dataset, _market(market))
 
 
 @router.post("/compare")
@@ -126,18 +164,23 @@ async def post_compare(req: CompareRequest):
     if not req.items:
         raise HTTPException(status_code=422, detail="items 不能为空")
     items = [it.model_dump() for it in req.items]
-    return await _run(service.compare, items, req.start, req.end, req.dataset)
+    return await _run(
+        service.compare, items, req.start, req.end, req.dataset, _market(req.market)
+    )
 
 
 @router.get("/screening")
-async def get_screening():
-    """因子筛选：质量门槛 + 同源去重后的保留清单与剔除明细（训练特征选择用）。"""
-    return await asyncio.to_thread(service.screening)
+async def get_screening(market: str = "CN"):
+    """因子筛选：质量门槛 + 同源去重后的保留清单与剔除明细（训练特征选择用）。
+
+    非 CN 诚实缺席（available:false + reason）：该产品为 A 股口径的七库筛选。
+    """
+    return await _run(service.screening, _market(market))
 
 
 @router.get("/scan")
-async def get_scan(dataset: FactorDataset = "private"):
-    """扫描 quantdb 目录，列出与快照目录的差异（新增/消失）。
+async def get_scan(dataset: FactorDataset = "private", market: str = "CN"):
+    """扫描本市场数据目录，列出与快照目录的差异（新增/消失）。
 
     **只读**：不写 factors.json、不触发重算（重算要 5~15 分钟并重写 5.5GB 宽表，
     值不值得付由用户看完差异再定）。dataset 只支持 private —— classic 的目录来自
@@ -146,7 +189,7 @@ async def get_scan(dataset: FactorDataset = "private"):
     把它的 ``ValueError`` 翻成状态码（避免两处各判一次、日后改一处漏一处）。
     """
     try:
-        return await _run(service.scan_sources, dataset)
+        return await _run(service.scan_sources, dataset, _market(market))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
@@ -156,15 +199,18 @@ async def get_scan(dataset: FactorDataset = "private"):
 
 
 @router.get("/snapshot-status")
-async def get_snapshot_status(dataset: FactorDataset = "classic"):
+async def get_snapshot_status(dataset: FactorDataset = "classic", market: str = "CN"):
     """快照状态（是否存在/构建中/进度日志）—— 供前端「一键计算」入口。"""
-    return await _run(service.snapshot_status, dataset)
+    return await _run(service.snapshot_status, dataset, _market(market))
 
 
 @router.post("/build")
-async def post_build(dataset: FactorDataset = "classic"):
-    """一键计算快照（后台子进程，全本地 QuantDB 计算、不上传任何数据）。"""
-    out = await _run(service.start_build, dataset)
+async def post_build(dataset: FactorDataset = "classic", market: str = "CN"):
+    """一键计算快照（后台子进程，全本地 QuantDB 计算、不上传任何数据）。
+
+    private 市场感知：非 CN 会以 ``--market`` 装配构建脚本（构建落本市场根目录）。
+    """
+    out = await _run(service.start_build, dataset, _market(market))
     if out.get("error"):
         raise HTTPException(status_code=500, detail=out["error"])
     return out
@@ -176,6 +222,9 @@ async def post_promote():
 
     刻意不发布 CN 训练目录（--publish 留给人/训练页）：这个按钮只让因子
     到达「因子研究/报告」的取数面。跑完重建快照即可见。
+
+    **CN 专属端点**（毕业桥目标 = CN rd_mined 目录，不带 market 参数；
+    非 CN 前端隐藏该入口，扫描响应里 pipeline 亦为 None）。
     """
     out = await _run(service.start_promote)
     if out.get("error"):
@@ -185,14 +234,15 @@ async def post_promote():
 
 @router.get("/promote-status")
 async def get_promote_status():
-    """毕业桥状态（是否运行中 / 日志最新一行）—— 供扫描面板一键毕业入口轮询。"""
+    """毕业桥状态（是否运行中 / 日志最新一行）—— 供扫描面板一键毕业入口轮询。**CN 专属**。"""
     return await _run(service.promote_status)
 
 
 @router.get("/correlation")
-async def get_correlation(codes: str | None = None):
+async def get_correlation(codes: str | None = None, market: str = "CN"):
+    """全量因子相关对（classic 产物）。非 CN 无此产物 → 422（不拿 A 股矩阵冒充）。"""
     lst = [c.strip() for c in codes.split(",") if c.strip()] if codes else None
-    return await asyncio.to_thread(service.correlation, lst)
+    return await _run(service.correlation, lst, _market(market))
 
 
 class ComposeRequest(BaseModel):
@@ -208,6 +258,7 @@ class ComposeRequest(BaseModel):
     start: str | None = None
     end: str | None = None
     dataset: FactorDataset = "classic"
+    market: str = "CN"
 
 
 @router.post("/compose")
@@ -223,6 +274,7 @@ async def post_compose(req: ComposeRequest):
         req.start,
         req.end,
         req.dataset,
+        _market(req.market),
     )
     if out.get("error"):
         raise HTTPException(status_code=422, detail=out["error"])
@@ -235,15 +287,26 @@ class OptimalRequest(BaseModel):
     start: str | None = None
     end: str | None = None
     dataset: FactorDataset = "classic"
+    market: str = "CN"
 
 
 @router.post("/optimal-weights")
 async def post_optimal(req: OptimalRequest):
-    """网格搜索最优权重（非负、和为 1）：夏普 / 年化 / 超额各一组。"""
+    """网格搜索最优权重（非负、和为 1）：夏普 / 年化 / 超额各一组。
+
+    「超额」目标 = 本市场主基准（响应 ``bench_primary`` 说明是谁；
+    FUTURES 无基准 → 该目标恒 None）。
+    """
     if not req.codes:
         raise HTTPException(status_code=422, detail="codes 不能为空")
     out = await _run(
-        service.optimal_weights, req.codes, req.top_n, req.start, req.end, req.dataset
+        service.optimal_weights,
+        req.codes,
+        req.top_n,
+        req.start,
+        req.end,
+        req.dataset,
+        _market(req.market),
     )
     if out.get("error"):
         raise HTTPException(status_code=422, detail=out["error"])

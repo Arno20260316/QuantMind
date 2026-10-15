@@ -73,6 +73,50 @@ def factor_source_dir(source: str = _DEFAULT_SOURCE, market: str = "CN") -> Path
     return reader.source_path(source)
 
 
+# ── 市场根解析（因子研究链路唯一入口）──────────────────────────────────────
+
+_MARKET_ALIASES: dict[str, str] = {"A": "CN", "A_SHARE": "CN", "SSE": "CN"}
+
+
+def validate_market(market: str | None) -> str:
+    """严格校验市场代码，返回规范大写；非法值抛 ``ValueError``（绝不落 CN）。
+
+    与 ``quantdb_factor_reader.normalize_market`` 的分工：那个是**宽松版**
+    （非法值静默回退 CN），服务「用户随手输入、回落无害」的既有场景；因子研究
+    链路必须用本函数 —— 要查 HK 却因市场拼错静默读到 A 股数据是数据污染
+    （报告会以「港股」名义展示 A 股口径），宁可显式失败。
+    """
+    from backend.services.engine.data_platform.quantdb_factor_reader import (
+        MARKET_FACTOR_SOURCES,
+    )
+
+    key = str(market or "CN").upper().strip()
+    key = _MARKET_ALIASES.get(key, key)
+    if key not in MARKET_FACTOR_SOURCES:
+        raise ValueError(
+            f"未知市场: {market!r}（可用: {', '.join(sorted(MARKET_FACTOR_SOURCES))}）"
+        )
+    return key
+
+
+def resolve_market_root(market: str = "CN") -> Path:
+    """市场数据根目录（因子研究链路的目录解析唯一入口）。
+
+    CN 走存量候选表 :func:`quantdb_paths.resolve_quantdb_dir`（``QM_QUANTDB_DATA_DIR``
+    → /data/quantdb → 便携包 ``$ROOT/data/quantdb`` → Windows 盘符；候选要求目录
+    存在且**非空**）；其余市场走 ``quantdb_factor_reader.market_data_dir``（各市场
+    ``QM_*_DATA_DIR`` env → 默认路径）。两条解析不合并成一条：CN 候选表的「非空」
+    探测是便携包首启语义（mkdir 出的空目录必须继续回退，否则静默读空），属既有
+    契约，不为对称砍掉。
+    """
+    key = validate_market(market)
+    if key == "CN":
+        from backend.shared.quantdb_paths import resolve_quantdb_dir
+
+        return resolve_quantdb_dir()
+    return market_data_dir(key)
+
+
 def user_dataset_dir(dataset: str = _DEFAULT_SOURCE) -> Path:
     """用户自定义数据集目录。
 

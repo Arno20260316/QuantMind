@@ -30,8 +30,12 @@ vi.mock('../../services/factorResearchService', async () => {
   return { ...actual, getCatalog: catalogMock, getLeaderboard: leaderboardMock };
 });
 
+// 页面读两个选择器：市场（uiSlice，决定 A股/港股… 分层）与 is_admin（auth）。
+// 按选择器自身对假 state 求值 —— 别再返回一个与语义无关的 false（那会让页面
+// 落到「市场未接入」的阻断面，而失败的只是下面某条断言，排查时看不出根因）。
 vi.mock('../../../../store', () => ({
-  useAppSelector: () => false,
+  useAppSelector: (sel: (s: unknown) => unknown) =>
+    sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: false } } }),
 }));
 
 // 子组件桩：只留出「是否被渲染」这一个信号

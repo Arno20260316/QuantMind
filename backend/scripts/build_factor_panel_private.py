@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """私人因子库快照构建（因子工作台「私人因子库」数据集）。
 
+市场分层（2026-10-16，``--market`` 默认 ``CN``，零行为变化）：同一脚本为
+CN/HK/US/FUTURES 各自构建快照，产物写 ``<市场根>/factor_research_private/``
+（市场根经 ``feature_source.resolve_market_root`` 唯一解析）。非 CN 口径差异
+（缺哪层口径的事实全部写入 meta，绝不冒充经典 CN 口径）：
+
+- ``kept``/``l1l2`` 两种来源是 A 股口径产物（七库筛选 / L2 逐笔）→ 强制
+  ``auto``，请求值与原因记入 meta（``source_requested``/``source_skip_reason``）；
+- 股票池无 ST/退市过滤（instrument_detail 为 A 股专属）→ 仅「近 120 日 60%
+  有效历史」，事实记入 meta（``universe``）；
+- **不读经典目录**（classic 为 A 股专属）：持有期收益本地重算、基准按市场
+  注册表写（HK=恒生系 / US=标普系 / FUTURES 无指数数据 → 空表，缺文件=没建过、
+  空表=本市场无基准，两信号不混）；
+- 本脚本自产 ``stock_snapshot.parquet``（名称←security_master、行业←sector、
+  市值/PE/PB←valuation 最新分区〔仅 US，注册表裁决；HK 分区脏、FUT 无目录
+  → 诚实置空〕）；CN 的仍由 build_factor_research.py 写经典目录，此处不重复。
+
 来源（``--source``，默认 ``auto``）：
 - ``auto``（默认）：**自动扫描 ``6_ml_datasets/`` 下的全部因子数据集**（alpha_library 429、
   alpha360 360、l1_factors 110、l2_factors 211、jq110 109、tdxgs 88、features_daily 47 等，
@@ -11,16 +27,18 @@
 跳过规则：``alpha_library_labels``（标签非因子）、``l1_l2_factors``（L1∪L2 冗余并集）；
 跨数据集重名列按优先级（l1 → l2 → 各因子库 → features_daily）保留首次出现。
 
-产物（<quantdb>/factor_research_private/）:
+产物（<市场根>/factor_research_private/）:
     factors.json          目录（code/display_name/来源库/方向/IC 指标）
     factor_panel.parquet  每因子每期前 150 名（rank/symbol/score/raw/fwd_ret，同经典口径）
     monthly_scores.parquet 宽表（trade_date, symbol, f1..fN float32）——合成按列裁剪读取
     ic.parquet            月频 RankIC（定向后：正值=有效方向）
-    fwd_returns.parquet / benchmarks.parquet  持有期收益与三基准（复用经典快照；缺失时自算）
+    fwd_returns.parquet / benchmarks.parquet  持有期收益与本市场基准
+    stock_snapshot.parquet 个股最新截面（非 CN 由本脚本写；CN 在经典目录，见上）
     metrics.json          构建元信息（状态接口用）
 
 口径（与经典数据集一致）：
-- 采样日（月末）、股票池（非 ST/退市、近 120 日 60% 有效）、成本（0.2%×换手）同经典；
+- 采样日（月末）、成本（0.2%×换手）同经典；股票池 CN 同经典（非 ST/退市 +
+  近 120 日 60% 有效），非 CN 仅历史过滤（见上）；
 - 打分 = 截面 pct rank → 正态分位（±4 截断）；方向按**全样本 IC 符号**自动统一
   （越大越好，供榜单/回测展示），原始值原样保留在 raw 列。
 
@@ -28,6 +46,7 @@
     python3 backend/scripts/build_factor_panel_private.py                   # 自动扫描 6_ml_datasets 全量
     python3 backend/scripts/build_factor_panel_private.py --source l1l2     # 仅 L1+L2
     python3 backend/scripts/build_factor_panel_private.py --source kept     # 筛选保留清单
+    python3 backend/scripts/build_factor_panel_private.py --market HK      # 港股（须设 QM_QUANTHK_DATA_DIR）
     python3 backend/scripts/build_factor_panel_private.py --smoke 200       # 冒烟（200 只）
     FACTOR_RESEARCH_OUT=<dir> 可改输出目录（冒烟隔离）
 """
@@ -53,7 +72,6 @@ from backend.services.engine.factor_research import data as frdata  # noqa: E402
 from backend.services.engine.factor_research import engine  # noqa: E402
 from backend.services.engine.factor_research.catalog import BY_CODE  # noqa: E402
 from backend.services.engine.factor_research import discovery  # noqa: E402
-from backend.shared.quantdb_paths import resolve_quantdb_dir  # noqa: E402
 
 LOOKBACK_START = "2018-06-01"
 DEFAULT_START = "2020-01-01"
@@ -99,13 +117,15 @@ def _write_wide_scores(wide_parts: list[pd.DataFrame], path: Path) -> int:
     return len(cols)
 
 
-def _out_dir() -> Path:
+def _out_dir(market: str = "CN") -> Path:
     env = os.environ.get("FACTOR_RESEARCH_OUT")  # 冒烟测试用临时目录
     if env:
         d = Path(env)
         d.mkdir(parents=True, exist_ok=True)
         return d
-    d = resolve_quantdb_dir() / "factor_research_private"
+    from backend.shared.feature_source import resolve_market_root
+
+    d = resolve_market_root(market) / "factor_research_private"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -180,9 +200,65 @@ def _wide_frame(
     )
 
 
+def _stock_snapshot_non_cn(market: str, daily: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """非 CN 自产个股快照（列与经典 ``_build_stocks_snapshot`` 同构，前端零改动）。
+
+    - name ← security_master（cn_name → en_name → symbol；FUTURES 无主表 → symbol）；
+    - industry ← sector/（industry 列优先、空串回退 sector 列；HK 实测全空 → 整列
+      缺省，界面按缺省渲染，绝不填假行业）；
+    - total_mv_yi/pe_ttm/pb ← 最新估值分区（供给由 ``frdata.VALUATION_SNAPSHOT_MARKETS``
+      裁决：仅 US；HK 分区脏、FUT 无目录 → NaN）；
+    - avg_amount_yi ← 面板最近 252 行日均成交额（单位换算走 ``frdata.amount_yi_factor``，
+      CN 万元 / 非 CN 元的差异只在那一处收口）。
+    """
+    close = daily["close"]
+    snap = pd.DataFrame({"symbol": close.columns})
+    master = frdata.load_security_master(market)
+    if master is not None:
+        m = master.drop_duplicates("symbol").set_index("symbol")
+        name = m["cn_name"].replace("", pd.NA).fillna(m["en_name"].replace("", pd.NA))
+    else:
+        name = pd.Series(dtype=object)
+    nm = name.reindex(snap["symbol"])
+    # 名称缺省回退代码本身（个股表按 name 列展示，空串会渲染成空白而非缺省样式）
+    snap["name"] = nm.fillna(
+        pd.Series(snap["symbol"].to_numpy(), index=nm.index)
+    ).to_numpy()
+    sect = frdata.load_sector_map(market)
+    if sect is not None:
+        s = sect.drop_duplicates("symbol").set_index("symbol")
+        ind = s["industry"].replace("", pd.NA) if "industry" in s.columns else pd.Series(
+            dtype=object, index=s.index
+        )
+        if "sector" in s.columns:
+            ind = ind.fillna(s["sector"].replace("", pd.NA))
+    else:
+        ind = pd.Series(dtype=object)
+    snap["industry"] = ind.reindex(snap["symbol"]).to_numpy()
+    val = frdata.load_valuation_snapshot(market)
+    for col, src in (("total_mv_yi", "total_mv"), ("pe_ttm", "pe_ttm"), ("pb", "pb")):
+        if val is not None and src in val.columns:
+            v = pd.to_numeric(
+                val.drop_duplicates("symbol").set_index("symbol")[src], errors="coerce"
+            )
+            if src == "total_mv":
+                v = v / 1e8  # 元 → 亿元（与经典 stock_snapshot 同口径）
+            snap[col] = v.reindex(snap["symbol"]).to_numpy(dtype=float)
+        else:
+            snap[col] = np.nan
+    amt = daily["amount"].tail(252).mean() * frdata.amount_yi_factor(market)
+    snap["avg_amount_yi"] = amt.reindex(snap["symbol"]).to_numpy(dtype=float)
+    return snap
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", type=int, default=0, help="冒烟：只取前 N 只股票")
+    ap.add_argument(
+        "--market",
+        default="CN",
+        help="市场：CN/HK/US/FUTURES（默认 CN；非 CN 仅支持 --source auto）",
+    )
     ap.add_argument(
         "--source",
         choices=["auto", "l1l2", "kept"],
@@ -190,36 +266,61 @@ def main() -> int:
         help="因子来源：auto=自动扫描 6_ml_datasets（默认）；l1l2=仅 L1+L2；kept=筛选保留清单",
     )
     args = ap.parse_args()
-    t0 = time.time()
-    out = _out_dir()
-    qroot = resolve_quantdb_dir()
-    external, fr_kept = _load_sources(args.source, qroot)
-    src_desc = " + ".join(f"{_lib_label(k)} {len(v)}" for k, v in external.items())
-    print(f"[1/6] 来源({args.source})：{src_desc} + factor_research {len(fr_kept)}")
+    from backend.shared.feature_source import resolve_market_root, validate_market
 
-    daily = frdata.load_daily_panel(LOOKBACK_START, "20991231")
-    instr = frdata.load_instrument()
+    mk = validate_market(args.market)
+    t0 = time.time()
+    out = _out_dir(mk)
+    qroot = resolve_market_root(mk)
+    # 非 CN：kept/l1l2 两种来源为 A 股口径产物（七库筛选 / L1·L2 逐笔）→ 强制 auto；
+    # 请求值与原因写进 meta（不静默假装按请求跑，也不让构建白等一次报错）。
+    source = args.source
+    source_skip_reason = ""
+    if mk != "CN" and source != "auto":
+        source_skip_reason = (
+            f"{source} 为 A 股口径产物（七库筛选 / L1·L2 逐笔），{mk} 市场不供给，已改用 auto"
+        )
+        source = "auto"
+        print(f"[0/6] ⚠ {source_skip_reason}")
+    external, fr_kept = _load_sources(source, qroot, mk)
+    src_desc = " + ".join(f"{_lib_label(k)} {len(v)}" for k, v in external.items())
+    print(f"[1/6] 市场 {mk} · 来源({source})：{src_desc} + factor_research {len(fr_kept)}")
+
+    daily = frdata.load_daily_panel(LOOKBACK_START, "20991231", market=mk)
+    # 股票池：CN 走 instrument（ST/退市口径）；非 CN 无对应物 → instr=None，
+    # 只做历史过滤（缺哪层过滤的事实由 meta.universe 说明，绝不冒充经典口径）。
+    instr = frdata.load_instrument() if mk == "CN" else None
     close = daily["close"]
     if args.smoke:
         syms = list(close.columns)[: args.smoke]
         for k in daily:
             daily[k] = daily[k][syms]
         close = daily["close"]
+    if close.empty:
+        print(f"[!] {mk} 行情面板为空——请先同步本市场行情（见数据管理页）")
+        return 1
     dates = [
         d
         for d in frdata.month_end_dates(close.index)
         if d >= pd.Timestamp(DEFAULT_START)
     ]
+    if not dates:
+        print(
+            f"[!] {mk} 无可用采样日（面板 {close.index.min().date()}~"
+            f"{close.index.max().date()}，需覆盖 {DEFAULT_START} 之后）"
+        )
+        return 1
     universe = frdata.build_universe(instr, close).reindex(dates).fillna(False)
     print(
         f"      采样日 {len(dates)}（{dates[0].date()} ~ {dates[-1].date()}）× {close.shape[1]} 只"
     )
 
-    # 持有期收益 / 基准：优先复用经典快照（同采样日），缺失时自算
+    # 持有期收益：CN 优先复用经典快照（同采样日），缺失时自算；
+    # 非 CN **不读经典目录**（classic 为 A 股专属），一律本地重算。
     classic = qroot / "factor_research"
     fwd = None
     fp = classic / "fwd_returns.parquet"
-    if fp.exists():
+    if mk == "CN" and fp.exists():
         fl = pd.read_parquet(fp)
         fwd = (
             fl.pivot(index="trade_date", columns="symbol", values="fwd_ret")
@@ -245,7 +346,7 @@ def main() -> int:
     panel_rows: list[pd.DataFrame] = []
     meta_entries: list[dict] = []
 
-    if args.source == "kept":
+    if source == "kept":
         lib_order = KEPT_LIB_SOURCES
     else:
         lib_order = tuple(external.keys())  # 按 _load_* 构建顺序（auto/l1l2）
@@ -282,7 +383,9 @@ def main() -> int:
             rf = pd.Series(fr).rank()
             sub = rk.notna().to_numpy() & rf.notna().to_numpy()[None, :]
             cnt = sub.sum(axis=1)
-            corr = rk.corrwith(rf, axis=1).to_numpy()
+            # pandas 3 CoW：corrwith().to_numpy() 是**只读**视图，必须 copy=True 才能
+            # 对样本不足的位置写 NaN（否则 numpy 直接抛 assignment destination is read-only）
+            corr = rk.corrwith(rf, axis=1).to_numpy(dtype=float, copy=True)
             corr[~(cnt >= 30)] = np.nan
             ic[:, di] = corr
         # 方向：全样本 IC 符号（正向因子保持，反向翻转，越大越好）
@@ -442,7 +545,7 @@ def main() -> int:
     ic_rows["ic"] = ic_rows["ic"].astype(np.float32)
     ic_rows.to_parquet(out / "ic.parquet", index=False)
 
-    print("[5/6] 收益 / 基准 / 目录 ...")
+    print("[5/6] 收益 / 基准 / 个股快照 / 目录 ...")
     fwd_long = fwd.stack()
     pd.DataFrame(
         {
@@ -452,13 +555,22 @@ def main() -> int:
         }
     ).to_parquet(out / "fwd_returns.parquet", index=False)
     bp = classic / "benchmarks.parquet"
-    if bp.exists():
+    if mk == "CN" and bp.exists():
         pd.read_parquet(bp).to_parquet(out / "benchmarks.parquet", index=False)
     else:
+        if mk == "CN":
+            # 存量 CN 兜底清单（与 scorecard.BENCH_ORDER 同码；勿改，注册表 CN 码不同）
+            bench_syms = ("000300.SH", "000906.SH", "000905.SH")
+        else:
+            from backend.services.engine.factor_report.blocks_common import (
+                benchmarks_for_market,
+            )
+
+            bench_syms = tuple(sym for sym, _ in benchmarks_for_market(mk))
         rows = []
-        for sym in ("000300.SH", "000906.SH", "000905.SH"):
+        for sym in bench_syms:
             s = (
-                frdata.load_index_close(LOOKBACK_START, "20991231", sym)
+                frdata.load_index_close(LOOKBACK_START, "20991231", sym, mk)
                 .reindex(dates)
                 .dropna()
             )
@@ -468,9 +580,18 @@ def main() -> int:
             b.columns = ["trade_date", "nav"]
             b["index_code"] = sym
             rows.append(b)
-        pd.concat(rows, ignore_index=True).to_parquet(
-            out / "benchmarks.parquet", index=False
+        # 空表也落盘：缺文件=「没建过」、空表=「本市场无基准」（FUTURES 无指数数据），
+        # 两个信号不混——缺文件会让上层指向「一键构建」，空表则如实说本市场无基准。
+        bench = (
+            pd.concat(rows, ignore_index=True)
+            if rows
+            else pd.DataFrame({"trade_date": [], "nav": [], "index_code": []})
         )
+        bench.to_parquet(out / "benchmarks.parquet", index=False)
+    if mk != "CN":
+        snap = _stock_snapshot_non_cn(mk, daily)
+        snap.to_parquet(out / "stock_snapshot.parquet", index=False)
+        print(f"      个股快照：{len(snap)} 只（名称/行业/估值缺省处诚实置空）")
 
     meta_entries.sort(key=lambda e: (e["l1"], e["l2"] or "", e["code"]))
     l1_order: list[str] = []
@@ -481,9 +602,17 @@ def main() -> int:
         l2s = l2_order.setdefault(e["l1"], [])
         if e["l2"] and e["l2"] not in l2s:
             l2s.append(e["l2"])
+    pool_note = (
+        "非 ST/退市（instrument 快照）+ 近 120 日 60% 有效历史"
+        if mk == "CN"
+        else f"{mk} 无 ST/退市口径（instrument_detail 为 A 股专属），仅近 120 日 60% 有效历史"
+    )
     meta = {
         "dataset": "factor_research_private",
-        "source": args.source,
+        "market": mk,
+        "source": source,
+        "source_requested": args.source,
+        "source_skip_reason": source_skip_reason,
         "built_at": pd.Timestamp.now().isoformat(timespec="seconds"),
         "window": [str(dates[0].date()), str(dates[-1].date())],
         "n_dates": len(dates),
@@ -492,7 +621,13 @@ def main() -> int:
         "panel_k": PANEL_K,
         "sources": {lib: len(v) for lib, v in external.items()}
         | {"factor_research": len(fr_kept)},
-        "conventions": "采样日/股票池/成本同经典数据集；方向按全样本 IC 符号自动统一（越大越好）",
+        "universe": pool_note,
+        "conventions": (
+            "采样日/股票池/成本同经典数据集；方向按全样本 IC 符号自动统一（越大越好）"
+            if mk == "CN"
+            else "采样日/成本同经典数据集；方向按全样本 IC 符号自动统一（越大越好）；"
+            f"股票池：{pool_note}"
+        ),
     }
     (out / "factors.json").write_text(
         json.dumps(

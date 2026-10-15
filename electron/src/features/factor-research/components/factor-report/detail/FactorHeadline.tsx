@@ -17,11 +17,8 @@ import { DASH, NEUTRAL, fmtNum, fmtPct } from './chartKit';
 
 const GROUPS = Array.from({ length: 10 }, (_, i) => i + 1);
 const COST_PRESETS = [0, 10, 20, 30, 50];
-export const BENCH_PRESETS = [
-  { symbol: '000300.SH', label: '沪深300' },
-  { symbol: '000905.SH', label: '中证500' },
-  { symbol: '000852.SH', label: '中证1000' },
-];
+// 基准控件已迁出到 ExcessTab（候选来自后端 excess_block.benchmarks，按市场下发）；
+// 原先这里还有一份 CN 三码 BENCH_PRESETS，无引用即删——留着就是一份会过时的假候选表。
 
 interface Props {
   factor: string;

@@ -5,23 +5,26 @@ import { Modal, message } from 'antd';
 import { Copy, RefreshCw, Target } from 'lucide-react';
 import { getFactorPortfolio } from '../../services/factorReportService';
 import type { FactorPortfolioResponse } from '../../types/factorReport';
+import type { ResearchMarket } from '../../types/factorResearch';
 
 interface Props {
   open: boolean;
   dataset: string;
   datasetLabel: string;
+  /** 本页当前市场（推荐组合按市场快照计算） */
+  market: ResearchMarket;
   onClose: () => void;
   onPick: (factor: string) => void;
 }
 
-export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLabel, onClose, onPick }) => {
+export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLabel, market, onClose, onPick }) => {
   const [data, setData] = useState<FactorPortfolioResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [showRejected, setShowRejected] = useState(false);
 
   const load = (recompute = false) => {
     setLoading(true);
-    getFactorPortfolio(dataset, recompute)
+    getFactorPortfolio(dataset, recompute, market)
       .then((res) => setData(res))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
@@ -29,7 +32,7 @@ export const FactorPortfolioModal: React.FC<Props> = ({ open, dataset, datasetLa
 
   useEffect(() => {
     if (open) load(false);
-  }, [open, dataset]);
+  }, [open, dataset, market]);
 
   const summary = data?.summary;
   const maxW = Math.max(...(data?.factors || []).map((f) => Math.abs(f.weight)), 1e-6);

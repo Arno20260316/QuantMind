@@ -1,12 +1,16 @@
 /**
  * 因子研究 —— 多因子合成页签：逐因子权重 + 可选过滤阈值（z 刻度）→ 区间内实时回测；
  * 「求最优权重」在所选因子上网格搜索（非负、和为 1），夏普 / 年化 / 超额各给一组。
+ *
+ * 基准面市场化（2026-10）：净值叠加与「超额最大」目标的基准 = 本市场主基准
+ * （CN 沪深300 → 旧键 excess_300；其余市场统一 excess_primary，名称由后端
+ * bench_primary 下发）。无基准市场（期货）→ 超额目标磁贴不渲染、不叠线。
  */
 import React, { useMemo, useState } from 'react';
 import { Play, Trash2, Wand2 } from 'lucide-react';
 import { postCompose, postOptimalWeights } from '../services/factorResearchService';
 import type { FactorDataset, RangeParams } from '../services/factorResearchService';
-import type { ComposeResponse, FactorMeta, OptimalResponse, OptimalWinner } from '../types/factorResearch';
+import type { ComposeResponse, FactorMeta, OptimalResponse, OptimalWinner, ResearchMarket } from '../types/factorResearch';
 import { Card, FACTOR_COLORS, fmtNum, fmtPct, KpiTiles, NavChart } from './common';
 import { EChartsChart } from '../../../components/common/EChartsChart';
 
@@ -16,9 +20,11 @@ interface Props {
   onChangeCodes: (codes: string[]) => void;
   range: RangeParams;
   dataset: FactorDataset;
+  /** 本页当前市场（合成/寻优按市场） */
+  market: ResearchMarket;
 }
 
-export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, range, dataset }) => {
+export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, range, dataset, market }) => {
   const [weights, setWeights] = useState<Record<string, number>>({});
   const [thresholds, setThresholds] = useState<Record<string, string>>({});
   const [topN, setTopN] = useState(30);
@@ -58,7 +64,7 @@ export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, ran
     }
     return { weights: w, top_n: topN, thresholds: Object.keys(th).length ? th : null,
              threshold: threshold === '' ? null : Number(threshold),
-             start: range.start ?? null, end: range.end ?? null, dataset };
+             start: range.start ?? null, end: range.end ?? null, dataset, market };
   };
 
   const run = async () => {
@@ -86,7 +92,7 @@ export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, ran
     setOptimizing(true);
     setError(null);
     try {
-      setOptimal(await postOptimalWeights(codes, topN, range, dataset));
+      setOptimal(await postOptimalWeights(codes, topN, range, dataset, market));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -110,7 +116,28 @@ export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, ran
     };
   }, [result]);
 
-  const OBJ_LABEL: Record<string, string> = { sharpe: '目标：夏普最大', annual_return: '目标：年化最大', excess_300: '目标：超额最大' };
+  // 超额目标键按市场分派：非 CN 只有 excess_primary（键缺席=该市场无基准）；
+  // CN 两个键都在（后端同时下发），优先读新键。
+  const optimalObjKeys = useMemo(() => {
+    const o = optimal?.objectives;
+    type ObjKey = 'sharpe' | 'annual_return' | 'excess_primary' | 'excess_300';
+    if (!o) return [] as ObjKey[];
+    const keys: ObjKey[] = ['sharpe', 'annual_return'];
+    if (o.excess_primary) keys.push('excess_primary');
+    else if (o.excess_300) keys.push('excess_300');
+    return keys;
+  }, [optimal]);
+  const objLabel = (key: string): string => {
+    if (key === 'sharpe') return '目标：夏普最大';
+    if (key === 'annual_return') return '目标：年化最大';
+    return `目标：超额最大（vs ${optimal?.bench_primary?.name ?? '主基准'}）`;
+  };
+  // 净值叠加的基准 = 合成超额映射（后端按 bench_order 生成）的首键；无基准市场 → null
+  const composeBench = useMemo(() => {
+    const code = result ? Object.keys(result.excess)[0] : undefined;
+    if (!code || !result) return null;
+    return result.benchmarks.find((b) => b.code === code) ?? { code, name: code };
+  }, [result]);
 
   return (
     <div className="flex-1 min-h-0 flex gap-2">
@@ -219,13 +246,13 @@ export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, ran
       <div className="flex-1 min-w-0 min-h-0 overflow-y-auto custom-scrollbar flex flex-col gap-2 pr-0.5">
         {optimal && (
           <div className="shrink-0 grid grid-cols-1 lg:grid-cols-3 gap-2">
-            {(['sharpe', 'annual_return', 'excess_300'] as const).map((key) => {
+            {optimalObjKeys.map((key) => {
               const w = optimal.objectives[key];
               if (!w) return null;
               return (
                 <div key={key} className="rounded-2xl border border-violet-100 bg-violet-50/40 p-2.5">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-extrabold text-violet-600">{OBJ_LABEL[key]}</span>
+                    <span className="text-[10px] font-extrabold text-violet-600">{objLabel(key)}</span>
                     <button
                       onClick={() => applyWinner(w)}
                       className="rounded-full bg-violet-600 text-white px-2 py-0.5 text-[10px] font-bold hover:bg-violet-700"
@@ -269,9 +296,11 @@ export const ComposeTab: React.FC<Props> = ({ factors, codes, onChangeCodes, ran
                 <NavChart
                   series={[
                     { name: '合成组合', data: result.nav },
-                    ...result.benchmarks
-                      .filter((b) => b.code === '000300.SH')
-                      .map((b) => ({ name: b.name, data: b.nav, color: '#94a3b8', dashed: true })),
+                    ...(composeBench
+                      ? result.benchmarks
+                          .filter((b) => b.code === composeBench.code)
+                          .map((b) => ({ name: b.name, data: b.nav, color: '#94a3b8', dashed: true }))
+                      : []),
                   ]}
                   height={200}
                 />

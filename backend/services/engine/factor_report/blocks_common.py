@@ -49,12 +49,44 @@ import numpy as np
 from . import metrics as M
 
 N_QUANTILES = 10
-BENCHMARKS: tuple[tuple[str, str], ...] = (
-    ("000300.SH", "沪深300"),
-    ("000905.SH", "中证500"),
-    ("000852.SH", "中证1000"),
-)
-"""多基准对照表。取数走 ``shared/benchmark.load_index_frame``（任意指数可传）。"""
+
+#: 多基准对照表（按市场）。取数走 ``shared/benchmark.load_index_frame``（任意指数可传）。
+#: 列表顺序 = 主基准优先级（excess_block 取第一个取得到的作主基准）；
+#: FUTURES 实测无 ``1_kline_data/index_daily`` → **诚实空表**：超额块整块降级为
+#: ``available=False`` + reason「该市场暂无指数基准数据」，绝不拿别的市场指数冒充。
+BENCHMARKS_BY_MARKET: dict[str, tuple[tuple[str, str], ...]] = {
+    "CN": (
+        ("000300.SH", "沪深300"),
+        ("000905.SH", "中证500"),
+        ("000852.SH", "中证1000"),
+    ),
+    "HK": (
+        ("HSI.HK", "恒生指数"),
+        ("HSCEI.HK", "恒生中国企业指数"),
+        ("HSTECH.HK", "恒生科技指数"),
+    ),
+    "US": (
+        ("SPX.US", "标普500"),
+        ("NDX.US", "纳斯达克100"),
+        ("DJI.US", "道琼斯工业平均"),
+    ),
+    "FUTURES": (),
+}
+
+#: 兼容别名：CN 基准表（存量调用点语义不变）
+BENCHMARKS = BENCHMARKS_BY_MARKET["CN"]
+
+
+def benchmarks_for_market(market: str | None) -> tuple[tuple[str, str], ...]:
+    """该市场的基准对照表；未接入市场抛 ValueError（与因子报告注册表同约定，
+    不静默落 CN —— 拿 A 股指数给港股因子算超额是数据污染）。"""
+    key = str(market or "CN").upper().strip()
+    try:
+        return BENCHMARKS_BY_MARKET[key]
+    except KeyError:
+        raise ValueError(
+            f"因子报告基准表未接入市场: {market!r}（已接入: {', '.join(BENCHMARKS_BY_MARKET)}）"
+        ) from None
 
 ROLL_SHORT = 21
 ROLL_LONG = 252  # 滚动 IR / 滚动 IC 的长窗口（与年化交易日一致）

@@ -1,7 +1,16 @@
 """因子报告支持的数据集注册表（构建脚本与 API 服务共用，避免两处口径漂移）。
 
+市场分层（2026-10-16）：注册表按市场分组（``DATASETS_BY_MARKET``）。CN 保持
+既有 14 个数据集的完整语义；HK/US/FUTURES 各接本市场 ``l1_factors``（HK 另接
+ccass/south 两个 donor 库）。访问器一律带 ``market``（缺省 ``"CN"``，零行为
+变化），目录 = ``resolve_market_root(market) / <dir_parts>``。
+**未接入的市场不得静默回退 CN**：``_registry`` 对未接入市场抛 ``ValueError``
+（路由层转 422 + reason）；未知数据集只回落到**本市场**的缺省数据集。
+
 每个数据集声明：
-  dir_parts    —— 相对 QuantDB 数据根的目录（经 quantdb_paths 解析，禁硬编码绝对路径）
+  dir_parts    —— 相对**本市场数据根**的目录（经 ``resolve_market_root`` 解析：
+                  CN 走 quantdb_paths 候选表、其余市场走各市场 env/默认路径；
+                  禁硬编码绝对路径）
   label_mode   —— labels_table：独立标签表（含 fwd_ret_* 列）
                   close_fwd   ：用本表 close 在 T+k 分区的收盘价算 (close_{T+k}/close_T - 1)
                                 与训练侧 features_daily.return_Nd 同口径
@@ -19,8 +28,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-
-from backend.shared.quantdb_paths import resolve_quantdb_subdir
 
 _ID_COLS = ("symbol", "date", "time", "dt")
 _OHLCV_COLS = ("open", "high", "low", "close", "volume", "amount")
@@ -46,7 +53,28 @@ _LEGACY_RETURN_COLS = (
     "return_60d",
 )
 
-DATASETS: dict[str, dict] = {
+# HK/US/FUTURES 的 l1_factors 由各市场自己的构建链产出，表首混入 10 个
+# **非因子原始列**（复权/换手/估值/市值——行情与估值输入，不是截面因子）；
+# CN l1_factors 不含这些列（20261015 footer 实测：CN 119 列，HK 190 / US 176 /
+# FUT 190，非 CN 表头 = symbol + 6 OHLCV + 这 10 列 + ~174 因子）。不剔除会让
+# 「市值本身」进因子轴——市值对收益的解释力会把真因子全压出榜单。
+#
+# 公开名（无 ``_`` 前缀）：因子研究（factor_research.discovery）扫描非 CN 库时
+# 也须剔除同一组列——两处各写一份名单迟早漂移，此处是唯一出处。
+RAW_MARKET_COLS = (
+    "adj_factor",
+    "turnover_rate",
+    "pe_ttm",
+    "pb",
+    "roe",
+    "bp",
+    "ep_ttm",
+    "float_mv",
+    "total_mv",
+    "ln_mv_total",
+)
+
+_CN_DATASETS: dict[str, dict] = {
     "alpha_library": {
         "label": "Alpha 库（Alpha101 / GTJA191 / Alpha158）",
         "dir_parts": ("6_ml_datasets", "alpha_library"),
@@ -208,47 +236,161 @@ DATASETS: dict[str, dict] = {
 
 DEFAULT_DATASET = "alpha_library"
 
+# HK/US/FUTURES 各接本市场 l1_factors（唯一带 OHLCV 的通用因子库）；
+# HK 另有 ccass/south 两个持股因子库（无 OHLCV，donor 走 HK l1_factors——
+# 两库 symbol 同为 0001.HK 四位后缀式，20261015 实测逐日全交集，可 join）。
+# 标签一律走 close_fwd(_donor)：日期只从分区目录名取，各市场 l1 表无日期列
+# 也无碍（HK/US/FUT l1 实测只有 symbol + 数值列）。
+DATASETS_BY_MARKET: dict[str, dict[str, dict]] = {
+    "CN": _CN_DATASETS,
+    "HK": {
+        "l1_factors": {
+            "label": "L1 因子（量价/换手/波动等基础因子）",
+            "dir_parts": ("6_ml_datasets", "l1_factors"),
+            "label_mode": "close_fwd",
+            "meta_cols": _ID_COLS + _OHLCV_COLS + RAW_MARKET_COLS,
+            "library_rule": "fixed:L1",
+            "universe": "港股全池（无 ST/退市过滤） · L1 因子（量价/换手/波动等基础因子）",
+        },
+        "ccass_factors": {
+            "label": "CCASS 中央结算持股因子（22）",
+            "dir_parts": ("6_ml_datasets", "ccass_factors"),
+            "label_mode": "close_fwd_donor",
+            "donor_parts": ("6_ml_datasets", "l1_factors"),
+            "meta_cols": _ID_COLS,
+            "library_rule": "fixed:ccass",
+            "universe": "港股 CCASS 覆盖池 · 中央结算持股因子（行情列取自 L1 因子库）",
+            "build_start": "20241125",
+        },
+        "south_factors": {
+            "label": "港股通南向持股因子（7）",
+            "dir_parts": ("6_ml_datasets", "south_factors"),
+            "label_mode": "close_fwd_donor",
+            "donor_parts": ("6_ml_datasets", "l1_factors"),
+            "meta_cols": _ID_COLS,
+            "library_rule": "fixed:south",
+            "universe": "港股通标的池 · 南向持股因子（行情列取自 L1 因子库）",
+            "build_start": "20241127",
+        },
+    },
+    "US": {
+        "l1_factors": {
+            "label": "L1 因子（量价/换手/波动等基础因子）",
+            "dir_parts": ("6_ml_datasets", "l1_factors"),
+            "label_mode": "close_fwd",
+            "meta_cols": _ID_COLS + _OHLCV_COLS + RAW_MARKET_COLS,
+            "library_rule": "fixed:L1",
+            "universe": "美股全池（无 ST/退市过滤） · L1 因子（量价/换手/波动等基础因子）",
+        },
+    },
+    "FUTURES": {
+        "l1_factors": {
+            "label": "L1 因子（量价/换手/波动等基础因子）",
+            "dir_parts": ("6_ml_datasets", "l1_factors"),
+            "label_mode": "close_fwd",
+            "meta_cols": _ID_COLS + _OHLCV_COLS + RAW_MARKET_COLS,
+            "library_rule": "fixed:L1",
+            "universe": "期货主连+外盘品种池 · L1 因子（量价/换手/波动等基础因子）",
+        },
+    },
+}
 
-def dataset_names() -> list[str]:
-    return list(DATASETS)
+DEFAULT_DATASET_BY_MARKET: dict[str, str] = {
+    "CN": DEFAULT_DATASET,
+    "HK": "l1_factors",
+    "US": "l1_factors",
+    "FUTURES": "l1_factors",
+}
+
+#: 兼容别名：CN 注册表（存量调用点最多，语义与分层前逐字相同）
+DATASETS = DATASETS_BY_MARKET["CN"]
 
 
-def dataset_dir(dataset: str) -> Path:
-    cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
-    return resolve_quantdb_subdir(*cfg["dir_parts"])
+def market_key(market: str | None) -> str:
+    """规范市场键（大小写/空白归一；空值按 CN 缺省）。
+
+    service/router 的缓存键与响应也都用它——HK/US/FUTURES 共用 ``l1_factors``
+    数据集名，任何跨市场缓存/存储键必须以此前缀区分，否则串数据。
+    """
+    return str(market or "CN").upper().strip()
 
 
-def label_dir(dataset: str) -> Path | None:
-    cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
+def supports_market(market: str | None) -> bool:
+    """该市场是否已接入因子报告（路由层据此给 422 + reason，而非静默落 CN）。"""
+    return market_key(market) in DATASETS_BY_MARKET
+
+
+def datasets_for_market(market: str = "CN") -> dict[str, dict]:
+    """该市场的注册表（未接入市场返回空 dict，不做跨市场回退）。"""
+    return DATASETS_BY_MARKET.get(market_key(market), {})
+
+
+def _registry(market: str | None) -> dict[str, dict]:
+    key = market_key(market)
+    reg = DATASETS_BY_MARKET.get(key)
+    if reg is None:
+        raise ValueError(
+            f"因子报告未接入市场: {market!r}（已接入: {', '.join(DATASETS_BY_MARKET)}）"
+        )
+    return reg
+
+
+def _cfg(dataset: str, market: str | None = "CN") -> tuple[str, dict]:
+    """``(规范市场键, 配置)``。未知数据集回落**本市场**缺省，不跨市场回退。"""
+    key = market_key(market)
+    reg = _registry(key)
+    default = DEFAULT_DATASET_BY_MARKET.get(key) or next(iter(reg))
+    return key, (reg.get(dataset) or reg[default])
+
+
+def _market_root(key: str) -> Path:
+    # 懒导入：本模块的存量调用点（eval 脚本等）只依赖标准库 + quantdb_paths，
+    # feature_source 会拉进 pandas，保持 CN 路径零新增导入面的既有事实。
+    from backend.shared.feature_source import resolve_market_root
+
+    return resolve_market_root(key)
+
+
+def dataset_names(market: str = "CN") -> list[str]:
+    return list(_registry(market))
+
+
+def dataset_dir(dataset: str, market: str = "CN") -> Path:
+    key, cfg = _cfg(dataset, market)
+    return _market_root(key) / Path(*cfg["dir_parts"])
+
+
+def label_dir(dataset: str, market: str = "CN") -> Path | None:
+    key, cfg = _cfg(dataset, market)
     parts = cfg.get("label_parts")
-    return resolve_quantdb_subdir(*parts) if parts else None
+    return _market_root(key) / Path(*parts) if parts else None
 
 
-def report_dir(dataset: str) -> Path:
-    return dataset_dir(dataset) / "report"
+def report_dir(dataset: str, market: str = "CN") -> Path:
+    return dataset_dir(dataset, market) / "report"
 
 
-def donor_dir(dataset: str) -> Path | None:
+def donor_dir(dataset: str, market: str = "CN") -> Path | None:
     """close_fwd_donor 模式的行情列来源目录；未声明 donor_parts 的数据集返回 None
     （构建器据此拒绝启动 donor 分支，而不是悄悄回退到不存在的本表 close）。"""
-    cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
+    key, cfg = _cfg(dataset, market)
     parts = cfg.get("donor_parts")
-    return resolve_quantdb_subdir(*parts) if parts else None
+    return _market_root(key) / Path(*parts) if parts else None
 
 
-def disk_state(dataset: str) -> dict:
+def disk_state(dataset: str, market: str = "CN") -> dict:
     """盘上分区现状（只读 parquet footer）：``{n_factors, first_dt, last_dt}``。
 
     因子列口径与构建器一致：meta_cols 之外、dtype 以数值前缀开头的列。
     最新分区损坏/缺文件时 n_factors 记 None（页面不显示坏数），日期照报。
     """
-    root = dataset_dir(dataset)
+    root = dataset_dir(dataset, market)
     parts = sorted(p for p in root.glob("dt=*") if p.is_dir())
     if not parts:
         return {"n_factors": None, "first_dt": None, "last_dt": None}
     first_dt = parts[0].name.split("=", 1)[1]
     last_dt = parts[-1].name.split("=", 1)[1]
-    cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
+    _, cfg = _cfg(dataset, market)
     meta = set(cfg["meta_cols"])
     try:
         import pyarrow.parquet as pq
@@ -264,9 +406,9 @@ def disk_state(dataset: str) -> dict:
     return {"n_factors": len(cols), "first_dt": first_dt, "last_dt": last_dt}
 
 
-def l2_columns() -> set[str]:
-    """l2_factors 的列集合（用于 L1+L2 表的归属判定）。"""
-    root = dataset_dir("l2_factors")
+def l2_columns(market: str = "CN") -> set[str]:
+    """l2_factors 的列集合（用于 L1+L2 表的归属判定；仅 CN 注册表用该规则）。"""
+    root = dataset_dir("l2_factors", market)
     parts = sorted(p for p in root.glob("dt=*") if p.is_dir())
     if not parts:
         return set()
@@ -278,8 +420,10 @@ def l2_columns() -> set[str]:
         return set()
 
 
-def library_of(dataset: str, column: str, l2_cols: set[str] | None = None) -> str:
-    cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
+def library_of(
+    dataset: str, column: str, l2_cols: set[str] | None = None, market: str = "CN"
+) -> str:
+    _, cfg = _cfg(dataset, market)
     rule = str(cfg["library_rule"])
     if rule.startswith("fixed:"):
         return rule.split(":", 1)[1]
@@ -290,7 +434,7 @@ def library_of(dataset: str, column: str, l2_cols: set[str] | None = None) -> st
             return "alpha101"
         return "gtja191"
     if rule == "l2_membership":
-        cols = l2_cols if l2_cols is not None else l2_columns()
+        cols = l2_cols if l2_cols is not None else l2_columns(market)
         return "L2" if column in cols else "L1"
     if rule == "gap_family":
         # GAP_MINED_MARK: 按因子名前缀判子库（因子名自带家族语义）

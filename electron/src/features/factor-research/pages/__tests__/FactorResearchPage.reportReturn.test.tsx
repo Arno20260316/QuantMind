@@ -32,7 +32,11 @@ vi.mock('../../services/factorResearchService', async () => {
   return { ...actual, getCatalog: catalogMock, getLeaderboard: leaderboardMock };
 });
 
-vi.mock('../../../../store', () => ({ useAppSelector: () => isAdminRef.value }));
+// 选择器对假 state 求值：市场恒 CN（本文件与分层无关），is_admin 由 isAdminRef 控制
+vi.mock('../../../../store', () => ({
+  useAppSelector: (sel: (s: unknown) => unknown) =>
+    sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: isAdminRef.value } } }),
+}));
 
 // 子组件桩：把页面传下去的 props 摊在 DOM 上，本文件测的就是这些 props
 vi.mock('../../components/CatalogSidebar', () => ({ CatalogSidebar: () => <div data-testid="sidebar" /> }));
@@ -113,13 +117,13 @@ beforeEach(() => {
 describe('FactorResearchPage：报告页签的反跳接线', () => {
   test('进报告页签补齐缺的目录：经典库因子查得到落点，不在目录里的查不到', async () => {
     renderPage();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private', 'CN'));
     // 报告页签只要目录索引，不依赖区间/榜单工具条
-    expect(catalogMock).not.toHaveBeenCalledWith('classic');
+    expect(catalogMock).not.toHaveBeenCalledWith('classic', 'CN');
 
     await gotoReport();
 
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('classic', 'CN'));
     await waitFor(() => expect(screen.getByTestId('loc-classic').getAttribute('data-hit')).toBe('1'));
     expect(screen.getByTestId('loc-private').getAttribute('data-hit')).toBe('1');
     expect(screen.getByTestId('loc-ghost').getAttribute('data-hit')).toBe('0');
@@ -127,7 +131,7 @@ describe('FactorResearchPage：报告页签的反跳接线', () => {
 
   test('反跳：落到单因子页的是这个因子、库切对了，不被「补第一个因子」顶掉', async () => {
     renderPage();
-    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(catalogMock).toHaveBeenCalledWith('private', 'CN'));
     await gotoReport();
     await waitFor(() => expect(screen.getByTestId('loc-classic').getAttribute('data-hit')).toBe('1'));
 

@@ -8,6 +8,10 @@
   - 兜底：序列文件缺失时按需扫分区（仅 labels_table 模式；close_fwd 模式无标签表，需要序列文件）
 
 支持数据集：alpha_library / l1_factors / l2_factors / l1_l2_factors（见 datasets.py）
+
+市场分层（2026-10-16）：全部读侧函数带 ``market``（缺省 "CN" 零行为变化）。
+缓存键**必须含 market**——HK/US/FUTURES 共用 ``l1_factors`` 这个名字（同数据集
+名、不同市场根），漏掉 market 就会把 A 股明细缓存串给港股请求。
 """
 
 from __future__ import annotations
@@ -29,11 +33,13 @@ import pyarrow.parquet as pq
 
 from . import blocks as BLK
 from .datasets import (
-    DATASETS,
     DEFAULT_DATASET,
+    DEFAULT_DATASET_BY_MARKET,
     dataset_dir,
+    datasets_for_market,
     disk_state,
     label_dir,
+    market_key,
     report_dir,
 )
 
@@ -86,27 +92,30 @@ def _finite_or_none(v: Any) -> float | None:
     return f if math.isfinite(f) else None
 
 
-def normalize_dataset(dataset: str | None) -> str:
+def normalize_dataset(dataset: str | None, market: str = "CN") -> str:
     key = str(dataset or "").strip()
-    return key if key in DATASETS else DEFAULT_DATASET
+    reg = datasets_for_market(market)
+    if key in reg:
+        return key
+    return DEFAULT_DATASET_BY_MARKET.get(market_key(market), DEFAULT_DATASET)
 
 
-def snapshot_path(dataset: str = DEFAULT_DATASET) -> Path:
-    return dataset_dir(normalize_dataset(dataset)) / "report" / "factor_report.json"
+def snapshot_path(dataset: str = DEFAULT_DATASET, market: str = "CN") -> Path:
+    return dataset_dir(normalize_dataset(dataset, market), market) / "report" / "factor_report.json"
 
 
-def series_path(dataset: str = DEFAULT_DATASET) -> Path:
+def series_path(dataset: str = DEFAULT_DATASET, market: str = "CN") -> Path:
     """单因子逐日明细序列（快照构建脚本一并产出）。"""
-    return dataset_dir(normalize_dataset(dataset)) / "report" / "factor_series.parquet"
+    return dataset_dir(normalize_dataset(dataset, market), market) / "report" / "factor_series.parquet"
 
 
-def load_snapshot(dataset: str = DEFAULT_DATASET) -> dict[str, Any] | None:
+def load_snapshot(dataset: str = DEFAULT_DATASET, market: str = "CN") -> dict[str, Any] | None:
     """读取快照；不存在返回 None（页面据此提示「尚未生成」）。
 
     返回对象已按 ``_json_safe`` 净化（非有限 float → None，含存量毒快照），
     并按文件 mtime/size 进程内缓存 —— 构建脚本重写文件即自动失效。
     """
-    path = snapshot_path(dataset)
+    path = snapshot_path(dataset, market)
     if not path.exists():
         return None
     try:
@@ -148,17 +157,17 @@ def enrich_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _partition_dates(dataset: str, limit: int | None = None) -> list[str]:
+def _partition_dates(dataset: str, limit: int | None = None, market: str = "CN") -> list[str]:
     """可用的分区日期（升序）。limit 表示只取最近 N 个。"""
-    root = dataset_dir(normalize_dataset(dataset))
+    root = dataset_dir(normalize_dataset(dataset, market), market)
     dts = sorted(p.name.split("=")[1] for p in root.glob("dt=*") if p.is_dir())
     if limit and limit > 0:
         dts = dts[-limit:]
     return dts
 
 
-def _read_factor_column(dataset: str, dt: str, factor: str) -> Any:
-    path = dataset_dir(normalize_dataset(dataset)) / f"dt={dt}" / "data.parquet"
+def _read_factor_column(dataset: str, dt: str, factor: str, market: str = "CN") -> Any:
+    path = dataset_dir(normalize_dataset(dataset, market), market) / f"dt={dt}" / "data.parquet"
     if not path.exists():
         return None
     try:
@@ -167,8 +176,8 @@ def _read_factor_column(dataset: str, dt: str, factor: str) -> Any:
         return None
 
 
-def _read_label_column(dataset: str, dt: str, horizon: str) -> Any:
-    root = label_dir(normalize_dataset(dataset))
+def _read_label_column(dataset: str, dt: str, horizon: str, market: str = "CN") -> Any:
+    root = label_dir(normalize_dataset(dataset, market), market)
     if root is None:
         return None
     path = root / f"dt={dt}" / "data.parquet"
@@ -208,6 +217,7 @@ def _rank(x: np.ndarray) -> np.ndarray:
 def _detail_from_series(
     dataset: str, factor: str, horizon: str, lookback: int,
     *, long_group: int, short_group: int, cost_bps: float, bench: str | None,
+    market: str = "CN",
 ) -> dict[str, Any] | None:
     """从预计算序列 parquet 取明细（毫秒级）。
 
@@ -217,10 +227,10 @@ def _detail_from_series(
     必须全窗口才有意义，而噪声型的日序列只需 ``lookback`` 个点。整列读进来
     也就几百 KB，不做两次 IO。
     """
-    path = series_path(dataset)
+    path = series_path(dataset, market)
     if not path.exists():
         return None
-    snap = load_snapshot(dataset) or {}
+    snap = load_snapshot(dataset, market) or {}
     meta = snap.get("meta") or {}
     snap_horizon = str(meta.get("horizon") or "")
     if snap_horizon and snap_horizon != horizon:
@@ -257,13 +267,13 @@ def _detail_from_series(
         blocks = BLK.build_blocks(
             full, factor=factor, horizon=horizon, lookback=lookback,
             long_group=long_group, short_group=short_group, cost_bps=cost_bps,
-            snapshot=snap, bench_symbol=bench,
+            snapshot=snap, bench_symbol=bench, market=market,
         )
     except Exception as e:  # noqa: BLE001 — 新块失败不该让既有明细整页打不开
         log.exception("因子明细块派生失败(%s/%s)", dataset, factor)
         blocks = {"error": f"{type(e).__name__}: {e}"}
     return {
-        "dataset": normalize_dataset(dataset),
+        "dataset": normalize_dataset(dataset, market),
         "factor": factor,
         "horizon": horizon,
         "empty": False,
@@ -288,18 +298,26 @@ def _detail_from_series(
     }
 
 
-def _load_pairs(dataset: str, dt: str, factor: str, horizon: str, label_mode: str, all_dts: list[str]) -> tuple[str, Any, Any] | None:
+def _load_pairs(
+    dataset: str,
+    dt: str,
+    factor: str,
+    horizon: str,
+    label_mode: str,
+    all_dts: list[str],
+    market: str = "CN",
+) -> tuple[str, Any, Any] | None:
     """读一个分区的因子列与标签列（供线程池并行调用）。
 
     label_mode=labels_table：标签读同 dt 的标签表；
     label_mode=close_fwd：标签=未来第 k 个交易日的 close（同一数据集内取）。
     """
-    fac = _read_factor_column(dataset, dt, factor)
+    fac = _read_factor_column(dataset, dt, factor, market)
     if fac is None:
         return None
     k = int(horizon.split("_")[-1])
     if label_mode == "labels_table":
-        lab = _read_label_column(dataset, dt, horizon)
+        lab = _read_label_column(dataset, dt, horizon, market)
         if lab is None:
             return None
         return dt, fac, lab
@@ -311,12 +329,12 @@ def _load_pairs(dataset: str, dt: str, factor: str, horizon: str, label_mode: st
     j = idx + k
     if j >= len(all_dts):
         return None
-    root = dataset_dir(normalize_dataset(dataset))
+    root = dataset_dir(normalize_dataset(dataset, market), market)
     try:
         fut = pq.read_table(f"{root}/dt={all_dts[j]}/data.parquet", columns=["symbol", "close"]).to_pandas()
     except Exception:  # noqa: BLE001
         return None
-    base = _read_factor_column(dataset, dt, "close")
+    base = _read_factor_column(dataset, dt, "close", market)
     if base is None:
         return None
     merged = base.merge(fut, on="symbol", how="inner", suffixes=("_t", "_tk"))
@@ -333,13 +351,13 @@ def _load_pairs(dataset: str, dt: str, factor: str, horizon: str, label_mode: st
 def compute_detail(
     dataset: str, factor: str, horizon: str = "fwd_ret_5", lookback: int = 250,
     *, long_group: int = DEFAULT_LONG_GROUP, short_group: int = DEFAULT_SHORT_GROUP,
-    cost_bps: float = DEFAULT_COST_BPS, bench: str | None = None,
+    cost_bps: float = DEFAULT_COST_BPS, bench: str | None = None, market: str = "CN",
 ) -> dict[str, Any]:
     """单因子明细：分位净值曲线、分位平均收益、IC 序列、换手序列、覆盖率 + 九个机构级块。
 
     优先读预计算序列（毫秒级）；缺失时回退扫分区（回退路径不产新块）。
     """
-    ds = normalize_dataset(dataset)
+    ds = normalize_dataset(dataset, market)
     if horizon not in HORIZONS:
         raise ValueError(f"不支持的前瞻期: {horizon}")
     if not factor or not factor.replace("_", "").isalnum():
@@ -353,18 +371,23 @@ def compute_detail(
     if not (0.0 <= cost_bps <= 1000.0):
         raise ValueError(f"成本 bps 超出合理范围 0..1000：{cost_bps}")
 
-    key = f"{ds}:{factor}:{horizon}:{lookback}:{long_group}:{short_group}:{cost_bps:g}:{bench or ''}"
+    # market 必须在缓存键里：HK/US/FUTURES 共用 "l1_factors" 数据集名
+    key = (
+        f"{market_key(market)}:{ds}:{factor}:{horizon}:{lookback}:"
+        f"{long_group}:{short_group}:{cost_bps:g}:{bench or ''}"
+    )
     hit = _DETAIL_CACHE.get(key)
     if hit and time.time() - hit[0] < _DETAIL_TTL_SECONDS:
         return hit[1]
 
     fast = _detail_from_series(ds, factor, horizon, lookback, long_group=long_group,
-                               short_group=short_group, cost_bps=cost_bps, bench=bench)
+                               short_group=short_group, cost_bps=cost_bps, bench=bench,
+                               market=market)
     if fast is not None:
         _DETAIL_CACHE[key] = (time.time(), fast)
         return fast
 
-    label_mode = str((DATASETS.get(ds) or {}).get("label_mode") or "labels_table")
+    label_mode = str((datasets_for_market(market).get(ds) or {}).get("label_mode") or "labels_table")
     if label_mode != "labels_table":
         # close_fwd 数据集没有独立标签表，明细只能来自序列快照
         payload = {
@@ -378,11 +401,14 @@ def compute_detail(
         _DETAIL_CACHE[key] = (time.time(), payload)
         return payload
 
-    all_dts = _partition_dates(ds)
+    all_dts = _partition_dates(ds, market=market)
     dts = all_dts[-lookback:] if lookback and lookback > 0 else all_dts
     loaded: list[tuple[str, Any, Any]] = []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [ex.submit(_load_pairs, ds, dt, factor, horizon, label_mode, all_dts) for dt in dts]
+        futures = [
+            ex.submit(_load_pairs, ds, dt, factor, horizon, label_mode, all_dts, market)
+            for dt in dts
+        ]
         for fut in futures:
             try:
                 res = fut.result()
@@ -483,10 +509,10 @@ def compute_detail(
     return payload
 
 
-def correlation_slice(dataset: str, names: list[str]) -> dict[str, Any]:
+def correlation_slice(dataset: str, names: list[str], market: str = "CN") -> dict[str, Any]:
     """从快照里取子矩阵（保持请求顺序，忽略不存在的因子）。"""
-    ds = normalize_dataset(dataset)
-    snap = load_snapshot(ds)
+    ds = normalize_dataset(dataset, market)
+    snap = load_snapshot(ds, market)
     if not snap:
         return {"available": False, "reason": f"数据集 {ds} 的快照尚未生成，请运行 backend/scripts/build_factor_report.py --dataset {ds}"}
     corr = snap.get("correlation") or {}
@@ -500,10 +526,10 @@ def correlation_slice(dataset: str, names: list[str]) -> dict[str, Any]:
     return {"available": True, "dataset": ds, "factors": picked, "matrix": rows}
 
 
-def top_correlated(dataset: str, factor: str, top: int = 8) -> list[dict[str, Any]]:
+def top_correlated(dataset: str, factor: str, top: int = 8, market: str = "CN") -> list[dict[str, Any]]:
     """与某因子相关性最高（含负相关）的其它因子，用于明细页「相关因子」区。"""
-    ds = normalize_dataset(dataset)
-    snap = load_snapshot(ds)
+    ds = normalize_dataset(dataset, market)
+    snap = load_snapshot(ds, market)
     if not snap:
         return []
     corr = snap.get("correlation") or {}
@@ -560,12 +586,14 @@ def _diversity_before_after(
         return None
 
 
-def correlation_clusters(dataset: str, threshold: float = 0.9, keep: str = "icir") -> dict[str, Any]:
+def correlation_clusters(
+    dataset: str, threshold: float = 0.9, keep: str = "icir", market: str = "CN"
+) -> dict[str, Any]:
     """因子去重簇：|ρ| ≥ 阈值 的同源因子聚成一簇，每簇留一个代表。"""
     from .clusters import cluster_by_correlation, summarize
 
-    ds = normalize_dataset(dataset)
-    snap = load_snapshot(ds)
+    ds = normalize_dataset(dataset, market)
+    snap = load_snapshot(ds, market)
     if not snap:
         return {"available": False, "dataset": ds, "reason":
                 f"数据集 {ds} 的快照尚未生成，请运行 backend/scripts/build_factor_report.py --dataset {ds}"}
@@ -596,9 +624,9 @@ _BUILD_PID = "build.pid"
 _BUILD_SCRIPT = Path("backend") / "scripts" / "build_factor_report.py"
 
 
-def build_running(dataset: str) -> int | None:
+def build_running(dataset: str, market: str = "CN") -> int | None:
     """返回正在运行的构建进程 PID（无则 None）。带 cmdline 校验防 PID 复用。"""
-    d = report_dir(normalize_dataset(dataset))
+    d = report_dir(normalize_dataset(dataset, market), market)
     pf = d / _BUILD_PID
     if not pf.exists():
         return None
@@ -616,14 +644,14 @@ def build_running(dataset: str) -> int | None:
     return pid
 
 
-def build_status(dataset: str = DEFAULT_DATASET) -> dict:
+def build_status(dataset: str = DEFAULT_DATASET, market: str = "CN") -> dict:
     """快照状态：是否已生成 / 构建中 / 元信息 / 日志最新一行（页面「重建快照」入口用）。
 
     快照/日志/PID 三件套都在 ``report_dir`` 下 —— 这里直接按目录读，
     不走 ``load_snapshot``（后者经 dataset_dir 解析，两条路径在测试与替换目录下会分叉）。
     """
-    ds = normalize_dataset(dataset)
-    d = report_dir(ds)
+    ds = normalize_dataset(dataset, market)
+    d = report_dir(ds, market)
     snap_file = d / "factor_report.json"
     meta: dict = {}
     exists = snap_file.exists()
@@ -632,7 +660,7 @@ def build_status(dataset: str = DEFAULT_DATASET) -> dict:
             meta = (json.loads(snap_file.read_text(encoding="utf-8")).get("meta")) or {}
         except Exception:  # noqa: BLE001 - 元信息损坏不阻塞状态查询
             meta = {}
-    pid = build_running(ds)
+    pid = build_running(ds, market)
     log_tail: list[str] = []
     step = ""
     lf = d / _BUILD_LOG
@@ -647,6 +675,7 @@ def build_status(dataset: str = DEFAULT_DATASET) -> dict:
             pass
     return {
         "dataset": ds,
+        "market": market_key(market),
         "exists": exists,
         "running": pid is not None,
         "pid": pid,
@@ -659,25 +688,26 @@ def build_status(dataset: str = DEFAULT_DATASET) -> dict:
     }
 
 
-def start_build(dataset: str) -> dict:
+def start_build(dataset: str, market: str = "CN") -> dict:
     """启动快照重建（后台子进程；已在构建则直接返回运行中）。全部本地计算。
 
     命令带 ``--start``（取注册表 build_start，如 rd_mined 的 20200102）——
     构建器缺省只回看 5 年，会把这些因子库的早段静默砍掉。
     """
     ds = str(dataset or "").strip()
-    if ds not in DATASETS:  # 构建入口严格校验：normalize 的兜底会静默改建默认数据集
-        return {"error": f"未知数据集: {dataset!r}"}
-    d = report_dir(ds)
-    if (pid := build_running(ds)) is not None:
+    reg = datasets_for_market(market)
+    if ds not in reg:  # 构建入口严格校验：normalize 的兜底会静默改建默认数据集
+        return {"error": f"未知数据集: {dataset!r}（市场 {market_key(market)} 可用: {', '.join(reg) or '无'}）"}
+    d = report_dir(ds, market)
+    if (pid := build_running(ds, market)) is not None:
         return {"started": False, "running": True, "pid": pid, "dataset": ds}
     d.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[4]  # …/factor_report → 仓库根
     script = root / _BUILD_SCRIPT
     if not script.exists():
         return {"error": f"构建脚本缺失: {script}"}
-    cmd = [sys.executable, str(script), "--dataset", ds]
-    start = DATASETS[ds].get("build_start")
+    cmd = [sys.executable, str(script), "--dataset", ds, "--market", market_key(market)]
+    start = reg[ds].get("build_start")
     if start:
         cmd += ["--start", str(start)]
     log = open(d / _BUILD_LOG, "a", encoding="utf-8")  # noqa: SIM115 - 交给子进程持有
@@ -695,15 +725,15 @@ def start_build(dataset: str) -> dict:
     return {"started": True, "running": True, "pid": proc.pid, "dataset": ds}
 
 
-def dataset_freshness(dataset: str) -> dict:
+def dataset_freshness(dataset: str, market: str = "CN") -> dict:
     """盘上分区（最新列集/日期）vs 快照元信息 → 快照是否落后。只读 parquet footer。
 
     快照缺失时不叠「落后」噪声（available=False 已说明问题）；两者都有才比较。
     """
-    ds = normalize_dataset(dataset)
-    snap = load_snapshot(ds)
+    ds = normalize_dataset(dataset, market)
+    snap = load_snapshot(ds, market)
     meta = (snap or {}).get("meta") or {}
-    st = disk_state(ds)
+    st = disk_state(ds, market)
     snap_n = meta.get("n_factors")
     snap_end = meta.get("end")
     reasons: list[str] = []

@@ -66,9 +66,22 @@ _SYMBOL_COL = "symbol"
 _DF_COLS: tuple[str, ...] = ("open", "high", "low", "close", "volume", "amount")
 
 
-def index_daily_dir() -> Path:
-    """QuantDB 指数日线目录（不检查存在性，由调用方决定如何降级）。"""
-    return resolve_quantdb_subdir("1_kline_data", "index_daily")
+def index_daily_dir(market: str = "CN") -> Path:
+    """指数日线目录（不检查存在性，由调用方决定如何降级）。
+
+    CN 走存量 ``resolve_quantdb_subdir`` 候选表（逐字不变）；其余市场 =
+    ``resolve_market_root(market)/1_kline_data/index_daily``（HK/US 实测有该目录；
+    FUTURES 无 → 取数函数按「取不到」降级，**不伪造空基准**）。非法市场由
+    ``resolve_market_root`` 严格拒绝（ValueError），不静默落 CN。
+    """
+    # 懒导入：本模块顶层保持零第三方依赖（见模块 docstring 的依赖约定），
+    # feature_source 只在真正取数时才被拉进来。
+    from backend.shared.feature_source import resolve_market_root, validate_market
+
+    key = validate_market(market)
+    if key == "CN":
+        return resolve_quantdb_subdir("1_kline_data", "index_daily")
+    return resolve_market_root(key) / "1_kline_data" / "index_daily"
 
 
 def _as_iso(value: object) -> str | None:
@@ -87,29 +100,35 @@ def load_index_frame(
     symbols: Sequence[str] | None = None,
     start: object = None,
     end: object = None,
+    market: str = "CN",
 ) -> pd.DataFrame:
-    """读 QuantDB ``index_daily``（后缀式符号，如 ``000300.SH``）。
+    """读 ``index_daily``（后缀式符号，如 CN ``000300.SH`` / HK ``HSI.HK``）。
 
     Args:
         columns: 需要的列（``time`` / ``symbol`` 自动带上）。
         symbols: 只要这些指数；``None`` 表示全部。
         start / end: 闭区间日期过滤，支持 ``date`` / ``datetime`` / ISO 字符串。
+        market: 数据根市场（缺省 CN；各市场指数目录见 :func:`index_daily_dir`）。
 
     Returns:
         列含 ``time``(datetime64) 与 ``symbol`` 的 DataFrame；无数据时为空表。
 
     Raises:
-        FileNotFoundError: 指数日线目录下没有分区文件（数据未同步）。
+        FileNotFoundError: 该市场指数日线目录下没有分区文件（数据未同步 / 该市场无此目录）。
     """
     import duckdb  # 延迟导入：与 l05_store / minibt_qdb 同约定
     import pandas as pd
 
-    part_dir = index_daily_dir()
+    part_dir = index_daily_dir(market)
     files = sorted(part_dir.glob(_PART_GLOB))
     if not files:
+        hint = (
+            "请先跑 QuantDB 同步（见 backend/scripts/quantdb_daily_sync.py）"
+            if str(market or "CN").upper().strip() in ("CN", "A", "A_SHARE", "SSE")
+            else f"该市场（{market}）无指数日线目录或尚未同步"
+        )
         raise FileNotFoundError(
-            f"指数日线数据缺失：{part_dir} 下没有 {_PART_GLOB}，"
-            f"请先跑 QuantDB 同步（见 backend/scripts/quantdb_daily_sync.py）"
+            f"指数日线数据缺失：{part_dir} 下没有 {_PART_GLOB}，{hint}"
         )
 
     cols = ", ".join(dict.fromkeys([_DATE_COL, _SYMBOL_COL, *columns]))
@@ -141,8 +160,13 @@ def resolve_benchmark(
     start: object = None,
     end: object = None,
     chain: Sequence[str] = BENCHMARK_CHAIN,
+    market: str = "CN",
 ) -> tuple[str, pd.DataFrame]:
     """按 ``chain`` 顺序取第一个覆盖充分的基准指数。
+
+    Args:
+        market: 数据根市场（缺省 CN；非 CN 调用方应显式传本市场指数链，
+            例如 HK ``("HSI.HK",)`` —— CN 缺省链各符号在非 CN 根下恒查空）。
 
     Returns:
         ``(实际使用的符号, 以 time 为索引的 DataFrame)`` —— **返回符号是刻意的**，
@@ -152,7 +176,7 @@ def resolve_benchmark(
         ValueError: 链上所有指数都取不到或行数不足 :data:`MIN_ROWS`。
     """
     chain = tuple(chain)
-    df = load_index_frame(columns=columns, symbols=chain, start=start, end=end)
+    df = load_index_frame(columns=columns, symbols=chain, start=start, end=end, market=market)
 
     tried: list[str] = []
     for sym in chain:
@@ -178,18 +202,24 @@ def load_benchmark_closes(
     column: str = "close",
     start: object = None,
     end: object = None,
+    market: str = "CN",
+    chain: Sequence[str] = BENCHMARK_CHAIN,
 ) -> tuple[str, pd.Series]:
     """基准指数单列序列；返回 ``(符号, Series)``。"""
-    sym, df = resolve_benchmark(columns=(column,), start=start, end=end)
+    sym, df = resolve_benchmark(columns=(column,), start=start, end=end,
+                                chain=chain, market=market)
     return sym, df[column].astype(float)
 
 
 def load_benchmark_ohlc(
     start: object = None,
     end: object = None,
+    market: str = "CN",
+    chain: Sequence[str] = BENCHMARK_CHAIN,
 ) -> tuple[pd.Series, pd.Series]:
     """基准指数 ``(open, close)``，对齐到同一索引（未与个股日历对齐，由调用方 reindex）。"""
-    sym, df = resolve_benchmark(columns=("open", "close"), start=start, end=end)
+    sym, df = resolve_benchmark(columns=("open", "close"), start=start, end=end,
+                                chain=chain, market=market)
     logger.info(
         "基准指数 %s：%d 行，%s ~ %s",
         sym,

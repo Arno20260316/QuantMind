@@ -6,6 +6,10 @@
  *
  * 页签内容用条件渲染（不是 CSS 隐藏）—— 五个页签加起来约 25 张 ECharts，
  * 全部同时挂载会一次性吃掉几百 MB 并让首次交互卡死。
+ *
+ * 市场分层（2026-10）：`market` 只向下游 ExcessTab 传（基准候选由该市场快照的
+ * benchmarks[] 驱动）；base 基准缺省值 = 空串（= 不点名，后端取本市场主基准），
+ * 绝不回落成 A 股代码。
  */
 
 import React, { useState } from 'react';
@@ -26,6 +30,7 @@ import type {
   FactorRelated,
   FactorSummary,
 } from '../../types/factorReport';
+import type { ResearchMarket } from '../../types/factorResearch';
 
 export type DetailTabKey = 'overview' | 'ic' | 'group' | 'excess' | 'style';
 
@@ -40,6 +45,8 @@ const TABS: Array<{ key: DetailTabKey; label: string }> = [
 interface Props {
   factor: string;
   dataset: string;
+  /** 本页当前市场（基准候选与口径文案按它分派） */
+  market: ResearchMarket;
   summary: FactorSummary | null;
   /** 全库因子（指标环的全库百分位分布来源） */
   library: FactorSummary[];
@@ -66,7 +73,7 @@ function splitBlocks(detail: FactorDetail | null): { blocks: FactorBlocks | null
 }
 
 export const FactorDetailTabs: React.FC<Props> = ({
-  factor, dataset, summary, library, detail, loading, params, onParams,
+  factor, dataset, market, summary, library, detail, loading, params, onParams,
   correlation, related, corrLoading, onPick, onOpenSingle,
 }) => {
   const [tab, setTab] = useState<DetailTabKey>('overview');
@@ -77,7 +84,8 @@ export const FactorDetailTabs: React.FC<Props> = ({
   const longGroup = params.longGroup ?? 3;
   const shortGroup = params.shortGroup ?? 9;
   const costBps = params.costBps ?? 20;
-  const bench = params.bench ?? '000300.SH';
+  // 空串 = 没点名 → 后端取本市场主基准；绝不把 A 股代码当缺省值兜进来
+  const bench = params.bench ?? '';
 
   const onExportCsv = () => {
     const payload = csvPayload(tab, detail, blocks);
@@ -198,8 +206,12 @@ export const FactorDetailTabs: React.FC<Props> = ({
             {tab === 'ic' && <IcTab detail={detail} blocks={blocks} />}
             {tab === 'group' && <GroupTab detail={detail} blocks={blocks} />}
             {tab === 'excess' && (
+              // key=market：换市场重挂载 —— 基准候选的「首见顺序」缓存在组件内，
+              // 不重置会把旧市场的基准条/点名状态带进新市场
               <ExcessTab
+                key={market}
                 blocks={blocks}
+                market={market}
                 bench={bench}
                 onBench={(b) => onParams({ longGroup, shortGroup, costBps, bench: b })}
                 definitions={definitions}

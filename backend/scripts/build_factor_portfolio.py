@@ -5,11 +5,12 @@
 |ICIR| 门槛 → 覆盖率门槛 → T+20 调仓的扣费净收益 > 0 → 相关性去重 → 最大 ICIR 配权 → 取 top-N。
 
 用法：
-  python backend/scripts/build_factor_portfolio.py                     # 四个数据集全跑
+  python backend/scripts/build_factor_portfolio.py                     # 本市场数据集全跑（缺省 CN）
+  python backend/scripts/build_factor_portfolio.py --market HK         # 港股（l1_factors/ccass/south）
   python backend/scripts/build_factor_portfolio.py --dataset l1_l2_factors
   python backend/scripts/build_factor_portfolio.py --n-top 40 --no-net-gate
 
-产出：<数据集>/report/factor_portfolio.json
+产出：<市场根>/<数据集>/report/factor_portfolio.json
 下一步：python backend/scripts/apply_factor_selection_to_catalog.py --dataset <数据集>   # 写进训练目录（训练页勾选）
 """
 
@@ -22,13 +23,20 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.services.engine.factor_report.datasets import DATASETS  # noqa: E402
+from backend.services.engine.factor_report.datasets import (  # noqa: E402
+    DATASETS_BY_MARKET,
+    datasets_for_market,
+    market_key,
+    supports_market,
+)
 from backend.services.engine.factor_report.portfolio import build_portfolio, portfolio_path  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成推荐因子组合 JSON")
     ap.add_argument("--dataset", default="all")
+    ap.add_argument("--market", default="CN",
+                    help=f"市场（缺省 CN；可用: {', '.join(DATASETS_BY_MARKET)}）")
     ap.add_argument("--n-top", type=int, default=30, help="最终入选因子数上限")
     ap.add_argument("--icir-min", type=float, default=0.15, help="|ICIR| 门槛")
     ap.add_argument("--coverage-min", type=float, default=0.60, help="覆盖率门槛")
@@ -37,8 +45,16 @@ def main() -> int:
     ap.add_argument("--holding-days", type=int, default=20, help="调仓周期（成本口径）")
     args = ap.parse_args()
 
-    datasets = list(DATASETS) if args.dataset == "all" else [args.dataset]
-    datasets = [d for d in datasets if d in DATASETS] or list(DATASETS)
+    if not supports_market(args.market):
+        ap.error(f"因子报告未接入市场: {args.market!r}（可用: {', '.join(DATASETS_BY_MARKET)}）")
+    mk = market_key(args.market)
+    reg = datasets_for_market(mk)
+
+    datasets = list(reg) if args.dataset == "all" else [args.dataset]
+    datasets = [d for d in datasets if d in reg]
+    if not datasets:
+        print(f"[{mk}] 无可用数据集（请求 {args.dataset!r}；本市场: {', '.join(reg)}）")
+        return 1
 
     for ds in datasets:
         res = build_portfolio(
@@ -49,12 +65,13 @@ def main() -> int:
             corr_threshold=args.corr_threshold,
             require_positive_net=not args.no_net_gate,
             holding_days=args.holding_days,
+            market=mk,
         )
         if not res.get("available"):
-            print(f"[{ds}] 跳过：{res.get('reason')}")
+            print(f"[{mk}/{ds}] 跳过：{res.get('reason')}")
             continue
         s = res["summary"]
-        print(f"[{ds}] 入选 {s['n_selected']}/{s['n_universe']}（通过门槛 {s['n_passed']}）"
+        print(f"[{mk}/{ds}] 入选 {s['n_selected']}/{s['n_universe']}（通过门槛 {s['n_passed']}）"
               f"｜组合 IC {s['composite_ic']:+.4f} / ICIR {s['composite_icir']:+.3f}"
               f"（单因子平均 |ICIR| {s['single_icir_avg']:.3f}）")
         top = res["factors"][:5]
@@ -80,7 +97,7 @@ def main() -> int:
                 )
         else:
             print(f"   精选子集：不可用（{bs.get('reason', '缺 best_subset 块')}）")
-        print(f"   → {portfolio_path(ds)}")
+        print(f"   → {portfolio_path(ds, mk)}")
     return 0
 
 

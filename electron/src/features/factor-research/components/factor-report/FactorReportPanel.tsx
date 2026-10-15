@@ -17,6 +17,13 @@
  *
  * 数据：backend/services/engine/factor_report（快照 + 预计算序列），
  * 快照由 backend/scripts/build_factor_report.py --dataset <名> 生成（或本页按钮触发）。
+ *
+ * 市场分层（2026-10）：所有请求带 `market`（数据集清单、摘要、明细、相关性、重建
+ * 都按市场独立）。换市场 = 换一份快照集：在途请求作废、清单/因子/明细全清后按
+ * 新市场重取，**绝不让 A 股快照的因子名去问港股明细**。基准不写死代码 —— 缺省
+ * 交给后端取本市场主基准（CN 即沪深300，与旧的写死值同路）；基准候选清单由
+ * 响应的 excess_block.benchmarks[] 下发（本市场基准表，含取数状态），无基准市场
+ * 的候选为空、超额块整块降级并给出原因（见 ExcessTab）。
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -54,10 +61,13 @@ import type {
   FactorReportMeta,
   FactorSummary,
 } from '../../types/factorReport';
+import type { ResearchMarket } from '../../types/factorResearch';
 // 只借类型（编译期擦除，不引入 ScreeningTab 的运行时依赖）
 import type { FactorLocation } from '../ScreeningTab';
 
 interface Props {
+  /** 本页当前市场（CN/HK/US/FUTURES）：清单/摘要/明细/基准候选全部按它分派 */
+  market: ResearchMarket;
   /**
    * 深链目标：进入时直接落到某个数据集的某个因子（筛选页的「报告」按钮带过来）。
    *
@@ -78,7 +88,7 @@ interface Props {
 }
 
 export const FactorReportPanel: React.FC<Props> = ({
-  initialDataset, initialCode, locateSingle, openSingle,
+  initialDataset, initialCode, locateSingle, openSingle, market,
 }) => {
   const [datasets, setDatasets] = useState<FactorDatasetInfo[]>([]);
   const [dataset, setDataset] = useState<string>(() => initialDataset || 'alpha_library');
@@ -120,18 +130,57 @@ export const FactorReportPanel: React.FC<Props> = ({
   const [buildStep, setBuildStep] = useState<string | null>(null);
   const [buildError, setBuildError] = useState<string | null>(null);
   const datasetRef = useRef(dataset);
-  // 分组 / 成本 / 基准 —— 后端已把它们纳入缓存键，改了必须重新请求
+  // loadSummary / refreshDatasets 还会被轮询与事件回调调用 —— 那些闭包里的 market
+  // 可能是旧渲染的；一律经 ref 取**调用当下**的市场。
+  const marketRef = useRef(market);
+  // 重建快照的发起市场：轮询按发起时的市场问状态（重建期间用户可能切走市场）
+  const buildMarketRef = useRef<ResearchMarket>(market);
+  // 上次按哪个市场装载的（换市场效应的哨兵；初值 = 当前市场 → 首装不清空）
+  const loadedMarketRef = useRef<ResearchMarket>(market);
+  // 深链带的 initialDataset 只钉**首次**装载：换市场后作废 —— 其它市场不一定有同名快照
+  const linkPinnedRef = useRef<boolean>(!!initialDataset);
+  // 清单已按哪个市场装好。摘要必须等它到位再发：换市场瞬间旧市场的数据集名在新市场
+  // 大概率查空，抢跑只会先闪一屏「快照不可用」再被纠正。
+  const [listMarket, setListMarket] = useState<ResearchMarket | null>(null);
+  // 分组 / 成本 / 基准 —— 后端已把它们纳入缓存键，改了必须重新请求。
+  // bench 缺省（不给键）= 后端取**本市场主基准**（CN 即沪深300）——绝不写死代码：
+  // 写死 000300.SH 会把 A 股基准带到港股/美股请求里。
   const [params, setParams] = useState<FactorDetailParams>({
-    longGroup: 3, shortGroup: 9, costBps: 20, bench: '000300.SH',
+    longGroup: 3, shortGroup: 9, costBps: 20,
   });
 
   useEffect(() => {
     datasetRef.current = dataset;
   }, [dataset]);
 
+  useEffect(() => {
+    marketRef.current = market;
+  }, [market]);
+
+  // 换市场：整套面板状态与在途请求全部作废，按新市场重新装载。首装不清空
+  // （哨兵初值即当前市场，直接跳过；下面的清单/摘要 effect 会正常装载）。
+  useEffect(() => {
+    if (loadedMarketRef.current === market) return;
+    loadedMarketRef.current = market;
+    summarySeqRef.current += 1; // 在途摘要作废（结果属于旧市场）
+    pendingCodeRef.current = null; // 深链只对首次装载生效
+    setSelected(null);
+    setDetail(null);
+    setRelated(null);
+    setCorrelation(null);
+    setMissingCode(null);
+    setFactors([]);
+    setMeta(null);
+    setUnavailable(null);
+    setBuildError(null);
+    setDatasets([]);
+    // 基准回落本市场主基准（旧市场点名的代码在新市场可能不存在）
+    setParams({ longGroup: 3, shortGroup: 9, costBps: 20 });
+  }, [market]);
+
   const refreshDatasets = async (): Promise<FactorDatasetInfo[] | null> => {
     try {
-      const res = await getFactorDatasets();
+      const res = await getFactorDatasets(marketRef.current);
       const items = res.items || [];
       setDatasets(items);
       return items;
@@ -144,12 +193,19 @@ export const FactorReportPanel: React.FC<Props> = ({
   useEffect(() => {
     void (async () => {
       const items = await refreshDatasets();
-      const first = (items || []).find((d) => d.available);
-      // 深链优先：带了 initialDataset 就不能再改写成「第一个可用集」，
+      const list = items || [];
+      const first = list.find((d) => d.available);
+      // 当前数据集在新市场的清单里 → 保留（换市场不清用户名下的选择）；
+      // 不在 → 切到第一个可用集。
+      const keep = list.some((d) => d.dataset === datasetRef.current);
+      // 深链优先：带了 initialDataset 就不能在**首次**装载改写成「第一个可用集」，
       // 否则用户点的那个因子会被安到一个不相干的数据集上。
-      if (first && !initialDataset) setDataset(first.dataset);
+      const pinned = linkPinnedRef.current;
+      linkPinnedRef.current = false;
+      if (!keep && first && !pinned) setDataset(first.dataset);
+      setListMarket(market);
     })();
-  }, [initialDataset]);
+  }, [initialDataset, market]);
 
   // 下拉点空白处关闭
   useEffect(() => {
@@ -166,7 +222,7 @@ export const FactorReportPanel: React.FC<Props> = ({
     const seq = (summarySeqRef.current += 1);
     setListLoading(true);
     try {
-      const res = await getFactorSummary({ dataset: ds, sort: 'abs_ic' });
+      const res = await getFactorSummary({ dataset: ds, sort: 'abs_ic', market: marketRef.current });
       if (seq !== summarySeqRef.current) return; // 已经有更新的请求发出去了，这份作废
       if (!res.available) {
         setUnavailable(res.reason || '快照尚未生成');
@@ -201,6 +257,9 @@ export const FactorReportPanel: React.FC<Props> = ({
 
   useEffect(() => {
     if (!dataset) return;
+    // 清单还没按本市场装好就先不发（换市场瞬间旧数据集名在新市场大概率查空）。
+    // 首次装载也因此改为「清单 → 摘要」串行：换来的是不会拿错数据集去取快照。
+    if (listMarket !== market) return;
     setSelected(null);
     setDetail(null);
     setRelated(null);
@@ -208,7 +267,7 @@ export const FactorReportPanel: React.FC<Props> = ({
     const want = pendingCodeRef.current;
     pendingCodeRef.current = null; // 只生效一次
     void loadSummary(dataset, want === null, want);
-  }, [dataset]);
+  }, [dataset, market, listMarket]);
 
   // 选中因子变化 → 明细 + 相关因子 → 相关性矩阵
   // ⚠️ 明细依赖 params：改分组/成本/基准会改变多空曲线本身，必须重新取数（后端已纳入缓存键）
@@ -217,7 +276,7 @@ export const FactorReportPanel: React.FC<Props> = ({
     let cancelled = false;
     setDetailLoading(true);
     setDetail(null);
-    getFactorDetail(selected, dataset, params)
+    getFactorDetail(selected, dataset, params, market)
       .then((d) => !cancelled && setDetail(d))
       .catch(() => !cancelled && setDetail(null))
       .finally(() => !cancelled && setDetailLoading(false));
@@ -225,19 +284,19 @@ export const FactorReportPanel: React.FC<Props> = ({
     return () => {
       cancelled = true;
     };
-  }, [selected, dataset, params]);
+  }, [selected, dataset, params, market]);
 
   // 相关性与分组/成本/基准无关 → 单独一个 effect，改参数时不重复拉
   useEffect(() => {
     if (!selected || !dataset) return;
     let cancelled = false;
     setCorrLoading(true);
-    getFactorRelated(selected, dataset, 7)
+    getFactorRelated(selected, dataset, 7, market)
       .then(async (r) => {
         if (cancelled) return;
         setRelated(r);
         const names = [selected, ...r.related.map((x) => x.name)];
-        const corr = await getFactorCorrelation(names, dataset);
+        const corr = await getFactorCorrelation(names, dataset, market);
         if (!cancelled) setCorrelation(corr);
       })
       .catch(() => {
@@ -251,7 +310,7 @@ export const FactorReportPanel: React.FC<Props> = ({
     return () => {
       cancelled = true;
     };
-  }, [selected, dataset]);
+  }, [selected, dataset, market]);
 
   const rebuild = async () => {
     if (buildDataset) return;
@@ -259,8 +318,9 @@ export const FactorReportPanel: React.FC<Props> = ({
     setBuildError(null);
     setBuildStep(null);
     setBuildDataset(dataset);
+    buildMarketRef.current = market; // 轮询按发起时的市场问状态
     try {
-      await startFactorReportBuild(dataset);
+      await startFactorReportBuild(dataset, market);
     } catch (e) {
       setBuildDataset(null);
       setBuildError(e instanceof Error ? e.message : '重建启动失败');
@@ -274,7 +334,8 @@ export const FactorReportPanel: React.FC<Props> = ({
     let cancelled = false;
     const tick = async () => {
       try {
-        const st = await getFactorReportBuildStatus(target);
+        // 状态按**发起重建时的市场**问（重建期间用户可能已切走市场）
+        const st = await getFactorReportBuildStatus(target, buildMarketRef.current);
         if (cancelled) return;
         setBuildStep(st.step || null);
         if (!st.running) {
@@ -454,6 +515,7 @@ export const FactorReportPanel: React.FC<Props> = ({
             selected={selected}
             onSelect={setSelected}
             dataset={dataset}
+            market={market}
             loading={listLoading}
           />
         </aside>
@@ -497,6 +559,7 @@ export const FactorReportPanel: React.FC<Props> = ({
             <FactorDetailTabs
               factor={selected}
               dataset={dataset}
+              market={market}
               summary={current}
               library={factors}
               detail={detail}
@@ -517,6 +580,7 @@ export const FactorReportPanel: React.FC<Props> = ({
         open={portfolioOpen}
         dataset={dataset}
         datasetLabel={currentDs?.label || dataset}
+        market={market}
         onClose={() => setPortfolioOpen(false)}
         onPick={(f) => setSelected(f)}
       />
@@ -525,6 +589,7 @@ export const FactorReportPanel: React.FC<Props> = ({
         open={clusterOpen}
         dataset={dataset}
         datasetLabel={currentDs?.label || dataset}
+        market={market}
         onClose={() => setClusterOpen(false)}
         onPick={(f) => setSelected(f)}
       />

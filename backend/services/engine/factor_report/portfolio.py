@@ -5,6 +5,10 @@
   - `GET /api/v1/factor-report/portfolio`（页面展示）
   - `scripts/apply_factor_selection_to_catalog.py`（写训练目录 → 训练页勾选）
 
+市场分层（2026-10-16）：全部入口带 ``market``（缺省 CN，零行为变化）。HK/US/FUTURES
+共用 ``l1_factors`` 数据集名 —— 目录/快照/序列一律经 ``market`` 解析，**不允许**只按
+数据集名取路径（会读到 CN 的组合 JSON）。
+
 选因子规则（透明可复现）：
   1. **硬门槛**：|ICIR| ≥ icir_min、覆盖率 ≥ coverage_min、T+20 调仓口径扣费净收益 > 0（可关）
   2. **相关性去重**：|ρ| ≥ corr_threshold 的同源簇只留 |ICIR| 最大者（复用 clusters 的连通分量）
@@ -25,6 +29,7 @@ import pyarrow.parquet as pq
 
 from .best_subset import compute_best_subset, load_net_returns
 from .clusters import cluster_by_correlation
+from .datasets import market_key
 from .optimize import (
     DEFAULT_HOLDING_DAYS,
     DEFAULT_ROUND_TRIP_COST,
@@ -37,13 +42,14 @@ from .service import dataset_dir, load_snapshot, normalize_dataset
 log = logging.getLogger(__name__)
 
 
-def portfolio_path(dataset: str = "alpha_library") -> Path:
-    return dataset_dir(normalize_dataset(dataset)) / "report" / "factor_portfolio.json"
+def portfolio_path(dataset: str = "alpha_library", market: str = "CN") -> Path:
+    return dataset_dir(normalize_dataset(dataset, market), market) / "report" / "factor_portfolio.json"
 
 
-def _series_stats(dataset: str, round_trip_cost: float, holding_days: int) -> dict[str, dict[str, float]]:
+def _series_stats(dataset: str, round_trip_cost: float, holding_days: int,
+                  market: str = "CN") -> dict[str, dict[str, float]]:
     """从序列快照算每因子的：扣费净收益（T+holding 调仓口径）、覆盖率、日换手。"""
-    path = dataset_dir(dataset) / "report" / "factor_series.parquet"
+    path = dataset_dir(dataset, market) / "report" / "factor_series.parquet"
     if not path.exists():
         return {}
     names = set(pq.ParquetFile(path).schema_arrow.names)
@@ -84,19 +90,22 @@ def build_portfolio(
     round_trip_cost: float = DEFAULT_ROUND_TRIP_COST,
     holding_days: int = DEFAULT_HOLDING_DAYS,
     persist: bool = True,
+    market: str = "CN",
 ) -> dict[str, Any]:
     """构建推荐因子集（含权重与淘汰理由）；persist=True 时写 factor_portfolio.json。"""
-    ds = normalize_dataset(dataset)
-    snap = load_snapshot(ds)
+    mk = market_key(market)
+    ds = normalize_dataset(dataset, mk)
+    snap = load_snapshot(ds, mk)
     if not snap:
-        return {"available": False, "dataset": ds,
-                "reason": f"数据集 {ds} 的快照尚未生成，请先运行 build_factor_report.py --dataset {ds}"}
+        return {"available": False, "dataset": ds, "market": mk,
+                "reason": f"[{mk}] 数据集 {ds} 的快照尚未生成，请先运行 "
+                          f"build_factor_report.py --dataset {ds} --market {mk}"}
 
     corr = snap.get("correlation") or {}
     all_names: list[str] = list(corr.get("factors") or [])
     matrix = list(corr.get("matrix") or [])
     metrics = {f["name"]: f for f in (snap.get("factors") or []) if f.get("name")}
-    stats = _series_stats(ds, round_trip_cost, holding_days)
+    stats = _series_stats(ds, round_trip_cost, holding_days, mk)
 
     rejected: list[dict[str, str]] = []
     passed: list[str] = []
@@ -139,7 +148,7 @@ def build_portfolio(
         rejected.append({"name": n, "reason": f"评分排名 {ranked.index(n) + 1} 超出 top {n_top}"})
 
     if len(sel) < 3:
-        return {"available": False, "dataset": ds,
+        return {"available": False, "dataset": ds, "market": mk,
                 "reason": f"通过门槛的因子只有 {len(sel)} 个（<3），请放宽 n_top/icir_min 或关闭净收益门槛"}
 
     # ── 权重：最大 ICIR（收缩 Σ⁻¹μ，带方向）—— 口径与回退路径统一在 optimize.py
@@ -159,7 +168,7 @@ def build_portfolio(
     # ── 组合表现：用**逐日 IC 序列**合成（与单因子 ICIR 同口径；
     #    为何不能用相关矩阵合成，见 optimize.composite_ic_series 的模块注释）
     comp_ic = comp_icir = None
-    sp = dataset_dir(ds) / "report" / "factor_series.parquet"
+    sp = dataset_dir(ds, mk) / "report" / "factor_series.parquet"
     if sp.exists():
         raw = pq.read_table(sp, columns=["factor", "date", "ic"]).to_pandas()
         piv = raw.pivot_table(index="date", columns="factor", values="ic")
@@ -186,7 +195,7 @@ def build_portfolio(
             directions=dirs,
             holding_days=holding_days,
             round_trip_cost=round_trip_cost,
-            series_path=dataset_dir(ds) / "report" / "factor_series.parquet",
+            series_path=dataset_dir(ds, mk) / "report" / "factor_series.parquet",
         )
         if net_ret is None:
             best = {
@@ -237,6 +246,7 @@ def build_portfolio(
     payload = {
         "available": True,
         "dataset": ds,
+        "market": mk,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "rule": {
             "n_top": n_top,
@@ -262,7 +272,7 @@ def build_portfolio(
         "best_subset": best,
     }
     if persist:
-        path = portfolio_path(ds)
+        path = portfolio_path(ds, mk)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             # allow_nan=False：宁可写失败也不落一份浏览器/网关读不得的 JSON

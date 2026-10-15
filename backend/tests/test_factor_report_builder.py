@@ -151,11 +151,11 @@ def _run(monkeypatch, tmp_path: Path, name: str, fac_dir: Path, lab_dir: Path | 
     }
     if donor is not None:
         cfg["donor_parts"] = ("pytest", "donor")
-        monkeypatch.setattr(bfr, "dataset_donor_dir", lambda _ds: donor)
-    monkeypatch.setitem(bfr.DATASETS, name, cfg)
-    monkeypatch.setattr(bfr, "dataset_dir", lambda _ds: fac_dir)
+        monkeypatch.setattr(bfr, "dataset_donor_dir", lambda *a, **k: donor)
+    monkeypatch.setitem(bfr.DATASETS_BY_MARKET["CN"], name, cfg)
+    monkeypatch.setattr(bfr, "dataset_dir", lambda *a, **k: fac_dir)
     if lab_dir is not None:
-        monkeypatch.setattr(bfr, "dataset_label_dir", lambda _ds: lab_dir)
+        monkeypatch.setattr(bfr, "dataset_label_dir", lambda *a, **k: lab_dir)
 
     out = tmp_path / "report" / "factor_report.json"
     series = tmp_path / "report" / "factor_series.parquet"

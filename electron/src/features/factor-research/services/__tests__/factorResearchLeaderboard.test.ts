@@ -31,13 +31,15 @@ afterEach(() => vi.unstubAllGlobals());
 const EMPTY = { leaderboard: [], meta: {} };
 
 describe('getLeaderboard：dedup 参数', () => {
-  test('去重开启：URL 带 dedup=0.9（与筛选页同口径的阈值）', async () => {
+  test('去重开启：URL 带 dedup=0.9（与筛选页同口径的阈值），market 一并带上', async () => {
     const calls = stubFetch(EMPTY);
 
-    await getLeaderboard(undefined, 30, 'private', 0.9);
+    await getLeaderboard(undefined, 30, 'private', 0.9, 'HK');
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toBe(`${SERVICE_ENDPOINTS.USER_SERVICE}/factor-research/leaderboard?dataset=private&dedup=0.9`);
+    expect(calls[0]).toBe(
+      `${SERVICE_ENDPOINTS.USER_SERVICE}/factor-research/leaderboard?dataset=private&market=HK&dedup=0.9`,
+    );
   });
 
   test('去重关闭（0）：URL 不含 dedup —— 默认路径字节级不变', async () => {

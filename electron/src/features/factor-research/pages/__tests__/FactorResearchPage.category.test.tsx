@@ -31,8 +31,11 @@ vi.mock('../../services/factorResearchService', async () => {
   return { ...actual, getCatalog: catalogMock, getLeaderboard: leaderboardMock };
 });
 
+// 页面读两个选择器：市场（uiSlice）与 is_admin（auth）。按选择器对假 state 求值，
+// 别返回与语义无关的 false（那会让页面落到「市场未接入」阻断面 —— 断言失败时看不出根因）。
 vi.mock('../../../../store', () => ({
-  useAppSelector: () => false,
+  useAppSelector: (sel: (s: unknown) => unknown) =>
+    sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: false } } }),
 }));
 
 // 目录桩：回显页面传下来的 loading 与 categoryFilter，并提供两个触发按钮

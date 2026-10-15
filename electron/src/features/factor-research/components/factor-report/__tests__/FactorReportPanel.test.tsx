@@ -103,7 +103,7 @@ describe('FactorReportPanel：深链', () => {
   test('带 initialDataset + initialCode 时落到指定的数据集与因子', async () => {
     summaryMock.mockResolvedValue(summaryFor([{ name: 'OTHER' }, { name: 'vol_persistence' }]));
 
-    render(<FactorReportPanel initialDataset="l2_factors" initialCode="vol_persistence" />);
+    render(<FactorReportPanel market="CN" initialDataset="l2_factors" initialCode="vol_persistence" />);
     await screen.findByTestId('detail');
 
     // 关键：数据集清单（alpha_library 在前）是**异步**回来的，它触发的重渲染会在
@@ -119,7 +119,7 @@ describe('FactorReportPanel：深链', () => {
   });
 
   test('点名的因子不在快照里：明说找不到，**不**回落到第一个因子', async () => {
-    render(<FactorReportPanel initialDataset="alpha_library" initialCode="ghost_factor" />);
+    render(<FactorReportPanel market="CN" initialDataset="alpha_library" initialCode="ghost_factor" />);
 
     expect(await screen.findByText(/该因子不在/)).toBeTruthy();
     expect(screen.getByText('ghost_factor')).toBeTruthy();
@@ -129,7 +129,7 @@ describe('FactorReportPanel：深链', () => {
   });
 
   test('不传深链：保持原行为，选第一个可用数据集的第一个因子', async () => {
-    render(<FactorReportPanel />);
+    render(<FactorReportPanel market="CN" />);
 
     const detail = await screen.findByTestId('detail');
     expect(detail.getAttribute('data-factor')).toBe('f1');
@@ -138,7 +138,7 @@ describe('FactorReportPanel：深链', () => {
 
   test('落空后用户自己挑一个因子：明细要顶掉横幅，不能是死路', async () => {
     summaryMock.mockResolvedValue(summaryFor([{ name: 'f1' }, { name: 'f2' }]));
-    render(<FactorReportPanel initialDataset="alpha_library" initialCode="ghost_factor" />);
+    render(<FactorReportPanel market="CN" initialDataset="alpha_library" initialCode="ghost_factor" />);
 
     expect(await screen.findByText(/该因子不在/)).toBeTruthy();
 
@@ -160,7 +160,7 @@ describe('FactorReportPanel：深链', () => {
     );
 
     // 深链落到 alpha_library（大快照，慢），它还没回来用户就切到了 L2
-    render(<FactorReportPanel initialDataset="alpha_library" />);
+    render(<FactorReportPanel market="CN" initialDataset="alpha_library" />);
     // 数据集切换 2026-10-09 收敛到顶栏下拉：先展开再点选项
     fireEvent.click(await screen.findByTestId('report-dataset-dropdown'));
     fireEvent.click(await screen.findByTestId('report-dataset-option-l2_factors'));
@@ -196,7 +196,7 @@ describe('FactorReportPanel：快照落后与重建（2026-10-09）', () => {
     });
     const datasetsCallsBefore = () => datasetsMock.mock.calls.length;
 
-    render(<FactorReportPanel />);
+    render(<FactorReportPanel market="CN" />);
 
     // 徽章：把「102 vs 80」的差额直接摆出来，而不是只有一句「落后了」
     const badge = await screen.findByTestId('report-stale-badge');
@@ -211,13 +211,13 @@ describe('FactorReportPanel：快照落后与重建（2026-10-09）', () => {
     fireEvent.click(screen.getByTestId('report-rebuild'));
 
     // 发起的构建目标 = 正在浏览的数据集（不是「第一个可用集」）
-    await waitFor(() => expect(startBuildMock).toHaveBeenCalledWith('alpha_library'));
+    await waitFor(() => expect(startBuildMock).toHaveBeenCalledWith('alpha_library', 'CN'));
     // 轮询首拍即 running:false → 重新拉数据集清单（徽章数据源随之更新）
     await waitFor(() => expect(datasetsCallsBefore()).toBeGreaterThan(before));
   });
 
   test('盘上无变化：不出现落后徽章（避免「永远是脏的」噪声）', async () => {
-    render(<FactorReportPanel />);
+    render(<FactorReportPanel market="CN" />);
     await screen.findByTestId('detail');
     expect(screen.queryByTestId('report-stale-badge')).toBeNull();
     expect(startBuildMock).not.toHaveBeenCalled();
@@ -239,7 +239,7 @@ describe('FactorReportPanel：快照落后与重建（2026-10-09）', () => {
         : Promise.resolve(summaryFor([{ name: 'f1' }])),
     );
 
-    render(<FactorReportPanel />);
+    render(<FactorReportPanel market="CN" />);
     await screen.findByTestId('detail');
 
     fireEvent.click(screen.getByTestId('report-dataset-dropdown'));
@@ -252,6 +252,6 @@ describe('FactorReportPanel：快照落后与重建（2026-10-09）', () => {
     fireEvent.click(screen.getByTestId('report-unavailable-rebuild'));
 
     // 重建目标 = rd_mined（不是「第一个可用数据集」）
-    await waitFor(() => expect(startBuildMock).toHaveBeenCalledWith('rd_mined'));
+    await waitFor(() => expect(startBuildMock).toHaveBeenCalledWith('rd_mined', 'CN'));
   });
 });

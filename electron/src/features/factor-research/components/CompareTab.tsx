@@ -1,12 +1,16 @@
 /**
  * 因子研究 —— 多因子对比页签：每因子可单独设持仓数，区间内净值/KPI/IC 叠加对比 + 相关热力图。
+ *
+ * 基准面市场化（2026-10）：超额列与净值叠加的基准取**本市场主基准**（= 后端
+ * 超额映射的首键，CN 沪深300 / HK 恒生 / US 标普500），名称用响应里下发的
+ * bench name；无基准市场（期货）不渲染叠加开关、超额列显示「—」。
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { X } from 'lucide-react';
 import { EChartsChart } from '../../../components/common/EChartsChart';
 import { postCompare } from '../services/factorResearchService';
 import type { FactorDataset, RangeParams } from '../services/factorResearchService';
-import type { CompareResponse } from '../types/factorResearch';
+import type { CompareResponse, ResearchMarket } from '../types/factorResearch';
 import { Card, FACTOR_COLORS, fmtNum, fmtPct, IcChart, NavChart } from './common';
 
 interface Props {
@@ -15,9 +19,11 @@ interface Props {
   nameOf: (code: string) => string;
   range: RangeParams;
   dataset: FactorDataset;
+  /** 本页当前市场（对比取数按市场） */
+  market: ResearchMarket;
 }
 
-export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, dataset }) => {
+export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, dataset, market }) => {
   const [data, setData] = useState<CompareResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,12 +43,21 @@ export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, da
     let alive = true;
     setLoading(true);
     setError(null);
-    postCompare(items, range, dataset)
+    postCompare(items, range, dataset, market)
       .then((d) => { if (alive) setData(d); })
       .catch((e: unknown) => { if (alive) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [JSON.stringify(items), range.start, range.end, dataset]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(items), range.start, range.end, dataset, market]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 主基准：超额映射（后端按 bench_order 生成）的首键 ↔ 响应 benchmarks 里的名称。
+  // 期货无基准表 → 首键缺席 → null：不叠线、超额列「—」。
+  const benchPrimary = useMemo(() => {
+    const first = data?.factors[0]?.excess;
+    const code = first ? Object.keys(first)[0] : undefined;
+    if (!code) return null;
+    return data?.benchmarks.find((b) => b.code === code) ?? { code, name: code };
+  }, [data]);
 
   const corrMatrix = useMemo(() => {
     if (!data?.corr || !data.factors.length) return null;
@@ -115,14 +130,16 @@ export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, da
           </span>
         ))}
         <div className="flex-1" />
-        <button
-          onClick={() => setBenchOn(!benchOn)}
-          className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold ${
-            benchOn ? 'border-slate-300 bg-slate-100 text-slate-600' : 'border-slate-200 text-slate-400'
-          }`}
-        >
-          叠加沪深300
-        </button>
+        {benchPrimary && (
+          <button
+            onClick={() => setBenchOn(!benchOn)}
+            className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold ${
+              benchOn ? 'border-slate-300 bg-slate-100 text-slate-600' : 'border-slate-200 text-slate-400'
+            }`}
+          >
+            叠加{benchPrimary.name}
+          </button>
+        )}
         <span className="text-[10px] text-slate-400">最多 12 个（超出自动截断）</span>
       </div>
 
@@ -147,7 +164,7 @@ export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, da
                   <th className="text-right py-1">夏普</th>
                   <th className="text-right py-1">最大回撤</th>
                   <th className="text-right py-1">月胜率</th>
-                  <th className="text-right py-1">超额vs300</th>
+                  <th className="text-right py-1">{benchPrimary ? `超额vs${benchPrimary.name}` : '超额'}</th>
                   <th className="text-right py-1">RankIC</th>
                   <th className="text-right py-1">IC_IR</th>
                 </tr>
@@ -165,8 +182,8 @@ export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, da
                     <td className="py-1 text-right font-mono text-slate-600">{fmtNum(f.kpi.sharpe)}</td>
                     <td className="py-1 text-right font-mono text-slate-500">{fmtPct(f.kpi.max_drawdown)}</td>
                     <td className="py-1 text-right font-mono text-slate-500">{fmtPct(f.kpi.win_rate)}</td>
-                    <td className={`py-1 text-right font-mono ${(f.excess['000300.SH'] || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                      {fmtPct(f.excess['000300.SH'])}
+                    <td className={`py-1 text-right font-mono ${(benchPrimary ? f.excess[benchPrimary.code] || 0 : 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
+                      {fmtPct(benchPrimary ? f.excess[benchPrimary.code] : null)}
                     </td>
                     <td className={`py-1 text-right font-mono ${(f.kpi.ic_mean || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>{fmtNum(f.kpi.ic_mean, 3)}</td>
                     <td className="py-1 text-right font-mono text-slate-500">{fmtNum(f.kpi.ic_ir)}</td>
@@ -186,9 +203,9 @@ export const CompareTab: React.FC<Props> = ({ codes, onRemove, nameOf, range, da
                     data: f.nav,
                     color: FACTOR_COLORS[i % FACTOR_COLORS.length],
                   })),
-                  ...(benchOn
+                  ...(benchOn && benchPrimary
                     ? data.benchmarks
-                        .filter((b) => b.code === '000300.SH')
+                        .filter((b) => b.code === benchPrimary.code)
                         .map((b) => ({ name: b.name, data: b.nav, color: '#94a3b8', dashed: true }))
                     : []),
                 ]}

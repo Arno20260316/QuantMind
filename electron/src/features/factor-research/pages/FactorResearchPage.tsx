@@ -5,14 +5,20 @@
  * 研究：排行榜 / 单因子分析 / 多因子对比 / 多因子合成 / 筛选
  * 工具：因子报告（2026-09-17 由技能中心迁入，全宽渲染；策略模板已迁至回测中心·策略管理右侧，评估中心已迁至模拟交易页签）
  * 数据：/api/v1/factor-research（引擎服务，快照由 build_factor_research.py 构建）
+ *
+ * 市场分层（2026-10）：跟随全局市场选择器（CN/HK/US/FUTURES），market 进全部
+ * 请求与依赖数组；切换市场即清空目录缓存与选择态、数据集重置为私人库、全量重取。
+ * CRYPTO 未接入（工作台无基准表）→ 诚实阻断卡片，**不发起任何请求**、绝不回退
+ * CN 数据（拿沪深300 给加密因子算超额是数据污染）。
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRightLeft, Award, BarChart3, ChevronsLeft, ChevronsRight, Database, Filter, Layers, LineChart, ScanSearch, Sigma, TableProperties } from 'lucide-react';
 import { PAGE_LAYOUT } from '../../../config/pageLayout';
+import { getMarketConfig } from '../../../config/marketConfig';
 import { ApiError, getCatalog, getLeaderboard } from '../services/factorResearchService';
 import type { FactorDataset, RangeParams } from '../services/factorResearchService';
-import type { CategoryFilter, FactorMeta, LeaderboardRow } from '../types/factorResearch';
+import type { CategoryFilter, FactorMeta, LeaderboardRow, ResearchMarket } from '../types/factorResearch';
 import { RangePicker } from '../components/common';
 import type { RangeValue } from '../components/common';
 import { CatalogSidebar } from '../components/CatalogSidebar';
@@ -30,6 +36,23 @@ import { FactorReportPanel } from '../components/factor-report/FactorReportPanel
 /** 排行榜去重阈值（与筛选页默认 |ρ| ≥ 0.9 同口径；改这里须同步筛选页语义） */
 const LEADERBOARD_DEDUP_RHO = 0.9;
 import { useAppSelector } from '../../../store';
+import { selectCurrentMarket } from '../../../store/slices/uiSlice';
+
+/**
+ * 因子研究已接入的市场（= ResearchMarket 全集）。全局 AppMarket 里 CRYPTO 不在内：
+ * 工作台未接基准表（后端 422「未接入市场」）。判断只在这一个地方做。
+ */
+const RESEARCH_MARKETS: readonly string[] = ['CN', 'HK', 'US', 'FUTURES'];
+const isResearchMarket = (m: string): m is ResearchMarket => RESEARCH_MARKETS.includes(m);
+
+/** 在途目录请求的键（见 `catalogInflightRef` 的注释）。 */
+const inflightKey = (market: ResearchMarket, dataset: FactorDataset): string => `${market}:${dataset}`;
+
+/** 数据集胶囊文案（`catalogDatasets` 决定当前市场渲染哪几枚） */
+const DATASET_LABELS: Record<FactorDataset, { label: string; title: string }> = {
+  classic: { label: '经典因子', title: 'factor-lib-demo 复刻的 82 因子（仅 A 股供给）' },
+  private: { label: '私人因子库', title: '本市场 L1/L2 等因子库筛选保留的私人因子' },
+};
 
 type Tab = 'leaderboard' | 'single' | 'compare' | 'compose' | 'screening' | 'factor-report';
 
@@ -63,6 +86,17 @@ const FactorResearchPage: React.FC = () => {
     [setSearchParams],
   );
   const isTool = isToolTab(tab);
+
+  // 全局市场选择器（顶栏切换）。`researchMarket` 为 null = 该市场未接入 →
+  // 渲染诚实阻断面，一切取数 effect 直接短路（CRYPTO 下一个请求都不发）。
+  const currentMarket = useAppSelector(selectCurrentMarket);
+  const researchMarket: ResearchMarket | null = isResearchMarket(currentMarket) ? currentMarket : null;
+  const marketLabel = getMarketConfig(currentMarket).label;
+  /** 目录数据集清单：经典库是 CN demo 口径的复刻，仅 CN 供给；非 CN 只有私人库 */
+  const catalogDatasets: FactorDataset[] = useMemo(
+    () => (researchMarket === 'CN' ? ['classic', 'private'] : ['private']),
+    [researchMarket],
+  );
 
   // URL 为准：外部导航（徽章深链等）带 ?tab= 时同步切换页签。
   // 依赖里**只放 searchParams、不放 tab**：本页自己的 setTab 是「先改 state、后跳
@@ -132,12 +166,15 @@ const FactorResearchPage: React.FC = () => {
    */
   const [catalogCache, setCatalogCache] = useState<Partial<Record<FactorDataset, FactorMeta[]>>>({});
   /**
-   * 在途的目录请求。主流程与「补缺的那份」两条路可能同时想要同一个数据集——
-   * 进页面就立刻点筛选页签最典型（私人库目录 1.1 MB 还在路上，cache 仍是空的）。
-   * 没有这个闸门就会把同一份目录拉两遍，而引擎被并发因子研究请求压垮过一次
-   * （2026-09-19，看门狗重启），这里不该再添一份。
+   * 在途的目录请求，键 = `市场:数据集`。主流程与「补缺的那份」两条路可能同时想要
+   * 同一个数据集——进页面就立刻点筛选页签最典型（私人库目录 1.1 MB 还在路上，
+   * cache 仍是空的）。没有这个闸门就会把同一份目录拉两遍，而引擎被并发因子研究
+   * 请求压垮过一次（2026-09-19，看门狗重启），这里不该再添一份。
+   *
+   * 键**必须带市场**：换市场时上一市场那条请求的 `.finally` 仍会销号，若只按数据集
+   * 记，它会把新市场同名数据集的在途登记一并抹掉，补缺那条路就会再拉一遍。
    */
-  const catalogInflightRef = useRef(new Set<FactorDataset>());
+  const catalogInflightRef = useRef(new Set<string>());
   /**
    * 每个目录的取回结果。筛选页要靠它区分两件**界面表现必须不同**的事：
    * 「这份目录还没到手 / 没取回来」与「目录到手了、里面确实没这个因子」。
@@ -158,7 +195,7 @@ const FactorResearchPage: React.FC = () => {
   // 「动量」这类中文字面量，过不了后端的来源库标识符校验。所以放行条件必须
   // 带上数据集，否则按钮点了只会全量 skipped，还把用户指向永远刷不出来的
   // 「刷新字段」。
-  const canRegister = isAdmin && dataset === 'private';
+  const canRegister = isAdmin && dataset === 'private' && researchMarket === 'CN';
 
   const rangeParams: RangeParams = useMemo(
     () => ({ start: range.start, end: range.end }),
@@ -166,11 +203,15 @@ const FactorResearchPage: React.FC = () => {
   );
 
   useEffect(() => {
+    if (!researchMarket) return; // 未接入市场：不发请求（面板由阻断卡片代替）
+    // 非 CN 市场只有私人库一份目录（见 catalogDatasets）。换市场那一帧 dataset 还是
+    // 旧市场的值（'classic'），不挡就会白拉一次本市场不存在的经典库。
+    if (!catalogDatasets.includes(dataset)) return;
     let alive = true;
     setLoading(true);
     setCatalogLoading(true);
-    catalogInflightRef.current.add(dataset);
-    getCatalog(dataset)
+    catalogInflightRef.current.add(inflightKey(researchMarket, dataset));
+    getCatalog(dataset, researchMarket)
       .then((cat) => {
         if (!alive) return;
         setFactors(cat.factors);
@@ -187,7 +228,7 @@ const FactorResearchPage: React.FC = () => {
       })
       .finally(() => {
         // 不论组件还在不在都要销号：请求已经结束了，留在册只会让补缺那条路永远跳过它。
-        catalogInflightRef.current.delete(dataset);
+        catalogInflightRef.current.delete(inflightKey(researchMarket, dataset));
         if (alive) {
           setLoading(false);
           setCatalogLoading(false);
@@ -196,7 +237,42 @@ const FactorResearchPage: React.FC = () => {
     return () => {
       alive = false;
     };
-  }, [dataset]);
+  }, [dataset, researchMarket, catalogDatasets]);
+
+  // 切换市场：目录缓存/回执全清（它们此前都是按 market+dataset 的内容，
+  // cache 只按 dataset 键存，不清就会把上一市场的因子清单喂给新市场），
+  // 选择态与面板一并复位，数据集回私人库（非 CN 唯一可选）。
+  //
+  // 在途登记**不清**：它按 `市场:数据集` 记，上一市场那条与新市场无关，且各自
+  // `.finally` 会销号。清掉反而是错的——本 effect 在挂载时排在「拉目录」那条之后，
+  // 清一次就等于把刚登记的那条抹掉，补缺那条路会把 1.1 MB 的目录再拉一遍。
+  // 首装也跳过：此刻各项状态本来就是下面这些默认值，跑一遍只多一轮白渲染。
+  const marketResetRef = useRef(currentMarket);
+  useEffect(() => {
+    if (marketResetRef.current === currentMarket) return;
+    marketResetRef.current = currentMarket;
+    setCatalogCache({});
+    setCatalogOutcome({});
+    catalogInflightRef.current.clear();
+    setFactors([]);
+    setL1Order([]);
+    setL2Order({});
+    setCatalogMeta({});
+    setLbMeta({});
+    setRows([]);
+    setSelected([]);
+    setActiveCode(null);
+    setTagFilter([]);
+    setCategoryFilter(null);
+    setRegisterTarget(null);
+    setReportTarget(null);
+    setScreeningSelected([]);
+    setPanel('none');
+    setError(null);
+    setErrorStatus(null);
+    setDataset('private');
+    keepActiveRef.current = null;
+  }, [currentMarket]);
 
   // 切换数据集：清空选择态，避免跨库代码混选。
   // 注册弹窗也要关——它按 dataset 决定目标库，挂着不关会用旧库的 codes 去写新库。
@@ -231,21 +307,22 @@ const FactorResearchPage: React.FC = () => {
   // l2Order 是「当前数据集」的展示态，不能被一次后台补数改掉。
   // 依赖里的 catalogCache 会让它在补完后重跑一次并立刻空转返回，不会自转。
   useEffect(() => {
+    if (!researchMarket) return;
     if (tab !== 'screening' && tab !== 'factor-report') return;
     // 在途的跳过：主流程可能正在拉同一个数据集（进页面就点筛选页签），
     // 不跳就会把 1.1 MB 的私人库目录拉两遍。
-    const missing = (['private', 'classic'] as FactorDataset[]).filter(
-      (d) => !catalogCache[d] && !catalogInflightRef.current.has(d),
+    const missing = catalogDatasets.filter(
+      (d) => !catalogCache[d] && !catalogInflightRef.current.has(inflightKey(researchMarket, d)),
     );
     if (missing.length === 0) return;
     let alive = true;
-    missing.forEach((d) => catalogInflightRef.current.add(d));
+    missing.forEach((d) => catalogInflightRef.current.add(inflightKey(researchMarket, d)));
     Promise.all(
       missing.map((d) =>
-        getCatalog(d)
+        getCatalog(d, researchMarket)
           .then((cat) => [d, cat.factors] as const)
           .catch(() => null)
-          .finally(() => catalogInflightRef.current.delete(d)),
+          .finally(() => catalogInflightRef.current.delete(inflightKey(researchMarket, d))),
       ),
     ).then((out) => {
       if (!alive) return;
@@ -266,30 +343,30 @@ const FactorResearchPage: React.FC = () => {
     return () => {
       alive = false;
     };
-  }, [tab, catalogCache]);
+  }, [tab, catalogCache, catalogDatasets, researchMarket]);
 
   const catalogIndex = useMemo(() => {
     const idx = new Map<string, FactorLocation>();
     // 索引键必须是目录的 **code**，不是 name_cn：筛选清单里的名字与 code 逐字
     // 相同（实测 362/362），而经典库的 name_cn 是「动量」这类中文名，用它建索引
     // 会一个都对不上。私人库后写：两份目录实测零重叠，万一将来重名，让主库赢。
-    (['classic', 'private'] as FactorDataset[]).forEach((ds) => {
+    catalogDatasets.forEach((ds) => {
       (catalogCache[ds] || []).forEach((f) => idx.set(f.code, { dataset: ds, code: f.code }));
     });
     return idx;
-  }, [catalogCache]);
+  }, [catalogCache, catalogDatasets]);
 
   /** 目录的可信度，交给筛选页决定怎么解释「这行点不进去」。 */
   const catalogStatus: 'loading' | 'degraded' | 'ready' = useMemo(() => {
-    const both: FactorDataset[] = ['private', 'classic'];
-    if (both.some((d) => catalogOutcome[d] === 'fail')) return 'degraded';
-    return both.every((d) => catalogOutcome[d] === 'ok') ? 'ready' : 'loading';
-  }, [catalogOutcome]);
+    if (catalogDatasets.some((d) => catalogOutcome[d] === 'fail')) return 'degraded';
+    return catalogDatasets.every((d) => catalogOutcome[d] === 'ok') ? 'ready' : 'loading';
+  }, [catalogOutcome, catalogDatasets]);
 
   useEffect(() => {
+    if (!researchMarket) return;
     let alive = true;
     setLoading(true);
-    getLeaderboard(rangeParams, lbN, dataset, lbDedup ? LEADERBOARD_DEDUP_RHO : 0)
+    getLeaderboard(rangeParams, lbN, dataset, lbDedup ? LEADERBOARD_DEDUP_RHO : 0, researchMarket)
       .then((lb) => {
         if (!alive) return;
         setRows(lb.leaderboard);
@@ -314,7 +391,7 @@ const FactorResearchPage: React.FC = () => {
     return () => {
       alive = false;
     };
-  }, [rangeParams, lbN, dataset, lbDedup, reloadKey]);
+  }, [rangeParams, lbN, dataset, lbDedup, reloadKey, researchMarket]);
 
   useEffect(() => {
     if (!activeCode && rows.length) setActiveCode(rows[0].code);
@@ -403,6 +480,12 @@ const FactorResearchPage: React.FC = () => {
             </div>
             <div className="flex items-center gap-2.5 ml-1 min-w-0">
               <h1 className="text-xl font-bold text-slate-800 tracking-tight">因子研究</h1>
+              <span
+                data-testid="research-market-tag"
+                className="rounded-md bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 text-[11px] font-bold text-indigo-600 shrink-0"
+              >
+                {marketLabel}
+              </span>
               <div className="h-4 w-[1px] bg-slate-200 self-center shrink-0" />
               <span className="text-sm font-medium text-slate-500 truncate">因子排行榜 · 单因子体检 · 对比 · 合成 · 因子报告</span>
             </div>
@@ -434,7 +517,8 @@ const FactorResearchPage: React.FC = () => {
               <>
                 <span className="hidden lg:inline-flex items-center gap-1.5 rounded-full bg-slate-100 border border-slate-200 px-3 py-1 text-[11px] font-bold text-slate-500">
                   <span className="h-1.5 w-1.5 rounded-full bg-indigo-500" />
-                  {available}/{factors.length || 82} 因子可用
+                  {/* 目录未到时不写死数字：82 是经典库的口径，非 CN 没有经典库 */}
+                  {factors.length ? `${available}/${factors.length} 因子可用` : '因子目录加载中'}
                 </span>
                 {window_ && (
                   <span className="hidden xl:inline-flex items-center rounded-full bg-indigo-50 border border-indigo-100 px-2.5 py-1 text-[11px] font-bold text-indigo-600">
@@ -446,8 +530,33 @@ const FactorResearchPage: React.FC = () => {
           </div>
         </header>
 
+        {/* 未接入市场（当前仅 CRYPTO）：诚实阻断 —— 不发起任何请求、不回退 CN 数据。
+            拿沪深300/申万行业这类 A 股口径去给别的市场算超额/IC 是数据污染。 */}
+        {!researchMarket && (
+          <div className="flex-1 min-h-0 min-w-0 flex items-center justify-center p-6" data-testid="research-market-blocked">
+            <div className="max-w-md w-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <div className="flex items-center gap-2.5 mb-3">
+                <div className="w-9 h-9 rounded-xl bg-slate-100 flex items-center justify-center">
+                  <Sigma className="w-4.5 h-4.5 text-slate-400" />
+                </div>
+                <div>
+                  <div className="text-sm font-bold text-slate-800">因子研究未接入{marketLabel}市场</div>
+                  <div className="text-[11px] text-slate-400">当前工作台只服务 A股 / 港股 / 美股 / 期货</div>
+                </div>
+              </div>
+              <p className="text-xs leading-relaxed text-slate-500">
+                本页的排行榜、超额、IC 与因子报告都以<strong className="text-slate-600">该市场自身的基准指数表</strong>为口径；
+                该市场尚未接入基准与因子快照，这里不会展示任何数据，也不会用其它市场的数据代填。
+              </p>
+              <p className="mt-3 text-[11px] text-slate-400">
+                请在顶部市场选择器切换到已接入的市场后再使用本页。
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* 工具页签：整页全宽（原技能中心的因子报告） */}
-        {isTool && tab === 'factor-report' && (
+        {researchMarket && isTool && tab === 'factor-report' && (
           <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
             <FactorReportPanel
               // key 换掉即重挂载：面板只在挂载时读一次深链目标（见它的 props 注释），
@@ -455,6 +564,7 @@ const FactorResearchPage: React.FC = () => {
               key={reportTarget ? `${reportTarget.dataset}|${reportTarget.code}` : 'default'}
               initialDataset={reportTarget?.dataset}
               initialCode={reportTarget?.code}
+              market={researchMarket}
               // 反跳回单因子分析：资格判据 = catalogIndex（= 单因子页真实打得开的
               // 集合），代码级查表，不按报告数据集名硬映射（两个命名空间不对齐）。
               locateSingle={(code) => catalogIndex.get(code) ?? null}
@@ -463,7 +573,7 @@ const FactorResearchPage: React.FC = () => {
           </div>
         )}
 
-        {!isTool && (
+        {researchMarket && !isTool && (
         <div className="flex-1 min-h-0 min-w-0 flex gap-2 p-3">
           {/* 左侧目录（可收起：给榜单让宽度） */}
           {catalogOpen && (
@@ -497,18 +607,16 @@ const FactorResearchPage: React.FC = () => {
                 目录
               </button>
               <div className="flex items-center gap-0.5 rounded-full bg-slate-100 border border-slate-200 p-0.5">
-                {([
-                  { key: 'classic', label: '经典因子' },
-                  { key: 'private', label: '私人因子库' },
-                ] as Array<{ key: FactorDataset; label: string }>).map((d) => (
+                {catalogDatasets.map((key) => (
                   <button
-                    key={d.key}
-                    onClick={() => setDataset(d.key)}
+                    key={key}
+                    onClick={() => setDataset(key)}
+                    title={DATASET_LABELS[key].title}
                     className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold transition-colors ${
-                      dataset === d.key ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                      dataset === key ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'
                     }`}
                   >
-                    {d.label}
+                    {DATASET_LABELS[key].label}
                   </button>
                 ))}
               </div>
@@ -557,9 +665,11 @@ const FactorResearchPage: React.FC = () => {
             </div>
 
             {panel === 'snapshot' ? (
-              <SnapshotPanel dataset={dataset} onReady={handleSnapshotReady} />
+              <SnapshotPanel dataset={dataset} market={researchMarket} onReady={handleSnapshotReady} />
             ) : panel === 'scan' ? (
               <ScanPanel
+                dataset={dataset}
+                market={researchMarket}
                 // 重算交给快照面板：进度、日志、轮询都只在那一边实现。
                 // 走「手动」入口：用户是冲着「重算」来的，面板不能自己收起来。
                 onRebuild={openSnapshotManually}
@@ -606,6 +716,7 @@ const FactorResearchPage: React.FC = () => {
                 onOpenSingle={openSingle}
                 meta={meta}
                 dedup={lbDedup}
+                market={researchMarket}
                 onToggleDedup={() => setLbDedup((v) => !v)}
                 onRegisterToTraining={canRegister ? () => setRegisterTarget({ codes: selected, dataset }) : undefined}
               />
@@ -614,27 +725,29 @@ const FactorResearchPage: React.FC = () => {
                 code={activeCode}
                 range={rangeParams}
                 dataset={dataset}
+                market={researchMarket}
                 // 单因子详情的「因子报告」入口复用筛选页的深链通道（同一个 openReport）。
                 onOpenReport={openReport}
               />
             ) : tab === 'compare' ? (
-              <CompareTab codes={selected} onRemove={toggleSelected} nameOf={nameOf} range={rangeParams} dataset={dataset} />
+              <CompareTab codes={selected} onRemove={toggleSelected} nameOf={nameOf} range={rangeParams} dataset={dataset} market={researchMarket} />
             ) : tab === 'screening' ? (
               <ScreeningTab
                 index={catalogIndex}
                 catalogStatus={catalogStatus}
+                market={researchMarket}
                 selected={screeningSelected}
                 onToggle={toggleScreening}
                 onToggleMany={toggleScreeningMany}
                 onOpenSingle={openSingle}
                 onOpenReport={openReport}
-                canRegisterToTraining={isAdmin}
+                canRegisterToTraining={isAdmin && researchMarket === 'CN'}
                 // 筛选的勾选恒为私人库 code（经典库的行根本勾不上），所以目标
                 // 数据集写死不跟 dataset 走——否则用户在经典库下勾选会写错库。
                 onRegister={() => setRegisterTarget({ codes: screeningSelected, dataset: 'private' })}
               />
             ) : (
-              <ComposeTab factors={factors} codes={selected} onChangeCodes={setSelected} range={rangeParams} dataset={dataset} />
+              <ComposeTab factors={factors} codes={selected} onChangeCodes={setSelected} range={rangeParams} dataset={dataset} market={researchMarket} />
             )}
           </div>
         </div>

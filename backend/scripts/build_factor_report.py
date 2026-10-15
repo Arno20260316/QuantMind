@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """因子报告快照（多数据集 × 分位收益 / 换手 / 相关性 / IC）→ JSON + parquet。
 
-支持的数据集 = backend/services/engine/factor_report/datasets.py 里的 DATASETS 注册表
-（以该注册表为准，此处不再罗列，免得加数据集时两处漂移）。
+支持的数据集 = backend/services/engine/factor_report/datasets.py 里的 DATASETS_BY_MARKET
+注册表（按市场分组；以该注册表为准，此处不再罗列，免得加数据集/加市场时两处漂移）。
 
 与 evaluate_alpha_library.py 的分工：
   - 那个脚本只算 IC（RankIC/ICIR/胜率/t 值），产出排序表 CSV；
@@ -17,17 +17,22 @@
   - 每日横截面按 symbol 对齐后：因子取秩（rank，抗异常值，无需去极值），
     分位按秩等分；秩相关矩阵用「秩矩阵逐日 X^T X 累加」的流式算法（内存 O(n×k)）
 
+市场分层（2026-10-16）：数据集注册表按市场分（``DATASETS_BY_MARKET``），因子/标签/产物
+目录 = 各市场数据根 / 6_ml_datasets/<数据集>。非 CN 市场**不供给**中性化 / 风格暴露 /
+可交易掩码（三项输入均为 CN-only），跳过事实写进快照 meta（``*_skip_reason``）——
+不报错、不静默、也不报成「缺产物」（missing 会把运维引去补一份永远用不上的东西）。
+
 用法：
-  python backend/scripts/build_factor_report.py --dataset alpha_library   # 近 5 年、fwd_ret_5、8 进程
-  python backend/scripts/build_factor_report.py --dataset l1_factors
-  python backend/scripts/build_factor_report.py --dataset l2_factors
-  python backend/scripts/build_factor_report.py --dataset l1_l2_factors
+  python backend/scripts/build_factor_report.py --dataset alpha_library   # 近 5 年、fwd_ret_5、8 进程（缺省 CN）
+  python backend/scripts/build_factor_report.py --market HK               # 港股（缺省数据集 l1_factors）
+  python backend/scripts/build_factor_report.py --market US --dataset l1_factors
+  python backend/scripts/build_factor_report.py --market FUTURES --dataset l1_factors
   python backend/scripts/build_factor_report.py --dataset l1_factors --years 3 --step 2   # 更快
   python backend/scripts/build_factor_report.py --dataset l1_factors --workers 1          # 单进程调试
 
-产出：
-  data/quantdb/6_ml_datasets/alpha_library/report/factor_report.json     排行 + 429×429 相关矩阵
-  data/quantdb/6_ml_datasets/alpha_library/report/factor_series.parquet  单因子逐日明细序列
+产出（<市场根> = CN: data/quantdb · HK: quanthk · US: quantus · FUTURES: quantfutures）：
+  <市场根>/6_ml_datasets/<数据集>/report/factor_report.json     排行 + 相关矩阵
+  <市场根>/6_ml_datasets/<数据集>/report/factor_series.parquet  单因子逐日明细序列
       （IC / 十分位收益 / 换手 / 覆盖率；报告页 detail 接口靠它把 2.4s 扫分区变成毫秒级切片）
 """
 
@@ -56,15 +61,20 @@ log = logging.getLogger("factor_report")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # 数据集注册表在服务侧（构建脚本与 API 共用同一份口径）。
-# 数据目录不在本脚本里拼路径：DATASETS/dataset_dir 内部一律经 quantdb_paths 解析，
-# 容器 /data/quantdb、便携包 $ROOT/data/quantdb、Windows 盘符都覆盖 —— 绕开它直接
-# 拼字符串，换部署形态就会静默读空目录。
+# 数据目录不在本脚本里拼路径：dataset_dir 内部一律经 resolve_market_root 解析
+# （CN 走 quantdb_paths 候选表，非 CN 走各市场 env/默认根），容器 /data/<市场>、
+# 便携包 $ROOT/data/<市场>、Windows 盘符都覆盖 —— 绕开它直接拼字符串，
+# 换部署形态或换市场就会静默读空目录。
 from backend.services.engine.factor_report.datasets import (  # noqa: E402
-    DATASETS,
+    DATASETS_BY_MARKET,
+    DEFAULT_DATASET_BY_MARKET,
     dataset_dir,
+    datasets_for_market,
     donor_dir as dataset_donor_dir,
     label_dir as dataset_label_dir,
     library_of,
+    market_key,
+    supports_market,
 )
 from backend.services.engine.factor_report import metrics as M  # noqa: E402
 from backend.services.engine.factor_report import tradability as TB  # noqa: E402
@@ -861,9 +871,11 @@ def build_headline_snapshot(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="构建因子报告快照（多数据集）")
-    ap.add_argument("--dataset", default="alpha_library", choices=sorted(DATASETS),
-                    help="因子源：alpha_library / l1_factors / l2_factors / l1_l2_factors")
+    ap = argparse.ArgumentParser(description="构建因子报告快照（多数据集 × 多市场）")
+    ap.add_argument("--dataset", default=None,
+                    help="因子源；缺省 = 本市场缺省数据集（CN=alpha_library，其余=l1_factors）")
+    ap.add_argument("--market", default="CN",
+                    help=f"市场（缺省 CN；可用: {', '.join(DATASETS_BY_MARKET)}）")
     ap.add_argument("--horizon", default="fwd_ret_5",
                     choices=["fwd_ret_1", "fwd_ret_2", "fwd_ret_3", "fwd_ret_5", "fwd_ret_10", "fwd_ret_20"],
                     help="主前瞻期（分位/换手/明细序列以它为准）")
@@ -887,6 +899,16 @@ def main() -> int:
                     help="不算可交易轨（掩码存在时默认为算：边际成本实测约 5ms/天）")
     args = ap.parse_args()
 
+    # 市场/数据集两级校验：未接入市场直接拒（退出码 2），未知数据集列出**本市场**可用
+    # 清单 —— 不静默回退 CN 缺省（那会把港股构建悄悄做成 A 股构建）。
+    if not supports_market(args.market):
+        ap.error(f"因子报告未接入市场: {args.market!r}（可用: {', '.join(DATASETS_BY_MARKET)}）")
+    mk = market_key(args.market)
+    reg = datasets_for_market(mk)
+    ds = args.dataset or DEFAULT_DATASET_BY_MARKET.get(mk) or next(iter(reg))
+    if ds not in reg:
+        ap.error(f"[{mk}] 未知数据集: {ds!r}（本市场可用: {', '.join(reg)}）")
+
     # 显式 spawn：Linux 默认 fork 与线程库（pyarrow/BLAS）混用会偶发死锁
     # —— 实测出现过父进程卡 anon_pipe_write、worker 卡 futex、全体 0% CPU 的挂死。
     try:
@@ -894,10 +916,10 @@ def main() -> int:
     except RuntimeError:
         pass
 
-    cfg = DATASETS[args.dataset]
-    factor_dir = dataset_dir(args.dataset)
+    cfg = reg[ds]
+    factor_dir = dataset_dir(ds, mk)
     if not factor_dir.is_dir():
-        log.error(f"数据集目录不存在: {factor_dir}")
+        log.error(f"[{mk}/{ds}] 数据集目录不存在: {factor_dir}")
         return 1
     out_path = Path(args.out) if args.out else factor_dir / "report" / "factor_report.json"
     series_out = Path(args.series_out) if args.series_out else out_path.parent / "factor_series.parquet"
@@ -905,7 +927,7 @@ def main() -> int:
     # 日期列表：先用**全部**日期（close_fwd 的 T+k 目标可能落在窗口右边界之外），再裁窗口抽样
     all_dts = sorted(p.name.split("=")[1] for p in factor_dir.glob("dt=*") if p.is_dir())
     if not all_dts:
-        log.error("没有可用的分区")
+        log.error(f"[{mk}/{ds}] 没有可用的分区: {factor_dir}")
         return 1
     dts = list(all_dts)
     if args.start:
@@ -914,7 +936,7 @@ def main() -> int:
         # 未显式给 --start/--years 时，注册表 build_start 优先于默认 5 年 ——
         # rd_mined 数据自 2020-01 起，默认 5 年会把它静默砍掉前 21 个月（只小不报错）。
         dts = [d for d in dts if d >= str(cfg["build_start"])]
-        log.info(f"[{args.dataset}] 起点取注册表 build_start={cfg['build_start']}")
+        log.info(f"[{mk}/{ds}] 起点取注册表 build_start={cfg['build_start']}")
     else:
         years = 5 if args.years is None else args.years
         if years > 0:
@@ -924,7 +946,7 @@ def main() -> int:
         dts = [d for d in dts if d <= args.end]
     dts = dts[:: max(args.step, 1)]
     if not dts:
-        log.error("窗口内没有可用的分区")
+        log.error(f"[{mk}/{ds}] 窗口内没有可用的分区")
         return 1
 
     # 因子列（取窗口内最新分区的 schema）：
@@ -941,7 +963,7 @@ def main() -> int:
     skipped = [c for c in sch.names if c not in meta_cols and c not in factor_cols]
     n_factors = len(factor_cols)
     log.info(
-        f"[{args.dataset}] 因子 {n_factors} 个；跳过非数值列 {skipped}；"
+        f"[{mk}/{ds}] 因子 {n_factors} 个；跳过非数值列 {skipped}；"
         f"日期 {dts[0]} ~ {dts[-1]} 共 {len(dts)} 天；horizon={args.horizon}；workers={args.workers}"
     )
 
@@ -949,41 +971,68 @@ def main() -> int:
     horizons = [h.strip() for h in str(args.horizons).split(",") if h.strip()]
     if args.horizon not in horizons:
         horizons.insert(0, args.horizon)      # 主前瞻期必须在列表里，否则算不到它
-    # 风格暴露产物：默认自动探测（不存在时整块跳过并在 meta 记 missing，不报错）
-    style_dir = args.style_dir or _probe_style_dir()
-    style_ok = any(Path(style_dir).glob("dt=*")) if Path(style_dir).is_dir() else False
-    # 可交易性掩码：默认探测、存在即算。掩码与因子集无关（只依赖行情与涨跌停规则），
-    # 一次构建全部数据集共用；边际成本实测约 5ms/天（复用理想轨的计数，只对几百只被挡股
-    # 做一次 bincount），不值得为省这点时间让它默认关——那样前端双轨图会永远是「需重跑构建」。
-    trade_mask = args.trade_mask or _probe_trade_mask()
-    trade_ok = (not args.no_tradable) and Path(trade_mask).exists()
+    # ── 构建期附加口径的供给（按市场）──────────────────────────────────────
+    # 三项的输入全是 CN-only：中性化依赖 valuation.total_mv + instrument_detail 行业码；
+    # 风格暴露是 CNE5/A 股口径，且探测路径 resolve_quantdb_subdir 指向 **CN 根** —— 非 CN
+    # 若走默认探测会读到 CN 风格产物去 join 本市场符号（全 NaN 却报 style_model=ok）；
+    # 可交易掩码按 A 股涨跌停规则生成。故非 CN 一律**不供给**，且 meta 记 "skip" 而非
+    # "missing"（missing = 缺产物、可补，会把运维引去构建一份永远用不上的东西）。
+    is_cn = mk == "CN"
+    if is_cn:
+        # 风格暴露产物：默认自动探测（不存在时整块跳过并在 meta 记 missing，不报错）
+        style_dir = args.style_dir or _probe_style_dir()
+        style_ok = any(Path(style_dir).glob("dt=*")) if Path(style_dir).is_dir() else False
+        # 可交易性掩码：默认探测、存在即算。掩码与因子集无关（只依赖行情与涨跌停规则），
+        # 一次构建全部数据集共用；边际成本实测约 5ms/天（复用理想轨的计数，只对几百只被挡股
+        # 做一次 bincount），不值得为省这点时间让它默认关——那样前端双轨图会永远是「需重跑构建」。
+        trade_mask = args.trade_mask or _probe_trade_mask()
+        trade_ok = (not args.no_tradable) and Path(trade_mask).exists()
+        neutral_on = not args.skip_neutral
+        neutral_skip_reason = None if neutral_on else "--skip-neutral（构建时显式跳过）"
+        style_skip_reason = None if style_ok else "风格暴露产物缺失（5_technical_derived/style_factors 未构建）"
+        tradable_skip_reason = None if trade_ok else (
+            "--no-tradable（构建时显式跳过）" if args.no_tradable
+            else "可交易掩码产物缺失（5_technical_derived/trade_mask 未构建）"
+        )
+    else:
+        style_dir, style_ok, trade_mask, trade_ok = None, False, None, False
+        neutral_on = False
+        neutral_skip_reason = "非 CN 市场不供给（输入为 CN-only：valuation.total_mv / instrument_detail 行业码）"
+        style_skip_reason = "非 CN 市场不供给（风格模型为 CNE5/A 股口径，仅 CN 供给）"
+        tradable_skip_reason = "非 CN 市场不供给（可交易掩码按 A 股涨跌停规则生成）"
+        if args.style_dir or args.trade_mask:
+            log.warning(f"[{mk}/{ds}] 忽略 --style-dir/--trade-mask：该输入为 CN-only，非 CN 市场不供给")
+        log.info(
+            f"[{mk}/{ds}] 非 CN 市场：跳过中性化/风格/可交易轨（CN-only 输入），"
+            f"留痕见快照 meta 的 *_skip_reason"
+        )
     options = {
-        "neutral": not args.skip_neutral,
+        "neutral": neutral_on,
         "style_dir": style_dir if style_ok else None,
         "trade_mask": trade_mask if trade_ok else None,
     }
     log.info(
-        f"前瞻期：主 {args.horizon}，同趟计算 {horizons}；"
+        f"[{mk}/{ds}] 前瞻期：主 {args.horizon}，同趟计算 {horizons}；"
         f"截面附加：neutral={'on' if options['neutral'] else 'off'}，"
-        f"style={'on' if style_ok else 'missing'}，"
-        f"tradable={'on' if trade_ok else ('off' if args.no_tradable else 'missing')}"
+        f"style={'on' if style_ok else ('skip' if not is_cn else 'missing')}，"
+        f"tradable={'on' if trade_ok else ('skip' if not is_cn else ('off' if args.no_tradable else 'missing'))}"
     )
     if cfg["label_mode"] == "labels_table":
-        label_dir = str(dataset_label_dir(args.dataset))
+        label_dir = str(dataset_label_dir(ds, mk))
         tasks = [
             (dt, horizons, args.horizon, str(factor_dir), factor_cols, meta_cols,
              "labels_table", label_dir, options)
             for dt in dts
         ]
     elif cfg["label_mode"] == "close_fwd_donor":
-        donor = dataset_donor_dir(args.dataset)
+        donor = dataset_donor_dir(ds, mk)
         if donor is None:
-            log.error(f"[{args.dataset}] close_fwd_donor 模式需要注册表声明 donor_parts")
+            log.error(f"[{mk}/{ds}] close_fwd_donor 模式需要注册表声明 donor_parts")
             return 1
         if not donor.is_dir():
-            log.error(f"[{args.dataset}] donor 库目录不存在: {donor}")
+            log.error(f"[{mk}/{ds}] donor 库目录不存在: {donor}")
             return 1
-        log.info(f"[{args.dataset}] 行情列来自 donor 库：{donor}")
+        log.info(f"[{mk}/{ds}] 行情列来自 donor 库：{donor}")
         idx = {d: i for i, d in enumerate(all_dts)}
         tasks = []
         for dt in dts:
@@ -1075,7 +1124,7 @@ def main() -> int:
     merged = merge_partials(_ordered_partials(), n_factors, horizons=horizons)
     dates = merged["dates"]
     if not dates:
-        log.error("没有任何有效日期（标签可能尚未落地）")
+        log.error(f"[{mk}/{ds}] 没有任何有效日期（标签可能尚未落地）")
         return 1
     corr = merged["corr"]
     q_mean = merged["q_mean"]
@@ -1094,10 +1143,10 @@ def main() -> int:
         if np.isfinite(v).all() and np.std(v) > 0:
             mono[j] = np.corrcoef(qi, v)[0, 1]
 
-    # 库归属（共享规则：alpha 前缀 / 固定 L1·L2 / 按 L2 成员关系）
+    # 库归属（共享规则：alpha 前缀 / 固定 L1·L2 / 按 L2 成员关系；l2_membership 仅 CN 注册表用）
     from backend.services.engine.factor_report.datasets import l2_columns  # noqa: PLC0415
 
-    l2_cols = l2_columns() if cfg["library_rule"] == "l2_membership" else None
+    l2_cols = l2_columns(mk) if cfg["library_rule"] == "l2_membership" else None
 
     # 附加序列的逐因子均值 / 有效天数（写入快照 factors[]，供列表页排序与筛选）
     extra_mean: dict[str, np.ndarray] = merged["extra_mean"]
@@ -1152,7 +1201,7 @@ def main() -> int:
                  for h, v in by_h.items()}
             ),
             "name": name,
-            "library": library_of(args.dataset, name, l2_cols),
+            "library": library_of(ds, name, l2_cols, mk),
             "ic_by_horizon": {h: (None if not np.isfinite(v["ic_mean"][j]) else round(float(v["ic_mean"][j]), 5))
                               for h, v in by_h.items()},
             "ls_by_horizon": {h: (None if not np.isfinite(v["ls_mean"][j]) else round(float(v["ls_mean"][j]), 5))
@@ -1174,21 +1223,30 @@ def main() -> int:
             "headline": headline_cols[j],
         })
 
-    universe = str(cfg.get("universe") or args.dataset)
+    universe = str(cfg.get("universe") or ds)
     payload = {
         "meta": {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "dataset": args.dataset,
+            "market": mk,
+            "dataset": ds,
             "horizon": args.horizon,
             # 截面附加口径的供给状态：前端据此决定哪些块可显示、哪些要提示「需重跑构建」
             "extras_days": merged["extras_days"],
             "neutral": bool(options["neutral"]),
-            # "missing" = 风格产物尚未构建（风格页签降级），不是错误
-            "style_model": "ok" if style_names else "missing",
+            # 没算中性化时为什么没算：None = 已算。措辞区分「显式跳过」与「非 CN 不供给」——
+            # 前端与运维都不用靠猜，也绝不会把后者当成「缺产物、可补」
+            "neutral_skip_reason": neutral_skip_reason,
+            # "missing" = 风格产物尚未构建（可补，风格页签降级）；"skip" = 非 CN 不供给；都不是错误
+            "style_model": "ok" if style_names else ("skip" if not is_cn else "missing"),
+            "style_skip_reason": None if style_names else style_skip_reason,
             "style_names": style_names,
-            # 可交易轨供给状态：ok = 双轨可比；missing = 掩码不存在，只有理想轨
-            "tradable": "ok" if merged["tradable_days"] else ("off" if args.no_tradable else "missing"),
+            # 可交易轨供给状态：ok = 双轨可比；missing = 掩码不存在；skip = 非 CN 不供给；
+            # off = 构建时显式 --no-tradable
+            "tradable": "ok" if merged["tradable_days"] else (
+                "skip" if not is_cn else ("off" if args.no_tradable else "missing")
+            ),
+            "tradable_skip_reason": None if merged["tradable_days"] else tradable_skip_reason,
             # 真正算到可交易轨的天数（掩码区间窄于报告区间时 < n_dates）——
             # 前端据此提示「双轨图只覆盖 x/y 天」，而不是把缺的那段画成 0
             "tradable_days": merged["tradable_days"],
@@ -1221,11 +1279,11 @@ def main() -> int:
         payload["meta"]["series_rows"] = int(shape["rows"])
         payload["meta"]["series_cols"] = int(shape["cols"])
         log.info(
-            f"明细序列已写出：{series_path}（{shape['rows']} 行 × {shape['cols']} 列，"
+            f"[{mk}/{ds}] 明细序列已写出：{series_path}（{shape['rows']} 行 × {shape['cols']} 列，"
             f"{series_path.stat().st_size / 1e6:.1f} MB）"
         )
     else:
-        log.warning("明细序列为空，未写出 parquet（detail 接口将回退到按需扫分区）")
+        log.warning(f"[{mk}/{ds}] 明细序列为空，未写出 parquet（detail 接口将回退到按需扫分区）")
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1236,18 +1294,21 @@ def main() -> int:
     with open(out, "w", encoding="utf-8") as f:
         # allow_nan=False 兜底：净化漏网时构建当场失败（显式），而不是写出毒快照（静默）
         json.dump(payload, f, ensure_ascii=False, allow_nan=False)
-    log.info(f"快照已写出：{out}（{out.stat().st_size / 1e6:.1f} MB，用时 {time.time() - t0:.0f}s）")
+    log.info(f"[{mk}/{ds}] 快照已写出：{out}（{out.stat().st_size / 1e6:.1f} MB，用时 {time.time() - t0:.0f}s）")
 
     # 逐块报「有多少因子真的出数」—— 空块不能以「构建成功」的姿态过关（零项即失败）
     cov = {k: int(np.isfinite(v).sum()) for k, v in extra_mean.items()}
     log.info(
-        f"截面附加出数因子数（共 {n_factors}）：半 IC {cov.get('ic_top', 0)}/{cov.get('ic_bot', 0)}、"
+        f"[{mk}/{ds}] 截面附加出数因子数（共 {n_factors}）：半 IC {cov.get('ic_top', 0)}/{cov.get('ic_bot', 0)}、"
         f"中性化 {cov.get('ic_neutral', 0)}、分域 {cov.get('ic_large', 0)}/{cov.get('ic_mid', 0)}/"
         f"{cov.get('ic_small', 0)}、clip_frac {cov.get('clip_frac', 0)}；"
         f"风格 {payload['meta']['style_model']}"
     )
+    # 非 CN 时中性化/分域 IC 是**设计性**缺席（CN-only 输入，meta 的 *_skip_reason 已留痕），
+    # 不该报「检查取数降级」—— 那会把运维引去排查一个本就不该存在的东西
+    cn_only_blocks = {"ic_neutral", "ic_large", "ic_mid", "ic_small"}
     for key, n_ok in cov.items():
-        if n_ok == 0:
+        if n_ok == 0 and (is_cn or key not in cn_only_blocks):
             log.warning(f"截面附加块 {key} 全为 NaN —— 检查取数是否降级（不是「该因子无效」）")
 
     top = sorted(

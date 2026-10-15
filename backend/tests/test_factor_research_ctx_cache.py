@@ -60,7 +60,8 @@ def env(monkeypatch):
         "topn_entered": threading.Event(),
     }
 
-    def fake_panel(dataset="classic"):
+    def fake_panel(dataset="classic", market="CN"):
+        # market 参数：service 层 2026-10 起按市场取值（分层），打桩签名须同步放宽
         state["builds"] += 1
         if state["delay"]:
             time.sleep(state["delay"])
@@ -74,7 +75,7 @@ def env(monkeypatch):
         return real_topn(*args, **kwargs)
 
     monkeypatch.setattr(service.store, "panel", fake_panel)
-    monkeypatch.setattr(service.store, "panel_stamp", lambda dataset="classic": state["stamp"])
+    monkeypatch.setattr(service.store, "panel_stamp", lambda *a, **k: state["stamp"])
     monkeypatch.setattr(service.store, "benchmark_table", lambda *a, **k: None)
     monkeypatch.setattr(service.store, "ic_table", lambda *a, **k: None)
     monkeypatch.setattr(scorecard, "topn_series", counting_topn)
@@ -126,7 +127,9 @@ def test_ctx_build_is_single_flight(env):
     out: list[dict] = []
 
     threads = [
-        threading.Thread(target=lambda: out.append(service._range_ctx(None, None, "private")))
+        threading.Thread(
+            target=lambda: out.append(service._range_ctx(None, None, "private"))
+        )
         for _ in range(8)
     ]
     for t in threads:
@@ -151,7 +154,16 @@ def test_derived_built_lazily_and_only_once(env):
 
     assert n_codes == 3, "用例规模变了，参与量断言要跟着改"
     assert env["topn"] == n_codes, f"应逐因子各算一次，实得 {env['topn']}/{n_codes}"
-    assert set(full) >= {"panel", "mask", "rdates", "benches", "ic", "series30", "env_tags", "time_tags"}
+    assert set(full) >= {
+        "panel",
+        "mask",
+        "rdates",
+        "benches",
+        "ic",
+        "series30",
+        "env_tags",
+        "time_tags",
+    }
     assert len(full["series30"]) == n_codes
 
     again = service._range_ctx_full(None, None, "private")
@@ -163,7 +175,9 @@ def test_derived_built_lazily_and_only_once(env):
 def test_derived_build_does_not_block_light_path(env):
     """派生量那把锁与轻上下文那把锁分开：一个慢排行榜不该堵住秒级端点。"""
     env["topn_delay"] = 0.6
-    worker = threading.Thread(target=lambda: service._range_ctx_full(None, None, "private"))
+    worker = threading.Thread(
+        target=lambda: service._range_ctx_full(None, None, "private")
+    )
     worker.start()
     try:
         assert env["topn_entered"].wait(5), "派生构建没开始，本用例没测到并发"

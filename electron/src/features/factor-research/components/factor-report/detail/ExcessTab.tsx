@@ -6,19 +6,25 @@
  *    不一致必须显式挑明 —— 静默换基准冒充，等于把「沪深300 超额」当「中证1000 超额」给用户看。
  * 2. 取不到就是取不到：一律 `<Degraded reason>`，绝不画 0 也不留白（空图与「值恰好是 0」
  *    在视觉上无法区分，是本项目已有教训）。
+ *
+ * 市场分层（2026-10）：候选基准**不再写死 A 股三码** —— 由响应的 `ex.benchmarks[]`
+ * （后端按市场基准表下发，含可用性与缺数原因）驱动；期货等无指数基准的市场整块降级
+ * （`available:false` + 原因），候选条不渲染。`BENCH_PRESETS` 仅作 CN 旧快照
+ * （响应未带 benchmarks[] 时）的兜底，绝不拿 A 股代码填别的市场。
  */
 
-import React from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { EChartsChart } from '../../../../../components/common/EChartsChart';
 import type {
   AnnualExcess, BenchmarkExcess, DrawdownEpisode, ExcessBlock, FactorBlocks, GroupBlock, HistBlock,
 } from '../../../types/factorReport';
+import type { ResearchMarket } from '../../../types/factorResearch';
 import {
   ACCENT, ChartShell, DASH, DOWN, Degraded, InfoDot, UP, bySign, catAxis,
   fmtDate, fmtInt, fmtNum, fmtPct, grid, hasData, tooltip, valAxis, zeroLine,
 } from './chartKit';
 
-/** 主基准候选：与后端 `blocks.BENCHMARKS` 同序；名称仅在后端没下发时兜底 */
+/** CN 旧快照兜底候选（响应没带 benchmarks[] 时）；名称仅在后端没下发时兜底 */
 const BENCH_PRESETS = [
   { symbol: '000300.SH', label: '沪深300' },
   { symbol: '000905.SH', label: '中证500' },
@@ -27,6 +33,12 @@ const BENCH_PRESETS = [
 
 const benchLabel = (symbol: string): string =>
   BENCH_PRESETS.find((b) => b.symbol === symbol)?.label || symbol || DASH;
+
+/**
+ * 基准条顺序按市场缓存（跨挂载存活）：= **未点名**那次响应的基准表顺序（主基准在前）。
+ * 后端把点名者排到 `benchmarks[]` 首位，直接照抄会让 chips 随点击乱跳。
+ */
+const BENCH_ORDER_CACHE: Partial<Record<ResearchMarket, string[]>> = {};
 
 /** 净值 → 累计收益 %（净值基准 1 即 0%）。缺口原样保留 null，不插值、不断线 */
 const navPct = (nav: Array<number | null>): Array<number | null> =>
@@ -58,14 +70,32 @@ function histBars(h: HistBlock | null | undefined): { centers: number[]; counts:
 
 interface Props {
   blocks: FactorBlocks | null;
-  /** 用户点名的基准（未必等于 `blocks.excess_block.bench_symbol`） */
+  /** 本页当前市场（基准候选与口径文案按它分派） */
+  market: ResearchMarket;
+  /** 用户点名的基准（未必等于 `blocks.excess_block.bench_symbol`）；空串 = 没点名 */
   bench: string;
   onBench: (symbol: string) => void;
   /** 后端口径文案（与计算代码同源，前端不另抄一份） */
   definitions: Record<string, string>;
 }
 
-export const ExcessTab: React.FC<Props> = ({ blocks, bench, onBench, definitions }) => {
+export const ExcessTab: React.FC<Props> = ({ blocks, market, bench, onBench, definitions }) => {
+  // ⚠️ 本组件有提前 return —— hooks 必须先于它们（行数随渲染变化会直接崩）
+  const exBlock = blocks?.excess_block;
+  const rows = useMemo<BenchmarkExcess[]>(
+    () => (exBlock && exBlock.available !== false ? exBlock.benchmarks ?? [] : []),
+    [exBlock],
+  );
+  const [tableOrder, setTableOrder] = useState<string[]>(() => BENCH_ORDER_CACHE[market] ?? []);
+  useEffect(() => {
+    // 点名响应（bench 非空）的顺序不可信（点名者被后端排到首位），不认；
+    // 每个市场只认一次未点名响应的顺序，跨挂载复用。
+    if (!rows.length || bench || BENCH_ORDER_CACHE[market]?.length) return;
+    const order = rows.map((b) => b.symbol);
+    BENCH_ORDER_CACHE[market] = order;
+    setTableOrder(order);
+  }, [rows, bench, market]);
+
   // 派生块还没到 → 加载态（旧字段照常可用，不能在这里就报「不可用」）
   if (!blocks) {
     return (
@@ -89,12 +119,26 @@ export const ExcessTab: React.FC<Props> = ({ blocks, bench, onBench, definitions
   const defOf = (key: string, fallback: string) => definitions?.[key] || fallback;
 
   // ── 基准身份：点名 vs 实际 ──
-  const rows: BenchmarkExcess[] = ex.benchmarks ?? [];
   const actual = ex.bench_symbol ?? '';
   const actualName = ex.bench_name || benchLabel(actual);
   const picked = rows.find((b) => b.symbol === bench);
   const mismatched = !!actual && !!bench && actual !== bench;
   const missing = rows.filter((b) => b.available === false && b.symbol !== bench);
+
+  // ── 候选基准条 ──
+  // 顺序 = 首见顺序（市场基准表序）；响应里冒出的新代码按响应顺序补到尾部。
+  // rows 为空（旧快照没带 benchmarks[]）时：CN 退静态预设，非 CN 无候选
+  // —— 绝不拿 A 股基准给别的市场充数。
+  const bySymbol = new Map(rows.map((b) => [b.symbol, b]));
+  const orderedSymbols = [
+    ...tableOrder.filter((s) => bySymbol.has(s)),
+    ...rows.map((b) => b.symbol).filter((s) => !tableOrder.includes(s)),
+  ];
+  const candidates = orderedSymbols.length
+    ? orderedSymbols.map((s) => ({ symbol: s, name: bySymbol.get(s)?.name || benchLabel(s) }))
+    : market === 'CN'
+      ? BENCH_PRESETS.map((b) => ({ symbol: b.symbol, name: b.label }))
+      : [];
 
   // ── 主序列 ──
   // 本页签上的序列全是累计型 → 后端给的 `dates` 就是**全窗口**轴（与 IC 页签的
@@ -230,35 +274,40 @@ export const ExcessTab: React.FC<Props> = ({ blocks, bench, onBench, definitions
       <div className="rounded-2xl border border-slate-200/80 bg-white p-3 shadow-sm min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-[10px] font-bold text-slate-400">主基准</span>
-          <div className="flex items-center rounded-full border border-slate-200 bg-slate-50 p-0.5">
-            {BENCH_PRESETS.map((b) => {
-              const meta = rows.find((r) => r.symbol === b.symbol);
-              const bad = meta?.available === false;
-              return (
-                <button
-                  key={b.symbol}
-                  onClick={() => onBench(b.symbol)}
-                  title={bad ? `取不到：${meta?.reason ?? '未知原因'}` : `${meta?.name || b.label}（${b.symbol}）`}
-                  className={`rounded-full px-2.5 py-[3px] text-[11px] font-bold transition-colors ${
-                    b.symbol === bench ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  } ${bad ? 'line-through decoration-amber-400' : ''}`}
-                >
-                  {meta?.name || b.label}
-                  {bad && <span className="ml-1 text-amber-500">⚠</span>}
-                </button>
-              );
-            })}
-          </div>
+          {candidates.length > 0 && (
+            <div className="flex items-center rounded-full border border-slate-200 bg-slate-50 p-0.5">
+              {candidates.map((b) => {
+                const meta = bySymbol.get(b.symbol);
+                const bad = meta?.available === false;
+                return (
+                  <button
+                    key={b.symbol}
+                    data-testid={`bench-chip-${b.symbol}`}
+                    onClick={() => onBench(b.symbol)}
+                    title={bad ? `取不到：${meta?.reason ?? '未知原因'}` : `${b.name}（${b.symbol}）`}
+                    className={`rounded-full px-2.5 py-[3px] text-[11px] font-bold transition-colors ${
+                      b.symbol === (bench || actual) ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                    } ${bad ? 'line-through decoration-amber-400' : ''}`}
+                  >
+                    {b.name}
+                    {bad && <span className="ml-1 text-amber-500">⚠</span>}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <span className="flex items-center gap-1 text-[10px] text-slate-400 font-mono">
             实际采用 {actual || DASH}{actualName ? ` · ${actualName}` : ''}
-            <InfoDot text={defOf('benchmarks', '主基准取数走 QuantDB index_daily；点名的指数缺数时按 沪深300 → 中证500 → 中证1000 顺位回退，页面上显示的是**实际采用**的那一个。')} />
+            <InfoDot text={defOf('benchmarks', market === 'CN'
+              ? '主基准取数走 QuantDB index_daily；点名的指数缺数时按 沪深300 → 中证500 → 中证1000 顺位回退，页面上显示的是**实际采用**的那一个。'
+              : '主基准取数走本市场指数日线；点名的指数缺数时按本市场基准表顺位回退，页面上显示的是**实际采用**的那一个。')} />
           </span>
         </div>
 
         {/* 点名 ≠ 实际：必须显式挑明，绝不允许静默冒充 */}
         {mismatched && (
           <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[10px] leading-relaxed text-amber-700">
-            ⚠ 你点名的基准<b>{benchLabel(bench)}（{bench}）</b>本次没取到，本页全部数字都是
+            ⚠ 你点名的基准<b>{picked?.name || benchLabel(bench)}（{bench}）</b>本次没取到，本页全部数字都是
             <b>{actualName}（{actual}）</b>口径的 —— 两者不可互相替代，请勿把这里的超额读成前者。
             {picked?.reason ? ` 取数失败原因：${picked.reason}` : ''}
           </div>

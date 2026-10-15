@@ -44,7 +44,12 @@ vi.mock('../../services/factorResearchService', async () => {
   };
 });
 
-vi.mock('../../../../store', () => ({ useAppSelector: () => false }));
+// 页面读两个选择器：市场（uiSlice）与 is_admin（auth）。按选择器对假 state 求值，
+// 别返回与语义无关的 false（那会让页面落到「市场未接入」阻断面 —— 断言失败时看不出根因）。
+vi.mock('../../../../store', () => ({
+  useAppSelector: (sel: (s: unknown) => unknown) =>
+    sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: false } } }),
+}));
 
 vi.mock('../../components/CatalogSidebar', () => ({ CatalogSidebar: () => <div /> }));
 vi.mock('../../components/LeaderboardTab', () => ({ LeaderboardTab: () => <div data-testid="tab-leaderboard" /> }));
@@ -117,7 +122,7 @@ describe('FactorResearchPage × SnapshotPanel：入口可达性', () => {
     fireEvent.click(screen.getByText('快照'));
     fireEvent.click(await screen.findByText('重算快照'));
 
-    await waitFor(() => expect(buildMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(buildMock).toHaveBeenCalledWith('private', 'CN'));
   });
 
   test('扫描面板 →「重算快照」也落到可点的按钮上（这条主路径此前一次都走不通）', async () => {
@@ -130,7 +135,7 @@ describe('FactorResearchPage × SnapshotPanel：入口可达性', () => {
     expect(await screen.findByText('重算快照')).toBeTruthy();
     fireEvent.click(screen.getByText('重算快照'));
 
-    await waitFor(() => expect(buildMock).toHaveBeenCalledWith('private'));
+    await waitFor(() => expect(buildMock).toHaveBeenCalledWith('private', 'CN'));
   });
 
   test('「快照」按钮可以收起面板（手动入口不能只开不关）', async () => {

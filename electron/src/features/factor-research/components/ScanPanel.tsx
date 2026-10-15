@@ -15,10 +15,15 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, GraduationCap, Loader2, RefreshCw, ScanSearch } from 'lucide-react';
 import { getPromoteStatus, getScanSources, postPromote } from '../services/factorResearchService';
-import type { ScanDiff, ScanDiffItem } from '../services/factorResearchService';
+import type { FactorDataset, ScanDiff, ScanDiffItem } from '../services/factorResearchService';
+import type { ResearchMarket } from '../types/factorResearch';
 import { Card } from './common';
 
 interface Props {
+  /** 扫描的数据集（页面上恒为 private；其它数据集后端 400） */
+  dataset: FactorDataset;
+  /** 本页当前市场（扫描本市场数据根） */
+  market: ResearchMarket;
   /** 去重算快照（交给快照面板：那里有进度与日志） */
   onRebuild: () => void;
   /** 关掉本面板 */
@@ -43,7 +48,7 @@ const Stat: React.FC<{ label: string; value: React.ReactNode; tone?: string }> =
   </span>
 );
 
-export const ScanPanel: React.FC<Props> = ({ onRebuild, onClose }) => {
+export const ScanPanel: React.FC<Props> = ({ dataset, market, onRebuild, onClose }) => {
   const [diff, setDiff] = useState<ScanDiff | null>(null);
   const [err, setErr] = useState<string | null>(null);
   // 初值即「扫描中」：首屏就是一次在途请求，否则会先闪一下空态
@@ -57,13 +62,13 @@ export const ScanPanel: React.FC<Props> = ({ onRebuild, onClose }) => {
     setScanning(true);
     setErr(null);
     try {
-      setDiff(await getScanSources());
+      setDiff(await getScanSources(dataset, market));
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setScanning(false);
     }
-  }, []);
+  }, [dataset, market]);
 
   useEffect(() => {
     void scan();

@@ -1,4 +1,10 @@
-/** 因子研究 API 服务层（/api/v1/factor-research，引擎服务经网关转发） */
+/**
+ * 因子研究 API 服务层（/api/v1/factor-research，引擎服务经网关转发）。
+ *
+ * 市场分层（2026-10）：所有调用带 `market`（缺省 'CN' 与后端默认一致）。
+ * market 由**页面参数传入**（不在这里读全局 store，避免服务层与 Redux 耦合；
+ * 测试也不必挂 Provider）。非法市场由后端 4xx 拒绝，前端不做第二套校验。
+ */
 
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import type {
@@ -10,6 +16,7 @@ import type {
   FactorDetail,
   LeaderboardResponse,
   OptimalResponse,
+  ResearchMarket,
 } from '../types/factorResearch';
 
 const BASE = `${SERVICE_ENDPOINTS.USER_SERVICE}/factor-research`;
@@ -58,17 +65,18 @@ export interface RangeParams {
 export type FactorDataset = 'classic' | 'private';
 
 /** 因子目录（分类顺序 + 基准 + 快照元信息） */
-export function getCatalog(dataset: FactorDataset = 'classic'): Promise<CatalogResponse> {
-  return requestJson<CatalogResponse>(`/catalog?dataset=${dataset}`);
+export function getCatalog(dataset: FactorDataset = 'classic', market: ResearchMarket = 'CN'): Promise<CatalogResponse> {
+  return requestJson<CatalogResponse>(`/catalog?dataset=${dataset}&market=${market}`);
 }
 
 /** 排行榜（区间内重算 KPI/超额/IC + 持仓画像 + 标签 + 综合分；n=持仓数；dedup>0 = 去重，口径同筛选页） */
-export function getLeaderboard(range?: RangeParams, n = 30, dataset: FactorDataset = 'classic', dedup = 0): Promise<LeaderboardResponse> {
+export function getLeaderboard(range?: RangeParams, n = 30, dataset: FactorDataset = 'classic', dedup = 0, market: ResearchMarket = 'CN'): Promise<LeaderboardResponse> {
   const qs = new URLSearchParams();
   if (range?.start) qs.set('start', range.start);
   if (range?.end) qs.set('end', range.end);
   if (n && n !== 30) qs.set('n', String(n));
   qs.set('dataset', dataset);
+  qs.set('market', market);
   if (dedup > 0) qs.set('dedup', String(dedup));
   return requestJson<LeaderboardResponse>(`/leaderboard?${qs.toString()}`, {}, 120000);
 }
@@ -80,25 +88,27 @@ export function getFactorDetail(
   range?: RangeParams,
   stocksN = 30,
   dataset: FactorDataset = 'classic',
+  market: ResearchMarket = 'CN',
 ): Promise<FactorDetail> {
   const qs = new URLSearchParams();
   qs.set('ns', ns.join(','));
   qs.set('stocks_n', String(stocksN));
   qs.set('dataset', dataset);
+  qs.set('market', market);
   if (range?.start) qs.set('start', range.start);
   if (range?.end) qs.set('end', range.end);
   return requestJson<FactorDetail>(`/factor/${encodeURIComponent(code)}?${qs.toString()}`, {}, 90000);
 }
 
 /** 多因子对比（每因子可单独设持仓数） */
-export function postCompare(items: CompareItemReq[], range?: RangeParams, dataset: FactorDataset = 'classic'): Promise<CompareResponse> {
-  const body: Record<string, unknown> = { items, dataset };
+export function postCompare(items: CompareItemReq[], range?: RangeParams, dataset: FactorDataset = 'classic', market: ResearchMarket = 'CN'): Promise<CompareResponse> {
+  const body: Record<string, unknown> = { items, dataset, market };
   if (range?.start) body.start = range.start;
   if (range?.end) body.end = range.end;
   return requestJson<CompareResponse>('/compare', { method: 'POST', body: JSON.stringify(body) }, 120000);
 }
 
-/** 多因子合成回测 */
+/** 多因子合成回测（market 在 req 里，调用方组装） */
 export function postCompose(req: ComposeRequest): Promise<ComposeResponse> {
   return requestJson<ComposeResponse>('/compose', { method: 'POST', body: JSON.stringify(req) }, 120000);
 }
@@ -109,16 +119,21 @@ export function postOptimalWeights(
   topN: number,
   range?: RangeParams,
   dataset: FactorDataset = 'classic',
+  market: ResearchMarket = 'CN',
 ): Promise<OptimalResponse> {
-  const body: Record<string, unknown> = { codes, top_n: topN, dataset };
+  const body: Record<string, unknown> = { codes, top_n: topN, dataset, market };
   if (range?.start) body.start = range.start;
   if (range?.end) body.end = range.end;
   return requestJson<OptimalResponse>('/optimal-weights', { method: 'POST', body: JSON.stringify(body) }, 180000);
 }
 
-/** 因子筛选结果（质量门槛 + 同源去重） */
-export function getScreening(): Promise<import('../types/factorResearch').ScreeningResponse> {
-  return requestJson('/screening');
+/**
+ * 因子筛选结果（质量门槛 + 同源去重）。
+ * 非 CN 市场后端诚实缺席（`available:false` + reason，该产物是 A 股七库口径），
+ * 前端据 reason 渲染阻断面 —— 不是「暂未筛选」。
+ */
+export function getScreening(market: ResearchMarket = 'CN'): Promise<import('../types/factorResearch').ScreeningResponse> {
+  return requestJson(`/screening?market=${market}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,12 +150,12 @@ export interface SnapshotStatus {
   log_tail: string[];
 }
 
-export function getSnapshotStatus(dataset: FactorDataset = 'classic'): Promise<SnapshotStatus> {
-  return requestJson<SnapshotStatus>(`/snapshot-status?dataset=${dataset}`);
+export function getSnapshotStatus(dataset: FactorDataset = 'classic', market: ResearchMarket = 'CN'): Promise<SnapshotStatus> {
+  return requestJson<SnapshotStatus>(`/snapshot-status?dataset=${dataset}&market=${market}`);
 }
 
-export function postBuildSnapshot(dataset: FactorDataset = 'classic'): Promise<{ started: boolean; running: boolean; pid?: number }> {
-  return requestJson(`/build?dataset=${dataset}`, { method: 'POST' }, 30000);
+export function postBuildSnapshot(dataset: FactorDataset = 'classic', market: ResearchMarket = 'CN'): Promise<{ started: boolean; running: boolean; pid?: number }> {
+  return requestJson(`/build?dataset=${dataset}&market=${market}`, { method: 'POST' }, 30000);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +209,8 @@ export interface PipelineState {
 }
 
 /** 扫描 quantdb 的因子来源，列出与快照目录的差异（只读，不触发重算） */
-export function getScanSources(dataset: FactorDataset = 'private'): Promise<ScanDiff> {
-  return requestJson<ScanDiff>(`/scan?dataset=${dataset}`, {}, 30000);
+export function getScanSources(dataset: FactorDataset = 'private', market: ResearchMarket = 'CN'): Promise<ScanDiff> {
+  return requestJson<ScanDiff>(`/scan?dataset=${dataset}&market=${market}`, {}, 30000);
 }
 
 // ---------------------------------------------------------------------------

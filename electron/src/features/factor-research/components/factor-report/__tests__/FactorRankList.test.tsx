@@ -5,7 +5,7 @@
  * 于是左栏从「搜索 + 库筛选」升级为研究控制台：
  * - 排序可切（|IC| / IC / ICIR / 多空 / 换手 / 名称）+ 升降序；
  * - 质量门槛（|ICIR| ≥ / |IC| ≥ / 换手 ≤）与方向（正向/反向）；
- * - ★ 自选收藏（localStorage 按数据集持久化）+ 只看自选；
+ * - ★ 自选收藏（localStorage 按**市场 × 数据集**持久化）+ 只看自选；
  * - 选中项被筛掉时给出提示与恢复出口，避免「明细在右、左栏找不到人」。
  */
 import React from 'react';
@@ -44,6 +44,7 @@ function renderList(over: Partial<React.ComponentProps<typeof FactorRankList>> =
       selected={null}
       onSelect={vi.fn()}
       dataset="alpha_library"
+      market="CN"
       {...over}
     />,
   );
@@ -125,13 +126,13 @@ describe('FactorRankList：筛选', () => {
 });
 
 describe('FactorRankList：自选收藏', () => {
-  test('点亮收藏：计数出现在「自选」开关上，并写入 localStorage（按数据集）', () => {
+  test('点亮收藏：计数出现在「自选」开关上，并写入 localStorage（按市场 × 数据集）', () => {
     renderList();
     fireEvent.click(screen.getByTestId('frl-fav-f1'));
     fireEvent.click(screen.getByTestId('frl-fav-f4'));
 
     expect(screen.getByTestId('frl-favs-only').textContent).toContain('2');
-    const raw = localStorage.getItem('qm:factor-report:favs:alpha_library') || '';
+    const raw = localStorage.getItem('qm:factor-report:favs:CN:alpha_library') || '';
     expect(JSON.parse(raw).sort()).toEqual(['f1', 'f4']);
   });
 
@@ -147,9 +148,30 @@ describe('FactorRankList：自选收藏', () => {
   });
 
   test('切数据集读各自的收藏（不串库）', () => {
-    localStorage.setItem('qm:factor-report:favs:other_ds', JSON.stringify(['f3']));
+    localStorage.setItem('qm:factor-report:favs:CN:other_ds', JSON.stringify(['f3']));
     renderList({ dataset: 'other_ds' });
     expect(screen.getByTestId('frl-favs-only').textContent).toContain('1');
+  });
+
+  test('市场隔离：港股的自选不出现在 A 股（代码空间不同，混算就是虚高）', () => {
+    localStorage.setItem('qm:factor-report:favs:HK:alpha_library', JSON.stringify(['hsi_1']));
+
+    renderList(); // market="CN"
+
+    expect(screen.getByTestId('frl-favs-only').textContent).toContain('0');
+  });
+
+  test('同一数据集下两市场的收藏互不覆盖', () => {
+    localStorage.setItem('qm:factor-report:favs:HK:alpha_library', JSON.stringify(['hsi_1']));
+
+    renderList({ market: 'HK' }); // market="HK"
+    expect(screen.getByTestId('frl-favs-only').textContent).toContain('1');
+
+    fireEvent.click(screen.getByTestId('frl-fav-f1'));
+
+    // 写的是 HK 键，CN 键一个字符都不该动
+    expect(JSON.parse(localStorage.getItem('qm:factor-report:favs:HK:alpha_library') || '[]')).toEqual(['hsi_1', 'f1']);
+    expect(localStorage.getItem('qm:factor-report:favs:CN:alpha_library')).toBeNull();
   });
 });
 

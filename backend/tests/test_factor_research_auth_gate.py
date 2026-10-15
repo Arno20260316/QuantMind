@@ -15,6 +15,10 @@
 `/api/v1/qlib/health` 正确地返回 401。整个过程中没有任何一层报错、也没有日志——
 前缀表漏一项的表现是「静默变成公开接口」，所以它必须由测试钉住而不是靠人记得。
 
+2026-10-16 复核：同族的 `/api/v1/factor-report/`（同一批私有因子的 IC/分层/多空
+序列，经 engine_proxy 白名单对外）当时也不在表内 —— 同款一致性缺口，一并补入
+并在此锁死（两前缀都过匿名拒绝 + 承重断言）。
+
 本文件钉三件事：
 
 1. **匿名必须被拒** —— 请求带着正确的内部密钥（等价于「经网关转发」），但没有用户
@@ -37,6 +41,10 @@ SECRET = "unit-test-internal-secret-9f2a"
 # 网关转发时的形状：内部密钥在、用户身份不在
 ANON_HEADERS = {"X-Internal-Call": SECRET}
 SCAN_PATH = "/api/v1/factor-research/scan?dataset=private"
+# 同族第二条链：因子报告的 datasets（同一批私有因子的目录）。
+# 2026-10-16 补入前缀表 —— 报告链路此前与 factor-research 同款裸奔。
+REPORT_PATH = "/api/v1/factor-report/datasets"
+PROTECTED_PATHS = (SCAN_PATH, REPORT_PATH)
 
 
 @pytest.fixture(autouse=True)
@@ -70,8 +78,14 @@ def test_factor_research_is_registered_as_protected() -> None:
     assert "/api/v1/factor-research/" in engine_main.PROTECTED_PREFIXES
 
 
-def test_anonymous_scan_is_rejected(client: TestClient) -> None:
-    r = client.get(SCAN_PATH, headers=ANON_HEADERS)
+def test_factor_report_is_registered_as_protected() -> None:
+    """报告链路与研究工作台是同族的私有 alpha 面（2026-10-16 补入）。"""
+    assert "/api/v1/factor-report/" in engine_main.PROTECTED_PREFIXES
+
+
+@pytest.mark.parametrize("path", PROTECTED_PATHS)
+def test_anonymous_access_is_rejected(client: TestClient, path: str) -> None:
+    r = client.get(path, headers=ANON_HEADERS)
     assert r.status_code == 401, r.text
 
 
@@ -88,8 +102,12 @@ def test_rejection_happens_before_the_route_runs(client: TestClient) -> None:
     assert "library" not in body
 
 
+@pytest.mark.parametrize(
+    ("path", "prefix"),
+    [(SCAN_PATH, "/api/v1/factor-research/"), (REPORT_PATH, "/api/v1/factor-report/")],
+)
 def test_prefix_entry_is_load_bearing(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str, prefix: str
 ) -> None:
     """承重：摘掉前缀，同一个匿名请求必须不再被拦。
 
@@ -99,11 +117,9 @@ def test_prefix_entry_is_load_bearing(
     monkeypatch.setattr(
         engine_main,
         "PROTECTED_PREFIXES",
-        tuple(
-            p for p in engine_main.PROTECTED_PREFIXES if p != "/api/v1/factor-research/"
-        ),
+        tuple(p for p in engine_main.PROTECTED_PREFIXES if p != prefix),
     )
-    r = client.get(SCAN_PATH, headers=ANON_HEADERS)
+    r = client.get(path, headers=ANON_HEADERS)
     assert r.status_code != 401, "摘掉前缀仍被 401 = 本文件没有锁住前缀表"
 
 

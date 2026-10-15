@@ -1,5 +1,12 @@
 /** 因子研究（factor-lib-demo 复刻版）类型定义 —— 与 /api/v1/factor-research 响应一一对应 */
 
+/**
+ * 因子研究已接入的市场（全局 AppMarket 的子集）。
+ * CRYPTO 不在内：工作台未接基准表（后端 422「未接入市场」），页面按诚实阻断面
+ * 处理（绝不回退 CN 数据 —— 拿沪深300 给加密因子算超额是数据污染）。
+ */
+export type ResearchMarket = 'CN' | 'HK' | 'US' | 'FUTURES';
+
 export interface FactorMeta {
   code: string;
   name_cn: string;
@@ -33,6 +40,8 @@ export interface CatalogResponse {
   l1_order: string[];
   l2_order: Record<string, string[]>;
   benchmarks: BenchRef[];
+  /** 本响应所属市场（后端回执；CN 缺省也回传） */
+  market?: ResearchMarket;
   meta: Record<string, unknown>;
 }
 
@@ -60,11 +69,12 @@ export interface FactorKpi {
   ic_win_rate?: number | null;
 }
 
-export interface ExcessKpi {
-  '000300.SH'?: number | null;
-  '000906.SH'?: number | null;
-  '000905.SH'?: number | null;
-}
+/**
+ * 年化超额：**按基准代码映射**（2026-10 市场分层后为动态键——键集 = 本市场
+ * 基准全表，如 CN 的 000300.SH/000906.SH/000905.SH、HK 的 HSI.HK…）。
+ * 前端一律按当前市场的 benchmarks 清单取键，不得再写死 CN 三码。
+ */
+export type ExcessKpi = Record<string, number | null>;
 
 export interface LeaderboardRow extends FactorKpi {
   rank: number;
@@ -79,14 +89,17 @@ export interface LeaderboardRow extends FactorKpi {
   composite: number;
   eff_z: number;
   perf_z: number;
+  /** 按基准代码映射的年化超额（键集 = 本市场基准全表；无序列的基准为 null） */
+  excess_by_bench?: Record<string, number | null>;
+  /** CN 旧键（一期兼容；**前端统一读 excess_by_bench**；非 CN 下这些键不存在） */
   excess_300?: number | null;
   excess_800?: number | null;
   excess_500?: number | null;
-  /** 最新截面 Top-N 持仓的中位总市值（亿） */
+  /** 最新截面 Top-N 持仓的中位总市值（亿；非 CN 无估值源时缺失） */
   median_mv_yi?: number | null;
-  /** 市值风格：大盘（≥500亿）/ 中盘（100-500亿）/ 小盘（<100亿） */
+  /** 市值风格：大盘（≥500亿）/ 中盘（100-500亿）/ 小盘（<100亿）；非 CN 多为 null */
   mv_style?: string | null;
-  /** 最新截面 Top-N 持仓的前三行业（申万二级） */
+  /** 最新截面 Top-N 持仓的前三行业（CN=申万二级；非 CN=该市场板块维度，缺源则空） */
   top_industries?: Array<{ name: string; count: number }> | null;
   env_tag: string;
   time_tag: string;
@@ -109,9 +122,22 @@ export interface LeaderboardDedupMeta {
   covered?: number;
 }
 
+/** 基准清单条目（leaderboard meta 口径：code+name；与 catalog 的 BenchRef symbol 键不同源，勿混用） */
+export interface BenchMeta {
+  code: string;
+  name: string;
+}
+
 export interface LeaderboardResponse {
   leaderboard: LeaderboardRow[];
-  meta: Record<string, unknown> & { range?: RangeMeta; dedup?: LeaderboardDedupMeta };
+  meta: Record<string, unknown> & {
+    range?: RangeMeta;
+    dedup?: LeaderboardDedupMeta;
+    /** 本响应所属市场 */
+    market?: ResearchMarket;
+    /** 本市场基准清单（榜单超额列的数据源；无基准市场为空表） */
+    benchmarks?: BenchMeta[];
+  };
 }
 
 /** 左侧目录选中的分类限定（l2 为 null = 整个大类）；null = 全部因子 */
@@ -234,6 +260,7 @@ export interface ComposeRequest {
   start?: string | null;
   end?: string | null;
   dataset?: 'classic' | 'private';
+  market?: ResearchMarket;
 }
 
 export interface ComposeHolding {
@@ -264,15 +291,22 @@ export interface OptimalWinner {
   annual_return: number;
   max_drawdown: number;
   win_rate: number;
-  excess_300: number | null;
+  /** 对**本市场主基准**的年化超额（全市场统一键） */
+  excess_primary: number | null;
+  /** CN 旧键（一期兼容；非 CN 不存在） */
+  excess_300?: number | null;
 }
 
 export interface OptimalResponse {
   objectives: {
     sharpe: OptimalWinner | null;
     annual_return: OptimalWinner | null;
-    excess_300: OptimalWinner | null;
+    /** 主基准超额目标（全市场统一键；CN 同时保留 excess_300 旧键） */
+    excess_primary: OptimalWinner | null;
+    excess_300?: OptimalWinner | null;
   };
+  /** 本市场主基准（无基准市场为 null，此时超额目标不存在、`excess_primary` 键缺席） */
+  bench_primary?: BenchMeta | null;
   n_combos: number;
   n_months: number;
   codes: string[];
@@ -307,6 +341,14 @@ export interface ScreeningGateDrop {
 }
 
 export interface ScreeningResponse {
+  /**
+   * 非 CN 市场诚实缺席（该产品是 A 股口径的七库筛选）：`available=false` +
+   * `reason`。**缺省视为可用** —— CN 存量产物没有这个字段，前端按 `!== false` 判。
+   */
+  available?: boolean;
+  reason?: string;
+  /** 本响应所属市场（非 CN 缺席时后端回话带市场） */
+  market?: ResearchMarket;
   generated_at: string;
   gates: { min_abs_ic: number; min_abs_icir: number; corr_threshold: number };
   cross_corr: string;

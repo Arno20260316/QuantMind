@@ -125,6 +125,21 @@ DATASETS: dict[str, dict] = {
         "universe": "A股全市场 · RD-Agent 自动挖掘因子（行情列取自 L1 因子库）",
         "build_start": "20200102",
     },
+    # FACTOR1300_MARK: 因子清单1300（2026-10-15 物化）。
+    # 源 = 私人收藏《1300 个因子.xlsx》清洗后的 1125 条公式，物化到 6_ml_datasets/factor1300
+    # （列 = f13_XXXX/Alpha*，symbol/time/dt，无 OHLCV）。与 rd_mined 同构：
+    # label_mode=close_fwd_donor，行情列由 l1_factors 充当 donor（同为 20160104 起、
+    # 逐日后缀式全市场快照，20261013 实测代码重叠 93.5%）。
+    "factor1300": {
+        "label": "因子清单1300（收藏公式物化库）",
+        "dir_parts": ("6_ml_datasets", "factor1300"),
+        "label_mode": "close_fwd_donor",
+        "donor_parts": ("6_ml_datasets", "l1_factors"),
+        "meta_cols": _ID_COLS,
+        "library_rule": "fixed:factor1300",
+        "universe": "A股全市场 · 因子清单1300（行情列取自 L1 因子库）",
+        "build_start": "20160104",
+    },
 }
 
 DEFAULT_DATASET = "alpha_library"

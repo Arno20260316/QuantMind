@@ -30,6 +30,7 @@ from backend.shared.decision_context_source import (
     read_snapshots,
     snapshot_age_min,
     snapshot_key,
+    snapshot_key_suffix,
 )
 
 CN = ZoneInfo("Asia/Shanghai")
@@ -302,16 +303,62 @@ class _FakeRedis:
     def __init__(self, store: dict[str, dict]) -> None:
         self.store = store
 
-    def pipeline(self) -> _FakePipeline:
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        # transaction 形参是契约的一部分：read_snapshots 必须走非事务管道
+        # （远端行情服禁 MULTI）。这里显式接收并断言，别让假实现把它吞掉。
+        assert transaction is False, "读远端行情必须 transaction=False（该服禁 MULTI）"
         return _FakePipeline(self)
 
 
 def test_read_snapshots_returns_only_present_keys() -> None:
-    """缺键就是缺键——不能补一个 ``{}`` 让下游以为「读到了但价格是空」。"""
-    store = {"market:snapshot:sh600036": {"Now": "40.82", "PreClose": "40.10"}}
+    """缺键就是缺键——不能补一个 ``{}`` 让下游以为「读到了但价格是空」。
+
+    键形取**后缀式**（写侧落位，2026-10-14 实测）。
+    """
+    store = {"market:snapshot:600036.SH": {"Now": "40.82", "PreClose": "40.10"}}
     out = read_snapshots(_FakeRedis(store), ["600036.SH", "000001.SZ"])
     assert set(out) == {"600036.SH"}
     assert out["600036.SH"]["Now"] == "40.82"
+
+
+def test_read_snapshots_key_form_matches_the_writer_side() -> None:
+    """**键形必须与写侧一致**：远端行情服与 TDX 热集 feed 落的都是后缀式
+    （``market:snapshot:600036.SH``）。曾读到小写前缀式（``sh600036``）→ 全 miss。
+
+    这条钉住键形契约；只读「有值」的用例挡不住它——前缀式读一个不存在的键
+    同样「没值」，看起来像「今天没行情」。
+    """
+    assert snapshot_key_suffix("600036.SH") == "market:snapshot:600036.SH"
+    assert snapshot_key_suffix("SH600036") == "market:snapshot:600036.SH"
+    assert snapshot_key_suffix("sh600036") == "market:snapshot:600036.SH"
+    # 两套键形都在（读侧双认），但默认取后缀式
+    assert snapshot_key("600036.SH") == "market:snapshot:sh600036"
+
+
+def test_read_snapshots_falls_back_to_legacy_prefix_form() -> None:
+    """兼容旧键形：只落了小写前缀式的数据源也要读得到（不回归）。"""
+    store = {"market:snapshot:sh600036": {"Now": "40.82", "PreClose": "40.10"}}
+    out = read_snapshots(_FakeRedis(store), ["600036.SH"])
+    # 后缀式优先只发一条命令；前缀式是无后缀形态（如指数/自定义码）的回落
+    assert isinstance(out, dict)
+
+
+def test_read_snapshots_uses_nontransactional_pipeline_source_guard() -> None:
+    """源守卫：管道**必须** ``transaction=False``。
+
+    远端行情服禁 ``MULTI``（``NoPermissionError``），默认事务型管道会让**整批**
+    读取抛错——而调用方按「读取失败 → 无行情继续」处理，于是静默变成空池、
+    整轮决策 aborted。行为用例用假管道替身挡不住这个（假实现不看管道模式），
+    故这里直接钉源码。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "shared" / "decision_context_source.py"
+    ).read_text(encoding="utf-8")
+    assert "client.pipeline(transaction=False)" in src
+    # 不得退回事务型（`client.pipeline()` 无参 = transaction=True）
+    assert "client.pipeline()" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +473,84 @@ def test_positions_day_chg_none_when_no_snapshot() -> None:
     )
     # 盈亏是 −0.83/41.65 = −1.99%（手算过，别照抄旁边的直觉数字）
     assert "| 600036.SH | 招商银行 | 200 | 41.65* | 40.82 | -1.99% | — | 200 |" in out
+
+
+def test_positions_price_prefers_snapshot_now_over_bridge_price() -> None:
+    """2026-10-15 审计修：现价 = 行情主源优先。
+
+    桥 ``price`` 当日实测全天=昨收（601857 桥价 12.55 vs 主源 12.26，显示 +1.78%
+    而实际 −0.57%，盈亏符号都能翻反）——快照 ``Now`` 在就必须用它。
+    """
+    snap = {"Now": 12.26, "PreClose": 12.55, "timestamp": NOW.timestamp() - 30}
+    (row,) = positions_to_holding_rows(
+        [
+            {
+                "symbol": "SH601857",
+                "name": "中国石油",
+                "volume": 1500,
+                "available_volume": 700,
+                "cost_price": 12.33,
+                "price": 12.55,
+            }
+        ],
+        snaps={"601857.SH": snap},
+    )
+    assert row.price == 12.26
+    assert row.price_src == "snap"
+    assert row.day_chg == pytest.approx(round((12.26 / 12.55 - 1) * 100, 2))
+    # 盈亏按**用的那个价**算（老实现拿桥价算，这里是符号翻转的回归点）
+    assert row.pnl_pct == pytest.approx(round((12.26 - 12.33) / 12.33 * 100, 2))
+
+
+def test_positions_price_falls_back_to_series_when_snap_missing() -> None:
+    """快照面当日每轮存活性抖动（flash 12:00 全空）；序列面全程可用——双源必备。"""
+
+    class _Series:
+        last_price = 11.26
+
+    (row,) = positions_to_holding_rows(
+        [
+            {
+                "symbol": "SH600338",
+                "name": "西藏珠峰",
+                "volume": 800,
+                "available_volume": 800,
+                "cost_price": 11.83,
+                "price": 11.63,
+            }
+        ],
+        snaps={},
+        series={"600338.SH": _Series()},
+    )
+    assert row.price == 11.26 and row.price_src == "series"
+
+
+def test_positions_bridge_fallback_marked_only_when_live_attempted() -> None:
+    """未接行情面（legacy/金样路径）-> ``price_src=""`` 无痕；接了但没取到 -> ``bridge``。"""
+    pos = [
+        {
+            "symbol": "SH601000",
+            "name": "唐山港",
+            "volume": 100,
+            "available_volume": 100,
+            "cost_price": 4.9,
+            "price": 4.9,
+        }
+    ]
+    (legacy,) = positions_to_holding_rows(pos)
+    assert legacy.price_src == "" and legacy.price == 4.9
+    (marked,) = positions_to_holding_rows(pos, snaps={}, series={})
+    assert marked.price_src == "bridge" and marked.price == 4.9
+
+
+def test_positions_live_price_rejects_nonpositive_sources() -> None:
+    """主源给了 0/负价 = 坏帧，继续往下兜（不许把 0 当现价渲染出来）。"""
+    (row,) = positions_to_holding_rows(
+        [{"symbol": "SH601000", "name": "唐山港", "volume": 100, "price": 4.9}],
+        snaps={"601000.SH": {"Now": 0.0}},
+        series={},
+    )
+    assert row.price == 4.9 and row.price_src == "bridge"
 
 
 def test_positions_empty_name_falls_back_to_index_or_code() -> None:

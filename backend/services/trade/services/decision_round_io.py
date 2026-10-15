@@ -399,6 +399,16 @@ def default_round_deps() -> RoundDeps:
 
         return real_mirror_service.real_trading_ready(get_redis(), "CN")
 
+    def _read_mirror_ctx() -> Mapping[str, Any]:
+        """镜像提示词面（2026-10-15 审计 P0-B/P0-C）：闸门约束 + 当日跳过明细。
+
+        与下单侧同一实现（``prompt_mirror_context``），读的是交易库（``get_redis``
+        = db2，与 ``record_skip`` 写侧同库）；读取失败在那边已兜成 ``skips=None``。
+        """
+        from backend.services.live_trading.services import real_mirror_service
+
+        return real_mirror_service.prompt_mirror_context(get_redis(), "CN")
+
     def _write_watch(agent: str, plan: Any) -> Any:
         return write_watch_plan(get_redis(), plan, agent=agent)
 
@@ -459,6 +469,8 @@ def default_round_deps() -> RoundDeps:
         read_series_summary=feeds.series_summaries,
         load_decision_rows=feeds.load_decision_rows,
         read_wake_ctx=_read_wake_ctx,
+        # 镜像闸门/回注（P0 审计修）：非镜像部署下 active=False → 两块整段空串
+        read_mirror_ctx=_read_mirror_ctx,
     )
 
 
@@ -621,7 +633,16 @@ def record_round_dialogue(
     ``arena_files`` 是本机独有的包（与「实盘交易」栏同纪律，见 ``.gitignore``）：
     公开仓缺它时**轮次照跑**，只是这一轮不落对话——那种部署里 arena 栏本身也不存在，
     「看得见却没数据」这个面不会出现。范式同 ``services/api/main.py`` 的 try/except 注册。
+
+    ``attempt.truncated``（``finish_reason=length``）时往 ``notes`` 记一条：成功轮里
+    本函数是唯一同时拿到 ``attempt`` 与 ``notes`` 的写侧，且截断事实直接关系刚落盘的
+    对话质量（尾部被切，前端看起来只是戛然而止）。
     """
+    if getattr(attempt, "truncated", False):
+        notes.append(
+            "供应商输出顶格截断（finish_reason=length）：对话与决策原文尾部可能被切，"
+            "建议调大该家 max_tokens"
+        )
     if arena_files is None:  # pragma: no cover - 取决于本机是否有该包
         return
     try:

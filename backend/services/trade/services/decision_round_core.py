@@ -434,9 +434,8 @@ class RoundDeps:
     #: () → 名册（P2.9）：**一家一项**，顺序即执行顺序（``None``/空 = 单家路径，
     #: 走 ``load_llm`` 那一条）。解析失败上抛，由 tick 收成「一家都跑不动」。
     roster: Callable[[], Sequence[AgentRun]] | None = None
-    #: () → 盘中 regime 快照（db0 ``qm:regime:intraday`` 全字段；服务未开/读失败
-    #: → ``None``）。**缺失不拦轮**：提示词按「本轮不可得」如实降级（见
-    #: ``shared/decision_blocks.build_market_state_block``）。``None`` = 未接线。
+    #: () → 盘中 regime 快照（db0 ``qm:regime:intraday``；服务未开/读失败 → ``None``）。
+    #: **缺失不拦轮**：提示词按「本轮不可得」降级（``build_market_state_block``）。``None`` = 未接线。
     load_regime: Callable[[], Mapping[str, Any] | None] | None = None
     #: (tenant, user) → (score_map, meta)（与 ``shared.signal_scores.
     #: load_score_snapshot`` 同一实现——取数失败已在那边吞成 ``ok=False``+
@@ -458,6 +457,8 @@ class RoundDeps:
     load_decision_rows: Callable[[date, str], Awaitable[Sequence[Any]]] | None = None
     #: (round_id) → 丙1 唤醒文本（非唤醒轮 ""）。写 wake_tick，渲染 extra_context。
     read_wake_ctx: Callable[[str], str] | None = None
+    #: () → 镜像上下文（闸门约束+当日跳过；``real_mirror_service.prompt_mirror_context``）。None = 未接线。
+    read_mirror_ctx: Callable[[], Mapping[str, Any]] | None = None
 
 
 @dataclass(frozen=True, slots=True)

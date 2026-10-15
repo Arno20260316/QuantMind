@@ -36,9 +36,15 @@ from backend.shared.decision.contract import (
     parse_decisions,
 )
 
-#: 调用器契约：提示词 → ``(原文, usage)``。**同步阻塞**——异步环境里由调用方
-#: 用 ``asyncio.to_thread`` 包（见 ``decision_llm_client`` 的模块 docstring）。
-Caller = Callable[[str], "tuple[str, Mapping[str, Any] | None]"]
+#: 调用器契约：提示词 → ``(原文, usage)`` 或 ``(原文, usage, finish_reason)``。
+#: 第 3 元是 2026-10-15 审计补的：glm 的 CoT 顶格 ``max_tokens`` 被静默当成功，
+#: 截断痕迹只能从 ``finish_reason`` 读；旧 2 元 caller 照常收（按「未报告」处理）。
+#: **同步阻塞**——异步环境里由调用方用 ``asyncio.to_thread`` 包（见
+#: ``decision_llm_client`` 的模块 docstring）。
+Caller = Callable[
+    [str],
+    "tuple[str, Mapping[str, Any] | None] | tuple[str, Mapping[str, Any] | None, str]",
+]
 
 #: 解析失败后追加纠正语重问的次数（相邻系统是 1，事故复盘也支持「再问一次就够」：
 #: 第二次仍取不出 JSON 的，几乎都是提示词/schema 串了，重试解决不了）。
@@ -49,6 +55,10 @@ USAGE_KEYS: tuple[str, ...] = ("prompt_tokens", "completion_tokens", "total_toke
 
 #: ``DecisionAttempt.errors`` 里单条错误的截断上限（留痕要有限度）。
 ERROR_LIMIT = 200
+
+#: finish_reason 里表示「输出顶格被截」的值（OpenAI 式 ``length`` / Anthropic 式
+#: ``max_tokens``）；不含 ``stop``（正常收尾）与 ``content_filter``（内容被拦，不是截断）。
+TRUNCATING_FINISH_REASONS = frozenset({"length", "max_tokens"})
 
 #: 非 str 原文在错误文案里的显示上限。
 _REPR_LIMIT = 80
@@ -150,6 +160,9 @@ class DecisionAttempt:
     errors: tuple[str, ...] = ()
     #: 模型原文全文（展示面用）；取不到时为空串，消费方回退 ``raw``
     raw_full: str = ""
+    #: 本次尝试里**至少一次**调用顶格截断（:data:`TRUNCATING_FINISH_REASONS`）。
+    #: 「截断但解析成功」是合法组合（JSON 恰好切在完整处），但审计面要能看见。
+    truncated: bool = False
 
     @property
     def status(self) -> str:
@@ -193,20 +206,43 @@ class _Call:
     usage: dict[str, int] | None = None
     status: str = ""
     error: str = ""
+    #: 供应商收尾原因（``stop``/``length``/…）；旧 2 元 caller 未报告时为空串
+    finish_reason: str = ""
 
     @property
     def ok(self) -> bool:
         return not self.status
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason in TRUNCATING_FINISH_REASONS
 
 
 def _brief(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:ERROR_LIMIT]
 
 
+def _unpack_result(raw: object) -> tuple[object, object, str]:
+    """caller 返回值 → ``(原文, usage, finish_reason)``；2 元按「未报告」补空串。
+
+    形状不对**抛**（由 :func:`_one_call` 收成 ``api_failed``）：旧实现直接
+    ``content, usage = call(prompt)``，caller 若返回 2 字符的 str 会被逐字符
+    解开、演成空输出——契约问题必须在门口拦下。
+    """
+    if isinstance(raw, tuple) and len(raw) in (2, 3):
+        content, usage = raw[0], raw[1]
+        finish_reason = str(raw[2] or "").strip() if len(raw) == 3 else ""
+        return content, usage, finish_reason
+    raise ValueError(
+        "caller 返回形状不对（要 (原文, usage[, finish_reason])，收到 "
+        f"{type(raw).__name__}）"
+    )
+
+
 def _one_call(call: Caller, prompt: str) -> _Call:
     """发一次调用并把**任何**异常收成三态之一（本模块不抛异常）。"""
     try:
-        content, usage = call(prompt)
+        content, usage, finish_reason = _unpack_result(call(prompt))
     except LLMNotConfigured as exc:
         return _Call(status=STATUS_NOT_CONFIGURED, error=_brief(exc))
     except Exception as exc:  # noqa: BLE001 调用链任何异常都归 api_failed——排查方向一致
@@ -218,7 +254,11 @@ def _one_call(call: Caller, prompt: str) -> _Call:
             status=STATUS_API_FAILED,
             error=f"caller 返回的原文不是 str（{described}）",
         )
-    return _Call(content=content, usage=normalize_usage(usage))
+    return _Call(
+        content=content,
+        usage=normalize_usage(usage),
+        finish_reason=finish_reason,
+    )
 
 
 def decide_with_retry(
@@ -239,7 +279,10 @@ def decide_with_retry(
       问题，追加纠正语没有对象可纠正）；
     * 有原文但取不出决策 → 追加 :data:`JSON_ONLY_HINT` 重问一次；
     * 重试也取不出 → ``parse_failed``，原文取**第二次**的（更接近模型最终想说的），
-      第二次为空则退回第一次。
+      第二次为空则退回第一次；
+    * caller 报了 ``finish_reason`` 且落在 :data:`TRUNCATING_FINISH_REASONS` →
+      ``truncated=True``（**任何一次**都算）：顶格截断与正常收尾此前不可区分，
+      「parse_failed 是被切了还是格式烂」在审计表里得能回答。
 
     ``schema`` 必须显式传：它决定 action 白名单，给个默认值会让「盘中轮误用调仓
     schema」这类事故变成静默丢决策。
@@ -254,24 +297,38 @@ def decide_with_retry(
             calls,
             errors,
             raw_full=first.content,
+            truncated=first.truncated,
         )
 
     batch = parse_decisions(first.content, schema=schema)
     if batch.ok or batch.status == STATUS_EMPTY_OUTPUT:
         return DecisionAttempt(
-            batch, first.usage, calls, errors, raw_full=first.content
+            batch,
+            first.usage,
+            calls,
+            errors,
+            raw_full=first.content,
+            truncated=first.truncated,
         )
 
     second = _one_call(call, prompt + JSON_ONLY_HINT)
     calls += 1
     if second.error:
         errors += (second.error,)
+    truncated = first.truncated or second.truncated
     usage = merge_usage(first.usage, second.usage)
     last = batch
     if second.ok:
         last = parse_decisions(second.content, schema=schema)
         if last.ok:
-            return DecisionAttempt(last, usage, calls, errors, raw_full=second.content)
+            return DecisionAttempt(
+                last,
+                usage,
+                calls,
+                errors,
+                raw_full=second.content,
+                truncated=truncated,
+            )
         # 与相邻系统同形（`content2 or content`）：第二次的原文更近，空则退回第一次
         raw = second.content or first.content
     else:
@@ -288,4 +345,5 @@ def decide_with_retry(
         calls,
         errors,
         raw_full=raw,
+        truncated=truncated,
     )

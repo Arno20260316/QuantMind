@@ -272,11 +272,17 @@ def decisions_json(*rows: Mapping) -> str:
     return json.dumps({"decisions": list(rows)}, ensure_ascii=False)
 
 
-def attempt_from(text: str, *, schema: str = SCHEMA_INTRADAY):
-    """假 caller 只吐文本，其余（重试/解析/契约）全走真件。"""
-    return decide_with_retry(
-        lambda _p: (text, {"prompt_tokens": 7}), "提示词", schema=schema
+def attempt_from(text: str, *, schema: str = SCHEMA_INTRADAY, finish_reason: str = ""):
+    """假 caller 只吐文本，其余（重试/解析/契约）全走真件。
+
+    ``finish_reason`` 非空时走 3 元 caller（顶格截断的留痕路径）。
+    """
+    out: tuple = (
+        (text, {"prompt_tokens": 7}, finish_reason)
+        if finish_reason
+        else (text, {"prompt_tokens": 7})
     )
+    return decide_with_retry(lambda _p: out, "提示词", schema=schema)
 
 
 @dataclass
@@ -298,6 +304,7 @@ def make_harness(**over) -> Harness:
         "decision_text",
         decisions_json({"action": "hold", "code": "600036.SH", "reason": "趋势未破"}),
     )
+    finish_reason = over.pop("finish_reason", "")
     positions = over.pop("positions", {"SH600036": dict(HOLDING_PAYLOAD)})
     account = over.pop(
         "account",
@@ -341,7 +348,7 @@ def make_harness(**over) -> Harness:
 
     def _decide(prompt, schema):
         log["llm"].append({"prompt": prompt, "schema": schema})
-        return attempt_from(text, schema=schema)
+        return attempt_from(text, schema=schema, finish_reason=finish_reason)
 
     # meta 形状与生产同形（``real_positions.merge_real_sources``）：每源一个 dict，
     # 空持仓时的归因（读到几行 / 是否停更）就靠这几个字段，形状不同则测试测不到真分支。
@@ -461,6 +468,8 @@ def make_harness(**over) -> Harness:
         read_series_summary=over.pop("read_series_summary", None),
         load_decision_rows=over.pop("load_decision_rows", None),
         read_wake_ctx=over.pop("read_wake_ctx", None),
+        # 镜像闸门/回注（P0 审计修）：默认 None = 未接线（两块整段不渲染）。
+        read_mirror_ctx=over.pop("read_mirror_ctx", None),
     )
     assert not over, f"未消费的替身参数：{sorted(over)}"
     return Harness(deps=deps, log=log)
@@ -875,6 +884,33 @@ async def test_run_once_parse_failure_writes_nothing_so_catch_up_can_retry():
     assert result.status == R.STATUS_LLM_FAILED
     assert h.log["exec"] == [] and h.log["ledger"] == [] and h.log["watch"] == []
     assert result.meta["calls"] >= 1  # 重试次数可见
+
+
+@pytest.mark.asyncio
+async def test_run_once_truncated_parse_failure_names_truncation_and_no_reason():
+    """顶格截断 + 取不出 JSON：note 要指认「被切了」，且光杆冒号有兜底文案。"""
+    h = make_harness(decision_text="今天没什么好说的", finish_reason="length")
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_LLM_FAILED
+    assert "未报告原因" in result.note  # parse_failed 无 error 条目：不许留空冒号
+    assert "顶格截断" in result.note
+    assert h.log["exec"] == [] and h.log["ledger"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_once_truncation_on_success_round_lands_in_notes(arena_root):
+    """解析成功但输出被切过：轮照跑，审计 notes 留下截断事实（对话尾部可能就是被切的）。"""
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        ),
+        finish_reason="length",
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    assert result.status == R.STATUS_OK  # 截断不动轮次状态
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("顶格截断" in n for n in notes), notes
 
 
 @pytest.mark.asyncio
@@ -1739,7 +1775,12 @@ async def test_round_renders_batch2_blocks_when_wired():
     # 低价候选（601988，一手 ¥420 过预算）加进池：风险块的「候选池命中」侧
     # 只有在池票真进宇宙时才可断言（600519 一手 17 万被池过滤，是反例）。
     cheap = PoolRow(
-        code="601988.SH", name="中国银行", industry="银行", score=1.0, fusion=0.6, rank=3
+        code="601988.SH",
+        name="中国银行",
+        industry="银行",
+        score=1.0,
+        fusion=0.6,
+        rank=3,
     )
     h = make_harness(
         pool=pool_doc(BANK_ROW, PRICEY_ROW, cheap),
@@ -1818,7 +1859,7 @@ async def test_round_renders_batch2_blocks_when_wired():
         "【风险预算档位】",
     ]
     idx = [prompt.index(m) for m in order]
-    assert idx == sorted(idx), [(m, i) for m, i in zip(order, idx)]
+    assert idx == sorted(idx), [(m, i) for m, i in zip(order, idx, strict=True)]
     # 唤醒说明按 **本轮 round_id** 真读回（写读两侧同库同键）
     assert wake_rids == [promised]
     # 丁5 四只指数进了询价清单（深市两只是本批常驻源）
@@ -1845,8 +1886,89 @@ async def test_round_unwired_batch2_keeps_legacy_prompt_bytes():
         "【行业整体劣化",
         "【风险预算档位】",
         "【本轮为触发唤醒】",
+        "【真单镜像闸门】",
+        "【今日真单执行受阻】",
     ):
         assert marker not in prompt, marker
+
+
+MIRROR_LIMITS = {
+    "max_order_value": 10000.0,
+    "max_daily_value": 50000.0,
+    "max_daily_orders": 20,
+    "max_daily_symbols": 5,
+    "max_slippage_pct": 0.02,
+}
+MIRROR_SKIP_MAX_ORDER = {
+    "symbol": "601985.SH",
+    "reason": "max_order_value",
+    "count": 1,
+    "side": "BUY",
+    "quantity": 1100,
+    "value": 10362.0,
+    "at": "2026-10-14T09:35:35",
+}
+
+
+@pytest.mark.asyncio
+async def test_round_injects_mirror_gates_and_skip_feedback():
+    """镜像启用（P0-B/P0-C）：生效约束与当日跳过明细进提示词；未启用整段不出现。"""
+    h = make_harness(
+        read_mirror_ctx=lambda: {
+            "active": True,
+            "limits": MIRROR_LIMITS,
+            "skips": [MIRROR_SKIP_MAX_ORDER],
+        }
+    )
+    result = await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = h.log["llm"][0]["prompt"]
+    assert "【真单镜像闸门】" in prompt
+    assert "单笔金额上限 ¥10,000" in prompt
+    assert "【今日真单执行受阻】" in prompt
+    assert "- 09:35 601985.SH 买入 1100 股（约 ¥10,362） · 单笔金额超上限" in prompt
+
+    off = make_harness(
+        read_mirror_ctx=lambda: {
+            "active": False,
+            "limits": MIRROR_LIMITS,
+            "skips": [MIRROR_SKIP_MAX_ORDER],
+        }
+    )
+    result = await run_once(SLOT_0935, deps=off.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    off_prompt = off.log["llm"][0]["prompt"]
+    assert "【真单镜像闸门】" not in off_prompt
+    assert "【今日真单执行受阻】" not in off_prompt  # active=False：连回注也不渲染
+
+
+@pytest.mark.asyncio
+async def test_round_mirror_context_degradation_is_loud_but_not_blocking():
+    """镜像上下文读失败/台账读不到：降级如实渲染 + 丁8 置顶留痕，绝不拦轮。"""
+    boom = make_harness(read_mirror_ctx=_raising_mirror_ctx)
+    result = await run_once(SLOT_0935, deps=boom.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = boom.log["llm"][0]["prompt"]
+    assert "【真单镜像闸门】" not in prompt
+    assert "【今日真单执行受阻】" not in prompt
+
+    dead = make_harness(
+        read_mirror_ctx=lambda: {
+            "active": True,
+            "limits": MIRROR_LIMITS,
+            "skips": None,
+        }
+    )
+    result = await run_once(SLOT_0935, deps=dead.deps, now=NOW)
+    assert result.status == R.STATUS_OK
+    prompt = dead.log["llm"][0]["prompt"]
+    assert "跳过台账读取失败" in prompt
+    assert "镜像跳过台账读取失败：执行受阻回注降级" in prompt  # 丁8 置顶汇总
+    assert "【数据新鲜度警告】" in prompt
+
+
+def _raising_mirror_ctx():
+    raise RuntimeError("镜像上下文读取炸了")
 
 
 @pytest.mark.asyncio
@@ -3604,7 +3726,10 @@ def test_default_roster_stays_empty_until_the_roster_env_is_set(monkeypatch):
     runs = IO.default_roster()
     assert [r.agent for r in runs] == ["deepseek-v4-pro", "deepseek-v4-flash"]
     # 每家的绑定指向自己那套配置（顺序即执行顺序；绑定延迟到真要问模型时才建客户端）
-    assert [r.load_llm().model for r in runs] == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    assert [r.load_llm().model for r in runs] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+    ]
 
 
 def test_default_round_deps_fills_every_injection_point(monkeypatch):

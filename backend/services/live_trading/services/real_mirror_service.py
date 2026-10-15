@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -442,13 +443,27 @@ def _load_ledger(
     return counts
 
 
-def _entry_detail(side: str, quantity: float, source: str) -> dict[str, Any]:
-    return {
+#: ``_entry_detail`` 收录的附加事实键（白名单制：写侧传什么、这里只抄这些，
+#: 其余 extra 只进返回值不进台账——台账是消费面契约，不许随机键漂进去）。
+_DETAIL_EXTRA_KEYS = ("value", "drift", "daily_value", "daily_orders", "daily_symbols")
+
+
+def _entry_detail(
+    side: str,
+    quantity: float,
+    source: str,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
         "side": side,
         "quantity": quantity,
         "source": source,
         "at": datetime.now().isoformat(timespec="seconds"),
     }
+    for key in _DETAIL_EXTRA_KEYS:
+        if extra and extra.get(key) is not None:
+            detail[key] = extra[key]
+    return detail
 
 
 def record_skip(
@@ -459,14 +474,20 @@ def record_skip(
     quantity: float,
     reason: str,
     source: str,
+    extra: Mapping[str, Any] | None = None,
 ) -> None:
-    """记录一次镜像跳过（供当日双轨对账报表），失败只记日志不打断下单流程。"""
+    """记录一次镜像跳过（供当日双轨对账报表），失败只记日志不打断下单流程。
+
+    ``extra``（可选）把该笔的附加事实（``value`` 本笔金额 / ``drift`` 漂移百分数 /
+    限额快照的当日累计）一并落进 ``:detail``——决策轮提示词的「执行受阻回注」
+    （2026-10-15 审计 P0-C）读它还原「被跳的那腿长什么样」。
+    """
     _record_ledger(
         _SKIP_HASH_PREFIX,
         redis,
         symbol=symbol,
         reason=reason,
-        detail=_entry_detail(side, quantity, source),
+        detail=_entry_detail(side, quantity, source, extra),
         ttl=_SKIP_TTL_SECONDS,
     )
 
@@ -484,6 +505,7 @@ def record_failure(
     quantity: float,
     reason: str,
     source: str,
+    extra: Mapping[str, Any] | None = None,
 ) -> None:
     """记录一次真单**提交失败**（异常 / 拒单 / 券商拒收），当日按标的与原因计数。
 
@@ -497,7 +519,7 @@ def record_failure(
         redis,
         symbol=symbol,
         reason=reason,
-        detail=_entry_detail(side, quantity, source),
+        detail=_entry_detail(side, quantity, source, extra),
         ttl=_FAIL_TTL_SECONDS,
     )
 
@@ -505,6 +527,89 @@ def record_failure(
 def load_failures(redis: Any, date_str: str | None = None) -> dict[str, int]:
     """读取某日的失败计数：{ "symbol:reason": count }（状态快照 / 对账用）。"""
     return _load_ledger(_FAIL_HASH_PREFIX, redis, date_str)
+
+
+def _load_ledger_entries(
+    prefix: str, redis: Any, date_str: str | None = None
+) -> list[dict[str, Any]]:
+    """读某日台账**明细**：``[{symbol, reason, count, …detail}]``，按 ``at`` 降序。
+
+    与 :func:`_load_ledger` 的两处差别：①带 ``:detail`` 行（side/quantity/at 等，
+    旧记录没有 :meth:`_entry_detail` 加的附加键也照样读）；②错误语义不同——Redis
+    不可用/读失败**上抛**（调用方据此说「读不到」），那边是吞成空表（对账按无跳过）。
+    """
+    client = _redis_client(redis)
+    if client is None:
+        raise RuntimeError("Redis 不可用")
+    key = f"{prefix}{date_str or trade_date_str()}"
+    raw = client.hgetall(key) or {}
+    counts: dict[str, int] = {}
+    details: dict[str, dict[str, Any]] = {}
+    for field, value in raw.items():
+        name = field.decode() if isinstance(field, bytes) else str(field)
+        text = value.decode() if isinstance(value, bytes) else str(value)
+        if name.endswith(":detail"):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                details[name[: -len(":detail")]] = parsed
+            continue
+        try:
+            counts[name] = int(float(text))
+        except (TypeError, ValueError):
+            continue
+    entries: list[dict[str, Any]] = []
+    for name, count in counts.items():
+        symbol, _, reason = name.partition(":")
+        entries.append(
+            {
+                "symbol": symbol,
+                "reason": reason,
+                "count": count,
+                **details.get(name, {}),
+            }
+        )
+    entries.sort(key=lambda e: str(e.get("at") or ""), reverse=True)
+    return entries
+
+
+def prompt_mirror_context(redis: Any, market_key: str = "CN") -> dict[str, Any]:
+    """决策轮提示词用的镜像上下文（2026-10-15 审计 P0-B/P0-C）：约束 + 当日跳过。
+
+    只读、只记日志、不上抛——提示词块是增益面。返回：
+
+    * ``active``：与下单侧**同一函数**（:func:`mirror_enabled`）判活跃，外加市场
+      在册（``cfg.markets``）——不复制判定，免得提示词说「闸门开着」而下单侧说
+      「没开」。
+    * ``limits``：**生效**配置的五项硬约束（env 基线经 ``mirror:config`` 覆盖后
+      的实际值）——提示词要讲生效值，不是默认值。
+    * ``skips``：当日 ``mirror:skipped:{date}`` 明细（写侧 :func:`record_skip`）。
+      读失败 → ``None``：「读不到」≠「没有」，渲染端会如实降级。
+    """
+    cfg = load_config(redis)
+    limits = {
+        "max_order_value": cfg.max_order_value,
+        "max_daily_value": cfg.max_daily_value,
+        "max_daily_orders": cfg.max_daily_orders,
+        "max_daily_symbols": cfg.max_daily_symbols,
+        "max_slippage_pct": cfg.max_slippage_pct,
+    }
+    skips: list[dict[str, Any]] | None
+    try:
+        skips = _load_ledger_entries(_SKIP_HASH_PREFIX, redis)
+    except Exception as exc:  # noqa: BLE001 读不到 → None，提示词按「不可得」降级
+        logger.warning("[Mirror] 提示词跳过台账读取失败: %s", exc)
+        skips = None
+    try:
+        active = (
+            mirror_enabled(redis, cfg) and str(market_key or "").upper() in cfg.markets
+        )
+    except Exception as exc:  # noqa: BLE001 判活失败按未启用（不往提示词里写约束）
+        logger.warning("[Mirror] 提示词镜像判活失败: %s", exc)
+        active = False
+    return {"active": active, "limits": limits, "skips": skips}
 
 
 # --------------------------------------------------------------------------
@@ -1362,6 +1467,7 @@ async def _submit_payload(
             quantity=quantity,
             reason=reason,
             source=str(payload.get("source") or "submit"),
+            extra=extra,
         )
         return {"status": "skipped", "reason": reason, "symbol": symbol, **extra}
 
@@ -1383,7 +1489,7 @@ async def _submit_payload(
                 drift * 100,
                 _SANITY_MAX_DRIFT * 100,
             )
-            return _skip("price_sanity")
+            return _skip("price_sanity", drift=round(drift * 100, 2))
     elif cfg.max_slippage_pct > 0 and drift > cfg.max_slippage_pct:
         # 参考价与虚拟成交价偏离过大（除权/停牌/数据滞后）→ 不下真单
         logger.warning(
@@ -1393,7 +1499,7 @@ async def _submit_payload(
             ref_price,
             drift * 100,
         )
-        return _skip("price_drift")
+        return _skip("price_drift", drift=round(drift * 100, 2))
 
     # 限价基准：普通信号用昨收（虚拟成交价与实时盘口可能脱钩，见计划 §2.3 开放问题）；
     # 强平/止损单用盘口价（payload price = 当时盘口），否则跌停保护价会被昨收口径算歪。
@@ -1461,7 +1567,7 @@ async def _submit_payload(
                 need,
                 float(account.get("cash") or 0),
             )
-            return _skip("insufficient_cash")
+            return _skip("insufficient_cash", value=order_value)
     else:
         # 账户快照键为后缀式（QuantDB 口径），payload 的 symbol 可能带市场后缀差异，
         # 查前统一归一化，避免口径不符导致的假「持仓不足」。
@@ -1476,7 +1582,7 @@ async def _submit_payload(
                 quantity,
                 available,
             )
-            return _skip("insufficient_position")
+            return _skip("insufficient_position", value=order_value)
 
     was_new_symbol = False
     try:
@@ -1498,7 +1604,7 @@ async def _submit_payload(
         )
         # 走 _skip 记台账：限额跳过原先裸 return，对账报表读不到 → 缺口永远
         # unexplained（2026-10-14 max_order_value 三笔隐形）。
-        return _skip(reason, **snapshot)
+        return _skip(reason, value=order_value, **snapshot)
     was_new_symbol = _as_int(snapshot.get("new_symbol")) == 1
     quota_date = str(snapshot.get("date") or "")
 

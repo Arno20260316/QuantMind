@@ -145,16 +145,17 @@ def test_absent_usage_keys_diverge_from_golden(request_golden: dict) -> None:
         "completion_tokens": 0,
         "total_tokens": 0,
     }
-    content, usage = _extract(
+    content, usage, finish_reason = _extract(
         {"choices": [{"message": {"content": ""}}], "usage": {"prompt_tokens": 5}}
     )
     assert usage == {"prompt_tokens": 5}
     assert content == ""
+    assert finish_reason == ""  # 响应没报就空串，不编 "stop"
 
 
 def test_reasoning_content_fallback_matches_golden(request_golden: dict) -> None:
     """推理模型的 content 可能是空的，话在 ``reasoning_content`` 里。"""
-    content, _ = _extract(
+    content, _, _ = _extract(
         {"choices": [{"message": {"content": "", "reasoning_content": "兜底文本"}}]}
     )
     assert content == request_golden["reasoning_content_fallback"] == "兜底文本"
@@ -471,11 +472,23 @@ def test_success_returns_content_and_usage(monkeypatch) -> None:
         )
     )
     monkeypatch.setattr(mod, "_post", post)
-    content, usage = call_with_usage("提示词", config=_cfg())
+    content, usage, finish_reason = call_with_usage("提示词", config=_cfg())
     assert content == OK_JSON
     assert usage == {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}
+    assert finish_reason == ""  # _body 没造 finish_reason：缺席照旧空串
     assert len(post.calls) == 1
     assert post.calls[0]["headers"]["Authorization"] == "Bearer sk-not-a-real-key"
+
+
+def test_truncating_finish_reason_is_lifted_out(monkeypatch) -> None:
+    """顶格截断（finish_reason=length）要抬到调用方——glm CoT 顶格曾是静默成功。"""
+    from backend.shared import decision_llm_client as mod
+
+    body = _body(OK_JSON)
+    body["choices"][0]["finish_reason"] = "length"
+    monkeypatch.setattr(mod, "_post", _Post(body))
+    _, _, finish_reason = call_with_usage("提示词", config=_cfg())
+    assert finish_reason == "length"
 
 
 def test_provider_retry_resends_after_transport_failure(monkeypatch) -> None:
@@ -484,7 +497,7 @@ def test_provider_retry_resends_after_transport_failure(monkeypatch) -> None:
 
     post = _Post(TimeoutError("90s 超时"), _body(OK_JSON))
     monkeypatch.setattr(mod, "_post", post)
-    content, _ = call_with_usage("提示词", config=_cfg())
+    content, _, _ = call_with_usage("提示词", config=_cfg())
     assert content == OK_JSON and len(post.calls) == 2
     assert [c["payload"] for c in post.calls] == [post.calls[0]["payload"]] * 2
 

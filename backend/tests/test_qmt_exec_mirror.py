@@ -1328,14 +1328,18 @@ class TestWhitelistKeyFormNormalization:
         redis = _redis(sets={"mirror:whitelist": {"default:00000001"}})
 
         # Act / Assert：规范账户必须能过闸
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        )
 
     def test_short_alias_entry_matches_canonical_account(self) -> None:
         # Arrange：另一条存量别名（int 化后是 1）
         redis = _redis(sets={"mirror:whitelist": {"default:1"}})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        )
 
     def test_canonical_entry_matches_legacy_caller(self) -> None:
         """反向也要通：白名单已改成规范键形，但某个老调用方仍传 00000001。"""
@@ -1343,7 +1347,9 @@ class TestWhitelistKeyFormNormalization:
         redis = _redis(sets={"mirror:whitelist": {"default:10000001"}})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="00000001") is True
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="00000001") is True
+        )
 
     def test_ordinary_numeric_user_is_not_collapsed(self) -> None:
         """归一只作用于管理员族：普通数字用户仍按原值精确匹配。
@@ -1356,7 +1362,9 @@ class TestWhitelistKeyFormNormalization:
 
         # Act / Assert：42 自己命中，管理员账户不命中
         assert m.whitelist_allows(redis, tenant_id="default", user_id="42") is True
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        )
 
     def test_alias_entry_with_strategy_matches(self) -> None:
         """三段式（tenant:user:strategy）也要归一段 —— 只有用户段有别名族。"""
@@ -1377,7 +1385,9 @@ class TestWhitelistKeyFormNormalization:
         redis = _redis(sets={"mirror:whitelist": {"default"}})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        )
 
     def test_unrelated_tenant_alias_still_blocks(self) -> None:
         """别把「归一」做成「一律放行」：别的租户的条目不能命中本租户。"""
@@ -1385,18 +1395,144 @@ class TestWhitelistKeyFormNormalization:
         redis = _redis(sets={"mirror:whitelist": {"other:00000001"}})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        )
 
     def test_empty_whitelist_blocks(self) -> None:
         # Arrange
         redis = _redis(sets={"mirror:whitelist": set()})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is False
+        )
 
     def test_wildcard_still_allows(self) -> None:
         # Arrange
         redis = _redis(sets={"mirror:whitelist": {"*"}})
 
         # Act / Assert
-        assert m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        assert (
+            m.whitelist_allows(redis, tenant_id="default", user_id="10000001") is True
+        )
+
+
+class TestPromptMirrorContext:
+    """决策轮提示词面（2026-10-15 审计 P0-B/P0-C）：生效约束 + 当日跳过明细。
+
+    关键纪律：``skips`` 读不到 → ``None``（不是 ``[]``）——渲染端对「读不到」
+    与「没有」是两句话；``active`` 与下单侧同一函数（``mirror_enabled``）。
+    """
+
+    def _skip_hash(self) -> tuple[str, dict[str, Any]]:
+        key = f"mirror:skipped:{m.trade_date_str()}"
+        detail = {
+            "side": "BUY",
+            "quantity": 1100,
+            "source": "decision",
+            "at": "2026-10-15T09:35:35",
+            "value": 10362.0,
+        }
+        return key, {
+            "601985.SH:max_order_value": "1",
+            "601985.SH:max_order_value:detail": json.dumps(detail, ensure_ascii=False),
+        }
+
+    def test_active_limits_and_detailed_skips(self) -> None:
+        key, hashes = self._skip_hash()
+        redis = _redis(strings={"mirror:enabled": "1"}, hashes={key: hashes})
+        with patch.object(m, "is_real_trading_enabled", return_value=True):
+            ctx = m.prompt_mirror_context(redis, "CN")
+        assert ctx["active"] is True
+        assert ctx["limits"]["max_order_value"] == 10000.0
+        assert ctx["limits"]["max_slippage_pct"] == 0.02
+        (skip,) = ctx["skips"]
+        assert skip["symbol"] == "601985.SH"
+        assert skip["reason"] == "max_order_value"
+        assert skip["count"] == 1
+        assert skip["side"] == "BUY"
+        assert skip["value"] == 10362.0
+
+    def test_market_outside_the_registry_is_inactive(self) -> None:
+        redis = _redis(strings={"mirror:enabled": "1"})
+        with patch.object(m, "is_real_trading_enabled", return_value=True):
+            assert m.prompt_mirror_context(redis, "HK")["active"] is False
+
+    def test_kill_switch_is_inactive_but_ledger_still_reads(self) -> None:
+        key, hashes = self._skip_hash()
+        redis = _redis(
+            strings={"mirror:enabled": "1", "mirror:kill": "1"}, hashes={key: hashes}
+        )
+        with patch.object(m, "is_real_trading_enabled", return_value=True):
+            ctx = m.prompt_mirror_context(redis, "CN")
+        assert ctx["active"] is False
+        assert ctx["skips"] is not None  # 台账面与开关无关：跳过发生过就要看得见
+
+    def test_unreadable_ledger_yields_none_not_empty(self) -> None:
+        class Broken(FakeRedisClient):
+            def hgetall(self, key: str) -> dict[str, Any]:
+                raise RuntimeError("redis 挂了")
+
+        redis = SimpleNamespace(client=Broken())
+        with patch.object(m, "is_real_trading_enabled", return_value=True):
+            ctx = m.prompt_mirror_context(redis, "CN")
+        assert ctx["skips"] is None
+
+    def test_missing_redis_client_yields_none_not_empty(self) -> None:
+        redis = SimpleNamespace(client=None)
+        with patch.object(m, "is_real_trading_enabled", return_value=True):
+            ctx = m.prompt_mirror_context(redis, "CN")
+        assert ctx["skips"] is None
+
+    def test_record_skip_keeps_only_whitelisted_extra(self) -> None:
+        redis = _redis()
+        m.record_skip(
+            redis,
+            symbol="601985.SH",
+            side="BUY",
+            quantity=1100.0,
+            reason="max_order_value",
+            source="decision",
+            extra={"value": 10362.0, "drift": 2.15, "noise": "x"},
+        )
+        entries = m._load_ledger_entries("mirror:skipped:", redis)
+        assert entries[0]["value"] == 10362.0
+        assert entries[0]["drift"] == 2.15
+        assert "noise" not in entries[0]
+
+    def test_entries_sorted_by_at_desc(self) -> None:
+        key = f"mirror:skipped:{m.trade_date_str()}"
+        redis = _redis(
+            hashes={
+                key: {
+                    "600338.SH:price_drift": "2",
+                    "600338.SH:price_drift:detail": json.dumps(
+                        {"at": "2026-10-15T09:38:19", "side": "SELL"}
+                    ),
+                    "601985.SH:max_order_value": "1",
+                    "601985.SH:max_order_value:detail": json.dumps(
+                        {"at": "2026-10-15T09:35:35", "side": "BUY"}
+                    ),
+                }
+            }
+        )
+        entries = m._load_ledger_entries("mirror:skipped:", redis)
+        assert [e["symbol"] for e in entries] == ["600338.SH", "601985.SH"]
+        assert entries[0]["count"] == 2
+
+    def test_bytes_fields_and_broken_detail_are_tolerated(self) -> None:
+        """真实 redis-py 可能回 bytes 字段；``:detail`` 坏值不许炸掉整批。"""
+        key = f"mirror:skipped:{m.trade_date_str()}"
+        redis = _redis(
+            hashes={
+                key: {
+                    b"601985.SH:max_order_value": b"3",
+                    b"601985.SH:max_order_value:detail": b"{broken json",
+                }
+            }
+        )
+        entries = m._load_ledger_entries("mirror:skipped:", redis)
+        assert entries[0]["symbol"] == "601985.SH"
+        assert entries[0]["count"] == 3
+        assert "side" not in entries[0]  # 坏 detail 丢弃，其余事实保留

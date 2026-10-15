@@ -22,6 +22,7 @@ from backend.shared.decision.contract import (
 )
 from backend.shared.decision.llm_call import (
     PARSE_RETRY_ATTEMPTS,
+    TRUNCATING_FINISH_REASONS,
     LLMNotConfigured,
     decide_with_retry,
     merge_usage,
@@ -44,13 +45,13 @@ class _Caller:
         self._outs = list(outs)
         self.prompts: list[str] = []
 
-    def __call__(self, prompt: str) -> tuple[str, dict | None]:
+    def __call__(self, prompt: str) -> tuple:
         self.prompts.append(prompt)
         out = self._outs.pop(0) if self._outs else ""
         if isinstance(out, BaseException):
             raise out
         if isinstance(out, tuple):
-            return out[0], out[1]  # type: ignore[return-value]
+            return out  # type: ignore[return-value]  # 2/3 元都原样透传
         return out, None  # type: ignore[return-value]
 
 
@@ -341,9 +342,73 @@ def test_raw_full_present_on_api_failure_but_empty() -> None:
 def test_raw_full_carries_second_attempt_on_parse_failure() -> None:
     """两次都取不出决策：全文取**第二次**的（更接近模型最终想说的），与 ``raw`` 同源。"""
     attempt = decide_with_retry(
-        _Caller(JUNK, "第二次的散文：" + "啰嗦。" * 3000), "提示词", schema=SCHEMA_REBALANCE
+        _Caller(JUNK, "第二次的散文：" + "啰嗦。" * 3000),
+        "提示词",
+        schema=SCHEMA_REBALANCE,
     )
     assert attempt.status == STATUS_PARSE_FAILED
     assert attempt.raw_full.startswith("第二次的散文：")
     assert len(attempt.raw_full) > 8000
     assert len(attempt.raw) == 8000
+
+
+# ---------------------------------------------------------------------------
+# 顶格截断（finish_reason）：glm CoT 顶格曾被静默当成功，截断痕迹要能进审计
+# ---------------------------------------------------------------------------
+
+
+def test_three_tuple_caller_reports_truncation() -> None:
+    """3 元 caller 报 ``length`` → ``truncated=True``（哪怕解析成功也留痕）。"""
+    attempt = decide_with_retry(
+        _Caller((OK_JSON, None, "length")), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.ok and attempt.truncated
+
+
+def test_two_tuple_caller_is_not_truncated() -> None:
+    """旧 2 元 caller 按「未报告」处理：没证据不算截断（也不因此失败）。"""
+    attempt = decide_with_retry(_Caller(OK_JSON), "提示词", schema=SCHEMA_REBALANCE)
+    assert attempt.ok and attempt.truncated is False
+
+
+def test_stop_finish_reason_is_not_truncation() -> None:
+    attempt = decide_with_retry(
+        _Caller((OK_JSON, None, "stop")), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.truncated is False
+
+
+def test_truncation_on_either_attempt_counts() -> None:
+    """解析重试：第一次顶格、第二次正常 → 仍算截断（过程事实，不只记最后一次）。"""
+    attempt = decide_with_retry(
+        _Caller((JUNK, None, "length"), (OK_JSON, None, "stop")),
+        "提示词",
+        schema=SCHEMA_REBALANCE,
+    )
+    assert attempt.ok and attempt.calls == 2
+    assert attempt.truncated is True
+
+
+def test_truncation_survives_parse_failed() -> None:
+    """顶格 + 取不出 JSON：审计要能区分「被切了」与「格式烂」。"""
+    attempt = decide_with_retry(
+        _Caller((JUNK, None, "length")), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.status == STATUS_PARSE_FAILED
+    assert attempt.truncated is True
+
+
+def test_max_tokens_alias_counts_as_truncation() -> None:
+    """Anthropic 式网关报 ``max_tokens`` 而不是 ``length``——两个都要认。"""
+    assert TRUNCATING_FINISH_REASONS == frozenset({"length", "max_tokens"})
+    attempt = decide_with_retry(
+        _Caller((OK_JSON, None, "max_tokens")), "提示词", schema=SCHEMA_REBALANCE
+    )
+    assert attempt.truncated is True
+
+
+def test_bad_caller_shape_is_api_failed_not_unpacked_chars() -> None:
+    """caller 返回裸 str：旧实现按 ``content, usage = ...`` 会逐字符解开、演成空输出。"""
+    attempt = decide_with_retry(lambda prompt: "ok", "提示词", schema=SCHEMA_REBALANCE)
+    assert attempt.status == STATUS_API_FAILED
+    assert "形状" in attempt.error_text()

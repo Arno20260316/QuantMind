@@ -189,6 +189,25 @@ def snapshot_key(code: str) -> str:
     return f"market:snapshot:{StockCodeUtil.to_prefix(code).lower()}"
 
 
+def snapshot_key_suffix(code: str) -> str:
+    """任意形态 → ``market:snapshot:{600036.SH}``（**后缀式小写**）。
+
+    第二套键形，2026-10-14 实测发现的**落位断链**：远端行情服
+    （``REMOTE_QUOTE_REDIS_*``）与 TDX 热集 feed 写入侧用的是后缀式
+    （``market:snapshot:600036.SH``，实测 5563/5563 全是这一形），而本模块与
+    ``realtime_core.snapshot_key`` 读的都是小写前缀式（``sh600036``）——
+    **读写两侧键形不一致**，且 ``read_snapshots`` 走的是**事务型 pipeline**
+    （redis-py 默认 ``transaction=True`` → ``MULTI``），而该远端服把 ``multi``
+    命令禁掉了（``NoPermissionError``）→ 整批读取直接抛错。
+
+    两个错误叠加的后果：决策轮拿不到任何现价 → 模型看到空池 → **整轮 aborted、
+    零决策零腿**（2026-10-14 实测）。两条都在本批修掉。
+    """
+    from backend.shared.stock_utils import StockCodeUtil
+
+    return f"market:snapshot:{StockCodeUtil.to_suffix(code).upper()}"
+
+
 def _f(value: object) -> float | None:
     """快照字段 → float；空/脏一律 ``None``（**不是 0**）。"""
     if value is None or value == "":
@@ -234,20 +253,38 @@ def read_snapshots(client: Any, codes: Iterable[str]) -> dict[str, Mapping[str, 
     """批量读快照 Hash（pipeline，逐只缺键就是缺键）。``code`` 用 suffix 形态做键。
 
     行数上限由调用方控制——热集是全市场的子集，持仓 + 池加起来通常两位数。
+
+    两处**必须**如此（2026-10-14 实测根因，见 :func:`snapshot_key_suffix`）：
+
+    1. ``pipeline(transaction=False)`` —— 远端行情服禁 ``MULTI``，默认事务型管道
+       会抛 ``NoPermissionError``，**整批**读取全废。
+    2. **两套键形都发** —— 现役写侧（远端服生产写侧）落后缀式
+       （``market:snapshot:600036.SH``，实测 5563/5563），本仓 ``tdx_aidata`` 订阅
+       引擎落小写前缀式（``sh600036``）。同一只标的两条都发，先命中的那条赢。
+
+    容量：2×N 条命令一批。实测该服 400 命令/批仍 OK（真正的天花板是 TCP 包文本
+    长度，约 1024 键），而本函数调用方上限 64 → 128 条，余量充足。若将来把调用方
+    上限提到 512，这里要跟着分片。
     """
-    keys: dict[str, str] = {}
+    keys: list[tuple[str, str]] = []  # [(查询键, 归一 symbol)]
     for code in codes:
-        k = snapshot_key(code)
-        if k:
-            keys[k] = _to_suffix(code)
+        suffix = _to_suffix(code)
+        for builder in (snapshot_key_suffix, snapshot_key):
+            try:
+                k = builder(code)
+            except Exception:  # noqa: BLE001 - 键构造失败按该形不可用
+                k = ""
+            if k:
+                keys.append((k, suffix))
     if not keys:
         return {}
-    pipe = client.pipeline()
-    for k in keys:
+    pipe = client.pipeline(transaction=False)
+    for k, _suffix in keys:
         pipe.hgetall(k)
     out: dict[str, Mapping[str, Any]] = {}
-    for symbol, data in zip(keys.values(), pipe.execute(), strict=True):
-        if data:
+    for (_k, symbol), data in zip(keys, pipe.execute(), strict=True):
+        # 先到的键形赢（后缀式在前）——两套都 miss 才是真缺键
+        if data and symbol not in out:
             out[symbol] = data
     return out
 
@@ -314,12 +351,40 @@ def resolve_name(code: str, fallback: str = "") -> str:
         return code
 
 
+def _live_snap_price(snap: Mapping[str, Any] | None) -> float | None:
+    """快照 ``Now``（两套字段名）→ 现价；缺失/非正/非数 → ``None``（坏帧继续往下兜）。"""
+    if not isinstance(snap, Mapping):
+        return None
+    px = _f(snap.get("Now") if snap.get("Now") is not None else snap.get("now"))
+    return px if px is not None and px > 0 else None
+
+
+def _live_series_price(item: Any) -> float | None:
+    """序列摘要 ``last_price`` → 现价（duck 类型：属性或 Mapping 都认）。"""
+    if item is None:
+        return None
+    px = _f(getattr(item, "last_price", None))
+    if px is None and isinstance(item, Mapping):
+        px = _f(item.get("last_price"))
+    return px if px is not None and px > 0 else None
+
+
 def positions_to_holding_rows(
     positions: Sequence[Mapping[str, Any]],
     *,
     snaps: Mapping[str, Mapping[str, Any]] | None = None,
+    series: Mapping[str, Any] | None = None,
 ) -> tuple[HoldingRow, ...]:
-    """``real_account_snapshots.payload_json.positions[]`` → 持仓行（**桥口径**）。
+    """``real_account_snapshots.payload_json.positions[]`` → 持仓行。
+
+    **现价取数优先级**（2026-10-15 审计修）：快照 ``Now`` → 序列 ``last_price``
+    → 桥快照 ``price`` 兜底。桥的 ``price`` 当日实测**全天恒等于昨收**
+    （tdx_bridge 口径），直取它会让模型在错价上做止损/止盈决策——601857 显示
+    +1.78% 而实际 −0.57%，盈亏符号都能翻反。
+
+    ``price_src`` 记录实际取数源：``snap``/``series`` = 行情主源；``bridge`` =
+    传了行情面但仍未取到（渲染端加 ``‡``）；``""`` = 调用方未接行情面
+    （legacy 路径，渲染逐字节与历史一致）。
 
     字段：``symbol/name/volume/available_volume/cost_price/price``。桥给的 ``name``
     可能是空串（实测 2026-09-23 有一个账户 50 只全是空名）→ 走名字索引兜底。
@@ -327,7 +392,9 @@ def positions_to_holding_rows(
     ``day_chg`` 只从快照来；没有快照就是 ``None`` → 渲染 ``—``（隔壁在这里会
     直接 ``TypeError`` 炸掉整轮提示词）。
     """
+    attempts_live = snaps is not None or series is not None
     snaps = snaps or {}
+    series = series or {}
     out: list[HoldingRow] = []
     for p in positions:
         if not isinstance(p, Mapping):
@@ -336,12 +403,19 @@ def positions_to_holding_rows(
         if not raw:
             continue
         code = _to_suffix(raw)
+        snap = snaps.get(code)
         cost = _f(p.get("cost_price"))
-        price = _f(p.get("price"))
         volume = _f(p.get("volume"))
         avail = _f(p.get("available_volume"))
+        live = _live_snap_price(snap)
+        price_src = "snap"
+        if live is None:
+            live, price_src = _live_series_price(series.get(code)), "series"
+        if live is None:
+            live = _f(p.get("price"))
+            price_src = "bridge" if attempts_live else ""
         cost_v = cost if cost is not None else 0.0
-        price_v = price if price is not None else 0.0
+        price_v = live if live is not None else 0.0
         out.append(
             HoldingRow(
                 code=code,
@@ -352,8 +426,9 @@ def positions_to_holding_rows(
                 pnl_pct=(
                     round((price_v - cost_v) / cost_v * 100, 2) if cost_v > 0 else 0.0
                 ),
-                day_chg=day_change_pct(snaps.get(code)),
+                day_chg=day_change_pct(snap),
                 avail=int(avail or 0),
+                price_src=price_src,
             )
         )
     return tuple(out)

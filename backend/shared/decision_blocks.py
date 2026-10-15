@@ -26,8 +26,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.shared.decision.context import PoolQuote
 from backend.shared.decision_context_source import day_change_pct
@@ -623,6 +624,22 @@ def _actionable(rows: Sequence[Any]) -> list[Any]:
     return [r for r in rows if str(getattr(r, "action", "")) in ("buy", "sell")]
 
 
+#: 台账时刻的统一展示时区（北京时间）。
+_CST = ZoneInfo("Asia/Shanghai")
+
+
+def _cst_hm(dt: datetime) -> str:
+    """台账时刻 → 北京时间 ``HH:MM``。
+
+    ``decided_at`` 列是 TIMESTAMPTZ（aware UTC）——直接 ``%H:%M`` 渲染出的是
+    UTC 墙钟（09:35 CST 显示成 01:35，2026-10-15 盘中审计）。naive 值按写入
+    契约解释为 UTC 再换算；已经是北京时间的输入换算后不变。
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_CST).strftime("%H:%M")
+
+
 def build_prev_round_block(rows: Sequence[Any], agent: str, now: datetime) -> str:
     """丁9【上一轮你的建议】：本 agent 今日最近一轮（买入/卖出行）+ 一致性规则。"""
     mine = [r for r in rows if str(getattr(r, "agent", "")) == agent]
@@ -633,11 +650,11 @@ def build_prev_round_block(rows: Sequence[Any], agent: str, now: datetime) -> st
     if not round_rows:
         return (
             "【上一轮你的建议】（"
-            f"{max(r.decided_at for r in mine):%H:%M} 一轮全部为 hold）"
+            f"{_cst_hm(max(r.decided_at for r in mine))} 一轮全部为 hold）"
             "——" + CONSISTENCY_RULES
         )
     lines = [
-        f"【上一轮你的建议】（{round_rows[0].decided_at:%H:%M}，{len(round_rows)} 条）"
+        f"【上一轮你的建议】（{_cst_hm(round_rows[0].decided_at)}，{len(round_rows)} 条）"
     ]
     lines.extend(_decision_line(r) for r in round_rows)
     lines.append(CONSISTENCY_RULES)
@@ -658,10 +675,10 @@ def build_cross_agent_block(rows: Sequence[Any], agent: str) -> str:
         picks = _actionable([r for r in group if r.round_id == latest_round])
         stamp = max(r.decided_at for r in group if r.round_id == latest_round)
         if not picks:
-            lines.append(f"- {name}（{stamp:%H:%M} 一轮）：全 hold")
+            lines.append(f"- {name}（{_cst_hm(stamp)} 一轮）：全 hold")
             continue
         for r in picks:
-            lines.append(f"- {name}（{stamp:%H:%M}）：{_decision_line(r)[2:]}")
+            lines.append(f"- {name}（{_cst_hm(stamp)}）：{_decision_line(r)[2:]}")
     return "\n".join(lines)
 
 
@@ -710,4 +727,148 @@ def build_freshness_block(alerts: Sequence[str]) -> str:
         return ""
     lines = ["【数据新鲜度警告】以下数据源本轮降级/缺位，判断前先看这里："]
     lines.extend(f"- {a}" for a in items)
+    return "\n".join(lines)
+
+
+# ── 镜像闸门 / 执行受阻回注（2026-10-15 盘中审计修的 P0-B/P0-C）─────────────
+# 背景：提示词自己的额度框架是「虚拟账本 × 比例」（AGENT_QUOTA_TOTAL=¥10 万，
+# 单票 10–20% ⇒ 单票预算 ¥1–2 万），而真单镜像对单笔/日累计另有硬上限
+# （单笔 ¥10,000 等）——模型按前者规划、被后者逐笔静默跳过（601985 买 ¥10,362
+# 超单笔上限、600338 卖漂移 2.15% 超 2%），全天零反馈 → 下一轮继续产出必被
+# 跳的腿。两个块对治：约束先讲清（B），跳过回注（C）。
+
+#: 回注明细的渲染上限（再多只列最近的 N 条，其余折进尾注一行）。
+_MIRROR_SKIP_RENDER_LIMIT = 10
+
+#: 跳过原因 → 一句话中文。**表外原因原样回显**——编词会把「不知道」化妆成
+#: 「知道」（reason 词汇表的唯一出处是 ``real_mirror_service`` 的 record_skip 各调用点）。
+_MIRROR_SKIP_ZH: dict[str, str] = {
+    "max_order_value": "单笔金额超上限",
+    "max_daily_value": "当日金额额度已用满",
+    "max_daily_orders": "当日笔数额度已用满",
+    "max_daily_symbols": "当日标的名额已用满",
+    "price_drift": "委托价与参考价漂移超限",
+    "price_sanity": "价格异常（偏离过大按脏数据拒发）",
+    "no_reference_price": "参考价不可得",
+    "outside_trading_hours": "非交易时段",
+    "whitelist": "不在镜像白名单",
+    "blacklist": "命中黑名单",
+    "insufficient_cash": "账户可用资金不足",
+    "insufficient_position": "账户可用持仓不足",
+    "queue_duplicate": "同一委托已入队（去重）",
+    "mirror_disabled": "镜像未启用",
+    "quota_error": "限额校验异常",
+    "redis_unavailable": "Redis 不可用",
+}
+
+
+def _skip_reason_zh(reason: str) -> str:
+    """跳过原因 → 展示文案；带 ``:`` 后缀的族（account_unavailable:…）单独收。"""
+    text = str(reason or "")
+    if text in _MIRROR_SKIP_ZH:
+        return _MIRROR_SKIP_ZH[text]
+    head, _, tail = text.partition(":")
+    if head == "account_unavailable":
+        return f"账户不可用（{tail or '未报告原因'}）"
+    if head == "market_not_supported":
+        return f"市场不支持镜像（{tail or '—'}）"
+    if text.startswith("invalid_"):
+        return "委托参数非法（被闸门拒收）"
+    return text
+
+
+def _money(value: object) -> str:
+    """金额 → ``¥10,362``；非正/坏值 → 空串（不编数）。"""
+    amount = _f(value)
+    return f"¥{amount:,.0f}" if amount is not None and amount > 0 else ""
+
+
+def build_mirror_gates_block(limits: Mapping[str, Any] | None) -> str:
+    """P0-B【真单镜像闸门】：把**生效**硬约束送进提示词（仅镜像启用时调用）。
+
+    ``limits`` = ``real_mirror_service.prompt_mirror_context`` 的生效配置五项
+    （env 基线经 ``mirror:config`` 覆盖后的实际值）——提示词要讲的是生效值，不是
+    默认值。单项缺失不编：该分句整体省略（渲染出的每个数字都必须是真闸门）。
+    """
+    order_cap = _f((limits or {}).get("max_order_value"))
+    daily_value = _f((limits or {}).get("max_daily_value"))
+    daily_orders = _f((limits or {}).get("max_daily_orders"))
+    daily_symbols = _f((limits or {}).get("max_daily_symbols"))
+    slip = _f((limits or {}).get("max_slippage_pct"))
+    per_order: list[str] = []
+    if order_cap is not None and order_cap > 0:
+        per_order.append(f"单笔金额上限 {_money(order_cap)}")
+    if slip is not None and slip > 0:
+        per_order.append(f"委托价与参考价偏离 > {slip:.0%} 的腿拒发")
+    daily: list[str] = []
+    if daily_value is not None and daily_value > 0:
+        daily.append(f"金额 ≤ {_money(daily_value)}")
+    if daily_orders is not None and daily_orders > 0:
+        daily.append(f"笔数 ≤ {daily_orders:.0f}")
+    if daily_symbols is not None and daily_symbols > 0:
+        daily.append(f"标的 ≤ {daily_symbols:.0f} 只")
+    lines = ["【真单镜像闸门】（你的腿会按下列硬约束逐笔过滤；被过滤的腿不下真单）"]
+    if per_order:
+        lines.append("- " + "；".join(per_order))
+    if daily:
+        lines.append(
+            "- 当日累计：" + " ｜ ".join(daily) + "（任一触顶后，当日新腿全部不过）"
+        )
+    lines.append(
+        "- 规划金额按上面的单笔上限换算：虚拟账本额度 ≠ 真单额度，超限的大单只会被跳过。"
+    )
+    return "\n".join(lines)
+
+
+def _mirror_skip_line(entry: Mapping[str, Any]) -> str:
+    """一条跳过明细 → ``- 09:35 601985.SH 买入 1100 股（约 ¥10,362） · 单笔金额超上限``。
+
+    ``at`` 是写侧本地墙钟 ISO（``real_mirror_service._entry_detail``），直接切
+    ``HH:MM``；缺失不猜时间（该格整体省略）。
+    """
+    at = str(entry.get("at") or "")
+    stamp = at[11:16] if len(at) >= 16 and at[10] == "T" else ""
+    side = {"BUY": "买入", "SELL": "卖出"}.get(str(entry.get("side") or "").upper(), "")
+    qty = _f(entry.get("quantity"))
+    qty_text = f"{qty:g} 股" if qty is not None and qty > 0 else ""
+    count = int(_f(entry.get("count")) or 1)
+    repeat = f"（当日 {count} 次）" if count > 1 else ""
+    amount = _money(entry.get("value"))
+    amount_text = f"（约 {amount}）" if amount else ""
+    drift = _f(entry.get("drift"))
+    drift_text = f"（偏离 {drift:g}%）" if drift is not None and drift > 0 else ""
+    head = " ".join(x for x in (stamp, str(entry.get("symbol")), side, qty_text) if x)
+    tail = _skip_reason_zh(str(entry.get("reason") or ""))
+    return f"- {head}{repeat}{amount_text}{drift_text} · {tail}"
+
+
+def build_mirror_feedback_block(
+    skips: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    """P0-C【今日真单执行受阻】：当日镜像跳过明细回注（同意图重发仍会被跳）。
+
+    ``skips`` = ``prompt_mirror_context`` 的当日明细（``at`` 降序）：
+    ``None`` = 台账读不到（如实说，**读不到 ≠ 没有**）；``[]`` = 今日无跳过 →
+    空串（整段不出现）。行内金额/漂移只在写侧给了才是真值（旧记录没有 → 省略），
+    原因经 :func:`_skip_reason_zh` 翻译、表外原样。
+    """
+    if skips is None:
+        return (
+            "【今日真单执行受阻】跳过台账读取失败——本轮无法回注"
+            "（读不到与没有是两件事，按「可能有已跳过的腿」处理）。"
+        )
+    rows = [e for e in skips if isinstance(e, Mapping) and e.get("symbol")]
+    if not rows:
+        return ""
+    total = sum(int(_f(e.get("count")) or 1) for e in rows)
+    lines = [
+        f"【今日真单执行受阻】（模拟腿镜像真单时被闸门跳过 {total} 次；"
+        "原样重发同样会被跳过——要执行请调整金额/价格）"
+    ]
+    for entry in rows[:_MIRROR_SKIP_RENDER_LIMIT]:
+        lines.append(_mirror_skip_line(entry))
+    if len(rows) > _MIRROR_SKIP_RENDER_LIMIT:
+        lines.append(
+            f"- ……另有 {len(rows) - _MIRROR_SKIP_RENDER_LIMIT} 条，见双轨对账报表"
+        )
     return "\n".join(lines)

@@ -542,3 +542,58 @@ def test_fenced_decision_block_as_the_prompt_asks_is_parseable() -> None:
     assert batch.ok
     assert [d.action for d in batch.decisions] == ["watch"]
     assert batch.decisions[0].stop_loss == 11.5
+
+
+# ---------------------------------------------------------------------------
+# 现价取数口径（2026-10-15 审计修）：主源价 / 桥兜底标记 / legacy 无痕
+# ---------------------------------------------------------------------------
+
+
+def _price_row(*, price: float, price_src: str) -> HoldingRow:
+    return HoldingRow(
+        code="601857.SH",
+        name="中国石油",
+        volume=1500,
+        cost=12.33,
+        price=price,
+        pnl_pct=round((price - 12.33) / 12.33 * 100, 2),
+        day_chg=None,
+        avail=700,
+        price_src=price_src,
+    )
+
+
+def _render_one_holding(row: HoldingRow) -> str:
+    return render_prompt(
+        RebalanceContext(
+            agent="flash",
+            now=datetime(2026, 10, 15, 13, 0, tzinfo=CN),
+            holdings=(row,),
+            direction=DirectionBlock("偏多"),
+        )
+    )
+
+
+def test_live_source_price_renders_note_without_marker() -> None:
+    """主源价（snap/series）：数字照用、无 ``‡``，口径注出现。"""
+    out = _render_one_holding(_price_row(price=12.26, price_src="snap"))
+    assert "| 601857.SH | 中国石油 | 1500 | 12.33* | 12.26 |" in out
+    assert "12.26‡" not in out  # 口径注本身含 ‡ 字样，钉的是**价格格**不带标记
+    assert ctxmod.PRICE_SRC_NOTE in out
+
+
+def test_bridge_fallback_price_is_marked_and_explained() -> None:
+    """桥兜底价：``‡`` 标记 + 口径注（桥价当日实测全天=昨收）。"""
+    out = _render_one_holding(
+        _price_row(price=12.55, price_src=ctxmod.PRICE_SRC_BRIDGE)
+    )
+    assert "| 601857.SH | 中国石油 | 1500 | 12.33* | 12.55‡ |" in out
+    assert ctxmod.PRICE_SRC_NOTE in out
+
+
+def test_legacy_rows_keep_the_prompt_free_of_markers_and_notes() -> None:
+    """``price_src=""``（legacy/金样翻译层）：无 ``‡``、无口径注——逐字节冻结路径。"""
+    out = _render_one_holding(_price_row(price=12.55, price_src=""))
+    assert "‡" not in out
+    assert ctxmod.PRICE_SRC_NOTE not in out
+    assert "注：**现价" not in out

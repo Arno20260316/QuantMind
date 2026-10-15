@@ -40,6 +40,8 @@ from backend.shared.decision_blocks import (
     build_l2_block,
     build_market_state_block,
     build_minute_block,
+    build_mirror_feedback_block,
+    build_mirror_gates_block,
     build_news_block,
     build_orderbook_block,
     build_prev_round_block,
@@ -80,8 +82,10 @@ def load_round_snapshots(
     positions_list: Sequence[Any],
     pool_rows: Sequence[Any],
     quotes_failure: str,
-) -> tuple[dict[str, Any] | None, Mapping[str, Mapping[str, Any]], str]:
-    """③b+④ 盘中 regime + 行情快照（要价清单装配在编排层之外，见细案）。
+) -> tuple[
+    dict[str, Any] | None, Mapping[str, Mapping[str, Any]], Mapping[str, Any], str
+]:
+    """③b+④ 盘中 regime + 行情快照 + 持仓行情序列（要价清单装配在编排层之外）。
 
     要价清单（suffix 形）= 持仓（原始 payload 直接取 symbol，不必先建持仓行）+
     池 + regime 指数 + **丁5 四只展示指数**（``decision_blocks.INDEX_CODES``：
@@ -90,6 +94,11 @@ def load_round_snapshots(
     regime（db0 ``qm:regime:intraday``）是**增益块**：未接线/读失败 → ``None``
     （不拦轮、指数不进清单），降级渲染与留痕在
     :func:`enrich_quotes_with_blocks` 收口。
+
+    **持仓行情序列**（``market:series`` 摘要，2026-10-15 审计修）在快照之外
+    单独取一份给持仓行现价用：快照面当日每轮存活性抖动（flash 12:00 全空），
+    序列面全程可用——持仓现价 = 快照 ``Now`` → 序列 ``last_price`` → 桥兜底。
+    读失败按空表降级（持仓行退回桥价并标 ``‡``，见 ``positions_to_holding_rows``）。
 
     快照读取失败同样**不在这里拦轮**（守护轮与已有持仓仍要靠行情；「池子整段
     没有价」能否继续由 ⑦ 的行情闸门判）：原因追加进 ``quotes_failure`` 原样返回。
@@ -100,13 +109,16 @@ def load_round_snapshots(
             regime = deps.load_regime()
         except Exception as exc:  # noqa: BLE001 增益块异常按不可得降级
             logger.warning("[DecisionRound] %s 盘中 regime 读取异常: %s", round_id, exc)
-    index = str((regime or {}).get("index") or "").strip()
-    codes = sorted(
+    held = sorted(
         {
             StockCodeUtil.to_suffix(str(p.get("symbol") or "").strip())
             for p in positions_list
             if isinstance(p, Mapping) and p.get("symbol")
         }
+    )
+    index = str((regime or {}).get("index") or "").strip()
+    codes = sorted(
+        set(held)
         | {str(r.code) for r in pool_rows}
         | ({StockCodeUtil.to_suffix(index)} if index else set())
         | set(INDEX_CODES)
@@ -118,7 +130,13 @@ def load_round_snapshots(
         except Exception as exc:  # noqa: BLE001 读失败先记因，是否中止见 ⑦ 的行情闸门
             quotes_failure = f"行情快照读取失败：{type(exc).__name__}: {exc}"
             logger.warning("[DecisionRound] %s（按无行情继续）", quotes_failure)
-    return regime, snapped, quotes_failure
+    series: Mapping[str, Any] = {}
+    if deps.read_series_summary is not None and held:
+        try:
+            series = deps.read_series_summary(held) or {}
+        except Exception as exc:  # noqa: BLE001 现价面读失败按桥兜底降级（标 ‡）
+            logger.warning("[DecisionRound] %s 持仓行情序列读取异常: %s", round_id, exc)
+    return regime, snapped, series, quotes_failure
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,9 +221,10 @@ async def enrich_quotes_with_blocks(
        「不可得」，原因进 ``notes``（审计）与丁8。绝不编 0。
     2. **总接线标记 = ``deps.read_series_summary``**（生产 ``default_round_deps``
        第二批闭包同批全量注入）：为 ``None``（旧替身）→ 丁1/丁3/丁2/丁5/丁7
-       整批空串，提示词逐字节等于历史。丁4/丁6/丁9/风险两槽/唤醒块各自以
-       自己的闭包（``load_news_files``/``load_decision_rows``/
-       ``load_risk_files``/``read_wake_ctx``）为门——未接线即空串。
+       整批空串，提示词逐字节等于历史。丁4/丁6/丁9/风险两槽/唤醒块/镜像两块
+       各自以自己的闭包（``load_news_files``/``load_decision_rows``/
+       ``load_risk_files``/``read_wake_ctx``/``read_mirror_ctx``）为门——
+       未接线即空串。
     3. 降级姿态：每块「本轮不可得」如实渲染；**汇总一句进丁8置顶**
        （``build_freshness_block``），读不到与没有是两件事。
     4. 丁7 档位经 ``deps.load_tier`` **再读一次**（编排 ⑤ 已读）：同源同值，
@@ -311,9 +330,30 @@ async def enrich_quotes_with_blocks(
             cross_block = build_cross_agent_block(rows, agent)
             prev_block = build_prev_round_block(rows, agent, now)
 
+    # 镜像闸门/回注（2026-10-15 审计 P0-B/P0-C）：镜像启用时把生效硬约束与当日
+    # 被跳过的腿送进提示词——模型看不见闸门就会产出必被跳的腿（全天零反馈）。
+    mirror_gates_block = mirror_feedback_block = ""
+    if deps.read_mirror_ctx is not None:
+        try:
+            mirror_ctx: Mapping[str, Any] = deps.read_mirror_ctx() or {}
+        except Exception as exc:  # noqa: BLE001 读不到按未接线降级（不往提示词涂鸦）
+            logger.warning("[DecisionRound] %s 镜像上下文读取异常: %s", round_id, exc)
+        else:
+            if mirror_ctx.get("active"):
+                mirror_gates_block = build_mirror_gates_block(
+                    mirror_ctx.get("limits") or {}
+                )
+                mirror_feedback_block = build_mirror_feedback_block(
+                    mirror_ctx.get("skips")
+                )
+                if mirror_ctx.get("skips") is None:
+                    alerts.append("镜像跳过台账读取失败：执行受阻回注降级")
+
     stage2_block = "\n\n".join(
         part
         for part in (
+            mirror_gates_block,
+            mirror_feedback_block,
             orderbook_block,
             minute_block,
             l2_block,

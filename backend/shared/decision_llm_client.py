@@ -371,11 +371,14 @@ def _post(
     return data
 
 
-def _extract(data: dict[str, Any]) -> tuple[str, dict[str, int] | None]:
-    """响应体 → ``(原文, usage)``。形状不对就抛（带截断的响应体，便于定位网关问题）。
+def _extract(data: dict[str, Any]) -> tuple[str, dict[str, int] | None, str]:
+    """响应体 → ``(原文, usage, finish_reason)``。形状不对就抛（带截断的响应体，便于定位网关问题）。
 
     ``reasoning_content`` 兜底：推理模型（deepseek-r1 一类）的 ``content`` 可能是空串、
     真正的话在 ``reasoning_content`` 里——不兜底会把「模型答了」记成 ``empty_output``。
+
+    ``finish_reason`` 原样抬出（取不到空串）：``decide_with_retry`` 靠它识别
+    顶格截断（``length``）——glm 的 CoT 在 ``max_tokens`` 顶格时此前被静默当成功。
     """
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -388,7 +391,8 @@ def _extract(data: dict[str, Any]) -> tuple[str, dict[str, int] | None]:
     content = str(msg.get("content") or "").strip()
     if not content:
         content = str(msg.get("reasoning_content") or "").strip()
-    return content, normalize_usage(data.get("usage"))
+    finish_reason = str((choices[0] or {}).get("finish_reason") or "").strip()
+    return content, normalize_usage(data.get("usage")), finish_reason
 
 
 def call_with_usage(
@@ -396,8 +400,8 @@ def call_with_usage(
     *,
     config: DecisionLLMConfig | None = None,
     model: str | None = None,
-) -> tuple[str, dict[str, int] | None]:
-    """真调一次 LLM（供应商级重试 ``PROVIDER_RETRY_ATTEMPTS`` 次）→ ``(原文, usage)``。
+) -> tuple[str, dict[str, int] | None, str]:
+    """真调一次 LLM（供应商级重试 ``PROVIDER_RETRY_ATTEMPTS`` 次）→ ``(原文, usage, finish_reason)``。
 
     可直接当 :data:`backend.shared.decision.llm_call.Caller` 用
     （``partial(call_with_usage, config=cfg)``）——接口刻意同形，省掉一层包装。
@@ -450,15 +454,16 @@ def make_caller(
     *,
     config: DecisionLLMConfig | None = None,
     model: str | None = None,
-) -> Callable[[str], tuple[str, dict[str, int] | None]]:
+) -> Callable[[str], tuple[str, dict[str, int] | None, str]]:
     """绑定配置的 ``Caller``（可直接交给 :func:`decision.llm_call.decide_with_retry`）。
 
     ``config`` 不传就在**每次调用时**解析 env——env 是进程级的，一轮调仓里不会变；
     不想让它碰 env 就显式传 ``config``。多模型竞争的写法是同一个 config 配不同
     ``model``（端点相同、模型名与系统提示词不同），一轮里每个 agent 建一个 caller。
+    返回 3 元组（含 ``finish_reason``）；``decide_with_retry`` 兼容旧的 2 元。
     """
 
-    def _call(prompt: str) -> tuple[str, dict[str, int] | None]:
+    def _call(prompt: str) -> tuple[str, dict[str, int] | None, str]:
         return call_with_usage(prompt, config=config, model=model)
 
     return _call

@@ -25,6 +25,8 @@ from backend.shared.decision_blocks import (
     build_l2_block,
     build_market_state_block,
     build_minute_block,
+    build_mirror_feedback_block,
+    build_mirror_gates_block,
     build_news_block,
     build_orderbook_block,
     build_prev_round_block,
@@ -674,6 +676,55 @@ class TestBuildPrevRoundBlock:
         text = build_prev_round_block(rows, "a1", NOW)
         assert "09:12 一轮全部为 hold" in text
 
+    def test_utc_decided_at_renders_beijing_time(self):
+        """``decided_at`` 列是 TIMESTAMPTZ（aware-UTC）：直接 ``%H:%M`` 渲染的是
+        UTC 墙钟（09:40 CST 显示成 01:40，2026-10-15 盘中审计）——必须转北京时间，
+        且 naive 值按写入契约解释为 UTC。互看块同一口径。"""
+        from backend.shared.decision_ledger_store import DecisionRecord
+
+        row = DecisionRecord(
+            id="u1",
+            pool_key="k",
+            round_id="rnd-u",
+            tenant_id="t",
+            user_id="u",
+            agent="a1",
+            market="CN",
+            trade_date=date(2026, 10, 14),
+            decided_at=datetime(2026, 10, 14, 1, 40, tzinfo=timezone.utc),
+            code="600036.SH",
+            action="buy",
+            pct=0.2,
+            reason="理由",
+        )
+        text = build_prev_round_block((row,), "a1", NOW)
+        assert "（09:40，1 条）" in text
+        assert "01:40" not in text
+        assert "a1（09:40）：买入 20% 600036.SH" in build_cross_agent_block(
+            (row,), "a2"
+        )
+
+    def test_naive_decided_at_is_read_as_utc(self):
+        """naive 值（历史脏数据）按「无时区输入一律视为 UTC」的库契约解释。"""
+        from backend.shared.decision_ledger_store import DecisionRecord
+
+        row = DecisionRecord(
+            id="u2",
+            pool_key="k",
+            round_id="rnd-n",
+            tenant_id="t",
+            user_id="u",
+            agent="a1",
+            market="CN",
+            trade_date=date(2026, 10, 14),
+            decided_at=datetime(2026, 10, 14, 1, 40),
+            code="600036.SH",
+            action="buy",
+            pct=0.2,
+            reason="理由",
+        )
+        assert "（09:40，1 条）" in build_prev_round_block((row,), "a1", NOW)
+
 
 class TestBuildCrossAgentBlock:
     def test_lists_other_agents_latest_rounds(self):
@@ -705,3 +756,142 @@ class TestBuildFreshnessBlock:
         assert text.startswith("【数据新鲜度警告】")
         assert "- 行情序列缺成员：分钟动量不可得" in text
         assert "- L2 无源" in text
+
+
+class TestBuildMirrorGatesBlock:
+    """P0-B【真单镜像闸门】（2026-10-15 审计）：生效约束进提示词；缺失项不编。
+
+    背景：提示词的额度框架是「虚拟账本 × 比例」，真单镜像另有单笔/日累计硬上限
+    ——不把生效值讲给模型，它就会系统性产出必被跳过的腿。
+    """
+
+    LIMITS = {
+        "max_order_value": 10000.0,
+        "max_daily_value": 50000.0,
+        "max_daily_orders": 20,
+        "max_daily_symbols": 5,
+        "max_slippage_pct": 0.02,
+    }
+
+    def test_renders_effective_limits(self):
+        text = build_mirror_gates_block(self.LIMITS)
+        assert text.startswith("【真单镜像闸门】")
+        assert "单笔金额上限 ¥10,000" in text
+        assert "偏离 > 2% 的腿拒发" in text
+        assert "金额 ≤ ¥50,000 ｜ 笔数 ≤ 20 ｜ 标的 ≤ 5 只" in text
+        assert "虚拟账本额度 ≠ 真单额度" in text
+
+    def test_missing_fields_are_omitted_not_invented(self):
+        text = build_mirror_gates_block({"max_order_value": 8000.0})
+        assert "¥8,000" in text
+        assert "偏离" not in text
+        assert "当日累计" not in text
+
+    def test_empty_limits_still_warn_about_sizing(self):
+        text = build_mirror_gates_block({})
+        assert "【真单镜像闸门】" in text
+        assert "虚拟账本额度 ≠ 真单额度" in text
+
+
+class TestBuildMirrorFeedbackBlock:
+    """P0-C【今日真单执行受阻】：读不到 ≠ 没有；行内事实全部来自台账。"""
+
+    def test_unreadable_ledger_says_so(self):
+        text = build_mirror_feedback_block(None)
+        assert "读取失败" in text
+        assert "读不到与没有是两件事" in text
+
+    def test_no_skips_is_empty(self):
+        assert build_mirror_feedback_block([]) == ""
+
+    def test_renders_skip_lines_with_zh_reasons(self):
+        text = build_mirror_feedback_block(
+            (
+                {
+                    "symbol": "601985.SH",
+                    "reason": "max_order_value",
+                    "count": 1,
+                    "side": "BUY",
+                    "quantity": 1100,
+                    "value": 10362.0,
+                    "at": "2026-10-15T09:35:35",
+                },
+                {
+                    "symbol": "600338.SH",
+                    "reason": "price_drift",
+                    "count": 2,
+                    "side": "SELL",
+                    "quantity": 800,
+                    "drift": 2.15,
+                    "at": "2026-10-15T09:38:19",
+                },
+            )
+        )
+        assert "被闸门跳过 3 次" in text
+        assert "- 09:35 601985.SH 买入 1100 股（约 ¥10,362） · 单笔金额超上限" in text
+        assert (
+            "- 09:38 600338.SH 卖出 800 股（当日 2 次）（偏离 2.15%）"
+            " · 委托价与参考价漂移超限" in text
+        )
+
+    def test_old_entries_without_amount_or_drift_still_render(self):
+        """旧记录（写侧未带 value/drift）只少两格，行不出假数。"""
+        text = build_mirror_feedback_block(
+            (
+                {
+                    "symbol": "601985.SH",
+                    "reason": "max_order_value",
+                    "count": 1,
+                    "side": "BUY",
+                    "quantity": 1100,
+                    "at": "2026-10-15T09:35:35",
+                },
+            )
+        )
+        assert "- 09:35 601985.SH 买入 1100 股 · 单笔金额超上限" in text
+        assert "¥" not in text
+
+    def test_unknown_reason_is_echoed_verbatim(self):
+        text = build_mirror_feedback_block(
+            (
+                {
+                    "symbol": "600036.SH",
+                    "reason": "brand_new_gate",
+                    "count": 1,
+                    "side": "BUY",
+                    "quantity": 100,
+                    "at": "2026-10-15T09:00:00",
+                },
+            )
+        )
+        assert "brand_new_gate" in text
+
+    def test_account_unavailable_family_is_translated(self):
+        text = build_mirror_feedback_block(
+            (
+                {
+                    "symbol": "600036.SH",
+                    "reason": "account_unavailable:empty",
+                    "count": 1,
+                    "side": "BUY",
+                    "quantity": 100,
+                    "at": "2026-10-15T09:00:00",
+                },
+            )
+        )
+        assert "账户不可用（empty）" in text
+
+    def test_renders_at_most_the_limit_and_counts_the_rest(self):
+        skips = tuple(
+            {
+                "symbol": f"60000{i}.SH",
+                "reason": "max_order_value",
+                "count": 1,
+                "at": f"2026-10-15T09:{i:02d}:00",
+            }
+            for i in range(12)
+        )
+        text = build_mirror_feedback_block(skips)
+        assert "被闸门跳过 12 次" in text
+        assert "另有 2 条" in text
+        assert text.count("\n- ") == 11  # 10 行明细 + 1 行尾注

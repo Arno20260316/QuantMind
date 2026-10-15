@@ -94,6 +94,11 @@ QUOTE_MAX_AGE_MIN = 45
 COST_SRC_LEDGER = "ledger"
 COST_SRC_BRIDGE = "bridge"
 
+#: 持仓行现价取数源：``snap``/``series`` = 行情主源；``bridge`` = 传了行情面但
+#: 实时价未取到、回退桥快照价（渲染加 ``‡``）；``""`` = 调用方未接行情面（legacy，
+#: 无痕）。桥 ``price`` 当日实测全天=昨收——直取它 = 模型在错价上决策。
+PRICE_SRC_BRIDGE = "bridge"
+
 #: 缺失值的唯一渲染（本仓口径：绝不显示成 0）。
 MISSING = "—"
 
@@ -116,6 +121,8 @@ class HoldingRow:
     day_chg: float | None
     avail: int
     cost_src: str = COST_SRC_BRIDGE
+    #: 现价取数源（见 ``PRICE_SRC_BRIDGE`` 注释）：``""`` = 未标注（legacy/金样）。
+    price_src: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +230,15 @@ LEDGER_COST_NOTE = (
 )
 
 
+#: 现价取数口径注（2026-10-15 审计修）。**只在持仓行带取数源标注时渲染**——
+#: legacy/金样路径（``price_src`` 全空）一个字节都不出现。
+PRICE_SRC_NOTE = (
+    "注：**现价 = 行情主源实时价**（快照 → 分钟序列，两源优先）；带 `‡` 的行"
+    "实时价未取到、回退桥快照价——盘前=昨收属正常，**盘中未必是现价，"
+    "勿作触发/定价依据**。"
+)
+
+
 def budget_filter_note(pct: float) -> str:
     """候选池已按资金量裁剪的说明（09:35 主入口与整点轮共用同一句，防口径漂移）。"""
     return (
@@ -270,6 +286,7 @@ def ledger_cost_rows(
                     day_chg=r.day_chg,
                     avail=r.avail,
                     cost_src=COST_SRC_LEDGER,
+                    price_src=r.price_src,
                 )
             )
         else:
@@ -284,6 +301,7 @@ def ledger_cost_rows(
                     day_chg=r.day_chg,
                     avail=r.avail,
                     cost_src=COST_SRC_BRIDGE,
+                    price_src=r.price_src,
                 )
             )
     return tuple(out)
@@ -314,12 +332,16 @@ def _holding_row_line(h: HoldingRow) -> str:
     **成本缺失时盈亏一并列 ``—``**：盈亏是相对成本的差，成本没有则盈亏无从谈起。
     隔壁在这里给的是 ``成本 0 / 盈亏 +0.00%``——读起来像「不赚不亏」，
     实际是「两本账都没这个数」，是会被模型当成持有理由的假值。
+
+    现价带 ``‡`` = 实时行情未取到、回退桥快照价（见 :data:`PRICE_SRC_BRIDGE`）；
+    ``price_src=""``（legacy/金样）不标——逐字节不动。
     """
     mark = "" if h.cost_src == COST_SRC_LEDGER else "*"
     has_cost = math.isfinite(h.cost) and h.cost > 0
     cost_cell = format(h.cost, "") + mark if has_cost else MISSING
+    price_cell = f"{h.price}‡" if h.price_src == PRICE_SRC_BRIDGE else h.price
     return (
-        f"| {h.code} | {h.name} | {h.volume} | {cost_cell} | {h.price} "
+        f"| {h.code} | {h.name} | {h.volume} | {cost_cell} | {price_cell} "
         f"| {_pct(h.pnl_pct) if has_cost else MISSING} | {_pct(h.day_chg)} | {h.avail} |"
     )
 
@@ -488,6 +510,10 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
         lines += [ctx.alert_block, ""]
     lines += [*_HOLDINGS_HEADER]
     lines += [_holding_row_line(h) for h in display]
+    # 现价取数口径注：只在接上行情面（price_src 有标注）时出现——legacy/金样路径
+    # 逐字节不动（见 :data:`PRICE_SRC_NOTE`）。
+    if any(h.price_src for h in display):
+        lines += ["", PRICE_SRC_NOTE]
     lines += [
         "",
         LEDGER_COST_NOTE,

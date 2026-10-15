@@ -334,8 +334,7 @@ async def _run_once_inner(
         )
     mine = ledger.mine()
     virtual_cash = float(ledger.virtual_cash)
-    #: 必须可见的说明（某项没判、口径回退…）。在裁剪持仓之前就要有：那一行留痕本身
-    #: 是「模型为什么对这几只票视而不见」的唯一答案，不能等到 ⑥ 才建表。
+    #: 必须可见的说明（没判/口径回退…）：先于裁剪持仓建表（不能等到 ⑥）——它是「模型为什么对这几只票视而不见」的唯一答案。
     notes: list[str] = []
 
     # ③ 候选池（日格式 **%Y%m%d**——传 ISO 日期会静默拿到 None）
@@ -345,15 +344,14 @@ async def _run_once_inner(
     pool_file = str(getattr(pool_doc, "source", "") or "")
     if pool_doc is None:
         logger.warning(
-            "[DecisionRound] %s 无候选池文件（%s/）：本轮不筛候选，模型点池外票会被"
-            "l2.pool_not_member 拦下",
+            "[DecisionRound] %s 无候选池文件（%s/）：本轮不筛候选，池外票被 l2.pool_not_member 拦下",
             round_id,
             day.strftime("%Y%m%d"),
         )
 
-    # ③b+④ 行情。客户端不可用/读失败本身**不在这里中止**：守护轮与已有持仓仍要靠
-    # 它，而「池子整段没有价」能不能继续取决于时段——那由 ⑦ 的行情闸门判。
-    # regime（增益块）与要价清单（持仓+池+regime 指数）的装配口径收在 io 助手。
+    # ③b+④ 行情。客户端不可用/读失败本身**不在这里中止**：守护轮与已有持仓仍要靠它
+    # （「池子整段没有价」能否继续取决于时段，由 ⑦ 行情闸门判）。regime 与要价清单
+    # （持仓+池+指数）的装配口径收在 io 助手。
     quote_client = None
     #: 行情不可用的**原因**（客户端构造失败/读取异常），进 abort 理由与日志。
     quotes_failure = ""
@@ -364,20 +362,19 @@ async def _run_once_inner(
     except Exception as exc:  # noqa: BLE001
         quotes_failure = f"行情客户端不可用：{type(exc).__name__}: {exc}"
         logger.warning("[DecisionRound] %s", quotes_failure)
-    regime, snapped, quotes_failure = load_round_snapshots(
+    regime, snapped, series, quotes_failure = load_round_snapshots(
         deps, round_id, quote_client, positions_list, pool_rows, quotes_failure
     )
-    holding_rows = positions_to_holding_rows(positions_list, snaps=snapped)
+    holding_rows = positions_to_holding_rows(
+        positions_list, snaps=snapped, series=series
+    )
 
     # ④b 分账裁剪（P2.7）：**只把本 agent 名下的持仓交给模型与执行段**。
-    #
     # 桥账户是共用的，`positions_list` 是整座账户的持仓；`mine` 是这本分账账本里属于
     # 本 agent 的那些代码（后缀式，与 `HoldingRow.code` 同形态）。模型看不见的仓位它
     # 就卖不掉——这是**可见性**防线，不是权限判断。2026-09-08：空账本的 agent 拿到
     # 全账户持仓，把另一家模型的票卖了。故这里**没有**「mine 为空就回退全量」的分支。
-    #
-    # 数量口径不变（可卖量仍取桥账户的 `avail`）：账本是「归属」的事实源，桥是
-    # 「今天能不能卖」的事实源——T+1 锁定只有桥知道。
+    # 数量口径不变（可卖量仍取桥的 `avail`）：账本是「归属」的事实源，桥是「今天能不能卖」的事实源——T+1 锁定只有桥知道。
     all_rows = holding_rows
     holding_rows = tuple(h for h in all_rows if h.code in mine)
     hidden = len(all_rows) - len(holding_rows)
@@ -533,13 +530,16 @@ async def _run_once_inner(
     if not getattr(attempt, "ok", False):
         # 没出决策：**不写审计行、不置 done 键**（补跑槽还能再来一次），只留状态。
         reason = str(getattr(attempt, "error_text", lambda: "")() or "")
+        note = f"LLM 未给出决策（{getattr(attempt, 'status', '')}）：{reason or '未报告原因'}"
+        if getattr(attempt, "truncated", False):  # 顶格截断≠格式烂（reason=length）
+            note += "（供应商输出顶格截断，非解析问题：调大该家 max_tokens）"
         return RoundResult(
             status=STATUS_LLM_FAILED,
             day=day,
             slot=slot,
             round_id=round_id,
             agent=agent,
-            note=f"LLM 未给出决策（{getattr(attempt, 'status', '')}）：{reason}",
+            note=note,
             errors=(reason,) if reason else (),
             mode=mode,
             meta={"calls": int(getattr(attempt, "calls", 0) or 0)},

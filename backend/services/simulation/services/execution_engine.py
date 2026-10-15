@@ -613,10 +613,37 @@ return tostring(granted)
             except ValueError:
                 max_unverified_notional = 100000.0
             if requested_qty * exec_price > max_unverified_notional:
-                return ExecutionResult(
-                    success=False,
-                    message="realtime_liquidity_unavailable_for_large_order",
+                # B split: unverified over-limit partial fill, remainder stays PENDING
+                from backend.services.simulation.services.market_rules import (
+                    lot_size_for_symbol,
                 )
+
+                lot = (
+                    int(lot_size_for_symbol(order.symbol, rules.market))
+                    if rules.market.value == "CN"
+                    else 1
+                )
+                lot = max(1, lot)
+                if exec_price > 0:
+                    capacity = int(max_unverified_notional // exec_price // lot * lot)
+                else:
+                    capacity = 0
+                if capacity <= 0:
+                    return ExecutionResult(
+                        success=False,
+                        message="realtime_liquidity_unavailable_for_large_order",
+                    )
+                fill_quantity = self._reserve_liquidity(
+                    symbol=order.symbol,
+                    requested=requested_qty,
+                    capacity=float(capacity),
+                    quote_timestamp=snapshot.quote_timestamp,
+                )
+                if fill_quantity <= 0:
+                    return ExecutionResult(
+                        success=False,
+                        message="realtime_liquidity_unavailable_for_large_order",
+                    )
 
         gross = fill_quantity * exec_price
         if rules.market.value == "CN":

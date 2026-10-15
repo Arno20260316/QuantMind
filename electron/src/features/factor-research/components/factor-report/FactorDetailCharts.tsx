@@ -48,15 +48,21 @@ export const FactorDetailCharts: React.FC<Props> = ({ detail, loading }) => {
     );
   }
 
-  const qMean = detail.quantile_mean.map((v) => +(v * 100).toFixed(3)); // 转 %
+  // 缺失（null）不折算成 0：null 透传，ECharts 收 null 即不画柱、不标数
+  const qMean = detail.quantile_mean.map((v) => (v == null || !Number.isFinite(v) ? null : +(v * 100).toFixed(3)));
   const qLabels = qMean.map((_, i) => `Q${i + 1}`);
-  const lsPct = +((detail.quantile_mean[9] - detail.quantile_mean[0]) * 100).toFixed(3);
+  const lsHi = detail.quantile_mean[9];
+  const lsLo = detail.quantile_mean[0];
+  const lsPct =
+    lsHi == null || lsLo == null || !Number.isFinite(lsHi) || !Number.isFinite(lsLo)
+      ? null
+      : +((lsHi - lsLo) * 100).toFixed(3);
 
   const quantileBarOption: any = {
     grid: { left: 42, right: 12, top: 18, bottom: 24 },
     tooltip: {
       trigger: 'axis',
-      valueFormatter: (v: number) => `${v > 0 ? '+' : ''}${v}%`,
+      valueFormatter: (v: number | null) => (v == null ? '—' : `${v > 0 ? '+' : ''}${v}%`),
     },
     xAxis: { type: 'category', data: qLabels, axisLabel: { fontSize: 10, color: '#94a3b8' }, axisTick: { show: false } },
     yAxis: {
@@ -67,7 +73,7 @@ export const FactorDetailCharts: React.FC<Props> = ({ detail, loading }) => {
     series: [
       {
         type: 'bar',
-        data: qMean.map((v) => ({ value: v, itemStyle: { color: v >= 0 ? '#e11d48' : '#059669', borderRadius: 3 } })),
+        data: qMean.map((v) => ({ value: v, itemStyle: { color: v === null ? '#e2e8f0' : v >= 0 ? '#e11d48' : '#059669', borderRadius: 3 } })),
         barMaxWidth: 22,
         label: { show: true, position: 'top', fontSize: 9, color: '#64748b' },
       },
@@ -134,7 +140,7 @@ export const FactorDetailCharts: React.FC<Props> = ({ detail, loading }) => {
       {
         name: '单边换手',
         type: 'line',
-        data: detail.turnover_series.map((v) => +v.toFixed(3)),
+        data: detail.turnover_series.map((v) => (v == null || !Number.isFinite(v) ? null : +v.toFixed(3))),
         showSymbol: false,
         areaStyle: { color: 'rgba(245, 158, 11, 0.18)' },
         lineStyle: { width: 1.6, color: '#f59e0b' },
@@ -145,7 +151,7 @@ export const FactorDetailCharts: React.FC<Props> = ({ detail, loading }) => {
 
   return (
     <div className="grid grid-cols-2 grid-rows-2 gap-3 flex-1 min-h-0">
-      <ChartShell title="分位平均前瞻收益" hint={`Q10−Q1 = ${lsPct > 0 ? '+' : ''}${lsPct}%`}>
+      <ChartShell title="分位平均前瞻收益" hint={lsPct == null ? 'Q10−Q1 = —' : `Q10−Q1 = ${lsPct > 0 ? '+' : ''}${lsPct}%`}>
         <EChartsChart option={quantileBarOption} />
       </ChartShell>
       <ChartShell title="分位净值曲线" hint="按日折算 · 绿=因子值低 红=因子值高">

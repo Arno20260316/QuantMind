@@ -8,33 +8,40 @@
  */
 
 import type { FactorDetail } from '../../../types/factorReport';
-import { quantileColor } from './chartKit';
+import { DASH, quantileColor } from './chartKit';
 import { fmtDate } from './chartKit';
 
 /** 分位标签 Q1..Q10 */
 export const qLabels = (n: number): string[] => Array.from({ length: n }, (_, i) => `Q${i + 1}`);
 
+/** 缺失（null）不折算成 0：null 透传，交给 ECharts 不画柱 / 交给调用方显示「—」 */
+const pctOrNull = (v: number | null): number | null =>
+  v == null || !Number.isFinite(v) ? null : +(v * 100).toFixed(3);
+
 /** 分位平均前瞻收益（柱） */
 export function quantileBarOption(detail: FactorDetail): any {
-  const qMean = detail.quantile_mean.map((v) => +(v * 100).toFixed(3));
+  const qMean = detail.quantile_mean.map(pctOrNull);
   return {
     grid: { left: 42, right: 12, top: 18, bottom: 24 },
-    tooltip: { trigger: 'axis', valueFormatter: (v: number) => `${v > 0 ? '+' : ''}${v}%` },
+    tooltip: { trigger: 'axis', valueFormatter: (v: number | null) => (v == null ? DASH : `${v > 0 ? '+' : ''}${v}%`) },
     xAxis: { type: 'category', data: qLabels(qMean.length), axisLabel: { fontSize: 10, color: '#94a3b8' }, axisTick: { show: false } },
     yAxis: { type: 'value', axisLabel: { fontSize: 10, color: '#94a3b8', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#f1f5f9' } } },
     series: [{
       type: 'bar',
-      data: qMean.map((v) => ({ value: v, itemStyle: { color: v >= 0 ? '#e11d48' : '#059669', borderRadius: 3 } })),
+      data: qMean.map((v) => ({ value: v, itemStyle: { color: v === null ? '#e2e8f0' : v >= 0 ? '#e11d48' : '#059669', borderRadius: 3 } })),
       barMaxWidth: 22,
       label: { show: true, position: 'top', fontSize: 9, color: '#64748b' },
     }],
   };
 }
 
-/** Q10−Q1 分位价差（%） */
-export function quantileSpread(detail: FactorDetail): number {
+/** Q10−Q1 分位价差（%）；任一端缺失（null）即给 null —— 调用方显示「—」，不折算成 0 */
+export function quantileSpread(detail: FactorDetail): number | null {
   const m = detail.quantile_mean;
-  return +(((m[m.length - 1] ?? 0) - (m[0] ?? 0)) * 100).toFixed(3);
+  const hi = m[m.length - 1];
+  const lo = m[0];
+  if (hi == null || lo == null || !Number.isFinite(hi) || !Number.isFinite(lo)) return null;
+  return +((hi - lo) * 100).toFixed(3);
 }
 
 /**
@@ -81,13 +88,13 @@ export function quantileCurveOption(detail: FactorDetail, withLegend = false): a
 export function turnoverOption(detail: FactorDetail): any {
   return {
     grid: { left: 46, right: 14, top: 18, bottom: 26 },
-    tooltip: { trigger: 'axis', valueFormatter: (v: number) => `${(v * 100).toFixed(0)}%` },
+    tooltip: { trigger: 'axis', valueFormatter: (v: number | null) => (v == null ? DASH : `${(v * 100).toFixed(0)}%`) },
     xAxis: { type: 'category', data: detail.turnover_dates.map(fmtDate), axisLabel: { fontSize: 10, color: '#94a3b8', interval: Math.max(1, Math.floor(detail.turnover_dates.length / 6)) }, axisTick: { show: false } },
     yAxis: { type: 'value', max: 1, axisLabel: { fontSize: 10, color: '#94a3b8', formatter: (v: number) => `${(v * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#f1f5f9' } } },
     series: [{
       name: '单边换手',
       type: 'line',
-      data: detail.turnover_series.map((v) => +v.toFixed(3)),
+      data: detail.turnover_series.map((v) => (v == null || !Number.isFinite(v) ? null : +v.toFixed(3))),
       showSymbol: false,
       areaStyle: { color: 'rgba(245, 158, 11, 0.18)' },
       lineStyle: { width: 1.6, color: '#f59e0b' },

@@ -119,7 +119,8 @@ export interface FactorDetail {
   /** 快照结构版本；缺字段的旧快照为 1 或 null → 页面提示「需重跑构建」 */
   schema_version?: number | null;
   dates: string[];
-  quantile_mean: number[];
+  /** 10 个分位的平均前瞻收益（升序：Q1 = 因子值最小）；全退化因子逐位 null = 缺失（显示「—」，不折算成 0） */
+  quantile_mean: (number | null)[];
   quantile_curves: number[][];
   ls_curve: number[];
   ic_series: (number | null)[];
@@ -127,7 +128,8 @@ export interface FactorDetail {
   ic_mean: number | null;
   ic_std: number | null;
   turnover_dates: string[];
-  turnover_series: number[];
+  /** 单边换手序列（截面分位成员迁移比例）；缺值日 null = 缺失 */
+  turnover_series: (number | null)[];
   turnover_mean: number | null;
   coverage_mean: number | null;
   n_dates: number;

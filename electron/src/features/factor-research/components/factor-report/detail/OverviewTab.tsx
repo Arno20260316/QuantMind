@@ -59,6 +59,9 @@ export const OverviewTab: React.FC<Props> = ({ factor, detail, blocks, costBps, 
 
   if (!detail || detail.empty) return <Degraded reason={detail?.reason || '请选择一个因子'} />;
 
+  // 缺失（全退化因子两端皆 null）→ 显示「—」，不折算成 0
+  const spread = quantileSpread(detail);
+
   return (
     <div className="flex flex-col gap-3 min-h-0">
       {/* ① 结论性两块：机构评分 + 收益梯度 */}
@@ -81,7 +84,7 @@ export const OverviewTab: React.FC<Props> = ({ factor, detail, blocks, costBps, 
         </ChartShell>
 
         <ChartShell primary title="分位平均前瞻收益" info="G1 = 因子值最小 … G10 = 因子值最大，与 IC 符号无关。单调递增说明因子值越大收益越高；两端翘、中间平则说明信号只集中在尾部。"
-          hint={`Q10−Q1 = ${quantileSpread(detail) > 0 ? '+' : ''}${quantileSpread(detail)}%`}>
+          hint={spread == null ? `Q10−Q1 = ${DASH}` : `Q10−Q1 = ${spread > 0 ? '+' : ''}${spread}%`}>
           <div className="h-[240px] min-w-0"><EChartsChart option={quantileBarOption(detail)} /></div>
         </ChartShell>
       </div>

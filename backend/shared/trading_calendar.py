@@ -101,6 +101,20 @@ ALL_MARKETS: dict[str, MarketDefinition] = {
             {"session_name": "REGULAR", "start_time": "09:00:00", "end_time": "15:30:00", "cross_day": False},
         ],
     ),
+    # 期货市场（芝商所 Globex：开盘 17:00 CT，次日 16:00 CT 收，每日 16:00-17:00 维护窗口）。
+    # 会话拆两段（0-16 点 + 17-24 点）而不是跨夜一段：``is_trading_time`` 只按本地
+    # 日期建窗口，跨夜段会被 ``end_at <= start_at`` 整段推到次日，当日下午 17 点后
+    # 就查不到在盘（见 ``get_sessions``）。两段写法两个方向的边界都落在当日。
+    # 注意：CME 感恩节/7 月 3 日**照常开市**（缩短时段），圣诞/元旦休市——与美股日历
+    # 不同，这正是不能拿 XNYS 顶替期货日历的原因。
+    "CME": MarketDefinition(
+        "CME", "CME", "America/Chicago", "芝商所",
+        time(17, 0), time(16, 0),
+        sessions=[
+            {"session_name": "GLOBEX", "start_time": "00:00:00", "end_time": "16:00:00", "cross_day": False},
+            {"session_name": "GLOBEX", "start_time": "17:00:00", "end_time": "23:59:59", "cross_day": False},
+        ],
+    ),
 }
 
 # 向后兼容：旧市场代码到 exchange_calendars 的映射
@@ -135,6 +149,12 @@ _MARKET_ALIASES = {
     # 抛错 → 调用方吞掉 → 只看周末 → **国庆/春节/中秋被当成交易日**。SSE 与 SZSE 的
     # xcal_name 同为 XSHG，节假日口径一致，故 CN 落 SSE。
     "CN": "SSE",
+    # "FUTURES" 同样是全仓的市场维度口径（推理中心 / 训练 / 模型 metadata.market 都用它），
+    # 而本表的键是交易所码。期货落芝商所（CME）：内外盘品种统一 Globex 口径，与
+    # ``model_training._MARKET_CALENDAR`` / ``script_runner._MARKET_XCAL`` 的
+    # FUTURES→CME 对齐。缺这一条时 get_market('FUTURES') 抛错 → 调用方吞掉 → 只看
+    # 周末 → **圣诞 / 元旦被当成交易日**（CME 感恩节照常开市，不能用美股日历反推）。
+    "FUTURES": "CME",
 }
 
 
@@ -269,13 +289,16 @@ def trading_days_xcal(market_code: str, start: date, end: date) -> list[date] | 
     return [session.date() for session in sessions]
 
 
-#: 全仓跑决策/训练/推理的三个市场 → 真日历名（与
-#: ``admin_training_utils._MARKET_TO_XCAL`` 同口径：CN/HK/US）。
+#: 全仓跑决策/训练/推理的四个市场 → 真日历名（与
+#: ``admin_training_utils._MARKET_TO_XCAL`` 同口径：CN/HK/US；FUTURES 走芝商所 CME，
+#: 推理中心期货分层上线后纳入覆盖看护——决策轮 fail-closed 的教训同样适用于
+#: 期货推理的日期解析，日历过期必须提前可见）。
 #: C13 体检按这张表逐历查覆盖年限。
 TRADED_MARKET_XCALS: tuple[tuple[str, str], ...] = (
     ("CN", "XSHG"),
     ("HK", "XHKG"),
     ("US", "XNYS"),
+    ("FUTURES", "CME"),
 )
 
 
@@ -448,10 +471,16 @@ class TradingCalendarService:
     def _safe_timezone(tz_name: str | None, market: str) -> str:
         candidate = str(tz_name or "").strip()
         if not candidate:
-            try:
-                candidate = _DEFAULT_MARKET_TZ.get(market, "Asia/Shanghai")
-            except Exception:
-                candidate = "Asia/Shanghai"
+            # _DEFAULT_MARKET_TZ 的键是交易所码（CME/XSHG/...），而调用方传的市场
+            # 可能是维度口径（FUTURES/CN）——先查表，未命中再走 get_market 解析别名。
+            # 缺这层时 FUTURES 的会话窗口会以 Asia/Shanghai 渲染（+08:00），
+            # Globex 时段整体错位 13~14 小时。
+            candidate = _DEFAULT_MARKET_TZ.get(market)
+            if not candidate:
+                try:
+                    candidate = get_market(market).timezone
+                except ValueError:
+                    candidate = "Asia/Shanghai"
         try:
             ZoneInfo(candidate)
             return candidate

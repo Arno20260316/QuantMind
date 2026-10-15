@@ -1,8 +1,9 @@
 /**
  * 推理中心跨市场适配层。
  *
- * 三个市场的页面结构与状态机完全一致（顶栏 → 截面推理 / 个股预测两个顶层 Tab），
- * 差异只有：市场常量、货币符号、默认标的、交易日历、代码联想源、K 线取数来源。
+ * 四个市场（A股 / 港股 / 美股 / 期货）的页面结构与状态机完全一致（顶栏 →
+ * 截面推理 / 个股预测两个顶层 Tab），差异只有：市场常量、货币符号、默认标的、
+ * 交易日历、代码联想源、K 线取数来源。
  * 共享的 InferenceCenterShell 通过 useInferenceCenter() 取这些差异，
  * 市场特有的东西一律在各自目录里实现，共享组件里不写市场分支。
  */
@@ -21,19 +22,19 @@ export interface SuggestionItem {
 }
 
 export interface InferenceCenterAdapter {
-  market: 'CN' | 'HK' | 'US';
+  market: 'CN' | 'HK' | 'US' | 'FUTURES';
   /** 顶栏 Tag 文案，如「A股市场」 */
   marketLabel: string;
-  /** 交易日历代码，直接传给 /market-calendar/*（SSE / HKEX / NYSE） */
+  /** 交易日历代码，直接传给 /market-calendar/*（SSE / HKEX / NYSE / CME） */
   calendar: string;
-  /** 货币符号：¥ / HK$ / $ */
+  /** 货币符号：¥ / HK$ / $ / ¥（期货内外盘混合，取人民币符号） */
   currencySymbol: string;
-  /** 个股预测的默认标的（CN: SH600519 / HK: 0700.HK / US: AAPL） */
+  /** 个股预测的默认标的（CN: SH600519 / HK: 0700.HK / US: AAPL / FUTURES: RB0.CN） */
   defaultSymbol: string;
   /** 个股预测输入框的占位提示（各市场举例不同） */
   searchPlaceholder: string;
 
-  /** 预加载联想数据源（CN 读本地静态表、HK 拉名称表、US 拉标的池）；失败应静默降级 */
+  /** 预加载联想数据源（CN 读本地静态表、HK 拉名称表、US 拉标的池、FUTURES 拉品种热力图）；失败应静默降级 */
   preload(): Promise<void>;
   /** 内存/远端搜索联想项 */
   search(keyword: string): Promise<SuggestionItem[]>;
@@ -44,9 +45,9 @@ export interface InferenceCenterAdapter {
   /** 用户手输的代码 → 归一代码 */
   normalize(raw: string): string;
 
-  /** 个股 K 线（CN/HK 走 /research/kline，US 走 /stock-terminal-us/kline） */
+  /** 个股 K 线（CN/HK 走 /research/kline，US 走 /stock-terminal-us/kline，FUTURES 走 /market/kline?market=FUTURES） */
   fetchKline(symbol: string, days: number, endDate?: string, startDate?: string): Promise<KlineItem[]>;
-  /** 多模型分数曲线需要的后缀式代码（CN: 600519.SH；US: 原样 ticker） */
+  /** 多模型分数曲线需要的后缀式代码（CN: 600519.SH；US: 原样 ticker；FUTURES: 原样三形态） */
   toSuffixSymbol(symbol: string): string;
 }
 

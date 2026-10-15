@@ -2082,7 +2082,7 @@ async def _infer_market_from_run(tid: str, uid: str, run_id: str) -> str | None:
                 context = meta.get("context")
                 if isinstance(context, dict):
                     market = str(context.get("market", "")).upper()
-                    if market in ("CN", "HK", "US", "CRYPTO"):
+                    if market in ("CN", "HK", "US", "CRYPTO", "FUTURES"):
                         return market
     except Exception:
         pass
@@ -2155,7 +2155,7 @@ async def _model_market(tid: str, uid: str, model_id: str) -> tuple[str, str | N
         try:
             meta = row[1] if isinstance(row[1], dict) else json.loads(row[1])
             m = str((meta.get("context") or {}).get("market", "")).upper()
-            if m in ("CN", "HK", "US", "CRYPTO"):
+            if m in ("CN", "HK", "US", "CRYPTO", "FUTURES"):
                 market = m
         except Exception:
             market = None
@@ -2717,6 +2717,49 @@ def _quantdb_kline_items(
         return []
 
 
+def _futures_kline_items(
+    normalized_symbol: str, days: int, end_date: str | None = None
+) -> list[dict[str, Any]]:
+    """期货版「QuantDB 兜底」：读 QuantFutures 本地 parquet（主力连续日K）。
+
+    与 ``_quantdb_kline_items`` 同形状返回，价格锚点/波动率推导共用下游。
+    symbol 三形态（CL.FUT / RB0.CN / Au99.99）大小写敏感，原样透传 —— 归一化
+    （to_prefix/to_suffix）会把 RB0.CN 洗成 CNRB0、Au99.99 洗成 AU99.99 而查空。
+    """
+    try:
+        from backend.services.engine.data_platform.quantfutures_hub import QuantFuturesDataHub
+
+        hub = QuantFuturesDataHub.get_instance()
+        try:
+            end = date.fromisoformat(str(end_date)[:10]) if end_date else date.today()
+        except (ValueError, TypeError):
+            end = date.today()
+        start = end - timedelta(days=days * 2 + 20)
+        df = hub.fetch_daily_kline(normalized_symbol, start, end)
+        if df is None or df.empty or "trade_date" not in df.columns:
+            return []
+        df = (
+            df.dropna(subset=["close"])
+            .drop_duplicates(subset=["trade_date"])
+            .sort_values("trade_date")
+            .tail(days)
+        )
+        return [
+            {
+                "date": r["trade_date"].strftime("%Y-%m-%d"),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r["volume"] if r["volume"] is not None else 0.0),
+            }
+            for _, r in df.iterrows()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[predict] QuantFutures K线读取失败 %s: %s", normalized_symbol, exc)
+        return []
+
+
 async def get_stock_kline(
     symbol: str, days: int, end_date: str | None = None, start_date: str | None = None
 ) -> dict[str, Any]:
@@ -3221,6 +3264,21 @@ def _sdl_anchor_symbol_key(normalized_symbol: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(normalized_symbol or "").upper())
 
 
+def _is_missing_table_error(exc: BaseException) -> bool:
+    """PG UndefinedTable（42P01）识别：遍历异常因果链，asyncpg 原异常与
+    SQLAlchemy 包裹层任一命中即真。"""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == "UndefinedTableError":
+            return True
+        if getattr(cur, "pgcode", None) == "42P01":
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 async def _fetch_sdl_anchor(
     normalized_symbol: str, market: str, target_date: str | None
 ) -> dict[str, Any] | None:
@@ -3268,8 +3326,17 @@ async def _fetch_sdl_anchor(
         WHERE {sym_predicate}{date_filter}
         ORDER BY sdl.trade_date DESC LIMIT 1
     """
-    async with get_session(read_only=True) as session:
-        row = (await session.execute(text(sql), params)).first()
+    try:
+        async with get_session(read_only=True) as session:
+            row = (await session.execute(text(sql), params)).first()
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_table_error(exc):
+            # 市场聚合表尚未物化（如期货 stock_daily_latest_futures）：锚点缺失
+            # 交由 K 线兜底路径（期货走 _futures_kline_items），而不是让整个预测 500。
+            # 表物化后此路自动恢复可用，无需改代码。
+            logger.warning("[predict] 市场聚合表缺失 %s（market=%s）: %s", sdl_table, market, exc)
+            return None
+        raise
     if not row:
         return None
     return {
@@ -3308,6 +3375,11 @@ async def predict_single_stock(
         market_key = StockCodeUtil.detect_market(symbol) or "CN"
     if market_key == "HK":
         normalized_symbol = StockCodeUtil.to_hk_suffix(symbol)
+    elif market_key == "FUTURES":
+        # 期货符号三形态（CL.FUT / RB0.CN / Au99.99）大小写与括号都敏感：
+        # to_prefix 会把 RB0.CN 洗成 CNRB0、Au99.99 洗成 AU99.99，全链查询落空。
+        # 一律保留原始形态（仅去空白），与 QuantFutures 本地 parquet 精确匹配对齐。
+        normalized_symbol = str(symbol or "").strip()
     else:
         normalized_symbol = StockCodeUtil.to_prefix(symbol)
 
@@ -3345,6 +3417,9 @@ async def predict_single_stock(
     # 有明确目标日时 K 线按目标日截断：基准价格/波动率/均线乖离都取目标日当时
     # 的值，否则盲测的预测扇形锚点是最新价，历史视角失真（前视泄露）。
     qd_items = _quantdb_kline_items(normalized_symbol, days=30, end_date=target_date)
+    if not qd_items and market_key == "FUTURES":
+        # 期货行情在 QuantFutures 本地 parquet（不在 A 股 QuantDB 里）
+        qd_items = _futures_kline_items(normalized_symbol, days=30, end_date=target_date)
     if qd_items:
         latest_close = float(qd_items[-1]["close"])
         if not target_date:
@@ -3356,9 +3431,10 @@ async def predict_single_stock(
             if len(closes) >= 20:
                 ma20 = float(np.mean(closes[-20:]))
                 ma_gap_20 = round((latest_close - ma20) / ma20 * 100, 2)
-    elif latest_close == 0.0 and market_key != "US":
+    elif latest_close == 0.0 and market_key not in ("US", "FUTURES"):
         # QuantDB 与聚合表均无该股数据时，通过实时行情感底获取最新收盘价与波动率。
-        # 美股没有实时行情源（腾讯兜底只认沪深/港股代码），跳过避免空等超时。
+        # 美股没有实时行情源（腾讯兜底只认沪深/港股代码），跳过避免空等超时；
+        # 期货同理——腾讯源不认期货代码，行情已在上游 _futures_kline_items 覆盖。
         k_payload = await get_stock_kline(normalized_symbol, days=30, end_date=target_date)
         k_items = (k_payload.get("data") or {}).get("items") or []
         if k_items:

@@ -175,6 +175,39 @@ async def _try_stock_daily_latest(symbol: str, start: date | None, end: date | N
         return items
 
 
+def _try_futures_hub(symbol: str, start: date | None, end: date | None):
+    """期货快路径：QuantFutures 本地 parquet（qfut_daily_forward 视图 / 文件兜底）。
+
+    符号大小写**敏感**（Au99.99 / Au(T+D) 为上金所原始形态，DuckDB 精确匹配
+    ``symbol = '...'``）：调用方必须传原始形态，大写化会静默查空。空结果按
+    「未找到」处理，不跌入聚合器 —— 聚合器没有期货适配器，错误信息会失真。
+    """
+    try:
+        from backend.services.engine.data_platform.quantfutures_hub import QuantFuturesDataHub
+    except Exception:
+        return None
+
+    hub = QuantFuturesDataHub.get_instance()
+    df = hub.fetch_daily_kline(symbol, start, end)
+    if df is None or df.empty:
+        return None
+    if "trade_date" not in df.columns:
+        # 文件兜底路径在无匹配时可能返回异形空帧（列名 time 而非 trade_date）
+        return None
+    items = []
+    for _, r in df.iterrows():
+        items.append({
+            "date": str(r.get("trade_date", ""))[:10],
+            "open": _safe_float(r.get("open")),
+            "high": _safe_float(r.get("high")),
+            "low": _safe_float(r.get("low")),
+            "close": _safe_float(r.get("close")),
+            "volume": _safe_float(r.get("volume")),
+            "amount": _safe_float(r.get("amount"), default=None),
+        })
+    return items
+
+
 _AGG_CACHE = None
 
 
@@ -282,8 +315,8 @@ def _aggregator_fetch(market: str, symbol: str, start: date | None, end: date | 
 
 @router.get("/kline")
 async def get_kline(
-    symbol: str = Query(..., description="600519.SH / 00700.HK / AAPL"),
-    market: str = Query("A", description="A / HK / US"),
+    symbol: str = Query(..., description="600519.SH / 00700.HK / AAPL / RB0.CN / CL.FUT / Au99.99"),
+    market: str = Query("A", description="A / HK / US / FUTURES"),
     period: str = Query("daily", description="daily 仅支持 daily"),
     start: str | None = Query(None, description="YYYY-MM-DD"),
     end: str | None = Query(None, description="YYYY-MM-DD"),
@@ -298,7 +331,9 @@ async def get_kline(
         raise HTTPException(status_code=400, detail=f"adjust {adjust} 非法，可选 qfq / hfq / none")
 
     m = market.upper()
-    sym = symbol.upper()
+    # 期货符号大小写敏感（Au99.99 / Au(T+D)）：大写化后 DuckDB 精确匹配静默查空，
+    # 故 FUTURES 保留原始形态（仅去空白）；其余市场统一大写。
+    sym = symbol.strip() if m == "FUTURES" else symbol.upper()
     sd = _parse_date(start)
     ed = _parse_date(end)
     if not (sd and ed):
@@ -354,6 +389,25 @@ async def get_kline(
                 }
         except Exception as exc:  # noqa: BLE001
             logger.warning("stock_daily_latest fast-path failed: %s", exc)
+
+    # 期货走 QuantFutures 本地 parquet（DuckDB 精确匹配；无适配器进聚合器，查空即 404）
+    if m == "FUTURES":
+        try:
+            import asyncio
+            items = await asyncio.to_thread(_try_futures_hub, sym, sd, ed)
+            if items:
+                _kline_cache_set(cache_key, items)
+                return {
+                    "success": True,
+                    "data": {
+                        "market": m, "symbol": sym, "period": period,
+                        "source_used": "quantfutures_parquet",
+                        "items": items, "fallbacks_tried": [], "cleaning_report": {},
+                    },
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("quantfutures parquet fast-path failed: %s", exc)
+        raise HTTPException(status_code=404, detail=f"未找到期货标的 {sym} 的日K数据")
 
     # HK/US 优先走 yahoo_finance 直连（跳过 aggregator 管线，避免超时）
     if m in ("HK", "US"):

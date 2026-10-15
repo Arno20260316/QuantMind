@@ -729,7 +729,9 @@ class InferenceScriptRunner:
         try:
             import exchange_calendars as xcals
 
-            _MARKET_XCAL = {"A": "XSHG", "HK": "XHKG", "US": "XNYS"}
+            # FUTURES 走芝商所（与 model_training._MARKET_CALENDAR /
+            # trading_calendar._MARKET_ALIASES 的 FUTURES→CME 同口径）；缺省仍 XSHG
+            _MARKET_XCAL = {"A": "XSHG", "HK": "XHKG", "US": "XNYS", "FUTURES": "CME"}
             xcal_name = _MARKET_XCAL.get(market_upper, "XSHG")
             cal = xcals.get_calendar(xcal_name)
             # 将输入日期转换为下一个交易日

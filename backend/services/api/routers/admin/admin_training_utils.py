@@ -44,7 +44,9 @@ _FEATURE_CATALOG_FALLBACK = Path(os.getcwd()) / "config" / "features" / "model_t
 # NOTE：_TREE/_DL 类型集合已删除，唯一来源为 backend.shared.training.request.ALLOWED_MODEL_TYPES
 #（此前两处各一份，hybrid 剔除时曾漏改——单源杜绝此类漂移）。
 # 市场 → exchange_calendars 日历名。CRYPTO 为 7x24 无休市，不在此映射中。
-_MARKET_TO_XCAL = {"CN": "XSHG", "US": "XNYS", "HK": "XHKG"}
+# FUTURES 走芝商所 Globex（与 model_training._MARKET_CALENDAR / trading_calendar
+# 的 FUTURES→CME 同口径）：缺了它训练标签 gap 会静默退化成日历日（返回 used_calendar=False）。
+_MARKET_TO_XCAL = {"CN": "XSHG", "US": "XNYS", "HK": "XHKG", "FUTURES": "CME"}
 
 
 # _clamp_int 下沉至 backend.shared.training.request（单源），此处 import 复用。

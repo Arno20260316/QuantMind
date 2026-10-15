@@ -210,6 +210,32 @@ class InferenceCenterService {
     }
   }
 
+  /**
+   * 市场通用日K（/market/kline）：期货等无专属 K 线端点的市场走这里。
+   * symbol **原样透传**——期货三形态（CL.FUT / RB0.CN / Au99.99）大小写敏感，
+   * 任何归一化都会静默查空（后端按精确匹配读出空表 → 404）。
+   */
+  async getMarketKline(
+    market: string,
+    symbol: string,
+    days: number = 60,
+    endDate?: string,
+    startDate?: string,
+  ): Promise<KlineItem[]> {
+    try {
+      const params = new URLSearchParams({ market, symbol, days: String(days) });
+      if (endDate) params.set('end', endDate);
+      if (startDate) params.set('start', startDate);
+      const resp = await this.client.get<{ success: boolean; data: { items: KlineItem[] } }>(
+        `/market/kline?${params.toString()}`,
+      );
+      return resp.data?.data?.items || [];
+    } catch (e) {
+      console.warn('获取市场K线失败:', e);
+      return [];
+    }
+  }
+
   async getStockKline(symbol: string, days: number = 60, endDate?: string, startDate?: string): Promise<KlineItem[]> {
     try {
       const params = new URLSearchParams({ days: String(days) });

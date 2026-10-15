@@ -7,6 +7,10 @@
 
 断言挑的是**已知假日/已知交易日**而非「不抛错」：只判周末的实现同样能让 is_trading_day
 返回布尔值，所以必须用真实日历才能区分。
+
+期货（`FUTURES`→CME）同理，且 CME 的休市口径与美股日历**不同**：2026 全年工作日
+休市实测仅元旦 / 耶稣受难日 / 圣诞三天，感恩节、7 月 3 日、MLK 日反而照常开市
+（缩短时段）——两类日历不能互推，样例按容器内 exchange_calendars 4.13.2 实测锁定。
 """
 
 from __future__ import annotations
@@ -38,16 +42,24 @@ CASES = [
     ("CN", "2026-10-05", False, "国庆假期内的周一"),
     ("CN", "2026-02-16", False, "春节休市"),
     ("SSE", "2026-10-01", False, "交易所码与 CN 口径一致"),
+    # 期货：FUTURES 是市场维度口径（推理中心/训练），日历表按交易所码登记为 CME。
+    # 缺别名时同一条退化路径 —— 圣诞/元旦被当成交易日。
+    ("FUTURES", "2026-09-24", True, "普通交易日"),
+    ("FUTURES", "2026-12-25", False, "CME 圣诞休市（工作日判断会判成交易日）"),
+    ("FUTURES", "2026-01-01", False, "CME 元旦休市"),
+    ("FUTURES", "2026-11-26", True, "CME 感恩节照常开市（缩短时段）——与美股日历不同，不能互推"),
+    ("FUTURES", "2026-10-01", True, "CME 国庆照常开市——期货日历不能用 A 股节假日反推"),
+    ("CME", "2027-01-01", False, "交易所码与 FUTURES 口径一致"),
 ]
 
 
-@pytest.mark.parametrize("alias", ["NYSE", "HKEX", "NASDAQ", "SSE", "SZSE", "CN"])
+@pytest.mark.parametrize("alias", ["NYSE", "HKEX", "NASDAQ", "SSE", "SZSE", "CN", "FUTURES", "CME"])
 def test_alias_resolves_to_registered_market(alias: str):
     """惯用名必须落到 ALL_MARKETS 里真实存在的键上，否则等于没配"""
     assert get_market(alias).code in ALL_MARKETS
 
 
-@pytest.mark.parametrize("market", ["NYSE", "HKEX", "XHKG", "CN"])
+@pytest.mark.parametrize("market", ["NYSE", "HKEX", "XHKG", "CN", "FUTURES"])
 def test_alias_yields_exchange_calendar(market: str):
     """能取到 exchange_calendars 的日历对象 —— 取不到时上层会静默退化为工作日判断"""
     assert _get_xcal_calendar(market) is not None
@@ -66,7 +78,26 @@ async def test_is_trading_day_uses_exchange_calendar(market: str, day: str, expe
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("market", ["CN", "SSE"])
+async def test_futures_sessions_render_in_chicago_time():
+    """会话窗口时区必须来自 CME（America/Chicago），不是别名未命中时的上海兜底。
+
+    时区解析缺口时 Globex 两段会以 +08:00 渲染——接口 200、数字全错（错位 13~14
+    小时），静默错的一种。两段窗口同时钉「维护窗口 16:00-17:00 不在会话内」。
+    """
+    sessions = await calendar_service.get_sessions(
+        market="FUTURES",
+        trade_date=date(2026, 10, 14),
+        tenant_id="default",
+        user_id="00000001",
+    )
+    assert [w.session_name for w in sessions] == ["GLOBEX", "GLOBEX"]
+    offsets = {w.start_at.utcoffset().total_seconds() / 3600 for w in sessions}
+    assert offsets == {-5}, f"期望芝加哥时区（CDT=-5），实得 {offsets}"  # 2026-10-14 为夏令时
+    assert [(w.start_at.hour, w.end_at.hour) for w in sessions] == [(0, 16), (17, 23)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("market", ["CN", "SSE", "FUTURES"])
 async def test_verdict_reports_the_exchange_calendar_as_its_source(market: str):
     """依据必须是**真日历**，不能是 weekday_fallback。
 
@@ -89,6 +120,8 @@ NEXT_CASES = [
     ("CN", "2026-10-08", "2026-10-09", "复市后的普通次一交易日"),
     ("HK", "2026-06-30", "2026-07-02", "香港回归纪念日（07-01）休市后复市"),
     ("US", "2026-07-02", "2026-07-06", "独立日观察日（07-03 周五）+ 周末后复市"),
+    ("FUTURES", "2026-12-24", "2026-12-28", "CME 圣诞（12-25 周五）休市 + 周末后复市"),
+    ("FUTURES", "2026-11-25", "2026-11-26", "CME 感恩节照常开市（美股日历答 11-27，两历不能互推）"),
 ]
 
 

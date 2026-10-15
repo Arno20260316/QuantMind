@@ -1,11 +1,15 @@
 /**
- * 推理中心三市场 E2E：A 股 / 港股 / 美股。
+ * 推理中心四市场 E2E：A 股 / 港股 / 美股 / 期货。
  *
  * 用法：QM_BASE=http://localhost:3080 node tests/inference-center.e2e.mjs
  *      QM_MARKETS=US 只跑部分市场
  *
  * 走真实用户路径：登录 → 切市场 → 进「推理中心」→ 断言同屏双栏
  * （左栏截面推理 + 右栏个股预测同时在，无需切 Tab）→ 搜标的 → 选建议 → 断言 K 线与结果块。
+ *
+ * 期货（expectEmptyModels）断言面不同：0 个已注册模型 → 无「模型信号分数」可断，
+ * 正确性锚在①市场/日历标识正确 ②诚实空态（当前市场无可用模型）③K 线仍可见
+ * （canvas 在选标的后渲染）④predict-stock 干净 404（非 500）、全程无 5xx。
  */
 import { chromium } from 'playwright';
 
@@ -15,6 +19,7 @@ const MARKETS = [
   { key: 'CN', radio: 'A股', label: 'A股市场', query: '600519', hint: '茅台', currency: '¥' },
   { key: 'HK', radio: '港股', label: '港股市场', query: '00700', hint: '腾讯', currency: 'HK$' },
   { key: 'US', radio: '美股', label: '美股市场', query: 'AAPL', hint: '苹果', currency: '$' },
+  { key: 'FUTURES', radio: '期货', label: '期货市场', query: 'RB0', hint: '螺纹钢', currency: '¥', calendarChip: 'CME', expectEmptyModels: true },
 ];
 
 const only = (process.env.QM_MARKETS || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
@@ -30,7 +35,7 @@ p.on('console', (m) => { if (m.type() === 'error') errors.push('[console] ' + m.
 p.on('pageerror', (e) => errors.push('[PAGEERROR] ' + (e.message || '').slice(0, 200)));
 p.on('response', (r) => {
   const u = r.url();
-  if (/\/api\/v1\/(models|research|stock-terminal-us|market-calendar)/.test(u)) {
+  if (/\/api\/v1\/(models|research|stock-terminal-us|market-calendar|market\/kline|market-analysis-futures)/.test(u)) {
     const path = u.replace(BASE, '').split('?')[0];
     apiCalls.push(r.status() + ' ' + path);
     if (r.status() >= 400) errors.push('[API ' + r.status() + '] ' + u.slice(0, 160));
@@ -104,15 +109,25 @@ for (const mk of TO_RUN) {
   const h1 = (await p.locator('h1').first().innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
   check(h1.includes('模型推理中心'), `页面标题（实测 h1="${h1}"）`);
   let f = flat(await p.locator('body').innerText().catch(() => ''));
-  check(f.includes(mk.label), `市场标识「${mk.label}」（三个市场各渲染自己的页面）`);
+  check(f.includes(mk.label), `市场标识「${mk.label}」（四个市场各渲染自己的页面）`);
+  if (mk.calendarChip) {
+    // 状态带的 calendar chip 取适配器声明（期货=CME），不是 weekday 兜底
+    check(f.includes(mk.calendarChip), `日历标识「${mk.calendarChip}」（MarketStatusBar chip）`);
+  }
 
   // ── 同屏双栏：左栏截面推理 + 右栏个股预测同时在场 ──
   await p.waitForTimeout(6000);
   f = flat(await p.locator('body').innerText().catch(() => ''));
-  check(f.includes('推理前置预检'), '左栏渲染出推理前置预检');
-  check(f.includes('手动推理执行'), '左栏渲染出手动推理执行');
-  check(f.includes('本次推理排名'), '左栏渲染出本次推理排名');
-  check(f.includes('推理历史'), '左栏渲染出推理历史入口');
+  if (mk.expectEmptyModels) {
+    // 0 模型市场：左栏整块被诚实空态替换（预检/排名/历史都不装门面）
+    check(f.includes('当前市场无可用模型'), '空模型市场：左栏诚实空态「当前市场无可用模型」');
+    check(!f.includes('推理前置预检'), '空模型市场：不渲染推理前置预检');
+  } else {
+    check(f.includes('推理前置预检'), '左栏渲染出推理前置预检');
+    check(f.includes('手动推理执行'), '左栏渲染出手动推理执行');
+    check(f.includes('本次推理排名'), '左栏渲染出本次推理排名');
+    check(f.includes('推理历史'), '左栏渲染出推理历史入口');
+  }
   check(!f.includes('市场截面推理') && !f.includes('个股预测推理'), '顶层 Tab 已移除（两个模块同屏，无 Tab 切换）');
 
   const input = p.locator('input[placeholder*="搜索"]').first();
@@ -134,17 +149,42 @@ for (const mk of TO_RUN) {
     await p.locator('body').click({ position: { x: 5, y: 5 } }).catch(() => {});
   }
   check(picked, `搜索「${mk.query}」出现联想项「${mk.hint}」`);
-  // 等结果区真正出现（首次预测可能要跑模型，最长给 90s），而不是固定 sleep 后碰运气
-  await p.locator('text=模型信号分数').first().waitFor({ state: 'visible', timeout: 90000 }).catch(() => {});
-  await p.waitForTimeout(1500);
+  if (mk.expectEmptyModels) {
+    // 无模型市场不会出「模型信号分数」，锚 K 线 canvas（选标的后 /market/kline 回来即渲染）
+    await p.locator('canvas').first().waitFor({ state: 'visible', timeout: 60000 }).catch(() => {});
+    await p.waitForTimeout(1500);
+    f = flat(await p.locator('body').innerText().catch(() => ''));
+    const canvases = await p.locator('canvas').count();
+    check(canvases > 0, `K 线 canvas 已渲染（${canvases} 个）`);
+    check(f.includes('当前市场无可用模型：下方为历史 K 线'), 'K 线上屏 + 诚实说明句（为什么没有预测）');
+    // 货币符号不断言：¥ 在预测分支里由报价条/指标卡承载（DOM 文本），K 线单图态只有
+    // canvas 轴标签与 hover 提示，DOM 里无 ¥ 可查。适配器契约由 vitest 锁（currencySymbol）。
+    check(
+      apiCalls.some((c) => c.startsWith('200') && c.includes('/market/kline')),
+      'K 线取数走 /market/kline 且 200（QuantFutures parquet 快路径）',
+    );
+    check(
+      apiCalls.some((c) => c.startsWith('404') && c.includes('/research/predict-stock')),
+      'predict-stock 干净 404（无模型市场的正确回应，非 500）',
+    );
+    check(!apiCalls.some((c) => /^5/.test(c)), '全程无任何 5xx');
+    check(
+      f.includes('这里会直接出该股的预测与因子归因') === false,
+      '不落「去点排名榜」空态（无模型市场没有排名榜）',
+    );
+  } else {
+    // 等结果区真正出现（首次预测可能要跑模型，最长给 90s），而不是固定 sleep 后碰运气
+    await p.locator('text=模型信号分数').first().waitFor({ state: 'visible', timeout: 90000 }).catch(() => {});
+    await p.waitForTimeout(1500);
 
-  f = flat(await p.locator('body').innerText().catch(() => ''));
-  check(f.includes(mk.currency), `货币符号「${mk.currency}」正确`);
-  const canvases = await p.locator('canvas').count();
-  check(canvases > 0, `K 线/预测图 canvas 已渲染（${canvases} 个）`);
-  check(f.includes('模型信号分数'), '结果区渲染出模型信号分数');
-  check(!f.includes('推理接口异常'), '未出现推理接口异常提示');
-  check(f.includes('这里会直接出该股的预测与因子归因') === false, '结果区已从空态切换到数据态');
+    f = flat(await p.locator('body').innerText().catch(() => ''));
+    check(f.includes(mk.currency), `货币符号「${mk.currency}」正确`);
+    const canvases = await p.locator('canvas').count();
+    check(canvases > 0, `K 线/预测图 canvas 已渲染（${canvases} 个）`);
+    check(f.includes('模型信号分数'), '结果区渲染出模型信号分数');
+    check(!f.includes('推理接口异常'), '未出现推理接口异常提示');
+    check(f.includes('这里会直接出该股的预测与因子归因') === false, '结果区已从空态切换到数据态');
+  }
 }
 
 console.log('\n---- 接口调用 ----');

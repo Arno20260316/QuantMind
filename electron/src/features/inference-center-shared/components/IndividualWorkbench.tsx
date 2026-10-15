@@ -603,6 +603,31 @@ export const IndividualWorkbench: React.FC<IndividualWorkbenchProps> = ({
               </div>
             </div>
           </div>
+        ) : ip.kline.length > 0 ? (
+          /* K 线已取到、预测未出：无模型市场（期货 0 模型）手输标的的常态。
+             早先这一态直接落下面的虚线空态——K 线取回来了却看不见，空态文案还指引
+             用户去点「本次推理排名」，而无模型市场根本没有排名榜。已取到的行情如实
+             上屏，并配一句「为什么没有预测」。 */
+          <div className="flex flex-col gap-3">
+            <div className="shrink-0 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-500">
+              {ip.models.length === 0
+                ? '当前市场无可用模型：下方为历史 K 线。训练并注册模型后，此处将产出预测与因子归因。'
+                : '该标的暂无模型推理结果：下方为历史 K 线。点「开始个股推理」可现场执行模型。'}
+            </div>
+            <div className="shrink-0" style={{ height: 'clamp(340px, 42vh, 520px)' }}>
+              <div className="h-full bg-white rounded-xl border border-slate-200 flex flex-col overflow-hidden">
+                <StockForecastChart
+                  currencySymbol={currencySymbol}
+                  kline={ip.kline}
+                  forecast={[]}
+                  symbol={ip.symbol}
+                  stockName=""
+                  currentPrice={ip.kline[ip.kline.length - 1]?.close ?? 0}
+                  asOfDate={ip.kline[ip.kline.length - 1]?.date}
+                />
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 bg-white rounded-xl border border-dashed border-slate-200 text-slate-500 min-h-[300px]">
             <Database size={26} className="opacity-30" />

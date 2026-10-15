@@ -2886,3 +2886,273 @@ CREATE TABLE IF NOT EXISTS qm_regime_daily (
     PRIMARY KEY (market, trade_date),
     CONSTRAINT ck_qm_regime_daily_state CHECK (state IN ('bull', 'neutral', 'bear'))
 );
+
+-- ── 通达信桥数据采集：tdx_* 表（批次 1，2026-10-15）──────────────────────
+-- 权威出处：backend/shared/tdx_ingest_contract.py 的 _CREATE_SQL（本段是逐字
+-- 镜像，由 backend/tests/test_tdx_ingest_contract.py 守着两份不漂移）。
+-- 老库自愈走 trade 启动期的 tdx_ingest_contract.ensure_tdx_ingest_tables_async()。
+-- 口径：stock_code=后缀式（桥原生）/ symbol=前缀式；trade_date 等业务日
+-- VARCHAR(8) YYYYMMDD；数值空→NULL（不填 0）；raw JSONB 留全量。
+-- 一次建全 20 张（数据 13 + 引用 5 + 运维 2）：批次 2 数据集（fn/kzz/ipo/
+-- trackzs/成分/个股信息）的表一并建好，避免两份 DDL 二次手抄。
+
+CREATE TABLE IF NOT EXISTS tdx_gpjy_long (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    field_code  VARCHAR(16) NOT NULL,
+    v1          DOUBLE PRECISION,
+    v2          DOUBLE PRECISION,
+    value_text  TEXT NOT NULL DEFAULT '',
+    units       VARCHAR(16) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date, field_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_gpjy_long_date ON tdx_gpjy_long (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tdx_gpjy_long_symbol ON tdx_gpjy_long (symbol, trade_date);
+CREATE TABLE IF NOT EXISTS tdx_bkjy_long (
+    bk_code     VARCHAR(16) NOT NULL,
+    bk_name     VARCHAR(64) NOT NULL DEFAULT '',
+    trade_date  VARCHAR(8)  NOT NULL,
+    field_code  VARCHAR(16) NOT NULL,
+    v1          DOUBLE PRECISION,
+    v2          DOUBLE PRECISION,
+    value_text  TEXT NOT NULL DEFAULT '',
+    units       VARCHAR(16) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (bk_code, trade_date, field_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_bkjy_long_date ON tdx_bkjy_long (trade_date);
+CREATE TABLE IF NOT EXISTS tdx_scjy_long (
+    trade_date  VARCHAR(8)  NOT NULL,
+    field_code  VARCHAR(16) NOT NULL,
+    v1          DOUBLE PRECISION,
+    v2          DOUBLE PRECISION,
+    value_text  TEXT NOT NULL DEFAULT '',
+    units       VARCHAR(16) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trade_date, field_code)
+);
+CREATE TABLE IF NOT EXISTS tdx_gp_one_data (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    field_code  VARCHAR(16) NOT NULL,
+    value_num   DOUBLE PRECISION,
+    value_text  TEXT NOT NULL DEFAULT '',
+    units       VARCHAR(16) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date, field_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_gp_one_data_date ON tdx_gp_one_data (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tdx_gp_one_data_symbol ON tdx_gp_one_data (symbol, trade_date);
+CREATE TABLE IF NOT EXISTS tdx_zdt_daily (
+    stock_code        VARCHAR(16) NOT NULL,
+    symbol            VARCHAR(16) NOT NULL,
+    trade_date        VARCHAR(8)  NOT NULL,
+    zdt_status_now    INTEGER,
+    zdt_status_ori    INTEGER,
+    first_time_zt     VARCHAR(16) NOT NULL DEFAULT '',
+    last_time_zt      VARCHAR(16) NOT NULL DEFAULT '',
+    last_open_time_zt VARCHAR(16) NOT NULL DEFAULT '',
+    first_time_dt     VARCHAR(16) NOT NULL DEFAULT '',
+    last_time_dt      VARCHAR(16) NOT NULL DEFAULT '',
+    last_open_time_dt VARCHAR(16) NOT NULL DEFAULT '',
+    open_times_zt     INTEGER,
+    open_times_dt     INTEGER,
+    fd_vol_max_zt     DOUBLE PRECISION,
+    fd_vol_max_dt     DOUBLE PRECISION,
+    vol_zt            DOUBLE PRECISION,
+    days_zt_series    INTEGER,
+    days_dt_series    INTEGER,
+    zt_status_days    TEXT NOT NULL DEFAULT '',
+    zt_recent_days    TEXT NOT NULL DEFAULT '',
+    raw               JSONB NOT NULL DEFAULT '{}',
+    fetched_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_zdt_daily_date ON tdx_zdt_daily (trade_date);
+CREATE TABLE IF NOT EXISTS tdx_more_info_daily (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    zaf         DOUBLE PRECISION,
+    f_hsl       DOUBLE PRECISION,
+    zjl         DOUBLE PRECISION,
+    zjl_hb      DOUBLE PRECISION,
+    ltsz        DOUBLE PRECISION,
+    zsz         DOUBLE PRECISION,
+    zt_price    DOUBLE PRECISION,
+    dt_price    DOUBLE PRECISION,
+    hq_date     VARCHAR(8) NOT NULL DEFAULT '',
+    raw         JSONB NOT NULL DEFAULT '{}',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_more_info_daily_date ON tdx_more_info_daily (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tdx_more_info_daily_symbol ON tdx_more_info_daily (symbol, trade_date);
+CREATE TABLE IF NOT EXISTS tdx_fin_report (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    report_date VARCHAR(8)  NOT NULL,
+    data        JSONB NOT NULL DEFAULT '{}',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, report_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_fin_report_date ON tdx_fin_report (report_date);
+CREATE TABLE IF NOT EXISTS tdx_gb_info (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    end_date    VARCHAR(8)  NOT NULL,
+    ltgb        DOUBLE PRECISION,
+    zgb         DOUBLE PRECISION,
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, end_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_gb_info_date ON tdx_gb_info (end_date);
+CREATE TABLE IF NOT EXISTS tdx_divid_factors (
+    stock_code   VARCHAR(16) NOT NULL,
+    symbol       VARCHAR(16) NOT NULL,
+    ex_date      VARCHAR(8)  NOT NULL,
+    div_type     VARCHAR(8)  NOT NULL DEFAULT '',
+    bonus        DOUBLE PRECISION,
+    allo_price   DOUBLE PRECISION,
+    share_bonus  DOUBLE PRECISION,
+    allotment    DOUBLE PRECISION,
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, ex_date, div_type)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_divid_factors_date ON tdx_divid_factors (ex_date);
+CREATE TABLE IF NOT EXISTS tdx_kzz_daily (
+    kzz_code      VARCHAR(16) NOT NULL,
+    symbol        VARCHAR(16) NOT NULL,
+    trade_date    VARCHAR(8)  NOT NULL,
+    name          VARCHAR(64) NOT NULL DEFAULT '',
+    hs_code       VARCHAR(16) NOT NULL DEFAULT '',
+    hs_name       VARCHAR(64) NOT NULL DEFAULT '',
+    kzz_now       DOUBLE PRECISION,
+    ag_now        DOUBLE PRECISION,
+    cur_rate      DOUBLE PRECISION,
+    expire_yield  DOUBLE PRECISION,
+    force_redeem  DOUBLE PRECISION,
+    put_back      DOUBLE PRECISION,
+    put_date      VARCHAR(8) NOT NULL DEFAULT '',
+    end_date      VARCHAR(8) NOT NULL DEFAULT '',
+    raw           JSONB NOT NULL DEFAULT '{}',
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (kzz_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_kzz_daily_date ON tdx_kzz_daily (trade_date);
+CREATE TABLE IF NOT EXISTS tdx_ipo_info (
+    ipo_code    VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    name        VARCHAR(64) NOT NULL DEFAULT '',
+    sg_code     VARCHAR(16) NOT NULL DEFAULT '',
+    sg_date     VARCHAR(8)  NOT NULL DEFAULT '',
+    max_sg      DOUBLE PRECISION,
+    pe_issue    DOUBLE PRECISION,
+    sg_price    DOUBLE PRECISION,
+    ipo_type    INTEGER,
+    raw         JSONB NOT NULL DEFAULT '{}',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (ipo_code, sg_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_ipo_info_sg_date ON tdx_ipo_info (sg_date);
+CREATE TABLE IF NOT EXISTS tdx_trackzs_daily (
+    zs_code     VARCHAR(16) NOT NULL,
+    zs_name     VARCHAR(64) NOT NULL DEFAULT '',
+    etf_code    VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    etf_name    VARCHAR(64) NOT NULL DEFAULT '',
+    iopv        DOUBLE PRECISION,
+    now_price   DOUBLE PRECISION,
+    pre_close   DOUBLE PRECISION,
+    sz          DOUBLE PRECISION,
+    zgb         DOUBLE PRECISION,
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (zs_code, etf_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_trackzs_daily_date ON tdx_trackzs_daily (trade_date);
+CREATE TABLE IF NOT EXISTS tdx_pricevol_daily (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    last_close  DOUBLE PRECISION,
+    now_price   DOUBLE PRECISION,
+    zaf         DOUBLE PRECISION,
+    volume_hand DOUBLE PRECISION,
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_pricevol_daily_date ON tdx_pricevol_daily (trade_date);
+CREATE TABLE IF NOT EXISTS tdx_stock_list_snapshot (
+    trade_date  VARCHAR(8)  NOT NULL,
+    market_key  VARCHAR(16) NOT NULL,
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    name        VARCHAR(64) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trade_date, market_key, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_stock_list_snapshot_stock ON tdx_stock_list_snapshot (stock_code, trade_date);
+CREATE TABLE IF NOT EXISTS tdx_sector_list (
+    trade_date   VARCHAR(8)  NOT NULL,
+    sector_code  VARCHAR(16) NOT NULL,
+    symbol       VARCHAR(16) NOT NULL,
+    name         VARCHAR(64) NOT NULL DEFAULT '',
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trade_date, sector_code)
+);
+CREATE TABLE IF NOT EXISTS tdx_sector_members (
+    trade_date   VARCHAR(8)  NOT NULL,
+    sector_code  VARCHAR(16) NOT NULL,
+    stock_code   VARCHAR(16) NOT NULL,
+    symbol       VARCHAR(16) NOT NULL,
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trade_date, sector_code, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_sector_members_stock ON tdx_sector_members (stock_code, trade_date);
+CREATE TABLE IF NOT EXISTS tdx_stock_info_snapshot (
+    stock_code  VARCHAR(16) NOT NULL,
+    symbol      VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    name        VARCHAR(64) NOT NULL DEFAULT '',
+    industry    VARCHAR(64) NOT NULL DEFAULT '',
+    raw         JSONB NOT NULL DEFAULT '{}',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+CREATE TABLE IF NOT EXISTS tdx_trading_dates (
+    market_key  VARCHAR(16) NOT NULL,
+    trade_date  VARCHAR(8)  NOT NULL,
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (market_key, trade_date)
+);
+CREATE TABLE IF NOT EXISTS tdx_ingest_cursor (
+    dataset          VARCHAR(32) NOT NULL,
+    window_key       VARCHAR(32) NOT NULL,
+    cursor           JSONB NOT NULL DEFAULT '{}',
+    status           VARCHAR(16) NOT NULL DEFAULT '',
+    last_error       TEXT NOT NULL DEFAULT '',
+    last_target_date VARCHAR(8) NOT NULL DEFAULT '',
+    rows_total       BIGINT NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (dataset, window_key)
+);
+CREATE TABLE IF NOT EXISTS tdx_ingest_runs (
+    id            BIGSERIAL PRIMARY KEY,
+    dataset       VARCHAR(32) NOT NULL,
+    slot          VARCHAR(8)  NOT NULL,
+    target_date   VARCHAR(8)  NOT NULL,
+    status        VARCHAR(16) NOT NULL,
+    rows_written  BIGINT NOT NULL DEFAULT 0,
+    rows_archived BIGINT NOT NULL DEFAULT 0,
+    calls         INTEGER NOT NULL DEFAULT 0,
+    duration_ms   BIGINT NOT NULL DEFAULT 0,
+    error         TEXT NOT NULL DEFAULT '',
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_tdx_ingest_runs_dataset ON tdx_ingest_runs (dataset, target_date DESC);
+CREATE INDEX IF NOT EXISTS idx_tdx_ingest_runs_day ON tdx_ingest_runs (target_date, started_at DESC);

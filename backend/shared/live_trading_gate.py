@@ -85,6 +85,9 @@ _MARKET_DATA_PREFIXES: tuple[str, ...] = (
     f"{_API}/tdx/quote-ticks",
     f"{_API}/tdx/l2",
     f"{_API}/tdx/l2-config",
+    # `/tdx/ingest/*`：通达信桥采集状态/数据集清单（2026-10-15 批次 1）。
+    # 纯读面（状态与 PG 统计），实盘关也应可见；手动触发不在此面（admin 鉴权）。
+    f"{_API}/tdx/ingest",
     f"{_API}/market",
     f"{_API}/ws",
 )

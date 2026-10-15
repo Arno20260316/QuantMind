@@ -78,6 +78,9 @@ MARKET_DATA_CASES: tuple[str, ...] = (
     f"{API}/tdx/l2/realtime",
     f"{API}/tdx/l2/status",
     f"{API}/tdx/l2-config",
+    # 通达信桥采集状态/清单（批次 1，2026-10-15）：纯读面，实盘关也应可见
+    f"{API}/tdx/ingest/status",
+    f"{API}/tdx/ingest/datasets",
     f"{API}/market/snapshot",
     f"{API}/market/kline",
     f"{API}/ws/market",

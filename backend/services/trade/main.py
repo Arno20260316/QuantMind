@@ -90,6 +90,7 @@ async def lifespan(app: FastAPI):
     decision_round_task = None
     leverage_trim_task = None
     call_auction_watch_task = None
+    tdx_ingest_task = None
 
     try:
         await init_unified_config(service_name="quantmind-trade")
@@ -148,6 +149,9 @@ async def lifespan(app: FastAPI):
         from backend.shared.signal_contract import (
             ensure_signal_contract_columns_async,
         )
+        from backend.shared.tdx_ingest_contract import (
+            ensure_tdx_ingest_tables_async,
+        )
         from backend.shared.trade_contract import ensure_trade_unique_index_async
 
         for _ensure in (
@@ -163,6 +167,7 @@ async def lifespan(app: FastAPI):
             ensure_decision_ledger_table_async,
             ensure_agent_ledger_tables_async,
             ensure_trade_unique_index_async,
+            ensure_tdx_ingest_tables_async,
         ):
             try:
                 await _ensure()
@@ -586,6 +591,16 @@ async def lifespan(app: FastAPI):
             run_call_auction_watch_task(),
             name="call-auction-watch",
         )
+        # 通达信桥数据面采集（2026-10-15 批次 1）：盘后档位制
+        # （15:31/15:45/16:45/17:20/17:30/23:50/06:30），落 PG + parquet 归档。
+        from backend.services.live_trading.services.tdx_ingest.task import (
+            run_tdx_ingest_task,
+        )
+
+        tdx_ingest_task = asyncio.create_task(
+            run_tdx_ingest_task(),
+            name="tdx-ingest",
+        )
         from backend.services.simulation.services.simulation_t1_unlock_task import (
             run_simulation_t1_unlock_task,
         )
@@ -937,6 +952,7 @@ async def lifespan(app: FastAPI):
         intel_briefing_task,
         tdx_quote_feed_task,
         call_auction_watch_task,
+        tdx_ingest_task,
         tdx_l2_capture_task,
         tdx_l2_realtime_task,
         t1_unlock_task,
@@ -1097,6 +1113,7 @@ from backend.services.trade.routers.decision_roster import (
 from backend.services.trade.routers.call_auction import (
     router as call_auction_router,
 )
+from backend.services.trade.routers.tdx_ingest import router as tdx_ingest_router
 
 app.include_router(tdx_config_router, prefix="/api/v1", tags=["TDX-Bridge"])
 app.include_router(tdx_quote_feed_router, prefix="/api/v1", tags=["TDX-Bridge"])
@@ -1107,6 +1124,7 @@ app.include_router(qmt_sltp_router, prefix="/api/v1", tags=["QMT-SLTP"])
 app.include_router(risk_ctl_router, prefix="/api/v1", tags=["Risk-Control"])
 app.include_router(decision_roster_router, prefix="/api/v1", tags=["Decision-Round"])
 app.include_router(call_auction_router, prefix="/api/v1", tags=["Call-Auction"])
+app.include_router(tdx_ingest_router, prefix="/api/v1", tags=["TDX-Bridge"])
 
 app.add_middleware(
     CORSMiddleware,

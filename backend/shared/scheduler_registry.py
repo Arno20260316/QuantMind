@@ -371,6 +371,22 @@ JOBS: tuple[JobSpec, ...] = (
         "非持仓情报 Redis 缓冲 → 卡片式速览合集（利空/风险优先，15 行折叠）；"
         "只认最近一档（错过的档不补发），读失败不落 done 键下周期重试",
     ),
+    # 通达信桥数据面采集（2026-10-15 批次 1）：盘后档位制全量采集
+    # （pricevol/universe/more_info/go/gp/sc/bk；zdt 挂起），心跳写在常驻循环里。
+    JobSpec(
+        "tdx_ingest",
+        "通达信桥数据采集",
+        "worker",
+        "trade",
+        "每交易日 7 档（15:31/15:45/16:45/17:20/17:30/23:50/次日 06:30；60s 轮询）",
+        "TDX_INGEST_ENABLED",
+        True,
+        3600,
+        "python backend/scripts/schedule_ctl.py run tdx_ingest",
+        "桥数据面全量落 PG + parquet 归档（_nc 绕缓存、令牌桶 180/min）；GP/BK/SC/GO "
+        "家族待 Windows 数据包（blocked 不重试不告警），zdt 挂起；心跳 TTL 1h——"
+        "防大档位（more_info 全 A ≈31min）被体检误判 stale",
+    ),
     # P2-5 值班死手检查：**住 celery（跨进程树）**——trade 整体死亡时它还得能响。
     # 核对当日四类回执（报表/摘要/停滞检查/实时信号），缺失集收缩语义告警。
     JobSpec(

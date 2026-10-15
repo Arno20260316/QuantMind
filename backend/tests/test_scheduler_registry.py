@@ -74,6 +74,9 @@ _HEARTBEAT_WIRED = {
     # 2026-10-12 QQ 情报速览（trade 常驻，08:35/11:35/15:15 三档）：心跳写在
     # 常驻循环里——「速览到底有没有人在冲刷」的唯一观测面。
     "intel_briefing": "services/trade/services/intel_briefing_task.py",
+    # 2026-10-15 通达信桥数据采集（trade 常驻，盘后 7 档）：心跳写在常驻循环里
+    # ——「桥数据面到底有没有人在采」的唯一观测面（采集静默停摆无下游可发现）。
+    "tdx_ingest": "services/live_trading/services/tdx_ingest/task.py",
     # P2-5 值班死手（celery beat，16:00~23:30）：心跳写在核对函数里——它是
     # 「该响没响」的裁判位，自身停摆没有任何下游能发现，心跳是唯一观测面。
     "duty_deadman": "services/engine/tasks/duty_deadman.py",
@@ -291,6 +294,8 @@ def test_schedule_ctl_dispatch_covers_rerun_declared_jobs():
         "intel_briefing",
         # 2026-10-14 TdxAiData 订阅集群守护（重跑 = 体检 + 缺片真拉起 worker 进程）
         "tdx_cluster_watch",
+        # 2026-10-15 通达信桥采集（重跑 = 目标日全数据集各跑一轮；非交易日拒绝）
+        "tdx_ingest",
     }
 
     # 未知任务 → 退出码 2（纯函数路径，不触发真实执行）

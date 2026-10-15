@@ -1,0 +1,53 @@
+{
+  "000001.SZ": {
+    "Code": ".SZ",
+    "FDVolMaxDT": "0.00",
+    "FDVolMaxZT": "0.00",
+    "FirstTimeDT": "0",
+    "FirstTimeZT": "0",
+    "LastOpenTimeDT": "0",
+    "LastOpenTimeZT": "0",
+    "LastTimeDT": "0",
+    "LastTimeZT": "0",
+    "OpenTimesDT": "0",
+    "OpenTimesZT": "0",
+    "TimeNow": "0",
+    "VolZT": "0.00",
+    "ZDTStatusNow": "0",
+    "ZDTStatusOri": "0"
+  },
+  "300750.SZ": {
+    "Code": ".SZ",
+    "FDVolMaxDT": "0.00",
+    "FDVolMaxZT": "0.00",
+    "FirstTimeDT": "0",
+    "FirstTimeZT": "0",
+    "LastOpenTimeDT": "0",
+    "LastOpenTimeZT": "0",
+    "LastTimeDT": "0",
+    "LastTimeZT": "0",
+    "OpenTimesDT": "0",
+    "OpenTimesZT": "0",
+    "TimeNow": "0",
+    "VolZT": "0.00",
+    "ZDTStatusNow": "0",
+    "ZDTStatusOri": "0"
+  },
+  "600036.SH": {
+    "Code": ".SZ",
+    "FDVolMaxDT": "0.00",
+    "FDVolMaxZT": "0.00",
+    "FirstTimeDT": "0",
+    "FirstTimeZT": "0",
+    "LastOpenTimeDT": "0",
+    "LastOpenTimeZT": "0",
+    "LastTimeDT": "0",
+    "LastTimeZT": "0",
+    "OpenTimesDT": "0",
+    "OpenTimesZT": "0",
+    "TimeNow": "0",
+    "VolZT": "0.00",
+    "ZDTStatusNow": "0",
+    "ZDTStatusOri": "0"
+  }
+}

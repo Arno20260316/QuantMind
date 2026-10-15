@@ -649,6 +649,53 @@ def _run_tdx_cluster_watch(date_str: str | None, force: bool) -> int:
     return 0 if started and up == len(started) else 1
 
 
+def _run_tdx_ingest(date_str: str | None, force: bool) -> int:
+    """通达信桥采集「重跑」= 立刻对目标日全数据集各跑一轮（顺序、令牌桶照常）。
+
+    默认目标日 = 今日；非交易日**拒绝**（rc 2）——补历史走
+    ``backend/scripts/tdx_ingest_backfill.py``，硬跑加 ``--force``（含挂起的
+    zdt 单跑）。``--date`` 支持 YYYYMMDD / YYYY-MM-DD。时长久：more_info 全 A
+    扫描 ≈ 半小时。退出码 1 = 有数据集 error（blocked/suspended 不算失败）。
+    """
+    import asyncio
+    from datetime import date as _date
+    from datetime import datetime
+
+    from backend.services.live_trading.services.tdx_ingest import task as ingest_task
+    from backend.services.live_trading.services.trading_session import TZ
+
+    target = (date_str or "").replace("-", "").strip()
+    if not target:
+        target = datetime.now(TZ).strftime("%Y%m%d")
+    if not (len(target) == 8 and target.isdigit()):
+        print(
+            f"tdx_ingest: 目标日非法 {date_str!r}（YYYYMMDD / YYYY-MM-DD）",
+            file=sys.stderr,
+        )
+        return 2
+
+    day = _date(int(target[:4]), int(target[4:6]), int(target[6:8]))
+    if not force:
+        from backend.services.trade.services.daily_pnl_report_task import (
+            _is_trading_day,
+        )
+
+        if not asyncio.run(_is_trading_day(day)):
+            print(
+                f"tdx_ingest: {target} 非交易日（--force 硬跑；补历史用 "
+                "tdx_ingest_backfill.py）",
+                file=sys.stderr,
+            )
+            return 2
+
+    results = asyncio.run(ingest_task.run_rerun_cycle(target, force=force))
+    summary = ", ".join(
+        f"{k}={v['status']}({v['rows_written']})" for k, v in results.items()
+    )
+    print(f"tdx_ingest {target}: {summary}")
+    return 1 if any(v["status"] == "error" for v in results.values()) else 0
+
+
 def _run_duty_deadman(date_str: str | None, force: bool) -> int:
     """值班死手「重跑」= 核对一遍；``--force`` 跳过非交易日闸门与当日封账键。
 
@@ -746,6 +793,9 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # 2026-10-14 TdxAiData 订阅集群守护：重跑 = 立刻体检 + 缺片真拉起 worker 进程
     # （订阅关时只体检不拉起，与常驻循环同判据）。
     "tdx_cluster_watch": _run_tdx_cluster_watch,
+    # 2026-10-15 通达信桥采集：重跑 = 目标日全数据集各跑一轮（非交易日拒绝，
+    # --date 补指定日；重跑幂等——upsert 非空覆盖 + 同 run 归档覆盖）。
+    "tdx_ingest": _run_tdx_ingest,
 }
 
 

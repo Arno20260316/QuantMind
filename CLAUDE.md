@@ -191,4 +191,5 @@ Electron 前端在本地开发时使用 Vite HMR；修改 `electron/src` 后运�
 - `backend/scripts/l05_maintenance.py` - L0.5 留存运维（质检报告 `report` / 容量 `capacity` / 降冷 `prune` 默认 dry-run）
 - `backend/services/live_trading/services/qmt_quote_backup.py` - 大 QMT 备源行情席（全推订阅 → 主源陈旧超 30s 时旁路写 `market:snapshot/series`，source=qmt_big；状态 `qm:qmt:quote:backup:status`）
 - `backend/services/live_trading/services/tdx_hot_set_feed.py` - TDX 桥热集行情轮询（trade 任务，env `TDX_HOTSET_FEED_ENABLED` 默认开）：热集 529 只含指数按 ~0.18s/只（桥限流 600/min 内）轮转取 `get_market_snapshot`（五档 Buyp/Buyv/Sellp/Sellv→bid1-5/ask1-5）→ 标准键 `market:snapshot/series`（source=tdx_bridge）；状态 `GET /tdx/quote-feed/status` → `hot_set` 段；节拍 `TDX_HOTSET_PACING_S` 可调
+- `backend/services/live_trading/services/tdx_ingest/` - 通达信桥数据面采集（trade 任务，批次 1 已交付）：盘后档位 15:31 pricevol / 15:45 universe / 16:45 more_info 全A扫描 / 17:20 go / 17:30 gp / 23:50+06:30 补采（预算是桥侧 600/min 共享中的 180/min 令牌桶，Redis db2）；PG+parquet 双写（`data/tdx_bridge/`）；GP/BK/SC/GO 家族缺客户端数据包时状态置 blocked 零重试，数据包就位自动转正；历史回填 `backend/scripts/tdx_ingest_backfill.py`（水位断点续跑）；状态面 `GET /api/v1/tdx/ingest/status`；设计全文 `docs/通达信桥数据面全量接入_实施细案_20261015.md`
 - `docker-compose.yml` - 本地部署配置

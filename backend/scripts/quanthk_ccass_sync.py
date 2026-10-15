@@ -234,9 +234,18 @@ async def sync_partition(
 
     # 残缺分区检测：分区存在但股票数远少于全市场（如中断后只剩 1 只），
     # 视为残缺需补抓，否则增量逻辑会永远跳过残缺分区。
-    incomplete = len(existing_stocks) < max(50, int(len(stock_df) * 0.5))
+    # 阈值 90%（2026-10-15 由 50% 上调）：50% 时 51%~99% 覆盖率的中断分区
+    # 会被永久判"完整"（如 1985/2780≈71% 卡了两天），低于 90% 即视为残缺补抓。
+    incomplete = len(existing_stocks) < max(50, int(len(stock_df) * 0.9))
     if date_str in existing and skip_existing_stocks and not incomplete and not symbol:
         return {"date": date_str, "status": "exists", "stocks": len(existing_stocks)}
+    if incomplete and date_str in existing:
+        log.warning(
+            "[%s] 分区残缺：已有 %d 只 / 全市场约 %d 只，将补抓缺失标的",
+            date_str,
+            len(existing_stocks),
+            len(stock_df),
+        )
 
     todo = [r for r in stock_df.to_dict("records") if r["id"] not in existing_stocks]
     if symbol:

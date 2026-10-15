@@ -36,6 +36,9 @@ vi.mock('../../services/factorResearchService', async () => {
 vi.mock('../../../../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) =>
     sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: false } } }),
+  // 页面头部挂了真 MarketSelector（页内市场切换入口）：它要 useAppDispatch。
+  // 本文件不测切市场，给 no-op（点击→dispatch 的接线由 markets 用例守）。
+  useAppDispatch: () => vi.fn(),
 }));
 
 // 目录桩：回显页面传下来的 loading 与 categoryFilter，并提供两个触发按钮

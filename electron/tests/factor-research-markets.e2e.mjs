@@ -14,9 +14,10 @@
  *    非 CN 面渲染了它，点进去得到的是一块永远空的榜；
  * 3. 基准口径按市场：港股页面出现「沪深300」= 拿 A 股指数算港股超额（数据污染）；
  *    期货无指数基准 → 诚实降级成「超额 vs 基准」（列全「—」），不拿 A 股充数；
- * 4. 应用内换市场清旧：研究页自身没有切换器（顶栏 MarketSelector 只在 ModuleGrid/
- *    回测中心等切面页挂载，研究页 button[role=radio] 实测=0）；真实路径=离开研究页
- *    → 到有切换器的页切市场 → SPA 导航回来。末段专抓「只有整页刷新才对」的假绿。
+ * 4. 页内换市场清旧：研究页头部左侧挂有本页自己的 MarketSelector（页内直切入口，
+ *    2026-10-16 接入；旧版研究页 button[role=radio] 实测=0，探针曾绕「回测中心切
+ *    → SPA 导航回来」）。末段在不离开页面的路径上直切 CN→HK→US，专抓「换了但不
+ *    清旧/不重取/基准列串市场」的假绿。
  */
 import { chromium } from 'playwright';
 
@@ -89,13 +90,13 @@ async function switchMarket(page, radioLabel, wantKey) {
   return false;
 }
 
-/** 进「因子研究」页（点侧栏导航，真实用户路径） */
+/** 进「因子研究」页（点侧栏导航，真实用户路径）。挂载锚 = 页内市场切换器 */
 async function openResearch(page) {
   const nav = page.locator('a,button', { hasText: '因子研究' }).first();
   await nav.waitFor({ state: 'visible', timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(800);
   await nav.click({ timeout: 8000 }).catch(() => {});
-  return page.locator('[data-testid=research-market-tag]').first()
+  return page.locator('[data-testid=research-market-switcher]').first()
     .waitFor({ state: 'visible', timeout: 30000 }).then(() => true).catch(() => false);
 }
 
@@ -118,11 +119,12 @@ for (const mk of TO_RUN) {
 
   const since = apiCalls.length;
   const opened = await openResearch(p);
-  check(opened, '「因子研究」页面已挂载（市场标签可见）');
+  check(opened, '「因子研究」页面已挂载（页内市场切换器可见）');
   if (!opened) continue;
 
-  const tag = (await p.locator('[data-testid=research-market-tag]').first().innerText().catch(() => '')).trim();
-  check(tag === mk.tag, `市场标签「${mk.tag}」（实测「${tag}」）`);
+  // 当前市场指示 = 页内切换器里 aria-checked 的那枚 radio（旧版是静态标签，已由它取代）
+  const tag = (await p.locator('[data-testid=research-market-switcher] button[aria-checked="true"]').first().innerText().catch(() => '')).trim();
+  check(tag === mk.tag, `页内切换器高亮「${mk.tag}」（实测「${tag}」）`);
 
   const rows = await waitRows(p);
   check(rows, '排行榜已出数（行数 > 0，本市场快照真实出数）');
@@ -160,55 +162,70 @@ for (const mk of TO_RUN) {
   }
 }
 
-// ---- 应用内换市场（不整页刷新）：研究页 → 回测中心切港股 → 回研究页 ----
-// ⚠️ 因子研究页**自身没有市场切换器**（顶栏 MarketSelector 只在 ModuleGrid/回测中心等
-// 切面页挂载，实测研究页 button[role=radio] 数=0）。真实用户的换市场路径=离开页面→
-// 在有切换器的地方切→再回来。本段走这条路径（SPA 内导航、不 reload），专门抓
-// 「整页刷新才能对」的假绿：redux 市场变了但重挂载后仍读旧市场的串市场残留。
-console.log('\n========== 应用内换市场（CN → HK，无整页刷新） ==========');
+// ---- 页内直切换市场（同一挂载实例，无导航无刷新）：CN → HK → US ----
+// 研究页头部左侧自带市场切换器（2026-10-16 接入，与顶栏共用 MarketSelector）。
+// 本段**不离开页面**直切市场：专抓「只有重挂载/整页刷新才对」的假绿——redux 市场
+// 变了但页面不清旧榜、不按新市场重取、基准列串市场，这几种坏了界面都看着正常。
+console.log('\n========== 页内直切换市场（CN → HK → US，无刷新无导航） ==========');
 await p.goto(`${BASE}/`, { waitUntil: 'domcontentloaded' });
 await dismissRiskModal(p);
 await switchMarket(p, 'A股', 'CN');
-let inAppSince = apiCalls.length;
 if (await openResearch(p) && await waitRows(p)) {
   let f = flat(await p.locator('body').innerText().catch(() => ''));
   check(f.includes('超额300'), 'CN：榜单出现存量超额列「超额300」');
 
-  inAppSince = apiCalls.length;
-  // 换市场必须去有切换器的切面页：回测中心顶栏自带 MarketSelector（App.tsx 路由实测）
-  await p.locator('a,button', { hasText: '回测中心' }).first().click({ timeout: 8000 }).catch(() => {});
-  await p.waitForTimeout(2500);
-  const sw = await switchMarket(p, '港股', 'HK');
-  check(sw, '回测中心内切换市场生效（顶栏 radio → qm:current_market=HK）');
-  const back = await openResearch(p);
-  check(back, 'SPA 导航回「因子研究」页（未整页刷新）');
-  const tagOk = await p.waitForFunction(
-    () => document.querySelector('[data-testid=research-market-tag]')?.textContent?.trim() === '港股',
-    null, { timeout: 15000 },
-  ).then(() => true).catch(() => false);
-  check(tagOk, '返回后市场标签即为「港股」');
-  check(await waitRows(p), '港股榜单重新出数');
-  check(requestsWith(/\/factor-research\/(leaderboard|catalog)/, inAppSince).some((c) => /[?&]market=HK(&|$)/.test(c)),
-    '重进出数的请求带 market=HK');
+  const pageRadio = (label) =>
+    p.locator('[data-testid=research-market-switcher] button[role=radio]', { hasText: label }).first();
+  const waitMarket = async (want) => {
+    for (let i = 0; i < 10; i++) {
+      await p.waitForTimeout(500);
+      if ((await p.evaluate(() => localStorage.getItem('qm:current_market'))) === want) return true;
+    }
+    return false;
+  };
+  const waitText = (s, timeout = 120000) =>
+    p.waitForFunction((t) => document.body.innerText.includes(t), s, { timeout })
+      .then(() => true).catch(() => false);
+  const activeLabel = async () =>
+    (await p.locator('[data-testid=research-market-switcher] button[aria-checked="true"]').first().innerText().catch(() => '')).trim();
+
+  // ① 页内直切港股
+  let since = apiCalls.length;
+  await pageRadio('港股').click({ timeout: 8000 }).catch(() => {});
+  check(await waitMarket('HK'), '页内点「港股」即生效（qm:current_market=HK，未离开页面）');
+  check((await activeLabel()) === '港股', '切换器高亮跟随（页内直切）');
+  check(await waitText('超额恒生指数'), '港股榜单在页内重新出数（超额列已是「超额恒生指数」）');
+  check(requestsWith(/\/factor-research\/(leaderboard|catalog)/, since).some((c) => /[?&]market=HK(&|$)/.test(c)),
+    '重取请求带 market=HK');
   f = flat(await p.locator('body').innerText().catch(() => ''));
-  check(f.includes('超额恒生指数'), '榜单超额列已是「超额恒生指数」（本市场基准）');
   check(!f.includes('超额300'), '旧市场列「超额300」已清（无 A 股口径残留）');
+
+  // ② 页内直切美股 —— 用户报障场景原文：「我切换美股，因子研究应该切换美股的啊」
+  since = apiCalls.length;
+  await pageRadio('美股').click({ timeout: 8000 }).catch(() => {});
+  check(await waitMarket('US'), '页内点「美股」即生效（qm:current_market=US）');
+  check((await activeLabel()) === '美股', '切换器高亮跟随（美股）');
+  check(await waitText('超额标普500'), '美股榜单在页内重新出数（超额列已是「超额标普500」）');
+  check(requestsWith(/\/factor-research\/(leaderboard|catalog)/, since).some((c) => /[?&]market=US(&|$)/.test(c)),
+    '重取请求带 market=US');
+  f = flat(await p.locator('body').innerText().catch(() => ''));
+  check(!f.includes('超额恒生指数') && !f.includes('超额300'), '旧市场超额列无残留（恒生/沪深300 都清）');
 }
 
 // ---- CRYPTO（若启用）：诚实阻断面，一个请求都不发 ----
-// 同样先回到有切换器的切面页再判断区块链 radio 是否启用（研究页上它恒为 0 → 会永远假跳过）
+// 研究页自带切换器后，区块链 radio 直接在本页可见（旧版须绕回测中心才看得到）。
+// 仍在研究页上点击：断言「切到未接入市场 → 阻断面且零请求」，页面不迁移不刷新。
 console.log('\n========== CRYPTO（若启用） ==========');
-await p.locator('a,button', { hasText: '回测中心' }).first().click({ timeout: 8000 }).catch(() => {});
-await p.waitForTimeout(2500);
-const cryptoRadio = p.locator('button[role=radio]', { hasText: '区块链' }).first();
+if (!(await p.locator('[data-testid=research-market-switcher]').count())) {
+  await openResearch(p);
+}
+const cryptoRadio = p.locator('[data-testid=research-market-switcher] button[role=radio]', { hasText: '区块链' }).first();
 if ((await cryptoRadio.count()) > 0) {
-  await switchMarket(p, '区块链', 'CRYPTO');
   const before = apiCalls.length;
-  const nav = p.locator('a,button', { hasText: '因子研究' }).first();
-  await nav.click({ timeout: 8000 }).catch(() => {});
+  await cryptoRadio.click({ timeout: 8000 }).catch(() => {});
   const blocked = await p.locator('[data-testid=research-market-blocked]').first()
     .waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false);
-  check(blocked, 'CRYPTO 未接入：渲染诚实阻断面');
+  check(blocked, 'CRYPTO 未接入：页内切换即渲染诚实阻断面');
   await p.waitForTimeout(3000);
   check(apiCalls.length === before, 'CRYPTO 阻断面：一个 factor-research 请求都不发（不拿别市场充数）');
 } else {

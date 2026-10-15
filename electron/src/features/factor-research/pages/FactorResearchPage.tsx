@@ -32,6 +32,7 @@ import { SnapshotPanel } from '../components/SnapshotPanel';
 import { ScanPanel } from '../components/ScanPanel';
 import { RegisterToTrainingModal } from '../components/RegisterToTrainingModal';
 import { FactorReportPanel } from '../components/factor-report/FactorReportPanel';
+import { MarketSelector } from '../../../components/layout/MarketSelector';
 
 /** 排行榜去重阈值（与筛选页默认 |ρ| ≥ 0.9 同口径；改这里须同步筛选页语义） */
 const LEADERBOARD_DEDUP_RHO = 0.9;
@@ -87,8 +88,10 @@ const FactorResearchPage: React.FC = () => {
   );
   const isTool = isToolTab(tab);
 
-  // 全局市场选择器（顶栏切换）。`researchMarket` 为 null = 该市场未接入 →
-  // 渲染诚实阻断面，一切取数 effect 直接短路（CRYPTO 下一个请求都不发）。
+  // 全局市场（顶栏及各切面页头部共用 uiSlice.currentMarket；**本页头部左侧也挂了
+  // 一枚** MarketSelector，页内直切即生效——换市场由 marketResetRef effect 清旧重取）。
+  // `researchMarket` 为 null = 该市场未接入 → 渲染诚实阻断面，一切取数 effect
+  // 直接短路（CRYPTO 下一个请求都不发）。
   const currentMarket = useAppSelector(selectCurrentMarket);
   const researchMarket: ResearchMarket | null = isResearchMarket(currentMarket) ? currentMarket : null;
   const marketLabel = getMarketConfig(currentMarket).label;
@@ -479,13 +482,15 @@ const FactorResearchPage: React.FC = () => {
               <Sigma className="w-5 h-5 text-white" />
             </div>
             <div className="flex items-center gap-2.5 ml-1 min-w-0">
-              <h1 className="text-xl font-bold text-slate-800 tracking-tight">因子研究</h1>
-              <span
-                data-testid="research-market-tag"
-                className="rounded-md bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 text-[11px] font-bold text-indigo-600 shrink-0"
-              >
-                {marketLabel}
-              </span>
+              {/* h1 不许被压缩换行：切换器撑宽后（1280 宽实测）标题会被挤成两行顶破头部 */}
+              <h1 className="text-xl font-bold text-slate-800 tracking-tight whitespace-nowrap shrink-0">因子研究</h1>
+              {/* 市场切换器：就地复挂全局 MarketSelector（与顶栏/回测中心同一实现，
+                  不另造第三份市场 UI）。点即 dispatch(setMarket) → 页面 marketResetRef
+                  effect 清旧市场缓存并带新市场重取。包 testid：探针要能确定性地锁定
+                  **本页这枚**，而不是拿全页 role 计数去猜（旧版静态标签已由它取代）。 */}
+              <div data-testid="research-market-switcher" className="shrink-0">
+                <MarketSelector />
+              </div>
               <div className="h-4 w-[1px] bg-slate-200 self-center shrink-0" />
               <span className="text-sm font-medium text-slate-500 truncate">因子排行榜 · 单因子体检 · 对比 · 合成 · 因子报告</span>
             </div>
@@ -520,8 +525,11 @@ const FactorResearchPage: React.FC = () => {
                   {/* 目录未到时不写死数字：82 是经典库的口径，非 CN 没有经典库 */}
                   {factors.length ? `${available}/${factors.length} 因子可用` : '因子目录加载中'}
                 </span>
+                {/* 大屏专属：头部左簇加了市场切换器（~240px）后，1280 宽下与页签组
+                    相挤（左簇压到 min-content 之下会溢出叠页签）。样本窗字样升到 2xl
+                    再显示，与「因子可用」chip 的 lg 档形成两段渐进披露。 */}
                 {window_ && (
-                  <span className="hidden xl:inline-flex items-center rounded-full bg-indigo-50 border border-indigo-100 px-2.5 py-1 text-[11px] font-bold text-indigo-600">
+                  <span className="hidden 2xl:inline-flex items-center rounded-full bg-indigo-50 border border-indigo-100 px-2.5 py-1 text-[11px] font-bold text-indigo-600">
                     样本 {window_[0]} ~ {window_[1]}
                   </span>
                 )}
@@ -549,7 +557,7 @@ const FactorResearchPage: React.FC = () => {
                 该市场尚未接入基准与因子快照，这里不会展示任何数据，也不会用其它市场的数据代填。
               </p>
               <p className="mt-3 text-[11px] text-slate-400">
-                请在顶部市场选择器切换到已接入的市场后再使用本页。
+                请用本页标题旁的市场切换器切到已接入的市场（A股 / 港股 / 美股 / 期货）后再使用本页。
               </p>
             </div>
           </div>

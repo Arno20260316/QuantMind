@@ -1,8 +1,9 @@
 /**
  * 因子研究页 —— 市场分层的接线契约（2026-10-16）。
  *
- * 页面跟随全局市场选择器（uiSlice.currentMarket）：CN/HK/US/FUTURES 各一份快照集
- * 与目录；CRYPTO 未接入 → 诚实阻断面（不发请求，也不假装有数据）。
+ * 页面跟随全局市场（uiSlice.currentMarket），且头部左侧挂有本页自己的
+ * MarketSelector（页内直切入口）：CN/HK/US/FUTURES 各一份快照集与目录；
+ * CRYPTO 未接入 → 诚实阻断面（不发请求，也不假装有数据）。
  *
  * 这里守的是「换市场」这条缝上的三件静默错——坏了都不报错，只是**看着像对的**：
  *
@@ -15,14 +16,16 @@
  */
 import React from 'react';
 import { describe, test, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import FactorResearchPage from '../FactorResearchPage';
+import { setMarket } from '../../../../store/slices/uiSlice';
 
-const { catalogMock, leaderboardMock, marketRef } = vi.hoisted(() => ({
+const { catalogMock, leaderboardMock, marketRef, dispatchSpy } = vi.hoisted(() => ({
   catalogMock: vi.fn(),
   leaderboardMock: vi.fn(),
   marketRef: { value: 'CN' as string },
+  dispatchSpy: vi.fn(),
 }));
 
 vi.mock('../../services/factorResearchService', async () => {
@@ -36,6 +39,10 @@ vi.mock('../../services/factorResearchService', async () => {
 vi.mock('../../../../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) =>
     sel({ ui: { currentMarket: marketRef.value }, auth: { user: { is_admin: false } } }),
+  // 页面头部现在挂真 MarketSelector（页内切换入口），它要 useAppDispatch。
+  // 本文件只验证「点击 → dispatch 了正确的 setMarket」这一跳；状态推进由
+  // marketRef 模拟（真实链路 e2e 探针守）。
+  useAppDispatch: () => dispatchSpy,
 }));
 
 // 子组件桩：本文件测的是页面对市场的分派，不是各页签怎么画（各有各的用例）
@@ -66,6 +73,17 @@ const switchMarket = async (market: string) => {
   });
 };
 
+/** 页内市场指示 = 头部切换器里 aria-checked 的那枚 radio（取代旧静态标签） */
+const activeMarketLabel = () =>
+  screen
+    .getByTestId('research-market-switcher')
+    .querySelector('button[aria-checked="true"]')
+    ?.textContent?.trim();
+
+/** 页内切换器的某枚 radio（如「美股」） */
+const pageMarketRadio = (label: string) =>
+  within(screen.getByTestId('research-market-switcher')).getByRole('radio', { name: label });
+
 const catalogCalls = () => catalogMock.mock.calls.map((c) => [c[0], c[1]]);
 const leaderboardCalls = () => leaderboardMock.mock.calls.map((c) => [c[2], c[4]]);
 
@@ -79,6 +97,7 @@ const renderPage = () =>
 beforeEach(() => {
   catalogMock.mockReset();
   leaderboardMock.mockReset();
+  dispatchSpy.mockClear();
   marketRef.value = 'CN';
   catalogMock.mockResolvedValue({ factors: [], l1_order: [], l2_order: {}, meta: {} });
   leaderboardMock.mockResolvedValue({ leaderboard: [], meta: {} });
@@ -88,7 +107,7 @@ describe('FactorResearchPage：市场分层', () => {
   test('CN：两枚数据集胶囊都在，请求带 CN', async () => {
     renderPage();
 
-    expect(screen.getByTestId('research-market-tag').textContent).toBe('A股');
+    expect(activeMarketLabel()).toBe('A股');
     expect(screen.getByText('经典因子')).toBeTruthy();
     expect(screen.getByText('私人因子库')).toBeTruthy();
     await waitFor(() => expect(catalogCalls()).toContainEqual(['private', 'CN']));
@@ -99,26 +118,39 @@ describe('FactorResearchPage：市场分层', () => {
     marketRef.value = 'HK';
     renderPage();
 
-    expect(screen.getByTestId('research-market-tag').textContent).toBe('港股');
+    expect(activeMarketLabel()).toBe('港股');
     expect(screen.queryByText('经典因子')).toBeNull();
     expect(screen.getByText('私人因子库')).toBeTruthy();
     await waitFor(() => expect(catalogCalls()).toContainEqual(['private', 'HK']));
     await waitFor(() => expect(leaderboardCalls()).toContainEqual(['private', 'HK']));
   });
 
-  test('换市场：目录/榜单用新市场重取，标签跟着走', async () => {
+  test('换市场：目录/榜单用新市场重取，页内切换器高亮跟着走', async () => {
     renderPage();
     await waitFor(() => expect(catalogCalls()).toContainEqual(['private', 'CN']));
 
     await switchMarket('US');
 
-    expect(screen.getByTestId('research-market-tag').textContent).toBe('美股');
+    expect(activeMarketLabel()).toBe('美股');
     await waitFor(() => expect(catalogCalls()).toContainEqual(['private', 'US']));
     await waitFor(() => expect(leaderboardCalls()).toContainEqual(['private', 'US']));
   });
 
+  // 用户报障场景（2026-10-16）：「切美股，因子研究应该切美股」——页内切换器
+  // 是这条链的头一跳。half-wired（点了没 dispatch / dispatch 错 payload）不报错，
+  // 只是页面完全不动；这里钉死 click → setMarket(US) 这一跳。
+  test('页内切换器：点「美股」radio 即 dispatch setMarket(US)', async () => {
+    renderPage();
+
+    // act 包住：radio 点击还会启动 framer-motion 高亮滑块动画（内部 state 更新）
+    await act(async () => {
+      fireEvent.click(pageMarketRadio('美股'));
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledWith(setMarket('US'));
+  });
+
   test('停在经典库时换市场：数据集回落到私人库，不拿经典库去问非 CN 市场', async () => {
-    const { fireEvent } = await import('@testing-library/react');
     renderPage();
     await waitFor(() => expect(catalogCalls()).toContainEqual(['private', 'CN']));
 

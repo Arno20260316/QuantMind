@@ -37,6 +37,9 @@ vi.mock('../../services/factorResearchService', async () => {
 vi.mock('../../../../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) =>
     sel({ ui: { currentMarket: 'CN' }, auth: { user: { is_admin: isAdminRef.value } } }),
+  // 页面头部挂了真 MarketSelector（页内市场切换入口）：它要 useAppDispatch。
+  // 本文件不测切市场，给 no-op（点击→dispatch 的接线由 markets 用例守）。
+  useAppDispatch: () => vi.fn(),
 }));
 
 // 子组件桩：把页面传下去的 props 摊在 DOM 上，本文件测的就是这些 props

@@ -1,15 +1,20 @@
 /**
- * 单因子详情「因子报告」跳转入口 实机验收探针（2026-10-15）。
+ * 单因子详情 ⇄ 因子报告 双向跳转 实机验收探针（2026-10-15）。
  *
- * 覆盖用户原话的一件事：因子研究每个因子详情里有一个按钮，跳转到因子报告里
- * 这个因子的对应报告页。三层断言（缺一层都可能是假的）：
- *   1. 入口出现且**带对库**：私人库 amt_log 的来源库是 l1_factors（wind_source
+ * 覆盖用户原话的两件事：① 单因子详情里有个按钮跳进因子报告的这个因子；
+ * ② 因子报告里也有按钮跳回单因子分析，**来回切换**。断言链（缺一环都可能是假的）：
+ *   1. 正向入口出现且**带对库**：私人库 amt_log 的来源库是 l1_factors（wind_source
  *      反查），按钮 title 必须显示 l1_factors 的报告快照标签「L1 因子…」——
  *      拿别的库去问，报告页只会显示「该因子不在快照里」，不会说库选错了；
  *   2. 点击后落到**因子报告页签**且深链生效：单因子页卸载（按钮消失），
  *      /factor-report/detail 请求带 factor=amt_log **且 dataset=l1_factors**
- *      （来源库直定位 = 本功能的核心契约）；
- *   3. 报告面板真的把 amt_log 展示出来（DOM 层），且全程零 pageerror。
+ *      （来源库直定位 = 核心契约）；
+ *   3. 报告面板真的把 amt_log 展示出来（DOM 层）；
+ *   4. **反跳**：报告页出现「单因子分析」入口（title 指 amt_log），点击回单因子页，
+ *      且数据集回到私人库（扫描按钮出现）——反跳资格由目录索引判，回错库会是一屏
+ *      「该因子不可用」；
+ *   5. **第二程**：再点正向入口，深链仍带 dataset=l1_factors、反跳入口又出现
+ *      （来回切换闭环成立），全程零 pageerror。
  *
  * 用法：node electron/tests/probe_factor_report_jump.mjs
  *      QM_BASE=http://localhost:3080 node electron/tests/probe_factor_report_jump.mjs
@@ -117,9 +122,43 @@ ok(body.includes('amt_log'), '报告面板 DOM 里出现 amt_log');
 ok(body.includes('L1 因子'), '报告面板数据集标签含「L1 因子」');
 await page.screenshot({ path: '/tmp/qm_factor_report_jumped.png' });
 
+// ── ④ 反跳：回单因子分析看同一个因子（数据集须回到私人库） ──────────────
+const back = page.locator('[data-testid="open-single-factor"]');
+await back.waitFor({ state: 'visible', timeout: 180000 });
+const backTitle = await back.getAttribute('title');
+ok((backTitle || '').includes('amt_log'), '反跳入口 title 指向当前因子 amt_log', backTitle || '(no title)');
+await page.screenshot({ path: '/tmp/qm_factor_single_back_btn.png' });
+
+await back.click();
+const fwd = page.locator('[data-testid="open-factor-report"]');
+await fwd.waitFor({ state: 'visible', timeout: 180000 });
+ok((await back.count()) === 0, '已回单因子页（反跳入口消失）');
+const fwdTitle = await fwd.getAttribute('title');
+ok(/L1 因子/.test(fwdTitle || '') && (fwdTitle || '').includes('amt_log'),
+  '回到的是同一个因子（正向入口 title 仍指 amt_log / L1 因子）', fwdTitle || '(no title)');
+ok((await page.locator('[data-testid="open-scan"]').count()) > 0,
+  '数据集回到私人库（扫描按钮只在私人库出现）');
+await page.screenshot({ path: '/tmp/qm_factor_back_to_single.png' });
+
+// ── ⑤ 第二程：再进报告，深链仍带来源库，反跳入口又出现 ─────────────────
+const [resp2] = await Promise.all([
+  page.waitForResponse(
+    (r) => r.url().includes('/factor-report/detail') && r.url().includes('factor=amt_log'),
+    { timeout: 180000 },
+  ),
+  fwd.click(),
+]);
+ok(resp2.status() === 200, '第二程前进：detail 响应 200', `status=${resp2.status()}`);
+ok(resp2.url().includes('dataset=l1_factors'), '第二程仍落来源库 l1_factors（不是默认 alpha_library）');
+await page.waitForTimeout(1200);
+ok((await page.locator('[data-testid="open-single-factor"]').count()) > 0, '又回到报告页（反跳入口再次出现）');
+await page.screenshot({ path: '/tmp/qm_factor_roundtrip_report2.png' });
+
 // ── 收尾 ────────────────────────────────────────────────────────────────
 ok(pageErrors.length === 0, '全程零 pageerror', pageErrors.slice(0, 2).join(' | '));
 console.log(`\n===== 结果：${pass} passed / ${fail} failed =====`);
-console.log('截图: /tmp/qm_factor_report_btn.png（按钮）/ /tmp/qm_factor_report_jumped.png（跳转后）');
+console.log('截图: /tmp/qm_factor_report_btn.png（正向入口）/ /tmp/qm_factor_report_jumped.png（报告落点）/');
+console.log('      /tmp/qm_factor_single_back_btn.png（反跳入口）/ /tmp/qm_factor_back_to_single.png（回到单因子）/');
+console.log('      /tmp/qm_factor_roundtrip_report2.png（第二程再进报告）');
 await browser.close();
 process.exit(fail === 0 ? 0 : 1);

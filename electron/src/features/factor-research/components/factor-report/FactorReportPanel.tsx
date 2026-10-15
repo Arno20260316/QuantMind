@@ -54,6 +54,8 @@ import type {
   FactorReportMeta,
   FactorSummary,
 } from '../../types/factorReport';
+// 只借类型（编译期擦除，不引入 ScreeningTab 的运行时依赖）
+import type { FactorLocation } from '../ScreeningTab';
 
 interface Props {
   /**
@@ -65,9 +67,19 @@ interface Props {
    */
   initialDataset?: string;
   initialCode?: string;
+  /**
+   * 反跳回单因子分析的资格查询：给 code，回它在单因子目录里的落点（查不到 = null）。
+   * 由页面提供（catalogIndex 查表）= 「单因子页真实打得开」的唯一真源。
+   * 面板**不**按数据集名硬映射：报告数据集名与单因子目录名不是同一命名空间。
+   */
+  locateSingle?: (code: string) => FactorLocation | null;
+  /** 点击反跳入口：回传整个落点（code + 数据集），由页面负责切库 + 切页签 */
+  openSingle?: (loc: FactorLocation) => void;
 }
 
-export const FactorReportPanel: React.FC<Props> = ({ initialDataset, initialCode }) => {
+export const FactorReportPanel: React.FC<Props> = ({
+  initialDataset, initialCode, locateSingle, openSingle,
+}) => {
   const [datasets, setDatasets] = useState<FactorDatasetInfo[]>([]);
   const [dataset, setDataset] = useState<string>(() => initialDataset || 'alpha_library');
   /**
@@ -283,6 +295,9 @@ export const FactorReportPanel: React.FC<Props> = ({ initialDataset, initialCode
   }, [buildDataset]);
 
   const current = useMemo(() => factors.find((f) => f.name === selected) || null, [factors, selected]);
+  // 反跳落点：当前选中因子在单因子目录里的位置。查不到（报告快照有、单因子目录没有）
+  // 就不入口 —— 点了只会落到一屏「该因子不可用」。两个回调都接上才透传。
+  const selectedLoc = selected && locateSingle ? locateSingle(selected) : null;
   const currentDs = useMemo(() => datasets.find((d) => d.dataset === dataset) || null, [datasets, dataset]);
   // 展示用差值（口径判断在后端 stale/stale_reason；这里只是把数字摆给人看）
   const pendingNew = currentDs?.stale && currentDs.disk_n_factors != null && currentDs.snapshot_n_factors != null
@@ -492,6 +507,7 @@ export const FactorReportPanel: React.FC<Props> = ({ initialDataset, initialCode
               related={related}
               corrLoading={corrLoading}
               onPick={setSelected}
+              onOpenSingle={selectedLoc && openSingle ? () => openSingle(selectedLoc) : undefined}
             />
           )}
         </main>

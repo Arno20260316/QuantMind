@@ -10,6 +10,7 @@
  */
 
 import React from 'react';
+import { ArrowUpRight, TableProperties } from 'lucide-react';
 import type { FactorBlocks, FactorSummary, HeadlineBlock, DegradedBlock } from '../../../types/factorReport';
 import { MetricRing, percentileOf } from './MetricRing';
 import { DASH, NEUTRAL, fmtNum, fmtPct } from './chartKit';
@@ -40,11 +41,18 @@ interface Props {
   definitions: Record<string, string>;
   /** 旧快照：新字段缺失，环上多项会是空 */
   staleSchema: boolean;
+  /**
+   * 反跳回单因子分析（与单因子页的正向「因子报告」入口对称）。
+   * 父级只在「这个因子在单因子目录里真有其位」时才传 —— 查不到还渲染入口，
+   * 点过去只会是一屏「该因子不可用」，入口本身就是个谎。
+   */
+  onOpenSingle?: () => void;
 }
 
 export const FactorHeadline: React.FC<Props> = ({
   factor, summary, library, blocks, nDates, start, end,
   longGroup, shortGroup, costBps, bench, onParams, definitions, staleSchema,
+  onOpenSingle,
 }) => {
   // 从联合类型上判 available 后再断言：直接在具体类型上比 `!== false` 会被 TS 判为无交集
   const headRaw = blocks?.headline;
@@ -121,6 +129,22 @@ export const FactorHeadline: React.FC<Props> = ({
             n={nDates} · {start} → {end}
           </div>
         </div>
+
+        {/* 反跳：回单因子分析看同一个因子（与单因子页的正向入口对称）。
+            不放进因子标识块内（那里 max-w-[240px]，会挤截断因子名）。 */}
+        {onOpenSingle && (
+          <button
+            type="button"
+            data-testid="open-single-factor"
+            onClick={onOpenSingle}
+            title={`在单因子分析里打开 ${factor}`}
+            className="flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 text-[10px] font-bold text-indigo-600 hover:bg-indigo-100"
+          >
+            <TableProperties className="w-3 h-3" />
+            单因子分析
+            <ArrowUpRight className="w-3 h-3" />
+          </button>
+        )}
 
         {/* 7 指标环 */}
         <div className="flex items-start gap-1 flex-wrap">

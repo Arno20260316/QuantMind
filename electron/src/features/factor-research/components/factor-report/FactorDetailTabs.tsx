@@ -51,6 +51,8 @@ interface Props {
   related: FactorRelated | null;
   corrLoading: boolean;
   onPick: (name: string) => void;
+  /** 反跳回单因子分析；由面板查得落点后才传（查不到 = 不渲染入口） */
+  onOpenSingle?: () => void;
 }
 
 /** `detail.blocks` 是「可用块」或「错误块」的联合，按有无 headline 判别 */
@@ -65,7 +67,7 @@ function splitBlocks(detail: FactorDetail | null): { blocks: FactorBlocks | null
 
 export const FactorDetailTabs: React.FC<Props> = ({
   factor, dataset, summary, library, detail, loading, params, onParams,
-  correlation, related, corrLoading, onPick,
+  correlation, related, corrLoading, onPick, onOpenSingle,
 }) => {
   const [tab, setTab] = useState<DetailTabKey>('overview');
   const [pdfHint, setPdfHint] = useState(false);
@@ -105,6 +107,7 @@ export const FactorDetailTabs: React.FC<Props> = ({
         })}
         definitions={definitions}
         staleSchema={stale}
+        onOpenSingle={onOpenSingle}
       />
 
       {/* 页签条 + 导出 */}

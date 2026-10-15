@@ -225,12 +225,13 @@ const FactorResearchPage: React.FC = () => {
     setPanel('none');
   }, [dataset]);
 
-  // 筛选页签需要**两个**数据集的目录才建得出 name→落点索引，而主流程只拉当前
-  // 那一个。缺的那份在这里补，且只补进 cache：factors/l1Order/l2Order 是
-  // 「当前数据集」的展示态，不能被一次后台补数改掉。
+  // 筛选页签与因子报告页签都需要**两个**数据集的目录才建得出 name→落点索引
+  // （前者给筛选清单定位；后者给反跳入口判「这个因子在单因子页打得开吗」），
+  // 而主流程只拉当前那一个。缺的那份在这里补，且只补进 cache：factors/l1Order/
+  // l2Order 是「当前数据集」的展示态，不能被一次后台补数改掉。
   // 依赖里的 catalogCache 会让它在补完后重跑一次并立刻空转返回，不会自转。
   useEffect(() => {
-    if (tab !== 'screening') return;
+    if (tab !== 'screening' && tab !== 'factor-report') return;
     // 在途的跳过：主流程可能正在拉同一个数据集（进页面就点筛选页签），
     // 不跳就会把 1.1 MB 的私人库目录拉两遍。
     const missing = (['private', 'classic'] as FactorDataset[]).filter(
@@ -454,6 +455,10 @@ const FactorResearchPage: React.FC = () => {
               key={reportTarget ? `${reportTarget.dataset}|${reportTarget.code}` : 'default'}
               initialDataset={reportTarget?.dataset}
               initialCode={reportTarget?.code}
+              // 反跳回单因子分析：资格判据 = catalogIndex（= 单因子页真实打得开的
+              // 集合），代码级查表，不按报告数据集名硬映射（两个命名空间不对齐）。
+              locateSingle={(code) => catalogIndex.get(code) ?? null}
+              openSingle={(loc) => openSingle(loc.code, loc.dataset)}
             />
           </div>
         )}

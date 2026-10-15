@@ -11,9 +11,12 @@ import { ModelHubCard } from './hub/ModelHubCard';
 import { ModelHubDetailDrawer } from './hub/ModelHubDetailDrawer';
 import { PublishModelModal } from './hub/PublishModelModal';
 import { modelTrainingService, UserModelRecord } from '../services/modelTrainingService';
+import { useAppSelector } from '../store';
+import { selectCurrentMarket } from '../store/slices/uiSlice';
 
 export const ModelHubPage: React.FC = () => {
   const navigate = useNavigate();
+  const currentMarket = useAppSelector(selectCurrentMarket);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [models, setModels] = useState<HubModelItem[]>([]);
@@ -21,9 +24,11 @@ export const ModelHubPage: React.FC = () => {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
 
-  // 筛选与排序
+  // 筛选与排序。市场初值跟随全局选择器（从「模型管理」进广场先看本市场），
+  // 但保留本地下拉可切 ALL 跨市场浏览（广场属性）；不做随全局实时跟随——
+  // 与页内显式下拉双控件打架，浏览中改筛选是意外。
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedMarket, setSelectedMarket] = useState<string>('ALL');
+  const [selectedMarket, setSelectedMarket] = useState<string>(currentMarket);
   const [selectedAlgo, setSelectedAlgo] = useState<string>('ALL');
   const [sortBy, setSortBy] = useState<string>('sharpe');
 

@@ -4,6 +4,7 @@ import { Card, Divider, Alert, Progress, Tabs, Empty, Typography, Button, Tag, m
 import { Play, FileText, LayoutGrid, Copy, Terminal, CheckCircle2, Layers, Calendar, Target, Clock, ArrowDown } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useNavigate } from 'react-router-dom';
+import { getMarketConfig } from '../../config/marketConfig';
 import {
   TrainingStatus,
   TrainingResult,
@@ -270,7 +271,7 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                 <div className="rounded-xl bg-slate-50 p-2.5 border border-slate-100">
                   <div className="text-[10px] text-slate-400 font-semibold mb-1">特征与基准</div>
                   <div className="text-slate-700 font-medium truncate">
-                    {requestPreview.selectedFeatures?.length || 0} 个因子 · {requestPreview.context?.benchmark || '000300.SH'}
+                    {requestPreview.selectedFeatures?.length || 0} 个因子 · {requestPreview.context?.benchmark || getMarketConfig(requestPreview.context?.market || 'CN').benchmark}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-600 truncate" title={requestPreview.pool_id || '全市场'}>
                     股票池：{requestPreview.pool_id || '全市场'}

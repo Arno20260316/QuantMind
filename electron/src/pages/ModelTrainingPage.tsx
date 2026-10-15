@@ -15,7 +15,7 @@ import { modelTrainingService } from '../services/modelTrainingService';
 import { useAppDispatch, useAppSelector } from '../store';
 import { selectCurrentMarket, AppMarket, setMarket } from '../store/slices/uiSlice';
 import { getMarketConfig } from '../config/marketConfig';
-import { TrainingTarget, TrainingParams, TrainingContext, TrainingStatus, TrainingDraft, SplitKey, TimePeriodMap, FeatureCategory, STORAGE_KEY, DEFAULT_FEATURE_CATEGORIES, getDefaultFeaturesForMarket, resolveDefaultSelectedFeatures, DEFAULT_TIME_PERIODS, DEFAULT_TARGET, DEFAULT_PARAMS, DEFAULT_CONTEXT, buildAutoDisplayName, buildLabelFormula, buildEffectiveTradeDate, daysBetween, toISOStringRange, restoreRange, shouldMigrateLegacyDraftPeriods, buildTrainingRequest, formatRange, toDynamicCategories, TrainingResult, buildBackendTrainingPayload, parseTrainingResult, parseSuggestedTimePeriods, MODEL_DL_DEFAULTS, WfaConfig, ImportedTrainingConfig, buildTrainingConfigFile, parseTrainingConfig, serializeTrainingConfig, TrainingFactorFilterConfig, DEFAULT_FACTOR_FILTER, TrainingMarket, TRAINING_MARKET_OPTIONS, resolveTrainingMarket, buildCrossSourceFeaturePlan, buildExtraFactorSourceOptions, buildFeatureOwnershipMap, findCrossSourceFeatureConflicts, formatCrossSourceConflictMessage, mergeSourceFeatureCategories, sanitizeExtraFactorSources } from './training/trainingUtils';
+import { TrainingTarget, TrainingParams, TrainingContext, TrainingStatus, TrainingDraft, SplitKey, TimePeriodMap, FeatureCategory, STORAGE_KEY, getDefaultFeaturesForMarket, resolveDefaultSelectedFeatures, DEFAULT_TIME_PERIODS, DEFAULT_TARGET, DEFAULT_PARAMS, DEFAULT_CONTEXT, buildAutoDisplayName, buildLabelFormula, buildEffectiveTradeDate, daysBetween, toISOStringRange, restoreRange, shouldMigrateLegacyDraftPeriods, buildTrainingRequest, formatRange, toDynamicCategories, TrainingResult, buildBackendTrainingPayload, parseTrainingResult, parseSuggestedTimePeriods, MODEL_DL_DEFAULTS, WfaConfig, ImportedTrainingConfig, buildTrainingConfigFile, parseTrainingConfig, serializeTrainingConfig, TrainingFactorFilterConfig, DEFAULT_FACTOR_FILTER, TrainingMarket, resolveTrainingMarket, resolveTrainingPoolMarket, getEnabledTrainingMarketOptions, buildCrossSourceFeaturePlan, buildExtraFactorSourceOptions, buildFeatureOwnershipMap, findCrossSourceFeatureConflicts, formatCrossSourceConflictMessage, mergeSourceFeatureCategories, sanitizeExtraFactorSources } from './training/trainingUtils';
 import { AdminModelFeatureDataCoverage, QuantDBTrainingSource } from '../features/admin/types';
 import { adminService } from '../features/admin/services/adminService';
 import { FeatureSelector } from './training/FeatureSelector';
@@ -202,6 +202,9 @@ export const ModelTrainingPage: React.FC = () => {
     () => resolveTrainingMarket(customMarketOverride ? 'CUSTOM' : null, currentMarket),
     [customMarketOverride, currentMarket],
   );
+  // 下拉与全局市场选择器（MarketSelector/uiSlice）同一把开关：生产构建隐藏区块链后，
+  // 训练页不能再留一个能选中它的入口（顶栏都选不到的市场，训练页也不该选得到）。
+  const trainingMarketOptions = useMemo(() => getEnabledTrainingMarketOptions(), []);
 
   // ── useReducer：草稿持久化的 7 字段 ──
   const [formState, dispatch] = useReducer(formReducer, {
@@ -221,7 +224,7 @@ export const ModelTrainingPage: React.FC = () => {
 
   // ── useState: 训练运行时 state（不参与草稿持久化） ──
   const [currentStep, setCurrentStep] = useState(0);
-  // A 股 QuantDB 的字段、分类与默认勾选只来自后端已发布目录。
+  // QuantDB 直读市场的字段、分类与默认勾选只来自后端已发布目录。
   const [anchorFeatureCategories, setAnchorFeatureCategories] = useState<FeatureCategory[]>([]);
   const [featureCatalogLoading, setFeatureCatalogLoading] = useState(false);
   const [factorSource, setFactorSource] = useState(DEFAULT_FACTOR_SOURCE);
@@ -449,7 +452,7 @@ export const ModelTrainingPage: React.FC = () => {
     }
   }, [trainingNodes, selectedNode]);
 
-  // 直读市场（CN/HK）训练目录完全由后端发布版本驱动；不回退到任何内置字段。
+  // 直读市场（六市场全部）训练目录完全由后端发布版本驱动；不回退到任何内置字段。
   // 锚库与附加库目录在同一次加载里取齐后一起落地：拆成两个 effect 会互相覆盖勾选，
   // 也会让「归属表 / 冲突检测 / 默认勾选」看到不同步的目录快照。
   useEffect(() => {
@@ -459,9 +462,11 @@ export const ModelTrainingPage: React.FC = () => {
       setFactorCatalogVersion(null);
       setDataCoverage(null);
       const anchorKey = `${trainingMarket}|${factorSource}`;
-      // 换锚库/换市场才重算默认勾选；只是增删附加库时必须保住用户已勾的特征
+      // 换锚库/换市场才重算默认勾选；只是增删附加库时必须保住用户已勾的特征。
+      // 判定用「进入时的已登记锚」；登记（写 ref）在决策点才做（见下方 commitAnchor），
+      // 被 cleanup 中止的运行不得消费掉「换锚」信号——否则 StrictMode 开发态双跑
+      // effect 时存活的第二次运行会误判「未换锚」走保留分支，目录默认勾选永远不落地。
       const anchorChanged = catalogAnchorKeyRef.current !== anchorKey;
-      catalogAnchorKeyRef.current = anchorKey;
       try {
         let effectiveExtras = sanitizeExtraFactorSources(extraFactorSources, factorSource);
         if (isQuantDBMarket(trainingMarket)) {
@@ -506,6 +511,8 @@ export const ModelTrainingPage: React.FC = () => {
           }
         }));
         if (!active) return;
+        // 存活的运行走到决策点才登记本次锚（此后再无 await，登记与下面的勾选决策同帧）
+        catalogAnchorKeyRef.current = anchorKey;
 
         const nextExtraCategories: Record<string, FeatureCategory[]> = {};
         const nextExtraErrors: Record<string, string> = {};
@@ -563,21 +570,16 @@ export const ModelTrainingPage: React.FC = () => {
           }
         }
       } catch (error) {
-        if (active && (trainingMarket === 'CN' || trainingMarket === 'CUSTOM')) {
-          // CN 与 CUSTOM 都禁止回退内置字段：字段名/契约只认后端已发布目录，
-          // 拿 A 股预设去猜自定义数据（rd_mined 挖掘因子）是在编造特征。
-          // 此分支刻意不弹提示（页面会以「目录未就绪」呈现），日志留痕供排查。
+        if (active) {
+          // 全市场同一侧：六个市场都是 QuantDB 直读市场，字段名/契约只认后端已发布
+          // 目录——拿内置 A 股预设去猜港股/美股/期货（与猜 rd_mined 同类）都是在编造
+          // 特征，且开始按钮本就被 isDirectCatalogReady 锁死，回落只制造「有特征可
+          // 选」的假象。此分支刻意不弹提示（页面会以「目录未就绪」呈现），日志留痕供排查。
           console.warn('[ModelTrainingPage] 训练目录加载失败，特征已清空（禁止回退内置字段）:', trainingMarket, error);
           setAnchorFeatureCategories([]);
           setExtraFeatureCategories({});
           setExtraCatalogErrors({});
           dispatch({ type: 'SET_FEATURES', payload: [] });
-        } else if (active) {
-          setAnchorFeatureCategories(DEFAULT_FEATURE_CATEGORIES);
-          setExtraFeatureCategories({});
-          setExtraCatalogErrors({});
-          dispatch({ type: 'SET_FEATURES', payload: getDefaultFeaturesForMarket(trainingMarket) });
-          message.warning('特征字典加载失败，已回退到内置字段');
         }
       } finally {
         if (active) setFeatureCatalogLoading(false);
@@ -854,10 +856,9 @@ export const ModelTrainingPage: React.FC = () => {
 
   const handleResetAll = () => {
     clearTimers();
-    // 默认勾选只认锚库目录：附加库的 default_selected 不参与，避免一开附加库就自动多勾一片
-    const features = anchorFeatureCategories.length > 0
-      ? resolveDefaultSelectedFeatures(anchorFeatureCategories, trainingMarket)
-      : getDefaultFeaturesForMarket(trainingMarket);
+    // 默认勾选只认锚库目录：附加库的 default_selected 不参与，避免一开附加库就自动多勾一片。
+    // 目录为空（未加载/未发布，如期货）时同一条不变量：空目录是显式答案，不落内置预设。
+    const features = resolveDefaultSelectedFeatures(anchorFeatureCategories, trainingMarket);
     dispatch({ type: 'SET_FEATURES', payload: features });
     setExtraFactorSources([]);
     const coveragePeriods = parseSuggestedTimePeriods(dataCoverage?.suggested_periods);
@@ -1042,7 +1043,7 @@ export const ModelTrainingPage: React.FC = () => {
                 onChange={handleTrainingMarketChange}
                 className="min-w-36"
                 disabled={isTrainingInProgress}
-                options={TRAINING_MARKET_OPTIONS}
+                options={trainingMarketOptions}
               />
               {trainingMarket === 'CUSTOM' && (
                 <Tooltip title="自定义数据市场：训练直接用后端已发布的自传数据集（如 RD 挖掘因子库），不改全局市场。">
@@ -1377,7 +1378,7 @@ export const ModelTrainingPage: React.FC = () => {
         open={poolPickerOpen}
         onClose={() => setPoolPickerOpen(false)}
         selectedPoolId={formState.poolId}
-        market={trainingMarket === 'CN' || trainingMarket === 'CUSTOM' ? 'CN' : undefined}
+        market={resolveTrainingPoolMarket(trainingMarket)}
         title="训练股票池"
         onSelect={(pool: StockPoolOption) => {
           dispatch({ type: 'SET_POOL', payload: { ref: `pool:${pool.code}`, name: pool.name, id: pool.pool_id } });

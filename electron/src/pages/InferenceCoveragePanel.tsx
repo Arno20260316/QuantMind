@@ -7,7 +7,18 @@ const { Text } = Typography;
 
 const STORAGE_KEY = (modelId: string) => `qm:backfill:${modelId}`;
 
-export const InferenceCoveragePanel: React.FC<{ modelId: string }> = ({ modelId }) => {
+interface InferenceCoveragePanelProps {
+  modelId: string;
+  /** 模型所属市场的交易日历（marketConfig.calendar：SSE / HKEX / NYSE / CME / 24/7）。
+   *  默认 SSE 仅为兼容；模型管理页恒显式传入当前市场日历——拿上交所日历判美股
+   *  覆盖会把感恩节/圣诞标成缺口日（永远补不上）。 */
+  calendar?: string;
+}
+
+/** 24/7 市场（加密）没有休市日：本地全开，不调后端日历（后端也答不了 24/7）。 */
+const ALL_DAY_CALENDAR = '24/7';
+
+export const InferenceCoveragePanel: React.FC<InferenceCoveragePanelProps> = ({ modelId, calendar = 'SSE' }) => {
   const [loading, setLoading] = useState(true);
   const [coverage, setCoverage] = useState<any>(null);
   const [backfilling, setBackfilling] = useState(false);
@@ -99,8 +110,12 @@ export const InferenceCoveragePanel: React.FC<{ modelId: string }> = ({ modelId 
       const days = new Date(y, m, 0).getDate();
       for (let d = 1; d <= days; d++) allDates.push(`${ym}-${String(d).padStart(2, '0')}`);
     }
-    void modelTrainingService.batchCheckTradingDays('SSE', allDates).then(setTradingMap).catch(() => setTradingMap({}));
-  }, [coverage?.latest_trade_date]);
+    if (calendar === ALL_DAY_CALENDAR) {
+      setTradingMap(Object.fromEntries(allDates.map((d) => [d, true])));
+      return;
+    }
+    void modelTrainingService.batchCheckTradingDays(calendar, allDates).then(setTradingMap).catch(() => setTradingMap({}));
+  }, [coverage?.latest_trade_date, calendar]);
 
   const gapCount = coverage?.gap_dates?.length ?? 0;
   const isUpToDate = coverage?.is_up_to_date ?? (gapCount === 0 && coverage?.max_date);
@@ -178,7 +193,7 @@ export const InferenceCoveragePanel: React.FC<{ modelId: string }> = ({ modelId 
             label: <span className="text-xs font-black text-slate-700 flex items-center gap-1.5"><Database size={12} className="text-blue-500"/>口径说明</span>,
             children: <div className="text-xs text-slate-600 leading-relaxed space-y-1">
               <div>覆盖基于 `pred.parquet`（`storage_path/pred.parquet`）的 `trade_date` 去重，与个股终端历史推理同源；`engine_signal_scores` 为 `completed` 落库。</div>
-              <div>补全按交易日逐日跑 `inference.py` 并追加到 `pred.parquet`，目标至 `latest_trade_date`（`SSE` 日历）。</div>
+              <div>补全按交易日逐日跑 `inference.py` 并追加到 `pred.parquet`，目标至 `latest_trade_date`（{calendar === ALL_DAY_CALENDAR ? '24/7 无休市' : calendar} 日历）。</div>
               <div>`pred.parquet` 缺失时区间显示为 QuantDB 因子可支持范围（预估口径，蓝色标记），补全后才生成真实覆盖。</div>
             </div>,
           }]}

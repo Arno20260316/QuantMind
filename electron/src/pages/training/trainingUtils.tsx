@@ -9,6 +9,7 @@ import {
   AdminModelFeatureSuggestedPeriods,
   QuantDBTrainingSource,
 } from '../../features/admin/types';
+import { isMarketEnabled } from '../../config/marketFlags';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -180,6 +181,28 @@ export function resolveTrainingMarket(
   }
   const upper = String(globalMarket || 'CN').toUpperCase();
   return (TRAINING_MARKET_OPTIONS.some(option => option.value === upper) ? upper : 'CN') as TrainingMarket;
+}
+
+/**
+ * 训练页股票池查询的市场口径。
+ *
+ * 股票池表 `qm_stock_pool` 按市场分行（CN 9 池 / HK 1 / US 1 / FUTURES 0），后端
+ * `pool_binding` 对「池 × 市场」不做任何校验——传错池就是静默错配（A 股成分混进
+ * 港股/美股训练）。CUSTOM 自传数据走 A 股供给（`CUSTOM_DATA_MARKET_CONFIG` 镜像
+ * CN），故映射回 CN；其余市场原样透传，绝不回落（undefined 在弹窗里会默认成 CN）。
+ */
+export function resolveTrainingPoolMarket(market: TrainingMarket): string {
+  return market === 'CUSTOM' ? 'CN' : market;
+}
+
+/**
+ * 训练页市场下拉的实际选项：与全局市场选择器（MarketSelector/uiSlice）共用
+ * 同一把开关 `isMarketEnabled`（生产构建隐藏 CRYPTO）。词表 `TRAINING_MARKET_OPTIONS`
+ * 保持全集不动，只在下拉渲染处收敛；配置导入另走同一开关做拒绝
+ * （见 `parseTrainingConfig`），两处口径必须一致。
+ */
+export function getEnabledTrainingMarketOptions(): { value: TrainingMarket; label: string }[] {
+  return TRAINING_MARKET_OPTIONS.filter((option) => isMarketEnabled(option.value));
 }
 
 export interface WfaConfig {
@@ -955,8 +978,13 @@ export const parseTrainingConfig = (source: string): ImportedTrainingConfig => {
   if (!isRecord(raw) || raw.kind !== TRAINING_CONFIG_KIND || raw.schema_version !== TRAINING_CONFIG_SCHEMA_VERSION) {
     throw new Error('不是受支持的 QuantMind 模型训练配置文件');
   }
-  if (!CONFIG_MARKETS.includes(raw.market as TrainingContext['market'])) {
-    throw new Error('配置中的市场标识无效');
+  if (
+    !CONFIG_MARKETS.includes(raw.market as TrainingContext['market'])
+    || !isMarketEnabled(String(raw.market))
+  ) {
+    // 市场标识既要在训练词表内，也要在当前构建实际启用（生产构建隐藏 CRYPTO：
+    // 顶栏都选不到的市场，不能靠一份配置文件绕过开关进训练）
+    throw new Error('配置中的市场标识无效或当前构建未启用该市场');
   }
   if (!isRecord(raw.configuration)) throw new Error('配置缺少 configuration 节点');
   const config = raw.configuration;
@@ -1178,6 +1206,10 @@ export const resolveDefaultSelectedFeatures = (
   market: string,
 ): string[] => {
   const allFeatures = categories.flatMap((c) => c.features);
+  // 空目录（目录未发布 / 未就绪，如期货未发布时 catalog_status='unpublished'）
+  // 是显式答案：没有任何特征可勾。此时落 PRESET 会把「数据契约里不存在的字段」
+  // 凭空勾上（期货 20 个预设键就是这么漏出去的）——空目录绝不猜。
+  if (allFeatures.length === 0) return [];
   const hasAnyFlag = allFeatures.some((f) => typeof f.defaultSelected === 'boolean');
 
   if (hasAnyFlag) {

@@ -894,7 +894,7 @@ export const ModelRegistryPage: React.FC = () => {
                             推理管理
                           </span>
                         ),
-                        children: <InferenceCoveragePanel modelId={selectedModel.model_id} />,
+                        children: <InferenceCoveragePanel modelId={selectedModel.model_id} calendar={marketConfig.calendar} />,
                       },
                     ]}
                   />

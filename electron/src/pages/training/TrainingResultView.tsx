@@ -27,12 +27,16 @@ import {
 
 const { Text } = Typography;
 
-const MARKET_LABELS: Record<string, string> = {
+// 结果元数据里的 market 是训练时的市场词表全集（TRAINING_MARKET_OPTIONS），
+// 词条必须六市场全覆盖——缺 CUSTOM 时结果卡会退化成显示原始码。单测以
+// TRAINING_MARKET_OPTIONS 为全集断言（防再漏）。
+export const MARKET_LABELS: Record<string, string> = {
   CN: 'A股',
   HK: '港股',
   US: '美股',
   CRYPTO: '区块链',
   FUTURES: '期货',
+  CUSTOM: '自定义市场',
 };
 
 interface TrainingResultViewProps {

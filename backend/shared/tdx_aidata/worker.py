@@ -573,6 +573,26 @@ class AidataWorker:
                 return {"__sdk_error__": out}
             return data or {}
 
+        if method == "get_call_auction_batch":
+            # 集合竞价批量取数（SDK v1.2.2+；type=1 仅早盘 / 0 早盘+尾盘）。
+            # 空 dict 且无 fd 输出是**合法态**（尚未开盘/无竞价记录），不报错——
+            # 与 get_minute_data 同口径，由调用方决定怎么展示「暂无数据」。
+            symbols = [
+                str(s).strip() for s in (params.get("symbols") or []) if str(s).strip()
+            ]
+            if not symbols:
+                raise ValueError("symbols 必填")
+            auction_type = int(params.get("type") or 1)
+            data, out = _capture_fd_call(
+                tqs.get_call_auction_batch,
+                stock_list=symbols,
+                field_list=[],
+                type=auction_type,
+            )
+            if not data and out.strip():
+                return {"__sdk_error__": out}
+            return data or {}
+
         raise ValueError(f"未知方法: {method}")
 
     # ── socket 服务 ────────────────────────────────────────────────

@@ -89,6 +89,7 @@ async def lifespan(app: FastAPI):
     live_equity_sampler_task = None
     decision_round_task = None
     leverage_trim_task = None
+    call_auction_watch_task = None
 
     try:
         await init_unified_config(service_name="quantmind-trade")
@@ -575,6 +576,16 @@ async def lifespan(app: FastAPI):
             run_tdx_quote_feed_task(),
             name="tdx-quote-feed",
         )
+        # 集合竞价取数（2026-10-15）：实盘持仓 ∪ 当日候选池，按档采样
+        # （09:15:30/09:20:30/09:25:05/15:00:05）落 Redis + /data/call_auction 归档。
+        from backend.services.live_trading.services.call_auction_watch import (
+            run_call_auction_watch_task,
+        )
+
+        call_auction_watch_task = asyncio.create_task(
+            run_call_auction_watch_task(),
+            name="call-auction-watch",
+        )
         from backend.services.simulation.services.simulation_t1_unlock_task import (
             run_simulation_t1_unlock_task,
         )
@@ -925,6 +936,7 @@ async def lifespan(app: FastAPI):
         duty_summary_task,
         intel_briefing_task,
         tdx_quote_feed_task,
+        call_auction_watch_task,
         tdx_l2_capture_task,
         tdx_l2_realtime_task,
         t1_unlock_task,

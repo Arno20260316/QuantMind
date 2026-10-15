@@ -286,6 +286,25 @@ class TdxAiDataClient:
             timeout=timeout,
         )
 
+    async def get_call_auction_batch(
+        self,
+        symbols: list[str],
+        *,
+        type: int = 1,
+        timeout: float | None = None,
+    ) -> dict[str, dict]:
+        """集合竞价批量取数（SDK v1.2.2+）。
+
+        ``type=1`` 仅早盘（09:15:00–09:24:5x 逐笔虚拟撮合），``type=0`` 早盘+尾盘。
+        每代码记录形如 ``{"Time": [...], "Price": [...], "Volume": [...],
+        "LeaveQty": [...]}``（值为 SDK 原生字符串）。未开盘/无记录返回空 dict。
+        """
+        return await self.call(
+            "get_call_auction_batch",
+            {"symbols": symbols, "type": type},
+            timeout=timeout or 60.0,
+        )
+
     async def subscription_status(self, *, timeout: float | None = None) -> dict:
         """订阅引擎状态（T-P6-02；未启用返回 {"enabled": False}）。"""
         return await self.call("subscription_status", {}, timeout=timeout or 15.0)

@@ -292,6 +292,22 @@ if os.getenv("FACTOR_BOARD_RESELECT_ENABLED", "true").lower() == "true":
         ),
     }
 
+# 聪明钱产物（市场分析 · 聪明钱追踪与选股 细案 §7，2026-10-15）：东财晚间发布
+# 节奏不定，19:10 先建一版、21:10 第二档 catch-up（脚本含采集，幂等 + 重叠窗口
+# 自愈，同日重跑覆盖）。落 QM_MARKET_SNAPSHOT_DIR 根下 market-analysis/smart_money
+#（worker 容器未注入该 env 时由 datasets.product_dir 的容器兜底解析 /data），
+# API/前端读取。独立开关 SMART_MONEY_ENABLED（借别的开关会让体检把「本就没开」
+# 报成「停摆」）。
+if os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true":
+    beat_schedule["smart-money-daily"] = {
+        "task": "engine.tasks.smart_money_build",
+        "schedule": crontab(minute="10", hour="19", day_of_week="1-5"),
+    }
+    beat_schedule["smart-money-daily-catchup"] = {
+        "task": "engine.tasks.smart_money_build",
+        "schedule": crontab(minute="10", hour="21", day_of_week="1-5"),
+    }
+
 celery_app.conf.update(
     # 序列化
     task_serializer="json",

@@ -253,7 +253,7 @@ JOBS: tuple[JobSpec, ...] = (
     ),
     JobSpec(
         "eval_scores",
-        "评分五卡（EOD）",
+        "评分六卡（EOD）",
         "worker",
         "trade",
         "交易日 16:00（60s 轮询）",
@@ -261,7 +261,7 @@ JOBS: tuple[JobSpec, ...] = (
         True,
         600,
         "python backend/scripts/schedule_ctl.py run eval_scores --date YYYY-MM-DD",
-        "因子/模型/策略/账户/每日选股五卡 → eval_scores 表（T-P4-05b）",
+        "因子/模型/策略/账户/实盘账户/每日选股六卡 → eval_scores 表（T-P4-05b）",
     ),
     JobSpec(
         "health_recheck",
@@ -638,6 +638,24 @@ JOBS: tuple[JobSpec, ...] = (
         "前窗选（重跑选择管线，同窗 85/65）→ 应用月台本 rolling/{YYYY-MM}.json，"
         "并把上月台本 oos 段按后窗 RankIC 回填（前窗选后窗验）；非月首退码 0 跳过；"
         "重跑 = 立刻跑一次（--date 指定训练窗尾 as_of=历史回填；--force 绕过月首判据）",
+    ),
+    # 聪明钱产物（市场分析 · 聪明钱追踪与选股 细案 §7，2026-10-15）：东财晚间发布
+    # 节奏不定，交易日 19:10 与 21:10 两档（第二档 catch-up，脚本幂等、重叠窗口
+    # 自愈）。心跳 TTL 4 天（同 factor_board）：cron 是 mon-fri，周末最长间隔 72h。
+    JobSpec(
+        "smart_money",
+        "聪明钱产物（市场分析）",
+        "celery_beat",
+        "celery",
+        "交易日 19:10 与 21:10（第二档 catch-up，幂等重跑）",
+        "SMART_MONEY_ENABLED",
+        True,
+        345600,
+        "python backend/scripts/schedule_ctl.py run smart_money",
+        "事件采集（龙虎榜/机构席位/大宗/调研/两融/北向）→ 事件池评分（入柱裁定见 "
+        "evidence.json，负向柱方向对齐）→ latest.json/{date}.json/scores/（"
+        "/data/market-analysis/smart_money）；重跑 = 立刻跳过采集按全量重算一份"
+        "（同日覆盖原子写；--date 不适用——评分追随库内最新交易日）",
     ),
 )
 

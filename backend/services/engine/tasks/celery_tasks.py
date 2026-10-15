@@ -1586,6 +1586,61 @@ def run_factor_board_build() -> dict[str, Any]:
         return {"status": "failed", "error": str(e)}
 
 
+@celery_app.task(name="engine.tasks.smart_money_build")
+def run_smart_money_build() -> dict[str, Any]:
+    """聪明钱产物（市场分析 · 聪明钱追踪与选股 细案 §7，2026-10-15）。
+
+    子进程跑 ``backend/scripts/market_analysis/build_smart_money.py``：事件采集
+    （akshare；**sync 失败但已有原始数据时仍构建**并置 ``meta.partial=true``
+    由页面横幅披露）→ 逐日事件池评分分区 → latest/trends/meta.json
+    （``datasets.product_dir()``，原子写，同日重跑覆盖）。beat 排 19:10 与
+    21:10 两档（东财晚间发布节奏不定，第二档 catch-up，脚本幂等）。
+
+    CLI 退码 0 成功 / 1 构建失败（不落盘）/ 2 入柱未裁定（拒绝出分）；退码≠0
+    如实转 failed，绝不静默产出坏产物。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("smart_money")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = (
+            root / "backend" / "scripts" / "market_analysis" / "build_smart_money.py"
+        )
+        cmd = [sys.executable, str(script)]  # 含采集；默认重算最近 40 个交易日
+        started = datetime.now()
+        logger.info("[SmartMoney] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=3600)
+        if proc.returncode != 0:
+            logger.error(
+                "[SmartMoney] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info("[SmartMoney] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:])
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[SmartMoney] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}
+
+
 @celery_app.task(name="engine.tasks.flow_evidence_build")
 def run_flow_evidence_build() -> dict[str, Any]:
     """资金流延续证据产物（市场分析 · 资金流全景 v2 §3/§8，2026-10-11）。

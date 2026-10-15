@@ -25,6 +25,7 @@ from backend.shared.factor_board import config as _fb_config
 logger = logging.getLogger(__name__)
 
 from . import flow_panorama, quantdb_feed, quantdb_snapshot as _snap
+from . import smart_money as _sm
 from .domain import SectorConflictError, SectorNotFoundError
 from .repository import MarketAnalysisRepository
 from .schemas import (
@@ -577,6 +578,75 @@ async def get_money_flow_evidence(
     """证据台：命中榜（延续状态 × 历史条件超额）+ 信号档案（过闸/否决两节）。"""
     _ = current_user
     return await asyncio.to_thread(flow_panorama.get_evidence, date=date)
+
+
+# ---- 聪明钱（市场分析 · 细案 §5.2；只读产物，无产物 404 smart_money_not_built） ----
+
+async def _sm_read(fn, *args, **kwargs):
+    """产物读侧统一调度：线程池执行 + SmartMoneyNotBuilt → 404 收敛。"""
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except _sm.SmartMoneyNotBuilt:
+        raise HTTPException(status_code=404, detail="smart_money_not_built") from None
+
+
+@router.get("/smart-money/overview")
+async def get_smart_money_overview(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """概览：龙虎榜/机构/两融/大宗/调研/北向统计卡 + 趋势序列 + 新鲜度。"""
+    _ = current_user
+    return await _sm_read(_sm.get_overview)
+
+
+@router.get("/smart-money/stocks")
+async def get_smart_money_stocks(
+    limit: int = Query(100, ge=1, le=500, description="选股榜行数上限（score 降序）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """选股榜：summary + items（研究评分，非交易指令）。"""
+    _ = current_user
+    return await _sm_read(_sm.get_stocks, limit=limit)
+
+
+@router.get("/smart-money/stock/{symbol}")
+async def get_smart_money_stock(
+    symbol: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """个股档案：榜上条目 + 事件时间线 + 北向季度序列（未上榜 200, on_board=false）。"""
+    _ = current_user
+    return await _sm_read(_sm.get_stock_detail, symbol)
+
+
+@router.get("/smart-money/branches")
+async def get_smart_money_branches(
+    window: int = Query(5, description="净买聚合窗口（交易日）：5 或 20"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """活跃营业部榜（净买降序，含代表买卖股；原始层现算）。"""
+    _ = current_user
+    if window not in _sm.BRANCHES_WINDOWS:
+        raise HTTPException(status_code=400, detail="window_invalid")
+    return await _sm_read(_sm.get_branches, window=window)
+
+
+@router.get("/smart-money/evidence")
+async def get_smart_money_evidence(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """验证证据台：双过闸 IC/分位超额/分年/相关塌缩 + 口径说明。"""
+    _ = current_user
+    return await _sm_read(_sm.get_evidence)
+
+
+@router.get("/smart-money/dates")
+async def get_smart_money_dates(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """可用评分快照日期。"""
+    _ = current_user
+    return await _sm_read(_sm.available_dates)
 
 
 # ---- Tag Dual Lookup Endpoints (标签双向查询) ----

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Sparkles, Activity, Network, TrendingUp, Clock, RefreshCw, Zap } from 'lucide-react';
+import { Sparkles, Activity, Network, TrendingUp, Clock, RefreshCw, Zap, Radar } from 'lucide-react';
 import { DatePicker, message } from 'antd';
 import dayjs from 'dayjs';
 import { BroadMarketHeader, IndexItem } from '../components/BroadMarketHeader';
@@ -7,8 +7,10 @@ import { HeatmapDrillCard } from '../components/HeatmapDrillCard';
 import { StockMoneyFlowTable, StockMoneyFlowItem } from '../components/StockMoneyFlowTable';
 import { MarketBreadthCard } from '../components/MarketBreadthCard';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
+import { StockTerminalWindow } from '../../market-analysis-shared/components/StockTerminalWindow';
 import { FactorBoardPanel } from '../components/FactorBoardPanel';
 import { FlowPanoramaPanel } from '../components/FlowPanoramaPanel';
+import { SmartMoneyPanel } from '../components/smart-money/SmartMoneyPanel';
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import { PAGE_LAYOUT } from '../../../config/pageLayout';
 import { fmtBeijingClock } from '../../../utils/timeBeijing';
@@ -39,6 +41,8 @@ export const MarketAnalysisPage: React.FC = () => {
   const [updateTime, setUpdateTime] = useState<string>('');
   // 🎯 个股资金流聚焦（顶栏搜索 / 排行榜下钻 → 资金流全景内打开个股详情卡）
   const [focusSymbol, setFocusSymbol] = useState<string | null>(null);
+  // 🎯 个股终端浮窗（聪明钱榜单行点击 → 弹窗；页面共用一个实例）
+  const [windowSymbol, setWindowSymbol] = useState<string | null>(null);
 
   // 🎯 快照历史日期（Phase 3 后端 /snapshot/dates）
   const [snapDate, setSnapDate] = useState<string | undefined>();
@@ -238,6 +242,7 @@ export const MarketAnalysisPage: React.FC = () => {
     { id: 'panorama', label: '大盘全景看板', icon: Activity },
     { id: 'flow-panorama', label: '资金流全景', icon: Network },
     { id: 'factor-board', label: '因子概率板', icon: Sparkles },
+    { id: 'smart-money', label: '聪明钱', icon: Radar },
   ];
 
   return (
@@ -412,7 +417,19 @@ export const MarketAnalysisPage: React.FC = () => {
           )}
 
           {activeTab === 'factor-board' && <FactorBoardPanel />}
+
+          {activeTab === 'smart-money' && (
+            <SmartMoneyPanel onPick={(s) => setWindowSymbol(s)} />
+          )}
         </div>
+
+        {/* 个股终端浮窗（页面共用一例；聪明钱榜单行点击打开） */}
+        <StockTerminalWindow
+          open={!!windowSymbol}
+          symbol={windowSymbol}
+          market="CN"
+          onClose={() => setWindowSymbol(null)}
+        />
       </div>
     </div>
   );

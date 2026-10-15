@@ -32,7 +32,7 @@ _HEARTBEAT_WIRED = {
     # T-P2-06 新增（对账/影子对照）
     "dual_book": "services/trade/services/dual_book_reconciliation_task.py",
     "mirror_shadow": "services/trade/services/shadow_compare_service.py",
-    # T-P4-05b 新增（EOD 五卡评分）
+    # T-P4-05b 新增（EOD 六卡评分）
     "eval_scores": "services/trade/services/eval_scores_service.py",
     # T-P4-06 新增（月度体检复检）
     "health_recheck": "services/trade/services/health_recheck_service.py",
@@ -208,6 +208,8 @@ def test_all_jobs_heartbeat_wired_in_source():
         "factor_board_reselect",
         # 资金流延续证据（市场分析 · 资金流全景 v2）
         "flow_evidence",
+        # 聪明钱产物（市场分析 · 聪明钱追踪 v1）
+        "smart_money",
     ):
         assert f'_sched_heartbeat("{job_key}")' in celery_src, f"{job_key} 未接心跳"
 
@@ -231,6 +233,8 @@ def test_all_jobs_heartbeat_wired_in_source():
         "flow_evidence",
         # 2026-10-12 QQ 情报速览（心跳在 trade 常驻循环，见 _HEARTBEAT_WIRED）
         "intel_briefing",
+        # 聪明钱产物（市场分析 · 聪明钱追踪 v1）
+        "smart_money",
     }
     registry = {j.key for j in JOBS if j.heartbeat_ttl is not None}
     assert registry == wired, f"注册表与接线不一致: {registry ^ wired}"
@@ -296,6 +300,8 @@ def test_schedule_ctl_dispatch_covers_rerun_declared_jobs():
         "tdx_cluster_watch",
         # 2026-10-15 通达信桥采集（重跑 = 目标日全数据集各跑一轮；非交易日拒绝）
         "tdx_ingest",
+        # 聪明钱产物（重跑 = 跳过采集按全量重算一份；--date 不适用）
+        "smart_money",
     }
 
     # 未知任务 → 退出码 2（纯函数路径，不触发真实执行）

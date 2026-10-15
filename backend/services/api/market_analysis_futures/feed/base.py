@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 from collections.abc import Sequence
 
@@ -49,6 +50,12 @@ RECEIPTS_REL = "2_base_sector/warehouse_receipts"  # 交易所仓单（日分区
 CFTC_REL = "2_base_sector/cftc"  # CFTC 持仓宽表（周度）
 FX_REL = "2_base_sector/fx_daily"  # 中行外汇牌价（100 外币兑人民币）
 REALTIME_REL = "2_base_sector/futures_realtime"  # 实时快照
+SPOT_BASIS_REL = "2_base_sector/spot_basis"  # 生意社现货价+基差（52 品种，日分区）
+INVENTORY_EM_REL = "2_base_sector/inventory_em"  # 东财库存（59 品种平铺文件）
+MEMBERS_REL = "2_base_sector/member_rank_sina"  # 席位排名（SHFE/CZCE，日分区）
+CCIDX_REL = "2_base_sector/ccidx_index"  # 中证商品期货指数（单文件双序列）
+EXD_REL = "2_base_sector/exchange_daily"  # 交易所官方全合约日行情（真实成交额）
+CMETA_REL = "2_base_sector/contract_meta"  # 合约生命周期快照（日分区）
 
 # ---- 口径常量 ----
 
@@ -85,6 +92,16 @@ def _yi(v: Any) -> float | None:
     if f != f:
         return None
     return round(f / 1e8, 2)
+
+
+def _rank_pct(s: pd.Series) -> pd.Series:
+    """0-100 分位（rank(pct)×100，组内秩平均处理并列）。
+
+    缺失保留 NaN——调用方出口再落 None（「—」），绝不把缺失当 0/末位。
+    """
+    v = pd.to_numeric(s, errors="coerce")
+    r = v.rank(pct=True) * 100.0
+    return r.where(v.notna())
 
 
 def _q(sql: str) -> pd.DataFrame:
@@ -446,6 +463,400 @@ def _fx_series(code: str = "USD") -> pd.DataFrame:
     return cached(f"futures:fx_series:{code}", _load, ttl=1800.0)
 
 
+# ---- 现货基差（生意社） ----
+
+
+def _spot_basis(n_days: int = 500) -> pd.DataFrame:
+    """spot_basis 近 n 个分区（历史基差，供分位与单品种历史）。
+
+    列：dt(YYYYMMDD) + symbol(品种 stem 大写) + spot_price / near_contract /
+    near_contract_price / dominant_contract / dominant_contract_price /
+    near_basis(_rate) / dom_basis(_rate)。rate 为**小数**（0.02 = 2%）。
+    """
+
+    def _load() -> pd.DataFrame:
+        parts = sorted((DATA_DIR / SPOT_BASIS_REL).glob("dt=*/data.parquet"))[-n_days:]
+        if not parts:
+            return pd.DataFrame()
+        literal = ",".join(repr(str(f)) for f in parts)
+        df = _q(
+            f"SELECT * FROM read_parquet([{literal}], union_by_name=true, filename=true)"
+        )
+        if df.empty:
+            return df
+        df["dt"] = df["filename"].str.extract(r"dt=(\d{8})")
+        df["symbol"] = df["symbol"].astype(str).str.upper()
+        for c in (
+            "spot_price",
+            "near_contract_price",
+            "dominant_contract_price",
+            "near_basis",
+            "dom_basis",
+            "near_basis_rate",
+            "dom_basis_rate",
+        ):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["dt"]).sort_values(["symbol", "dt"])
+
+    return cached(f"futures:spot_basis:{n_days}", _load, ttl=1800.0)
+
+
+# ---- 东财库存 ----
+
+
+def _inventory_em() -> pd.DataFrame:
+    """东财库存（每品种一个平铺文件，各自滚动窗口）。
+
+    列 [symbol, dt(YYYYMMDD), inventory, delta]。**每品种 as-of 不同**：
+    个别品种源侧停更（实测 AP 止于 2026-05-29、FU 止于 2025-12-31），
+    页面必须按品种标注最新日期，不得用全局最新日冒充。
+    库存为东财口径（单位随品种），只做相对分位与变化，不做跨品种绝对值比较。
+    """
+
+    def _load() -> pd.DataFrame:
+        files = sorted((DATA_DIR / INVENTORY_EM_REL).glob("*.parquet"))
+        frames = []
+        for f in files:
+            try:
+                d = pd.read_parquet(f, columns=["time", "symbol", "inventory", "delta"])
+            except Exception:  # noqa: BLE001
+                logger.warning("inventory_em 读取失败: %s", f.name)
+                continue
+            frames.append(d)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df["dt"] = pd.to_datetime(df["time"], errors="coerce").dt.strftime("%Y%m%d")
+        df["symbol"] = df["symbol"].astype(str).str.upper()
+        df["inventory"] = pd.to_numeric(df["inventory"], errors="coerce")
+        df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+        return df.dropna(subset=["dt"]).sort_values(["symbol", "dt"])
+
+    return cached("futures:inventory_em", _load, ttl=1800.0)
+
+
+# ---- 席位排名（新浪，SHFE/CZCE） ----
+
+
+def _member_rank() -> pd.DataFrame:
+    """新浪席位排名全分区（主力合约 long/short/volume 三榜，前 10-20 席位）。
+
+    列：dt + time/venue/contract/variety/side/rank/member/size/delta。
+    size 单位=**手**（long/short 为持仓量、volume 为成交量）；CZCE 合约码
+    在摄取侧已归一 4 位年（AP2610）。覆盖仅 SHFE/CZCE（DCE/CFFEX/INE 无源）。
+    """
+
+    def _load() -> pd.DataFrame:
+        parts = sorted((DATA_DIR / MEMBERS_REL).glob("dt=*/data.parquet"))
+        if not parts:
+            return pd.DataFrame()
+        literal = ",".join(repr(str(f)) for f in parts)
+        df = _q(
+            f"SELECT * FROM read_parquet([{literal}], union_by_name=true, filename=true)"
+        )
+        if df.empty:
+            return df
+        df["dt"] = df["filename"].str.extract(r"dt=(\d{8})")
+        df["variety"] = df["variety"].astype(str).str.upper()
+        df["side"] = df["side"].astype(str).str.lower()
+        for c in ("size", "delta", "rank"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["dt"])
+
+    return cached("futures:member_rank", _load, ttl=1800.0)
+
+
+# ---- 中证商品指数 ----
+
+
+def _ccidx(slug: str = "commodity") -> pd.DataFrame:
+    """中证商品期货指数序列（单文件；slug=commodity|price）。
+
+    自带官方口径区间收益：change_1m/3m/6m/ytd_change（%）与
+    annual_return_1y/3y/5y/10y（%）。序列自 2022-10-17 起。
+    """
+
+    def _load() -> pd.DataFrame:
+        p = DATA_DIR / CCIDX_REL / "data.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        df = pd.read_parquet(p)
+        if "index_slug" not in df.columns:
+            return pd.DataFrame()
+        df = df[df["index_slug"] == slug].copy()
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        for c in (
+            "close",
+            "settle",
+            "change",
+            "pct_change",
+            "change_1m",
+            "change_3m",
+            "change_6m",
+            "ytd_change",
+            "annual_return_1y",
+            "annual_return_3y",
+            "annual_return_5y",
+            "annual_return_10y",
+        ):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["time"]).sort_values("time")
+
+    return cached(f"futures:ccidx:{slug}", _load, ttl=1800.0)
+
+
+# ---- 交易所官方成交额 ----
+
+
+def _exchange_turnover() -> dict[str, Any] | None:
+    """交易所官方最新**完整日**成交额（真实口径）。
+
+    完整日 = SHFE/CZCE/CFFEX/INE 四所齐备的最近分区。turnover 源侧单位为
+    **万元**（实测四所 ratio≈1e-4，与 close×volume×乘数 一致），此处换算为
+    亿元。DCE/GFEX 源侧无接口 → 恒缺，如实列出 `venues_missing`。
+    """
+
+    def _load() -> dict[str, Any] | None:
+        d = DATA_DIR / EXD_REL
+        days = sorted(p.name[3:] for p in d.glob("dt=*") if p.is_dir())
+        for ymd in reversed(days[-10:]):
+            f = d / f"dt={ymd}" / "data.parquet"
+            if not f.exists():
+                continue
+            try:
+                df = pd.read_parquet(f, columns=["venue", "turnover"])
+            except Exception:  # noqa: BLE001
+                logger.warning("exchange_daily 读取失败: %s", ymd)
+                continue
+            venues = set(df["venue"].dropna().astype(str))
+            if not {"SHFE", "CZCE", "CFFEX", "INE"} <= venues:
+                continue
+            t = pd.to_numeric(df["turnover"], errors="coerce")
+            by = (
+                df.assign(_t=t).groupby("venue")["_t"].sum(min_count=1)
+                * 1e4  # 万元 → 元
+            )
+            total_yuan = float(t.sum(min_count=1)) * 1e4
+            return {
+                "date": to_iso(ymd),
+                "total_yi": round(total_yuan / 1e8, 1),
+                "by_venue_yi": {
+                    str(v): round(float(x) / 1e8, 1) for v, x in by.items()
+                },
+                "row_count": int(len(df)),
+                "venues_missing": ["DCE", "GFEX"],
+            }
+        return None
+
+    return cached("futures:exchange_turnover", _load, ttl=1800.0)
+
+
+# ---- 合约生命周期 ----
+
+
+def _norm_meta_symbol(sym: str) -> str:
+    """contract_meta 合约码归一：CZCE 3 位年（AP610 → AP2610），其余大写。"""
+    s = str(sym).strip().upper()
+    m = re.fullmatch(r"([A-Z]+)(\d{3})", s)
+    return f"{m.group(1)}2{m.group(2)}" if m else s
+
+
+def _contract_expiry() -> pd.DataFrame:
+    """最新 contract_meta 快照：合约 → 到期参考日。
+
+    列 [symbol(大写 4 位年), venue, expiry(YYYY-MM-DD), source]。
+    expiry = last_trade_date（CFFEX/CZCE 有）→ expire_date（SHFE/INE 仅有
+    后者）；DCE/GFEX 无 meta → 不在表内（调用方走月差估算并标注 estimated）。
+    """
+
+    def _load() -> pd.DataFrame:
+        parts = sorted((DATA_DIR / CMETA_REL).glob("dt=*/data.parquet"))
+        if not parts:
+            return pd.DataFrame()
+        try:
+            df = pd.read_parquet(parts[-1])
+        except Exception:  # noqa: BLE001
+            logger.warning("contract_meta 读取失败: %s", parts[-1].name)
+            return pd.DataFrame()
+        if "symbol" not in df.columns:
+            return pd.DataFrame()
+        out = pd.DataFrame(index=df.index)
+        out["symbol"] = df["symbol"].astype(str).map(_norm_meta_symbol)
+        out["venue"] = (
+            df["venue"].astype(str)
+            if "venue" in df.columns
+            else pd.Series("", df.index)
+        )
+        ltd = pd.to_datetime(df.get("last_trade_date"), errors="coerce")
+        exp = pd.to_datetime(df.get("expire_date"), errors="coerce")
+        pick = ltd.where(ltd.notna(), exp)
+        src = pd.Series("last_trade_date", index=df.index).where(
+            ltd.notna(), pd.Series("expire_date", index=df.index).where(exp.notna())
+        )
+        out["expiry"] = pick.dt.strftime("%Y-%m-%d")
+        out["source"] = src
+        return out.dropna(subset=["symbol"]).drop_duplicates("symbol", keep="first")
+
+    return cached("futures:contract_expiry", _load, ttl=1800.0)
+
+
+# ---- 数据质检（/status 与总览质检条共用） ----
+
+# 新鲜度阈值（自然日）：fresh ≤ _FRESH_DAYS；≤ _STALE_DAYS 为 stale；否则 unavailable
+_FRESH_DAYS = 4  # 覆盖周末与单日源侧延迟
+_STALE_DAYS = 14
+
+
+def _freshness(latest_iso: str | None, fresh_days: int = _FRESH_DAYS) -> str:
+    """最新日期 → fresh/stale/unavailable（无数据 = unavailable）。"""
+    if not latest_iso:
+        return "unavailable"
+    try:
+        d = pd.Timestamp(latest_iso)
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+    age = (pd.Timestamp.now().normalize() - d.normalize()).days
+    if age <= fresh_days:
+        return "fresh"
+    return "stale" if age <= _STALE_DAYS else "unavailable"
+
+
+def _datasets_quality() -> list[dict[str, Any]]:
+    """十项数据集的「最新日期 / 覆盖 / 新鲜度」质检行（页面质检条唯一数据源）。"""
+    rows: list[dict[str, Any]] = []
+
+    def _add(
+        key: str,
+        name: str,
+        latest: str | None,
+        coverage: str,
+        fresh_days: int = _FRESH_DAYS,
+        note: str | None = None,
+    ) -> None:
+        rows.append(
+            {
+                "key": key,
+                "name": name,
+                "latest": latest,
+                "coverage": coverage,
+                "freshness": _freshness(latest, fresh_days),
+                "note": note,
+            }
+        )
+
+    if not _avail():
+        return rows
+
+    # 行情主源
+    kd = _latest_trade_date()
+    _add("kline", "主力连续日K", to_iso(kd) if kd else None, "国内 84 品种主力连续")
+    # 分合约
+    c = _contracts()
+    _add(
+        "contracts",
+        "分合约日K",
+        c["time"].max().strftime("%Y-%m-%d") if not c.empty else None,
+        f"{int(c['stem'].nunique())} 品种" if not c.empty else "0 品种",
+    )
+    # 官方成交额
+    try:
+        ex = _exchange_turnover()
+    except Exception:  # noqa: BLE001
+        ex = None
+    _add(
+        "exchange_daily",
+        "交易所官方日行情",
+        ex["date"] if ex else None,
+        "SHFE/CZCE/CFFEX/INE（DCE/GFEX 无源）",
+        note="真实成交额来源；常规约 640 合约/日",
+    )
+    # 现货基差
+    try:
+        sb = _spot_basis(10)
+    except Exception:  # noqa: BLE001
+        sb = pd.DataFrame()
+    _add(
+        "spot_basis",
+        "现货基差（生意社）",
+        to_iso(str(sb["dt"].max())) if not sb.empty else None,
+        f"{int(sb['symbol'].nunique())} 品种/日" if not sb.empty else "0 品种",
+    )
+    # 东财库存
+    try:
+        ie = _inventory_em()
+    except Exception:  # noqa: BLE001
+        ie = pd.DataFrame()
+    if not ie.empty:
+        latest_ie = str(ie["dt"].max())
+        fresh_n = int(
+            ie.groupby("symbol")["dt"]
+            .max()
+            .ge((pd.Timestamp(latest_ie) - pd.Timedelta(days=7)).strftime("%Y%m%d"))
+            .sum()
+        )
+        _add(
+            "inventory_em",
+            "东财库存",
+            to_iso(latest_ie),
+            f"{int(ie['symbol'].nunique())} 品种（{fresh_n} 个跟随最新）",
+        )
+    else:
+        _add("inventory_em", "东财库存", None, "0 品种")
+    # 仓单
+    r = _receipts()
+    if not r.empty:
+        rl = str(r["dt"].max())
+        rv = sorted(r.loc[r["dt"] == rl, "venue"].dropna().astype(str).unique())
+        _add("receipts", "交易所仓单", to_iso(rl), "、".join(rv) or "无")
+    else:
+        _add("receipts", "交易所仓单", None, "无")
+    # 席位
+    try:
+        mb = _member_rank()
+    except Exception:  # noqa: BLE001
+        mb = pd.DataFrame()
+    if not mb.empty:
+        ml = str(mb["dt"].max())
+        _add(
+            "members",
+            "席位排名（新浪）",
+            to_iso(ml),
+            f"{int(mb.loc[mb['dt'] == ml, 'variety'].nunique())} 品种（SHFE/CZCE）",
+        )
+    else:
+        _add("members", "席位排名（新浪）", None, "无")
+    # CFTC
+    cf = _cftc_long("c")
+    _add(
+        "cftc",
+        "CFTC 持仓",
+        cf["date"].max() if not cf.empty else None,
+        f"{int(cf['item'].nunique())} 品种" if not cf.empty else "0 品种",
+        fresh_days=10,  # 周度数据
+    )
+    # 中证商品指数
+    ci = _ccidx("commodity")
+    _add(
+        "ccidx",
+        "中证商品期货指数",
+        ci["time"].max().strftime("%Y-%m-%d") if not ci.empty else None,
+        "commodity + price 双序列",
+    )
+    # 合约生命周期
+    cm = _contract_expiry()
+    meta_dirs = sorted((DATA_DIR / CMETA_REL).glob("dt=*"))
+    _add(
+        "contract_meta",
+        "合约生命周期",
+        to_iso(meta_dirs[-1].name[3:]) if meta_dirs else None,
+        f"{len(cm)} 合约（SHFE/CZCE/CFFEX/INE）" if not cm.empty else "无",
+    )
+    return rows
+
+
 # ---- 诊断 ----
 
 
@@ -486,6 +897,8 @@ def feed_status() -> dict[str, Any]:
         "fx_latest": fx["date"] if fx else None,
         "universe_size": len(FUTURES_META),
         "sectors": SECTORS,
+        # 十项数据集质检（前端质检条唯一数据源）
+        "datasets": _datasets_quality(),
         # 页面需向用户明示的口径与覆盖限制
         "notes": {
             "price": "价格为品种报价口径（元/吨、元/克等），主力连续含换月跳空",
@@ -508,11 +921,18 @@ __all__ = [
     "CFTC_REL",
     "FX_REL",
     "REALTIME_REL",
+    "SPOT_BASIS_REL",
+    "INVENTORY_EM_REL",
+    "MEMBERS_REL",
+    "CCIDX_REL",
+    "EXD_REL",
+    "CMETA_REL",
     "MIN_CN_SYMBOLS",
     "clear_cache_futures",
     "feed_status",
     "_num",
     "_yi",
+    "_rank_pct",
     "_q",
     "_avail",
     "_partition_file",
@@ -530,5 +950,13 @@ __all__ = [
     "_cftc_long",
     "_fx_rate",
     "_fx_series",
+    "_spot_basis",
+    "_inventory_em",
+    "_member_rank",
+    "_ccidx",
+    "_exchange_turnover",
+    "_contract_expiry",
+    "_norm_meta_symbol",
+    "_datasets_quality",
     "to_iso",
 ]

@@ -12,8 +12,10 @@ import pandas as pd
 
 from backend.services.api.market_analysis_shared.caching import cached
 from backend.services.api.market_analysis_futures.feed.base import (
+    _ccidx,
     _cross_section,
     _enrich,
+    _exchange_turnover,
     _num,
     _yi,
     to_iso,
@@ -68,13 +70,62 @@ def _group_stat(sub: pd.DataFrame) -> dict:
     }
 
 
+def _benchmark() -> dict | None:
+    """大盘背景条：中证商品期货指数（点位 + 官方口径区间/年化收益 + 近 90 日走势）。"""
+
+    def _load() -> dict | None:
+        df = _ccidx("commodity")
+        if df.empty:
+            return None
+        last = df.iloc[-1]
+        tail = df.tail(90)
+        return {
+            "name": str(last.get("index_name") or "中证商品期货指数"),
+            "code": str(last.get("index_code") or "") or None,
+            "date": str(pd.Timestamp(last["time"]).date()),
+            "close": _num(last["close"]),
+            "pct_change": _num(last.get("pct_change")),
+            "change_1m": _num(last.get("change_1m")),
+            "change_3m": _num(last.get("change_3m")),
+            "change_6m": _num(last.get("change_6m")),
+            "ytd_change": _num(last.get("ytd_change")),
+            "annual_return_1y": _num(last.get("annual_return_1y")),
+            "annual_return_3y": _num(last.get("annual_return_3y")),
+            "annual_return_5y": _num(last.get("annual_return_5y")),
+            "annual_return_10y": _num(last.get("annual_return_10y")),
+            "history": [
+                {
+                    "date": str(pd.Timestamp(r["time"]).date()),
+                    "close": _num(r["close"]),
+                }
+                for _, r in tail.iterrows()
+            ],
+            "source": "中证商品期货指数（官方口径区间/年化收益）",
+        }
+
+    return cached("futures:benchmark", _load, ttl=1800.0)
+
+
 def get_overview() -> dict:
-    """全市场统计卡：涨跌家数 / 中位涨幅 / 名义成交额与持仓额 / 首尾板块。"""
+    """全市场统计卡：涨跌家数 / 中位涨幅 / 名义成交额与持仓额 / 首尾板块
+    + 大盘基准（中证商品指数）+ 交易所官方成交额（真实口径）。"""
 
     def _load() -> dict:
         trade_date, snap = _cross_section()
+        benchmark = _benchmark()
+        try:
+            market_turnover = _exchange_turnover()
+        except Exception:  # noqa: BLE001
+            market_turnover = None
         if not trade_date or snap.empty:
-            return {"trade_date": None, "totals": {}, "domestic": {}, "groups": []}
+            return {
+                "trade_date": None,
+                "totals": {},
+                "domestic": {},
+                "groups": [],
+                "benchmark": benchmark,
+                "market_turnover": market_turnover,
+            }
         df = _enrich(snap)
         syms = df["symbol"].astype(str)
         domestic = df[syms.str.endswith(".CN")]
@@ -104,6 +155,8 @@ def get_overview() -> dict:
             "sge": _group_stat(sge),
             "top_sector": _sector_entry(sector_rows[0]) if sector_rows else None,
             "bottom_sector": _sector_entry(sector_rows[-1]) if sector_rows else None,
+            "benchmark": benchmark,
+            "market_turnover": market_turnover,
         }
 
     return cached("futures_overview", _load)

@@ -14,7 +14,9 @@ import pandas as pd
 
 from backend.services.api.market_analysis_shared.caching import cached
 from backend.services.api.market_analysis_futures.feed.base import (
+    _inventory_em,
     _num,
+    _rank_pct,
     _receipts,
     to_iso,
 )
@@ -154,3 +156,115 @@ def get_receipts(variety: str | None = None, days: int = 30) -> dict:
         }
 
     return cached(f"futures_receipts:{variety or 'all'}:{days}", _load)
+
+
+# ---- 东财库存（59 品种，与仓单互为印证） ----
+
+_CYCLE_BAND = 0.005  # 20 日变化 ±0.5% 内记「持平」
+_STALE_DAYS = 7  # 品种 as-of 落后全局最新 > 7 自然日 → 陈旧显形
+
+
+def get_inventory_em(symbol: str | None = None, limit: int = 80) -> dict:
+    """东财库存榜：5/20 日变化、自身历史分位、累去库标签；（可选）单品种历史。
+
+    每品种 as-of 可能不同（个别源侧停更，实测 AP/FU）——out_of_sync 显形，
+    绝不用全局最新日冒充。库存单位随品种（东财口径），只做相对比较。
+    """
+
+    def _load() -> dict:
+        df = _inventory_em()
+        if df.empty:
+            return {
+                "as_of": None,
+                "rows": [],
+                "variety_count": 0,
+                "history": None,
+                "notes": ["inventory_em 数据不可用"],
+            }
+        global_latest = str(df["dt"].max())
+        stale_cut = (
+            pd.Timestamp(global_latest) - pd.Timedelta(days=_STALE_DAYS)
+        ).strftime("%Y%m%d")
+        rows = []
+        for sym, sub in df.groupby("symbol"):
+            sub = sub.dropna(subset=["inventory"]).sort_values("dt")
+            if sub.empty:
+                continue
+            inv = sub["inventory"]
+            latest_row = sub.iloc[-1]
+            chg5 = (
+                float(inv.iloc[-1] / inv.iloc[-6] - 1.0) * 100.0
+                if len(sub) >= 6 and inv.iloc[-6]
+                else float("nan")
+            )
+            chg20 = (
+                float(inv.iloc[-1] / inv.iloc[-21] - 1.0) * 100.0
+                if len(sub) >= 21 and inv.iloc[-21]
+                else float("nan")
+            )
+            pct_hist = _rank_pct(inv).iloc[-1] if len(sub) >= 20 else float("nan")
+            cycle = None
+            if chg20 == chg20:
+                if chg20 > _CYCLE_BAND * 100:
+                    cycle = "build"  # 累库
+                elif chg20 < -_CYCLE_BAND * 100:
+                    cycle = "draw"  # 去库
+                else:
+                    cycle = "flat"
+            stem = str(sym)
+            rows.append(
+                {
+                    "symbol": stem,
+                    "name": STEM_NAME.get(stem, stem),
+                    "as_of": to_iso(str(latest_row["dt"])),
+                    "out_of_sync": str(latest_row["dt"]) < stale_cut,
+                    "inventory": _num(latest_row["inventory"], 0),
+                    "delta_1d": _num(latest_row.get("delta"), 0),
+                    "chg_5d_pct": _num(chg5, 1) if chg5 == chg5 else None,
+                    "chg_20d_pct": _num(chg20, 1) if chg20 == chg20 else None,
+                    "pct_hist": _num(pct_hist, 1) if pct_hist == pct_hist else None,
+                    "cycle": cycle,
+                    "sample_days": int(len(sub)),
+                }
+            )
+        rows.sort(
+            key=lambda r: (
+                r["chg_20d_pct"] is None,
+                -(r["chg_20d_pct"] or 0),
+            )
+        )
+
+        history = None
+        if symbol:
+            stem = str(symbol).strip().upper().replace(".CN", "")
+            sub = df[df["symbol"] == stem].sort_values("dt")
+            if not sub.empty:
+                history = {
+                    "symbol": stem,
+                    "name": STEM_NAME.get(stem, stem),
+                    "points": [
+                        {
+                            "date": to_iso(str(r["dt"])),
+                            "inventory": _num(r["inventory"], 0),
+                            "delta": _num(r.get("delta"), 0),
+                        }
+                        for _, r in sub.iterrows()
+                    ],
+                }
+        fresh_n = sum(1 for r in rows if not r["out_of_sync"])
+        return {
+            "as_of": to_iso(global_latest),
+            "rows": rows[:limit],
+            "variety_count": len(rows),
+            "fresh_count": fresh_n,
+            "history": history,
+            "notes": [
+                "东财库存口径，单位随品种（只做相对分位与变化）",
+                f"{len(rows) - fresh_n} 个品种 as-of 落后最新（源侧停更，已显形）"
+                if fresh_n < len(rows)
+                else "全部品种跟随最新",
+                "theory of storage：去库通常对应近端偏强（前瞻板库存因子即此口径取反）",
+            ],
+        }
+
+    return cached(f"futures_inventory_em:{symbol or 'all'}:{limit}", _load, ttl=1800.0)

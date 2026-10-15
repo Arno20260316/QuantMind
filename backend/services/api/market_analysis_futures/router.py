@@ -1,7 +1,7 @@
 # mypy: disable-error-code=untyped-decorator
 
-"""期货市场分析 API Router — 行情总览 / 板块热力 / 期限结构 / 持仓分析 /
-仓单库存 / 内外盘与期现价差。
+"""期货市场分析 API Router — 行情总览 / 前瞻视角 / 板块热力 / 期限结构 /
+持仓与席位 / 库存与基差 / 内外盘与期现价差。
 
 端点前缀：`/api/v1/market-analysis-futures`
 结构对标美股 `market_analysis_us/router.py`（REST 同步 + SSE 流式重算），
@@ -27,7 +27,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from backend.services.api.market_analysis_futures.feed import (
+    basis,
     inventory,
+    members,
+    outlook,
     overview,
     positions,
     sectors,
@@ -147,6 +150,40 @@ async def get_term_ranking(
         raise _fatal(exc) from exc
 
 
+# ---- Tab 2 前瞻视角（多因子分位合成） ----
+
+
+@router.get("/outlook")
+async def get_outlook(
+    sector: str | None = Query(default=None, max_length=30),
+    limit: int | None = Query(default=None, ge=5, le=200),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """前瞻板：carry/基差/库存/动量/季节性 五因子等权合成分位视角。
+
+    展示面只说位置（靠前/居中/靠后）：不给买卖词汇、不写「概率」。
+    缺失因子剔除权重重归一；可用因子 < 2 → composite 为 null（不排名）。
+    """
+    _ = current_user
+    try:
+        return await asyncio.to_thread(outlook.get_outlook, sector, limit)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/variety")
+async def get_variety(
+    symbol: str = Query(min_length=1, max_length=20),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """品种画像：前瞻因子行 + carry 一年历史 + 基差/库存/价量/席位下钻。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(outlook.get_variety, symbol)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
 # ---- Tab 4 持仓分析 ----
 
 
@@ -177,6 +214,21 @@ async def get_oi_changes(
         raise _fatal(exc) from exc
 
 
+@router.get("/members")
+async def get_members(
+    symbol: str | None = Query(default=None, max_length=10),
+    limit: int = Query(default=60, ge=5, le=120),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """席位排名（新浪口径，SHFE/CZCE）：多空净额/前五集中度/日变化；
+    symbol 给定时附单品种三榜明细与逐日净多趋势。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(members.get_members, symbol, limit)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
 # ---- Tab 5 仓单库存 ----
 
 
@@ -193,6 +245,21 @@ async def get_receipts(
     _ = current_user
     try:
         return await asyncio.to_thread(inventory.get_receipts, variety, days)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/inventory")
+async def get_inventory(
+    symbol: str | None = Query(default=None, max_length=10),
+    limit: int = Query(default=80, ge=5, le=120),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """东财库存（59 品种）：5/20 日变化、自身历史分位、累/去库标签；
+    symbol 给定时附单品种历史。个别品种源侧停更 → out_of_sync 显形。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(inventory.get_inventory_em, symbol, limit)
     except Exception as exc:
         raise _fatal(exc) from exc
 
@@ -226,6 +293,22 @@ async def get_precious_basis(
         raise _fatal(exc) from exc
 
 
+@router.get("/basis")
+async def get_basis(
+    symbol: str | None = Query(default=None, max_length=10),
+    limit: int = Query(default=60, ge=5, le=120),
+    days: int = Query(default=500, ge=60, le=750),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """现货基差全景（生意社 52 品种）：基差率 + 自身 250d 时序分位；
+    symbol 给定时附单品种近 2 年逐日历史。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(basis.get_basis, symbol, limit, days)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
 # ---- 手动刷新 ----
 
 
@@ -238,12 +321,16 @@ def _sse(event: str, data: Any) -> str:
 _REFRESH_STEPS = [
     ("overview", overview.get_overview),
     ("ranking", overview.get_ranking, "change", None, 20),
+    ("outlook", outlook.get_outlook, None, None),
     ("heatmap", sectors.get_heatmap, None),
     ("sector_stats", sectors.get_sector_stats),
     ("term_ranking", term.get_term_ranking, 40),
     ("cftc", positions.get_cftc, 15),
     ("oi_changes", positions.get_oi_changes, 1, 30),
+    ("members", members.get_members, None, 60),
     ("receipts", inventory.get_receipts, None, 30),
+    ("inventory_em", inventory.get_inventory_em, None, 80),
+    ("basis", basis.get_basis, None, 60, 500),
     ("cross_market", spread.get_cross_market, 60),
     ("precious_basis", spread.get_precious_basis, 60),
 ]

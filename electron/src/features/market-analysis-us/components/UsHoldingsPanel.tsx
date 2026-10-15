@@ -29,7 +29,9 @@ const ROW = 'grid gap-1 px-1 py-[3px] text-[10px] items-center border-b border-s
 const SCROLL = 'flex flex-col flex-1 min-h-0 overflow-y-auto';
 
 const INS_GRID = 'grid-cols-[14px_1fr_58px_34px_58px]';
-const INST_GRID = 'grid-cols-[14px_1fr_54px_40px_54px]';
+// 「增家数/减家数」六字头在 54px 轨道里折成两行（实机截图确认）——
+// 轨道加宽到 64px 并把表头缩为「增/减家数」，行值仍是 红增/绿减 双色数字
+const INST_GRID = 'grid-cols-[14px_1fr_64px_40px_60px]';
 const DIV_GRID = 'grid-cols-[14px_1fr_36px_40px_58px]';
 const SPLIT_GRID = 'grid-cols-[14px_1fr_58px_48px]';
 
@@ -107,7 +109,7 @@ function MetricTile({ label, value, tone = 'blue' }: { label: string; value: Rea
 // ---- 四张表 ----
 
 const INS_HEAD = ['#', '标的 / 内部人', ['最近日期', true], ['笔数', true], ['金额', true]] as const;
-const INST_HEAD = ['#', '标的', ['增家数/减家数', true], ['机构数', true], ['增减金额', true]] as const;
+const INST_HEAD = ['#', '标的', ['增/减家数', true], ['机构数', true], ['增减金额', true]] as const;
 const DIV_HEAD = ['#', '标的', '除息日', ['距今', true], ['派息日', true]] as const;
 const SPLIT_HEAD = ['#', '标的', '拆股日', ['比例（新:旧）', true]] as const;
 
@@ -183,7 +185,7 @@ const InsiderCard: React.FC<{ insider: UsInsiderMovers | null; loading: boolean 
       <MetricTile label="买入金额" value={`US$ ${fmtInt(insider?.buy_amount_yi)}亿`} tone="red" />
       <MetricTile label="卖出金额" value={`US$ ${fmtInt(insider?.sell_amount_yi)}亿`} tone="green" />
     </div>
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-1.5 shrink-0 xl:h-[380px]">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-1.5 shrink-0 xl:h-[460px]">
       <div className="flex flex-col gap-0.5 min-w-0 min-h-0">
         <MiniHead tone="red" label="买入榜" extra={`Top ${insider?.top_buys?.length ?? 0}`} />
         <Table
@@ -230,7 +232,7 @@ const InstCard: React.FC<{ inst: UsInstitutionalHolders | null; loading: boolean
       <MetricTile label="机构持股中位占比" value={pctOrDash(inst?.institutions_pct_median)} />
       <MetricTile label="内部人持股中位占比" value={pctOrDash(inst?.insiders_pct_median, 2)} tone="red" />
     </div>
-    <div className="flex flex-col gap-0.5 min-w-0 min-h-0">
+    <div className="flex flex-col gap-0.5 min-w-0 min-h-0 flex-1">
       <span className="flex items-center gap-1.5 px-1 pb-0.5 border-b border-slate-100">
         <span className="text-[10px] font-extrabold text-blue-700">增持榜</span>
         <span className="text-[9px] font-mono text-slate-400">按增减金额排序</span>
@@ -240,7 +242,7 @@ const InstCard: React.FC<{ inst: UsInstitutionalHolders | null; loading: boolean
         loading={loading} emptyText="暂无增持记录" render={instCells}
       />
     </div>
-    <div className="flex flex-col gap-0.5 min-w-0 min-h-0">
+    <div className="flex flex-col gap-0.5 min-w-0 min-h-0 flex-1">
       <span className="flex items-center gap-1.5 px-1 pb-0.5 border-b border-slate-100">
         <span className="text-[10px] font-extrabold text-blue-700">减持榜</span>
         <span className="text-[9px] font-mono text-slate-400">按增减金额排序</span>
@@ -340,8 +342,10 @@ export const UsHoldingsPanel: React.FC = () => {
         <DateBadge label="数据" date={insider?.as_of || dividends?.as_of} />
       </div>
 
-      {/* 第一行：内部人交易榜（2 栏）+ 机构持仓（1 栏） */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-1.5 shrink-0 xl:h-[300px]">
+      {/* 第一行：内部人交易榜（2 栏）+ 机构持仓（1 栏）
+          行高 300px 时两张卡的行是「标的 + 头部持股」两行式，双榜各只剩 1 行可见、
+          第二行文字被卡底裁掉（实机截图确认）；430px 让每榜稳定露出 3-4 行并可滚动。 */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-1.5 shrink-0 xl:h-[580px]">
         <InsiderCard insider={insider} loading={loading} />
         <InstCard inst={institutional} loading={loading} />
       </div>

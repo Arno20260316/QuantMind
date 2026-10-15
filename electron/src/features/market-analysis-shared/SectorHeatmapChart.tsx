@@ -18,6 +18,8 @@ export interface SectorHeatmapItem {
   leader_pct?: number;
   /** 主力净额（亿）；仅下钻/按净额着色时有值 */
   flow_net?: number;
+  /** tooltip 透传附加字段（下钻层展示细分行业/量比/成交额等）；不参与布局 */
+  extra?: Record<string, unknown>;
 }
 
 interface SectorHeatmapChartProps {
@@ -33,6 +35,8 @@ interface SectorHeatmapChartProps {
   labelValueOf?: (item: SectorHeatmapItem) => string;
   /** tooltip 内追加一行（下钻层显示主力净额）；返回空串则不显示 */
   tooltipExtraOf?: (item: SectorHeatmapItem) => string;
+  /** 涨跌幅行的口径名（默认「平均涨跌幅」；中位聚合的市场传「中位涨跌幅」） */
+  pctLabel?: string;
   /**
    * 渲染键：当取色/标签口径变化（如切换「涨跌幅 ↔ 主力净额」）时，
    * 调用方把该值一并改变即可触发重绘。回调函数一律走 ref 读取最新值，
@@ -49,6 +53,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
   colorOf,
   labelValueOf,
   tooltipExtraOf,
+  pctLabel = '平均涨跌幅',
   renderKey = '',
 }) => {
   const chartRef = useRef<HTMLDivElement>(null);
@@ -59,11 +64,13 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
   const colorOfRef = useRef(colorOf);
   const labelValueOfRef = useRef(labelValueOf);
   const tooltipExtraOfRef = useRef(tooltipExtraOf);
+  const pctLabelRef = useRef(pctLabel);
   useEffect(() => {
     onItemClickRef.current = onItemClick;
     colorOfRef.current = colorOf;
     labelValueOfRef.current = labelValueOf;
     tooltipExtraOfRef.current = tooltipExtraOf;
+    pctLabelRef.current = pctLabel;
   });
 
   const sectorItems = data && data.length > 0 ? data : [];
@@ -89,6 +96,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
       leader: item.leader,
       leader_pct: item.leader_pct,
       flow_net: (item as { flow_net?: number }).flow_net,
+      extra: item.extra,
       // 第二行标签文本：默认涨跌幅，下钻层可覆盖为「+x.xx亿」等
       label_value:
         labelValueOfRef.current?.(item) ??
@@ -131,6 +139,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
               leader: d.leader,
               leader_pct: d.leader_pct,
               flow_net: d.flow_net,
+              extra: d.extra,
             } as SectorHeatmapItem);
             return raw ? `<div style="margin-top: 2px;">${raw}</div>` : '';
           })();
@@ -138,7 +147,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
             <div style="font-family: sans-serif; font-size: 12px; padding: 2px 4px;">
               <div style="font-weight: bold; font-size: 13px; margin-bottom: 4px; border-bottom: 1px solid #475569; padding-bottom: 4px;">${info.name}</div>
               <div>${valueLabel}: <b>${cap} 亿</b></div>
-              <div>平均涨跌幅: <span style="color: ${color}; font-weight: bold;">${pct >= 0 ? '+' : ''}${pct}%</span></div>
+              <div>${pctLabelRef.current}: <span style="color: ${color}; font-weight: bold;">${pct >= 0 ? '+' : ''}${pct}%</span></div>
               ${leaderText}
               ${extra}
             </div>
@@ -238,7 +247,7 @@ export const SectorHeatmapChart: React.FC<SectorHeatmapChartProps> = ({
       chart.dispose();
       instanceRef.current = null;
     };
-  }, [sectorItems, valueLabel, renderKey]);
+  }, [sectorItems, valueLabel, pctLabel, renderKey]);
 
   if (sectorItems.length === 0) {
     return (

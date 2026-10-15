@@ -89,6 +89,169 @@ SECTOR_CN: dict[str, str] = {
     "Unknown": "未分类",
 }
 
+# 细分行业（yahoo industry 口径）常用词条中译 —— 下钻 tooltip 与个股画像展示用。
+# 查不到的中译回落英文原文（不硬译），新词条随行业表更新迭代。
+INDUSTRY_CN: dict[str, str] = {
+    # 信息技术
+    "Consumer Electronics": "消费电子",
+    "Software - Infrastructure": "基础软件",
+    "Software - Application": "应用软件",
+    "Semiconductors": "半导体",
+    "Semiconductor Equipment & Materials": "半导体设备与材料",
+    "Computer Hardware": "计算机硬件",
+    "Information Technology Services": "信息技术服务",
+    "Communication Equipment": "通信设备",
+    "Electronic Components": "电子元件",
+    "Scientific & Technical Instruments": "科学仪器",
+    "Solar": "光伏",
+    "Electronics & Computer Distribution": "电子与计算机分销",
+    "Computer Distribution": "计算机分销",
+    "Data Storage": "数据存储",
+    # 金融
+    "Banks - Diversified": "多元化银行",
+    "Banks - Regional": "区域银行",
+    "Credit Services": "信贷服务",
+    "Asset Management": "资产管理",
+    "Capital Markets": "资本市场",
+    "Financial Data & Stock Exchanges": "金融数据与交易所",
+    "Insurance - Diversified": "多元化保险",
+    "Insurance - Life": "寿险",
+    "Insurance - Property & Casualty": "财产与意外险",
+    "Insurance - Reinsurance": "再保险",
+    "Insurance - Specialty": "专业保险",
+    "Insurance Brokers": "保险经纪",
+    "Mortgage Finance": "抵押金融",
+    "Financial Conglomerates": "金融集团",
+    "Shell Companies": "壳公司",
+    # 医疗保健
+    "Drug Manufacturers - General": "通用制药",
+    "Drug Manufacturers - Specialty & Generic": "特色与仿制药",
+    "Biotechnology": "生物技术",
+    "Medical Devices": "医疗器械",
+    "Medical Instruments & Supplies": "医疗仪器与耗材",
+    "Diagnostics & Research": "诊断与研究服务",
+    "Healthcare Plans": "健康保险计划",
+    "Medical Care Facilities": "医疗服务设施",
+    "Health Information Services": "健康信息服务",
+    "Pharmaceutical Retailers": "医药零售",
+    "Medical Distribution": "医疗分销",
+    # 可选消费
+    "Auto Manufacturers": "汽车制造",
+    "Auto Parts": "汽车零部件",
+    "Auto & Truck Dealerships": "汽车经销商",
+    "Recreational Vehicles": "房车",
+    "Home Improvement Retail": "家居建材零售",
+    "Specialty Retail": "专业零售",
+    "Internet Retail": "互联网零售",
+    "Apparel Retail": "服装零售",
+    "Department Stores": "百货商店",
+    "Discount Stores": "折扣商店",
+    "Restaurants": "餐饮",
+    "Lodging": "酒店住宿",
+    "Resorts & Casinos": "度假村与赌场",
+    "Travel Services": "旅游服务",
+    "Leisure": "休闲",
+    "Gambling": "博彩",
+    "Textile Manufacturing": "纺织制造",
+    "Apparel Manufacturing": "服装制造",
+    "Footwear & Accessories": "鞋类与配饰",
+    "Luxury Goods": "奢侈品",
+    "Furnishings, Fixtures & Appliances": "家具与家电",
+    "Residential Construction": "住宅建设",
+    "Building Products & Equipment": "建筑产品与设备",
+    "Packaging & Containers": "包装与容器",
+    "Personal Services": "个人服务",
+    "Specialty Business Services": "专业商务服务",
+    "Staffing & Employment Services": "人力资源服务",
+    "Education & Training Services": "教育培训",
+    "Advertising Agencies": "广告代理",
+    # 日常消费
+    "Food Distribution": "食品分销",
+    "Grocery Stores": "食品杂货店",
+    "Packaged Foods": "包装食品",
+    "Confectioners": "糖果",
+    "Beverages - Non-Alcoholic": "非酒精饮料",
+    "Beverages - Brewers": "啤酒",
+    "Beverages - Wineries & Distilleries": "葡萄酒与烈酒",
+    "Tobacco": "烟草",
+    "Household & Personal Products": "家庭与个人用品",
+    "Farm Products": "农产品",
+    "Agricultural Inputs": "农业投入品",
+    # 工业
+    "Aerospace & Defense": "航空航天与国防",
+    "Airlines": "航空",
+    "Airports & Air Services": "机场与航空服务",
+    "Railroads": "铁路",
+    "Trucking": "公路货运",
+    "Marine Shipping": "海运",
+    "Integrated Freight & Logistics": "综合货运物流",
+    "Engineering & Construction": "工程与建筑",
+    "Industrial Distribution": "工业分销",
+    "Machinery": "机械",
+    "Farm & Heavy Construction Machinery": "农业与重型工程机械",
+    "Specialty Industrial Machinery": "专业工业机械",
+    "Tools & Accessories": "工具与配件",
+    "Metal Fabrication": "金属加工",
+    "Electrical Equipment & Parts": "电气设备与部件",
+    "Pollution & Treatment Controls": "污染治理",
+    "Waste Management": "废物管理",
+    "Security & Protection Services": "安防服务",
+    "Consulting Services": "咨询服务",
+    "Rental & Leasing Services": "租赁服务",
+    "Business Equipment & Supplies": "商用设备与耗材",
+    "Conglomerates": "综合企业",
+    # 能源
+    "Oil & Gas Integrated": "综合油气",
+    "Oil & Gas E&P": "油气勘探与生产",
+    "Oil & Gas Midstream": "油气中游",
+    "Oil & Gas Refining & Marketing": "炼油与销售",
+    "Oil & Gas Drilling": "油气钻井",
+    "Oil & Gas Equipment & Services": "油气设备与服务",
+    "Uranium": "铀",
+    "Thermal Coal": "动力煤",
+    # 公用事业
+    "Utilities - Regulated Electric": "受监管电力",
+    "Utilities - Regulated Gas": "受监管燃气",
+    "Utilities - Regulated Water": "受监管水务",
+    "Utilities - Diversified": "多元化公用事业",
+    "Utilities - Independent Power Producers": "独立发电",
+    "Utilities - Renewable": "可再生能源",
+    # 房地产
+    "REIT - Diversified": "多元化 REIT",
+    "REIT - Residential": "住宅 REIT",
+    "REIT - Retail": "零售 REIT",
+    "REIT - Office": "办公 REIT",
+    "REIT - Industrial": "工业 REIT",
+    "REIT - Healthcare Facilities": "医疗 REIT",
+    "REIT - Hotel & Motel": "酒店 REIT",
+    "REIT - Specialty": "特色 REIT",
+    "REIT - Mortgage": "抵押 REIT",
+    "Real Estate Services": "房地产服务",
+    "Real Estate - Development": "房地产开发",
+    "Real Estate - Diversified": "多元化房地产",
+    # 基础材料
+    "Chemicals": "化工",
+    "Specialty Chemicals": "特种化工",
+    "Steel": "钢铁",
+    "Copper": "铜",
+    "Aluminum": "铝",
+    "Gold": "黄金",
+    "Silver": "白银",
+    "Other Precious Metals & Mining": "其他贵金属与采矿",
+    "Other Industrial Metals & Mining": "其他工业金属与采矿",
+    "Coking Coal": "焦煤",
+    "Paper & Paper Products": "造纸",
+    "Lumber & Wood Production": "木材",
+    "Building Materials": "建筑材料",
+    # 通信服务
+    "Internet Content & Information": "互联网内容与信息",
+    "Telecom Services": "电信服务",
+    "Entertainment": "娱乐",
+    "Electronic Gaming & Multimedia": "电子游戏与多媒体",
+    "Broadcasting": "广播电视",
+    "Publishing": "出版",
+}
+
 
 # ---- 基础设施 ----
 
@@ -299,6 +462,27 @@ def _universes() -> pd.DataFrame:
     return cached("us:universe", _load, ttl=1800.0)
 
 
+def _snapshot_files(rel_glob: str) -> list[str]:
+    """标的级快照目录下的全部 parquet 文件（显式清单，供 union_by_name 读取）。"""
+    return sorted(str(p) for p in (DATA_DIR / rel_glob).parent.glob("*.parquet"))
+
+
+def _read_snapshot_files(sql_cols: str, rel_glob: str) -> pd.DataFrame:
+    """读「每股一文件」快照目录，**列型不一致安全的唯一读法**。
+
+    上游降级写入会把个别文件写出全 NULL 列（NULL 型），DuckDB glob 默认取
+    首文件 schema → `ConversionException: failed to cast ... to NULL` 整批读炸
+    （2026-10-15 实测 f10/sector 各 516 文件）。因此：
+    1. 走文件清单 + `union_by_name=true`（对齐 `_load_analyst_table` 先例）
+    2. 外层 try/except 降级为空表 —— 下游面板显示空，而不是整页 500
+    """
+    files = _snapshot_files(rel_glob)
+    if not files:
+        return pd.DataFrame()
+    literal = ",".join(repr(f) for f in files)
+    return _q(f"SELECT {sql_cols} FROM read_parquet([{literal}], union_by_name=true)")
+
+
 def _sector_map() -> pd.DataFrame:
     """GICS 行业映射：symbol -> sector(11 大类) / industry(细分)。
 
@@ -307,11 +491,18 @@ def _sector_map() -> pd.DataFrame:
     """
 
     def _load() -> pd.DataFrame:
-        df = _q(
-            f"SELECT symbol, sector, industry FROM {_glob_sql(SECTOR_GLOB)}"
-        )
+        empty = pd.DataFrame(columns=["symbol", "sector", "industry"])
+        try:
+            df = _read_snapshot_files(
+                "symbol, CAST(sector AS VARCHAR) AS sector, "
+                "CAST(industry AS VARCHAR) AS industry",
+                SECTOR_GLOB,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取 sector 快照失败，降级为空表: %s", exc)
+            return empty
         if df.empty:
-            return pd.DataFrame(columns=["symbol", "sector", "industry"])
+            return empty
         df = df.drop_duplicates("symbol")
         # 29 只 sector 为空 → 归为「未分类」，避免热力图/轮动出现 NaN 分组
         df["sector"] = df["sector"].fillna("").replace("", "Unknown")
@@ -325,21 +516,39 @@ def _f10_snapshot() -> pd.DataFrame:
     """基本面快照：市值 / PE / PB / 股息率 / 52 周高低 / 中文名。
 
     这是**估值类分析的主数据源**（valuation 分区曾长期静默写空，
-    见 docs/美股市场分析模块_设计方案.md §四）。
+    见 docs/美股市场分析模块_设计方案.md §四）。读取走
+    `_read_snapshot_files`（union_by_name + 降级），列型不一致不再炸。
     """
+    _EMPTY_COLS = [
+        "symbol",
+        "name",
+        "market_cap",
+        "pe_ratio",
+        "pb_ratio",
+        "dividend_yield",
+        "52w_high",
+        "52w_low",
+        "avg_volume",
+    ]
 
     def _load() -> pd.DataFrame:
-        df = _q(
-            "SELECT symbol, name, market_cap, pe_ratio, pb_ratio, dividend_yield, "
-            f'"52w_high", "52w_low", avg_volume FROM {_glob_sql(F10_GLOB)}'
-        )
-        if df.empty:
-            return pd.DataFrame(
-                columns=[
-                    "symbol", "name", "market_cap", "pe_ratio", "pb_ratio",
-                    "dividend_yield", "52w_high", "52w_low", "avg_volume",
-                ]
+        try:
+            df = _read_snapshot_files(
+                "symbol, CAST(name AS VARCHAR) AS name, "
+                "CAST(market_cap AS DOUBLE) AS market_cap, "
+                "CAST(pe_ratio AS DOUBLE) AS pe_ratio, "
+                "CAST(pb_ratio AS DOUBLE) AS pb_ratio, "
+                "CAST(dividend_yield AS DOUBLE) AS dividend_yield, "
+                'CAST("52w_high" AS DOUBLE) AS "52w_high", '
+                'CAST("52w_low" AS DOUBLE) AS "52w_low", '
+                "CAST(avg_volume AS DOUBLE) AS avg_volume",
+                F10_GLOB,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取 f10 快照失败，降级为空表: %s", exc)
+            return pd.DataFrame(columns=_EMPTY_COLS)
+        if df.empty:
+            return pd.DataFrame(columns=_EMPTY_COLS)
         return df.drop_duplicates("symbol")
 
     return cached("us:f10", _load, ttl=1800.0)
@@ -381,6 +590,13 @@ def _sector_cn(sector: str | None) -> str:
     if not sector:
         return SECTOR_CN["Unknown"]
     return SECTOR_CN.get(sector, sector)
+
+
+def _industry_cn(industry: str | None) -> str:
+    """细分行业英文名 -> 中文展示名（查不到回落英文原文）。"""
+    if not industry:
+        return ""
+    return INDUSTRY_CN.get(industry, industry)
 
 
 # ---- 诊断 ----
@@ -439,6 +655,7 @@ __all__ = [
     "_load_analyst_table",
     "_load_events",
     "_sector_cn",
+    "_industry_cn",
     "to_iso",
     "trading_days_until",
     "partition_dates_to_sql",

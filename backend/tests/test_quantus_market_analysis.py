@@ -116,7 +116,9 @@ def test_index_spread_pairs():
     assert spread["pairs"], "指数相对强弱为空"
     for p in spread["pairs"]:
         assert p["left_symbol"] and p["right_symbol"]
-        assert abs(p["spread"] - (p["left_return"] - p["right_return"])) < 0.01
+        # spread 与两端收益各自独立四舍五入到 2 位，双重舍入最坏差 = 3 × 0.005 = 0.015，
+        # 容差取 0.02 才不会在边界日（如今天 -1.075 vs 0.60/-1.68）随机翻红
+        assert abs(p["spread"] - (p["left_return"] - p["right_return"])) < 0.02
 
 
 def test_market_breadth_consistency():
@@ -311,6 +313,48 @@ def test_sector_heatmap_items():
         assert it["advance_count"] >= 0
     values = [i["value"] for i in items]
     assert values == sorted(values, reverse=True), "热力图必须按成交额降序"
+
+
+def test_sector_heatmap_drill_contract():
+    """板块下钻：面积降序、摘要自洽、龙头唯一且与摘要一致。"""
+    heat = sectors.get_sector_heatmap(10)
+    assert heat, "热力图为空，取不到板块样本"
+    sector = heat[0]["sector"]
+    res = sectors.get_sector_drill(sector)
+    assert res is not None and res["sector"] == sector
+    assert res["sector_cn"], "下钻必须带中文板块名"
+    items = res["items"]
+    assert items, "下钻无成分"
+    values = [it["value"] for it in items]
+    assert values == sorted(values, reverse=True), "下钻必须按面积（市值）降序"
+    for it in items:
+        assert it["symbol"] and it["name"], "成分必须带符号与名称"
+        assert it["value"] > 0
+        assert it["value_basis"] in ("market_cap", "amount")
+        assert it["industry_cn"] is not None, "有细分行业则必须带中译字段"
+    s = res["summary"]
+    assert s["members"] >= s["shown"] == len(items)
+    assert s["truncated"] is (s["members"] > s["shown"])
+    assert s["advance"] + s["decline"] + s["flat"] == s["shown"]
+    # 标的池（约 517 只）任一板块都不会触 300 上限 → 龙头必在展示集内且唯一
+    leaders = [it for it in items if it["is_leader"]]
+    assert len(leaders) == 1, "恰有一名领涨龙头"
+    assert s["leader_symbol"] == leaders[0]["symbol"]
+    assert s["leader"] == leaders[0]["name"]
+    assert s["leader_pct"] == leaders[0]["pct_change"]
+
+
+def test_sector_heatmap_drill_limit_and_unknown():
+    """limit 参与缓存键（小页不得污染大页）；未知/空板块返回 None 由路由转 404。"""
+    sector = sectors.get_sector_heatmap(10)[0]["sector"]
+    small = sectors.get_sector_drill(sector, 10)
+    big = sectors.get_sector_drill(sector, 300)
+    assert len(small["items"]) == 10
+    assert small["summary"]["shown"] == 10
+    if big["summary"]["members"] > 10:
+        assert len(big["items"]) > 10, "limit=10 的缓存污染了 limit=300 的请求"
+    assert sectors.get_sector_drill("NoSuchSector") is None
+    assert sectors.get_sector_drill("") is None
 
 
 def test_sector_rotation_sorted_and_nullable():
@@ -514,6 +558,39 @@ def test_size_tiers_partition():
     for t in res["tiers"]:
         assert t["count"] > 0
         assert t["pe_median"] is None or t["pe_median"] >= 3
+
+
+def test_size_tiers_drill_members_and_order():
+    """下钻的成分应与概览层同口径（同 _tier_subset 阈值），且按市值降序。"""
+    overview = {t["key"]: t for t in valuation.get_size_tiers()["tiers"]}
+    # 亿为单位的层界：mega ≥ 2000 亿 / large ≥ 100 亿 / mid ≥ 20 亿 / small < 20 亿
+    floors_yi = {"mega": 2000.0, "large": 100.0, "mid": 20.0, "small": 0.0}
+    for key, floor_yi in floors_yi.items():
+        res = valuation.get_size_tiers_drill(key)
+        assert res is not None and res["tier"] == key
+        assert res["label"]
+        assert res["items"], f"{key} 层无成分"
+        # 与概览层家数一致（同一次快照下的同一划分）
+        assert res["summary"]["members"] == overview[key]["count"]
+        caps = [it["market_cap_yi"] for it in res["items"]]
+        assert caps == sorted(caps, reverse=True), f"{key} 层未按市值降序"
+        if key != "small":
+            assert min(caps) >= floor_yi, f"{key} 层出现低于层界 {floor_yi} 亿的标的"
+        assert res["summary"]["total_mv_yi"] > 0
+        # 涨跌幅缺失是合法态（行情侧缺日），但一旦给出必须是数字
+        for it in res["items"]:
+            assert it["symbol"] and it["name"]
+            assert it["pct_change"] is None or isinstance(it["pct_change"], float)
+
+
+def test_size_tiers_drill_limit_and_unknown():
+    res = valuation.get_size_tiers_drill("mega", 10)
+    assert len(res["items"]) == 10
+    assert res["summary"]["shown"] == 10
+    assert res["summary"]["truncated"] is (res["summary"]["members"] > 10)
+    # 未知分层不静默回落成别的层，返回 None 由路由转 404
+    assert valuation.get_size_tiers_drill("huge") is None
+    assert valuation.get_size_tiers_drill("") is None
 
 
 def test_valuation_overview_quantiles():

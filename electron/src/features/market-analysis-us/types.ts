@@ -154,13 +154,58 @@ export interface UsBreadthData {
 export interface UsSectorHeatItem {
   name: string;
   sector: string;
+  /** 面积权重（亿美元）：市值口径，市值全缺的板块回落成交额（见 value_basis） */
   value: number;
+  /** 面积口径来源：market_cap=成分总市值 / amount=成交额回落 */
+  value_basis: 'market_cap' | 'amount';
+  market_cap_yi: number | null;
+  amount_yi: number;
   pct_change: number;
   leader: string;
   leader_symbol: string;
   leader_pct: number;
   stock_count: number;
   advance_count: number;
+}
+
+/** 板块下钻 · 成分个股（/heatmap/drill） */
+export interface UsSectorDrillItem {
+  symbol: string;
+  name: string;
+  industry: string;
+  industry_cn: string;
+  /** 面积权重（亿美元）：个股市值，缺失回落成交额 */
+  value: number;
+  value_basis: 'market_cap' | 'amount';
+  market_cap_yi: number | null;
+  amount_yi: number;
+  pct_change: number;
+  rvol: number | null;
+  is_leader: boolean;
+}
+
+export interface UsSectorDrillSummary {
+  members: number;
+  shown: number;
+  truncated: boolean;
+  advance: number;
+  decline: number;
+  flat: number;
+  avg_pct: number;
+  median_pct: number;
+  leader: string | null;
+  leader_symbol: string | null;
+  leader_pct: number | null;
+  total_mv_yi: number | null;
+  total_amount_yi: number | null;
+}
+
+export interface UsSectorDrill {
+  trade_date: string | null;
+  sector: string;
+  sector_cn: string;
+  items: UsSectorDrillItem[];
+  summary: UsSectorDrillSummary;
 }
 
 export interface UsProfitLeader {
@@ -481,6 +526,40 @@ export interface UsSizeTiers {
   tiers: UsSizeTier[];
   total_market_cap_yi: number;
   as_of: string;
+}
+
+/** 市值分层下钻 · 成分个股行 */
+export interface UsSizeTierDrillItem {
+  symbol: string;
+  name: string;
+  sector: string;
+  market_cap_yi: number;
+  pe_ratio: number | null;
+  pb_ratio: number | null;
+  dividend_yield: number | null;
+  pct_change: number | null;
+}
+
+/** 市值分层下钻 · 整层摘要（涨跌家数/中位数按整层统计，非当前页） */
+export interface UsSizeTierDrillSummary {
+  members: number;
+  shown: number;
+  truncated: boolean;
+  total_mv_yi: number;
+  pe_median: number | null;
+  pb_median: number | null;
+  dividend_yield_median: number | null;
+  advance: number;
+  decline: number;
+  median_pct: number | null;
+}
+
+export interface UsSizeTierDrill {
+  tier: string;
+  label: string;
+  trade_date: string;
+  items: UsSizeTierDrillItem[];
+  summary: UsSizeTierDrillSummary;
 }
 
 export interface UsValuationOverview {

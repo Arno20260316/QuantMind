@@ -23,7 +23,9 @@ from backend.services.api.market_analysis_us.feed.base import (
     _avail,
     _dedupe_bars,
     _f10_snapshot,
+    _hot_snapshot,
     _index_trading_days,
+    _industry_cn,
     _latest_index_date,
     _market_pct_snapshot,
     _names,
@@ -36,6 +38,8 @@ from backend.services.api.market_analysis_us.feed.base import (
 # 轮动周期（交易日）
 _ROTATION_WINDOWS = (1, 5, 20, 60)
 _SECTOR_TTL = 900.0
+# 下钻个股层上限（对齐 A 股 MAX_DRILL_ITEMS 约定）
+_MAX_DRILL_ITEMS = 300
 
 
 def _sector_returns(window: int = 60) -> pd.DataFrame:
@@ -87,8 +91,10 @@ def _sector_frame() -> pd.DataFrame:
 
 
 def get_sector_heatmap(limit: int = 40) -> list[dict[str, Any]]:
-    """GICS 板块热力图：平均涨幅 / 成交额 / 领涨龙头。
+    """GICS 板块热力图：中位涨幅 / 总市值（面积）/ 领涨龙头。
 
+    面积口径 = 板块成分总市值（亿美元），与下钻个股层（面积=个股市值）
+    父子面积自洽；市值全缺的板块回落成交额，`value_basis` 如实标注。
     对齐热力图组件的数据形状（name/value/pct_change/leader/leader_pct），
     与 A 股、港股共用同一个 treemap 组件。
     """
@@ -104,19 +110,39 @@ def get_sector_heatmap(limit: int = 40) -> list[dict[str, Any]]:
         if smap.empty:
             return []
         df = snap.merge(smap, on="symbol", how="inner")
+        f10 = _f10_snapshot()
+        if not f10.empty and "market_cap" in f10.columns:
+            df = df.merge(
+                f10[["symbol", "market_cap"]].drop_duplicates("symbol"),
+                on="symbol",
+                how="left",
+            )
+        else:
+            df["market_cap"] = None
         name_map = _names(df["symbol"].tolist())
 
         items: list[dict[str, Any]] = []
         for sector, g in df.groupby("sector", sort=False):
             amount = float(g["amount"].fillna(0).sum())
-            if amount <= 0:
+            mv_sum = float(
+                pd.to_numeric(g["market_cap"], errors="coerce").fillna(0).sum()
+            )
+            if amount <= 0 and mv_sum <= 0:
                 continue
             top = g.sort_values("pct_change", ascending=False).iloc[0]
+            basis = "market_cap" if mv_sum > 0 else "amount"
             items.append(
                 {
                     "name": _sector_cn(sector),
                     "sector": sector,
-                    "value": fmt_yi(amount),
+                    "value": (
+                        round(mv_sum / 1e8, 1)
+                        if basis == "market_cap"
+                        else fmt_yi(amount)
+                    ),
+                    "value_basis": basis,
+                    "market_cap_yi": round(mv_sum / 1e8, 1) if mv_sum > 0 else None,
+                    "amount_yi": fmt_yi(amount),
                     "pct_change": round(float(g["pct_change"].median()), 2),
                     "leader": name_map.get(top["symbol"], top["symbol"]),
                     "leader_symbol": top["symbol"],
@@ -129,6 +155,161 @@ def get_sector_heatmap(limit: int = 40) -> list[dict[str, Any]]:
         return items[:limit]
 
     return cached(f"us_sector_heatmap:{limit}", _load)
+
+
+def get_sector_drill(
+    sector: str, limit: int = _MAX_DRILL_ITEMS
+) -> dict[str, Any] | None:
+    """板块下钻：成分个股热力矩形图（面积=总市值，颜色=涨跌幅）。
+
+    `sector` 为英文 GICS 类名（热力图 `sector` 字段原样透传），"Unknown" 为
+    未分类桶。板块名不在分类表 → 返回 ``None``（router → 404），非空结果带
+    `industry`（细分行业英文）/`industry_cn`（中译展示）供 tooltip 与个股画像。
+
+    与 A 股 `/heatmap/drill` 契约对齐：items[symbol/name/value/pct_change/
+    is_leader] + summary（advance/decline/flat/avg_pct/total_mv_yi），前端
+    共用同一套下钻交互。个股层市值缺失回落成交额（`value_basis="amount"`），
+    超过 :data:`_MAX_DRILL_ITEMS` 按市值降序截断并在 summary 如实披露。
+    """
+    limit = max(10, min(int(limit), _MAX_DRILL_ITEMS))
+    sector = str(sector or "").strip()
+    if not sector:
+        return None
+    smap = _sector_map()
+    if smap.empty or sector not in set(smap["sector"]):
+        return None
+
+    def _load() -> dict[str, Any]:
+        empty_summary = {
+            "members": 0,
+            "shown": 0,
+            "truncated": False,
+            "advance": 0,
+            "decline": 0,
+            "flat": 0,
+            "avg_pct": 0.0,
+            "median_pct": 0.0,
+            "leader": None,
+            "leader_symbol": None,
+            "leader_pct": None,
+            "total_mv_yi": None,
+            "total_amount_yi": None,
+        }
+        latest, snap = _hot_snapshot()
+        if not latest or snap.empty:
+            return {
+                "trade_date": None,
+                "sector": sector,
+                "sector_cn": _sector_cn(sector),
+                "items": [],
+                "summary": empty_summary,
+            }
+        g = snap.merge(smap[smap["sector"] == sector], on="symbol", how="inner")
+        if g.empty:
+            return {
+                "trade_date": to_iso(str(latest)),
+                "sector": sector,
+                "sector_cn": _sector_cn(sector),
+                "items": [],
+                "summary": empty_summary,
+            }
+
+        f10 = _f10_snapshot()
+        mv_map: dict[str, float] = {}
+        f10_name: dict[str, str] = {}
+        if not f10.empty:
+            for r in f10.drop_duplicates("symbol").itertuples(index=False):
+                mv = safe_float(getattr(r, "market_cap", None))
+                if mv > 0:
+                    mv_map[str(r.symbol)] = mv
+                nm = str(getattr(r, "name", "") or "").strip()
+                if nm and nm.lower() != "nan":
+                    f10_name[str(r.symbol)] = nm
+        name_map = _names(g["symbol"].tolist())
+
+        rows: list[dict[str, Any]] = []
+        mv_total = 0.0
+        amount_total = 0.0
+        for r in g.itertuples(index=False):
+            sym = str(r.symbol)
+            mv = mv_map.get(sym, 0.0)
+            amount = safe_float(getattr(r, "amount", 0.0))
+            mv_total += mv
+            amount_total += amount
+            basis = "market_cap" if mv > 0 else "amount"
+            value = (mv if mv > 0 else amount) / 1e8
+            rv = getattr(r, "rvol", None)
+            rvol = round(float(rv), 2) if rv is not None and rv == rv else None
+            cn = name_map.get(sym, sym)
+            if cn == sym and f10_name.get(sym):
+                cn = f10_name[sym]
+            industry = str(getattr(r, "industry", "") or "")
+            rows.append(
+                {
+                    "symbol": sym,
+                    "name": cn,
+                    "industry": industry,
+                    "industry_cn": _industry_cn(industry),
+                    "value": max(round(value, 2), 0.01),
+                    "value_basis": basis,
+                    "market_cap_yi": round(mv / 1e8, 2) if mv > 0 else None,
+                    "amount_yi": round(amount / 1e8, 2),
+                    "pct_change": round(safe_float(r.pct_change), 2),
+                    "rvol": rvol,
+                    "is_leader": False,
+                }
+            )
+
+        # 领涨龙头在**截断前**的全量成分上取，与被截掉的尾部无关
+        top = max(rows, key=lambda x: x["pct_change"])
+        top["is_leader"] = True
+
+        total = len(rows)
+        rows.sort(key=lambda x: x["value"], reverse=True)
+        truncated = total > limit
+        rows = rows[:limit]
+
+        adv = sum(1 for r in rows if r["pct_change"] > 0)
+        dec = sum(1 for r in rows if r["pct_change"] < 0)
+        flat = len(rows) - adv - dec
+        pcts = sorted(r["pct_change"] for r in rows)
+        avg_pct = round(sum(pcts) / len(pcts), 2) if pcts else 0.0
+        median_pct = (
+            round(
+                pcts[len(pcts) // 2]
+                if len(pcts) % 2
+                else (pcts[len(pcts) // 2 - 1] + pcts[len(pcts) // 2]) / 2,
+                2,
+            )
+            if pcts
+            else 0.0
+        )
+
+        return {
+            "trade_date": to_iso(str(latest)),
+            "sector": sector,
+            "sector_cn": _sector_cn(sector),
+            "items": rows,
+            "summary": {
+                "members": total,
+                "shown": len(rows),
+                "truncated": truncated,
+                "advance": adv,
+                "decline": dec,
+                "flat": flat,
+                "avg_pct": avg_pct,
+                "median_pct": median_pct,
+                "leader": top["name"],
+                "leader_symbol": top["symbol"],
+                "leader_pct": top["pct_change"],
+                "total_mv_yi": round(mv_total / 1e8, 1) if mv_total > 0 else None,
+                "total_amount_yi": round(amount_total / 1e8, 1),
+            },
+        }
+
+    # 缓存键必须带 limit：截断在 _load 内完成，漏掉 limit 会让先到的
+    # 小页响应（如 limit=10）污染默认 300 的请求
+    return cached(f"us:sector_drill:{sector}:{limit}", _load, ttl=_SECTOR_TTL)
 
 
 def get_sector_rotation(limit: int = 24) -> dict[str, Any]:
@@ -180,7 +361,9 @@ def get_sector_rotation(limit: int = 24) -> dict[str, Any]:
         rows.sort(key=lambda x: (x["ret_20d"] is None, -(x["ret_20d"] or 0)))
         return {
             "trade_date": to_iso(latest[0]) if latest else "",
-            "index_date": to_iso(_latest_index_date() or "") if _latest_index_date() else "",
+            "index_date": to_iso(_latest_index_date() or "")
+            if _latest_index_date()
+            else "",
             "benchmark_return_20d": benchmark,
             "sectors": rows[:limit],
         }
@@ -222,7 +405,12 @@ def get_sector_fund_flow(limit: int = 24) -> dict[str, Any]:
     limit = max(5, min(int(limit), 50))
 
     def _load() -> dict[str, Any]:
-        empty = {"trade_date": "", "total_amount_yi": 0.0, "base_days": 0, "sectors": []}
+        empty = {
+            "trade_date": "",
+            "total_amount_yi": 0.0,
+            "base_days": 0,
+            "sectors": [],
+        }
         if not _avail():
             return empty
         latest, snap = _market_pct_snapshot()
@@ -236,12 +424,7 @@ def get_sector_fund_flow(limit: int = 24) -> dict[str, Any]:
         total_today = float(today["amount"].fillna(0).sum())
         if total_today <= 0:
             return empty
-        cur = (
-            today.groupby("sector")["amount"]
-            .sum()
-            .rename("amount")
-            .reset_index()
-        )
+        cur = today.groupby("sector")["amount"].sum().rename("amount").reset_index()
         cur["share"] = cur["amount"] / total_today * 100
 
         # 20 日基准占比：每日各板块成交额 / 当日全市场成交额，再取均值
@@ -257,9 +440,7 @@ def get_sector_fund_flow(limit: int = 24) -> dict[str, Any]:
                 per_day = k.groupby(["dt", "sector"])["amount"].sum().reset_index()
                 totals = per_day.groupby("dt")["amount"].transform("sum")
                 per_day["share"] = per_day["amount"] / totals * 100
-                base_share = (
-                    per_day.groupby("sector")["share"].mean().to_dict()
-                )
+                base_share = per_day.groupby("sector")["share"].mean().to_dict()
                 base_days = int(per_day["dt"].nunique())
 
         rows = []
@@ -280,7 +461,9 @@ def get_sector_fund_flow(limit: int = 24) -> dict[str, Any]:
                     ),
                 }
             )
-        rows.sort(key=lambda x: (x["share_change_pp"] is None, -(x["share_change_pp"] or 0)))
+        rows.sort(
+            key=lambda x: (x["share_change_pp"] is None, -(x["share_change_pp"] or 0))
+        )
         return {
             "trade_date": to_iso(latest),
             "total_amount_yi": fmt_yi(total_today),
@@ -319,9 +502,7 @@ def get_sector_valuation(limit: int = 24) -> list[dict[str, Any]]:
                     "pe_median": _median_or_none(g["pe_pos"]),
                     "pb_median": _median_or_none(g["pb_pos"]),
                     "dividend_yield_median": _median_or_none(g["dividend_yield"]),
-                    "market_cap_yi": fmt_yi(
-                        float(g["market_cap"].fillna(0).sum())
-                    ),
+                    "market_cap_yi": fmt_yi(float(g["market_cap"].fillna(0).sum())),
                     "stock_count": int(len(g)),
                 }
             )

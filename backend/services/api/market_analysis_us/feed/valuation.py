@@ -16,9 +16,11 @@ import pandas as pd
 
 from backend.services.api.market_analysis_shared.caching import cached
 from backend.services.api.market_analysis_shared.display import fmt_yi, safe_float
+from backend.services.api.market_analysis_shared.market_days import to_iso
 from backend.services.api.market_analysis_us.feed.base import (
     _avail,
     _f10_snapshot,
+    _hot_snapshot,
     _names,
     _sector_cn,
     _sector_map,
@@ -43,6 +45,24 @@ _SIZE_TIERS = (
     ("mid", "中盘", 2e9),
     ("small", "小盘", 0.0),
 )
+
+_TIER_LABELS = {key: label for key, label, _ in _SIZE_TIERS}
+_TIER_KEYS = tuple(_TIER_LABELS)
+
+
+def _tier_subset(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """按分层键取市值子集：floor(本层) ≤ 市值 < floor(上一层)。
+
+    阈值一律从 `_SIZE_TIERS` 推导，概览与下钻共用同一份口径；
+    调用方须保证 `market_cap` 已为数值列。
+    """
+    idx = _TIER_KEYS.index(key)
+    floor = _SIZE_TIERS[idx][2]
+    cap = df["market_cap"]
+    mask = cap >= floor
+    if idx > 0:
+        mask &= cap < _SIZE_TIERS[idx - 1][2]
+    return df[mask]
 
 
 def get_valuation_rankings(kind: str = "dividend", limit: int = 20) -> dict[str, Any]:
@@ -118,15 +138,8 @@ def get_size_tiers() -> dict[str, Any]:
             return empty
 
         tiers = []
-        for key, label, floor in _SIZE_TIERS:
-            if key == "mega":
-                sub = df[df["market_cap"] >= floor]
-            elif key == "large":
-                sub = df[(df["market_cap"] >= floor) & (df["market_cap"] < 2e11)]
-            elif key == "mid":
-                sub = df[(df["market_cap"] >= floor) & (df["market_cap"] < 1e10)]
-            else:
-                sub = df[df["market_cap"] < 2e9]
+        for key, label, _floor in _SIZE_TIERS:
+            sub = _tier_subset(df, key)
             if sub.empty:
                 continue
             pe_pos = sub["pe_ratio"].where(sub["pe_ratio"] >= _PE_MIN)
@@ -147,6 +160,125 @@ def get_size_tiers() -> dict[str, Any]:
         }
 
     return cached("us_size_tiers", _load, ttl=_VALUATION_TTL)
+
+
+def get_size_tiers_drill(tier: str, limit: int = 300) -> dict[str, Any] | None:
+    """市值分层下钻：某分层成分个股（按市值降序）+ 中位数摘要。
+
+    `tier` 取 /valuation/size-tiers 的 key（mega/large/mid/small），Pydantic 之外的
+    语义校验也在这里 —— 未知 key 返回 None，路由层转 404（不静默回落成别的层）。
+    涨跌幅取自最新截面（行情侧不可用时为 None，不拖垮估值主数据）；
+    PE/PB/股息率给 f10 快照原值（含负值），是否可用于展示由前端按 '--' 缺省处理。
+    """
+    limit = max(10, min(int(limit), 300))
+    key = (tier or "").strip().lower()
+    if key not in _TIER_LABELS:
+        return None
+
+    def _load() -> dict[str, Any]:
+        label = _TIER_LABELS[key]
+        empty: dict[str, Any] = {
+            "tier": key,
+            "label": label,
+            "trade_date": "",
+            "items": [],
+            "summary": {
+                "members": 0,
+                "shown": 0,
+                "truncated": False,
+                "total_mv_yi": 0.0,
+                "pe_median": None,
+                "pb_median": None,
+                "dividend_yield_median": None,
+                "advance": 0,
+                "decline": 0,
+                "median_pct": None,
+            },
+        }
+        if not _avail():
+            return empty
+        f10 = _f10_snapshot()
+        if f10.empty:
+            return empty
+        df = f10.copy()
+        for col in ("market_cap", "pe_ratio", "pb_ratio", "dividend_yield"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df[df["market_cap"].fillna(0) > 0]
+        if df.empty:
+            return empty
+        sub = _tier_subset(df, key)
+        if sub.empty:
+            return empty
+        members = int(len(sub))
+        total_mv = float(sub["market_cap"].sum())
+        sub = sub.sort_values("market_cap", ascending=False)
+
+        # 最新截面涨跌幅（附加信息）：行情侧缺日不阻塞估值下钻
+        trade_date = ""
+        pct_by_symbol: dict[str, float] = {}
+        try:
+            latest, snap = _hot_snapshot()
+            trade_date = to_iso(str(latest))
+            sp = snap[["symbol", "pct_change"]].dropna(subset=["pct_change"])
+            pct_by_symbol = {
+                str(s): float(p)
+                for s, p in zip(sp["symbol"], sp["pct_change"], strict=False)
+            }
+        except Exception:  # noqa: BLE001 —— 见上：涨跌幅缺失只是 None，不算失败
+            trade_date = ""
+
+        merged = sub.merge(_sector_map(), on="symbol", how="left")
+        top = merged.head(limit)
+        name_map = _names([str(s) for s in top["symbol"]])
+        items = []
+        for _, r in top.iterrows():
+            sym = str(r["symbol"])
+            cn = name_map.get(sym)
+            # 中文名优先（security_master 口径）；无中文名才回落 f10 的英文长名
+            display = cn if cn and cn != sym else (r.get("name") or sym)
+            cap = safe_float(r.get("market_cap"), 0.0) or 0.0
+            items.append(
+                {
+                    "symbol": sym,
+                    "name": display,
+                    "sector": _sector_cn(r.get("sector")),
+                    "market_cap_yi": fmt_yi(cap),
+                    "pe_ratio": _opt(r.get("pe_ratio")),
+                    "pb_ratio": _opt(r.get("pb_ratio")),
+                    "dividend_yield": _opt(r.get("dividend_yield")),
+                    "pct_change": (
+                        round(pct_by_symbol[sym], 2) if sym in pct_by_symbol else None
+                    ),
+                }
+            )
+
+        # 涨跌家数 / 中位涨跌幅按**整层**统计（items 只截前 limit 只，
+        # 拿它统计会把摘要说成"这一页"的涨跌，与 members 口径打架）
+        all_pcts = [
+            pct_by_symbol[str(s)] for s in sub["symbol"] if str(s) in pct_by_symbol
+        ]
+        pe_pos = sub["pe_ratio"].where(sub["pe_ratio"] >= _PE_MIN)
+        pb_pos = sub["pb_ratio"].where(sub["pb_ratio"] >= _PB_MIN)
+        return {
+            "tier": key,
+            "label": label,
+            "trade_date": trade_date,
+            "items": items,
+            "summary": {
+                "members": members,
+                "shown": len(items),
+                "truncated": members > len(items),
+                "total_mv_yi": fmt_yi(total_mv),
+                "pe_median": _median(pe_pos),
+                "pb_median": _median(pb_pos),
+                "dividend_yield_median": _median(sub["dividend_yield"]),
+                "advance": sum(1 for p in all_pcts if p > 0),
+                "decline": sum(1 for p in all_pcts if p < 0),
+                "median_pct": _median(pd.Series(all_pcts)) if all_pcts else None,
+            },
+        }
+
+    return cached(f"us_size_tiers_drill:{key}:{limit}", _load, ttl=_VALUATION_TTL)
 
 
 def get_valuation_overview() -> dict[str, Any]:

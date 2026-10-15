@@ -66,7 +66,9 @@ async def get_status(current_user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/indices/overview")
-async def get_indices_overview(current_user: dict = Depends(get_current_user)) -> list[dict]:
+async def get_indices_overview(
+    current_user: dict = Depends(get_current_user),
+) -> list[dict]:
     """5 大指数快照（不含成交额：index_daily 的 amount 恒为 0）。"""
     _ = current_user
     try:
@@ -100,12 +102,36 @@ async def get_sector_heatmap(
     limit: int = Query(default=40, ge=5, le=100),
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
-    """GICS 板块热力图（中位涨幅 / 成交额 / 领涨龙头）。"""
+    """GICS 板块热力图（中位涨幅 / 总市值 / 领涨龙头）。"""
     _ = current_user
     try:
         return await asyncio.to_thread(sectors.get_sector_heatmap, limit)
     except Exception as exc:
         raise _fatal(exc) from exc
+
+
+@router.get("/heatmap/drill")
+async def get_sector_drill(
+    sector: str = Query(min_length=1, max_length=64),
+    limit: int = Query(default=300, ge=10, le=300),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """板块下钻：成分个股热力矩形图（面积=总市值，颜色=涨跌幅）。
+
+    `sector` 传 `/heatmap` 返回的英文类名原值；未知板块 → 404
+    （detail 携带 `sector` 与 `reason=unknown_sector`，前端好定位）。
+    """
+    _ = current_user
+    try:
+        result = await asyncio.to_thread(sectors.get_sector_drill, sector, limit)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"sector": sector, "reason": "unknown_sector"},
+        )
+    return result
 
 
 @router.get("/profit-leaders")
@@ -153,7 +179,9 @@ async def get_unusual_volume(
 
 
 @router.get("/market-distribution")
-async def get_market_distribution(current_user: dict = Depends(get_current_user)) -> dict:
+async def get_market_distribution(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
     """全市场涨跌幅分布直方图 + 分位数。"""
     _ = current_user
     try:
@@ -430,8 +458,34 @@ async def get_size_tiers(current_user: dict = Depends(get_current_user)) -> dict
         raise _fatal(exc) from exc
 
 
+@router.get("/valuation/size-tiers/drill")
+async def get_size_tiers_drill(
+    tier: str = Query(min_length=1, max_length=16),
+    limit: int = Query(default=300, ge=10, le=300),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """市值分层下钻：某分层成分个股（按市值降序）+ 中位数摘要。
+
+    `tier` 传 `/valuation/size-tiers` 的 key（mega/large/mid/small）；
+    未知分层 → 404（detail 携带 `tier` 与 `reason=unknown_tier`）。
+    """
+    _ = current_user
+    try:
+        result = await asyncio.to_thread(valuation.get_size_tiers_drill, tier, limit)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"tier": tier, "reason": "unknown_tier"},
+        )
+    return result
+
+
 @router.get("/valuation/overview")
-async def get_valuation_overview(current_user: dict = Depends(get_current_user)) -> dict:
+async def get_valuation_overview(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
     """全市场估值概览（PE/PB/股息率中位数与分位）。"""
     _ = current_user
     try:

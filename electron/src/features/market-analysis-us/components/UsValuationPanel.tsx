@@ -1,13 +1,30 @@
-/** 美股估值主题面板 —— 估值概览 / 市值分层 / 估值三榜（高股息 · 低PE · 低PB）
+/** 美股估值主题面板 —— 估值概览 / 市值分层（两层：分层 → 成分个股下钻）/ 估值三榜
  *
  * 数据源为 f10 基本面快照（单点截面，含中文名与市值），
  * PE/PB 只取正值参与排名；三个榜单均施加健全性门槛剔除陈旧快照标的（见脚注）。
+ * 市值分层支持下钻到成分个股（点击分层行进入、面包屑返回、行点击开个股终端），
+ * 与板块热力图同一交互范式。
  */
 
 import React, { useEffect, useState } from 'react';
-import { Coins, Info, Layers, LineChart } from 'lucide-react';
-import { getSizeTiers, getValuationOverview, getValuationRankings } from '../services/api';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  ChevronRight,
+  Coins,
+  Info,
+  Layers,
+  LineChart,
+  Loader2,
+} from 'lucide-react';
+import {
+  getSizeTiers,
+  getSizeTiersDrill,
+  getValuationOverview,
+  getValuationRankings,
+} from '../services/api';
 import type {
+  UsSizeTierDrill,
   UsSizeTiers,
   UsValuationOverview,
   UsValuationRankRow,
@@ -16,6 +33,7 @@ import type {
 import {
   DateBadge,
   EmptyHint,
+  PctText,
   SectionCard,
   fmtInt,
 } from '../../market-analysis-shared/ui';
@@ -51,6 +69,8 @@ const ROW = 'grid gap-1 px-1 py-[3px] text-[10px] items-center border-b border-s
 
 const RANK_GRID = 'grid-cols-[14px_1fr_34px_44px_42px_44px_50px]';
 const TIER_GRID = 'grid-cols-[68px_44px_1fr_60px_72px]';
+/** 分层下钻成分表：# / 标的(名+码+板块) / 市值 / PE / PB / 股息率 / 涨跌幅 */
+const TIER_DRILL_GRID = 'grid-cols-[16px_1fr_60px_44px_38px_48px_52px]';
 
 /** 估值概览单行指标条：label / value（/ 次要值） */
 function Metric({ label, value, sub }: { label: string; value: React.ReactNode; sub?: string }) {
@@ -63,13 +83,23 @@ function Metric({ label, value, sub }: { label: string; value: React.ReactNode; 
   );
 }
 
-export const UsValuationPanel: React.FC = () => {
+interface UsValuationPanelProps {
+  /** 点击成分行 → 宿主打开美股个股终端 */
+  onStockClick?: (symbol: string, name: string) => void;
+}
+
+export const UsValuationPanel: React.FC<UsValuationPanelProps> = ({ onStockClick }) => {
   const [overview, setOverview] = useState<UsValuationOverview | null>(null);
   const [tiers, setTiers] = useState<UsSizeTiers | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [kind, setKind] = useState<RankKind>('dividend');
   const [ranking, setRanking] = useState<UsValuationRankings | null>(null);
   const [rankLoading, setRankLoading] = useState(true);
+  // 市值分层下钻（null = 概览层）
+  const [drillTier, setDrillTier] = useState<string | null>(null);
+  const [tierDrill, setTierDrill] = useState<UsSizeTierDrill | null>(null);
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -105,8 +135,37 @@ export const UsValuationPanel: React.FC = () => {
     };
   }, [kind]);
 
+  // 市值分层下钻数据（切层即拉取；取消标记防竞态）
+  useEffect(() => {
+    if (!drillTier) {
+      setTierDrill(null);
+      setDrillError(null);
+      return;
+    }
+    let cancelled = false;
+    setDrillLoading(true);
+    setDrillError(null);
+    setTierDrill(null);
+    getSizeTiersDrill(drillTier)
+      .then((d) => {
+        if (!cancelled) setTierDrill(d);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setDrillError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setDrillLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [drillTier]);
+
   const tierRows = tiers?.tiers ?? [];
   const rankItems = ranking?.items ?? [];
+  const tierLabel =
+    tierDrill?.label || tierRows.find((t) => t.key === drillTier)?.label || drillTier || '';
+  const tierSummary = tierDrill?.summary;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -166,23 +225,167 @@ export const UsValuationPanel: React.FC = () => {
           </p>
         </SectionCard>
 
-        {/* 市值分层 */}
+        {/* 市值分层（两层：分层概览 → 成分个股下钻） */}
         <SectionCard
           className="!p-2.5 gap-1.5 h-full"
           title={
-            <span className="flex items-center gap-1.5">
-              <Layers className="w-3.5 h-3.5 text-blue-600" />
-              市值分层
-              <span className="text-[9px] font-normal text-slate-400">家数 / 总市值 / PE / 股息率</span>
+            <span className="flex items-center gap-1.5 min-w-0">
+              <Layers className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+              {drillTier ? (
+                <span className="flex items-center gap-1 min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => setDrillTier(null)}
+                    className="flex items-center gap-0.5 text-blue-600 hover:text-blue-800 hover:underline shrink-0 cursor-pointer"
+                    title="返回分层概览"
+                  >
+                    <ArrowLeft className="w-3 h-3" />
+                    市值分层
+                  </button>
+                  <ChevronRight className="w-3 h-3 text-slate-300 shrink-0" />
+                  <span className="truncate">{tierLabel}</span>
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5">
+                  市值分层
+                  <span className="text-[9px] font-normal text-slate-400">
+                    家数 / 总市值 / PE / 股息率
+                  </span>
+                </span>
+              )}
             </span>
           }
           extra={
-            <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">
-              合计 US$ {fmtInt(tiers?.total_market_cap_yi)} 亿
-            </span>
+            drillTier ? (
+              <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">
+                {tierDrill?.trade_date
+                  ? `${tierDrill.trade_date} · 点击行打开个股终端`
+                  : '点击行打开个股终端'}
+              </span>
+            ) : (
+              <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">
+                合计 US$ {fmtInt(tiers?.total_market_cap_yi)} 亿
+              </span>
+            )
           }
         >
-          {tierRows.length === 0 ? (
+          {drillTier ? (
+            drillLoading ? (
+              <div className="flex items-center justify-center py-6">
+                <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
+              </div>
+            ) : drillError ? (
+              <div className="flex flex-col items-center justify-center gap-2 py-4 text-[11px] text-slate-500 bg-slate-50/60 rounded-lg border border-dashed border-slate-200">
+                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                <span>「{tierLabel}」成分数据加载失败：{drillError.slice(0, 80)}</span>
+                <button
+                  type="button"
+                  onClick={() => setDrillTier(null)}
+                  className="px-3 py-0.5 rounded-full bg-blue-600 text-white text-[10px] font-extrabold hover:bg-blue-500 cursor-pointer"
+                >
+                  返回分层概览
+                </button>
+              </div>
+            ) : tierDrill && tierDrill.items.length > 0 && tierSummary ? (
+              <div className="flex flex-col gap-1 min-h-0">
+                {/* 整层摘要（涨跌家数/中位数按整层统计，与「显示前 N」无关） */}
+                <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-2 py-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <Metric
+                    label="成分"
+                    value={`${fmtInt(tierSummary.members)} 只`}
+                    sub={tierSummary.truncated ? `显示前 ${tierSummary.shown}` : undefined}
+                  />
+                  <Metric label="总市值" value={fmtInt(tierSummary.total_mv_yi)} sub="亿美元" />
+                  <Metric
+                    label="涨/跌"
+                    value={`${tierSummary.advance} / ${tierSummary.decline}`}
+                  />
+                  <Metric
+                    label="中位涨跌"
+                    value={<PctText value={tierSummary.median_pct} className="text-[11px]" />}
+                  />
+                  <Metric label="PE中位" value={fmtNum(tierSummary.pe_median)} />
+                  <Metric label="PB中位" value={fmtNum(tierSummary.pb_median)} />
+                  <Metric
+                    label="股息率中位"
+                    value={pctOrDash(tierSummary.dividend_yield_median, 2)}
+                  />
+                </div>
+                <div className="flex flex-col max-h-[380px] overflow-y-auto">
+                  <div
+                    className={`${HEAD} ${TIER_DRILL_GRID} sticky top-0 z-10 bg-white/95 backdrop-blur`}
+                  >
+                    <span>#</span>
+                    <span>标的</span>
+                    <span className="text-right">市值</span>
+                    <span className="text-right">PE</span>
+                    <span className="text-right">PB</span>
+                    <span className="text-right">股息率</span>
+                    <span className="text-right">涨跌幅</span>
+                  </div>
+                  {tierDrill.items.map((it, i) => (
+                    <button
+                      type="button"
+                      key={it.symbol}
+                      onClick={() => onStockClick?.(it.symbol, it.name)}
+                      title={onStockClick ? '点击打开个股终端' : undefined}
+                      className={`${ROW} ${TIER_DRILL_GRID} text-left w-full hover:bg-blue-50/70 transition-colors ${
+                        onStockClick ? 'cursor-pointer' : 'cursor-default'
+                      }`}
+                    >
+                      <span
+                        className={`text-[9px] font-extrabold ${
+                          i < 3 ? 'text-blue-600' : 'text-slate-400'
+                        }`}
+                      >
+                        {i + 1}
+                      </span>
+                      <span className="flex items-center gap-1 min-w-0">
+                        <span className="font-bold text-slate-800 truncate" title={it.name}>
+                          {it.name}
+                        </span>
+                        {it.name !== it.symbol && (
+                          <span className="text-[9px] font-mono text-slate-400 truncate flex-shrink-0">
+                            {it.symbol}
+                          </span>
+                        )}
+                        {it.sector && (
+                          <span
+                            className="text-[8px] font-bold text-blue-700 bg-blue-50 border border-blue-100 rounded px-1 whitespace-nowrap hidden xl:inline"
+                            title={it.sector}
+                          >
+                            {it.sector}
+                          </span>
+                        )}
+                      </span>
+                      <span
+                        className="text-right font-mono font-bold text-slate-700 whitespace-nowrap"
+                        title="总市值（亿美元）"
+                      >
+                        {fmtInt(it.market_cap_yi)}
+                      </span>
+                      <span className="text-right font-mono text-slate-600 whitespace-nowrap">
+                        {fmtNum(it.pe_ratio)}
+                      </span>
+                      <span className="text-right font-mono text-slate-600 whitespace-nowrap">
+                        {fmtNum(it.pb_ratio)}
+                      </span>
+                      <span className="text-right font-mono text-slate-600 whitespace-nowrap">
+                        {pctOrDash(it.dividend_yield, 2)}
+                      </span>
+                      <span className="text-right whitespace-nowrap">
+                        <PctText value={it.pct_change} className="text-[10px]" />
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center py-4 text-[11px] text-slate-400 bg-slate-50/60 rounded-lg border border-dashed border-slate-200">
+                该分层暂无成分数据
+              </div>
+            )
+          ) : tierRows.length === 0 ? (
             <EmptyHint loading={overviewLoading} />
           ) : (
             <div className="flex flex-col overflow-x-auto">
@@ -194,7 +397,13 @@ export const UsValuationPanel: React.FC = () => {
                 <span className="text-right">股息率中位</span>
               </div>
               {tierRows.map((t) => (
-                <div key={t.key} className={`${ROW} ${TIER_GRID}`}>
+                <button
+                  type="button"
+                  key={t.key}
+                  onClick={() => setDrillTier(t.key)}
+                  title={`查看${t.label}成分股`}
+                  className={`${ROW} ${TIER_GRID} text-left w-full hover:bg-blue-50/70 transition-colors cursor-pointer`}
+                >
                   <span className="text-[9px] font-extrabold text-blue-700 bg-blue-50 border border-blue-100 rounded px-1 py-px text-center whitespace-nowrap">
                     {t.label}
                   </span>
@@ -210,12 +419,15 @@ export const UsValuationPanel: React.FC = () => {
                   <span className="text-right font-mono text-slate-600 whitespace-nowrap">
                     {pctOrDash(t.dividend_yield_median, 2)}
                   </span>
-                </div>
+                </button>
               ))}
             </div>
           )}
           <p className="text-[9px] text-slate-400 leading-relaxed">
             分层阈值：超大盘 ≥ 2000 亿 / 大盘 ≥ 100 亿 / 中盘 ≥ 20 亿 / 其余为小盘（美元）。
+            {drillTier
+              ? '摘要的涨跌家数与中位数按整层成分统计；PE/PB 为快照原值，负值显示为负。'
+              : '点击分层行查看成分个股。'}
           </p>
         </SectionCard>
         </div>

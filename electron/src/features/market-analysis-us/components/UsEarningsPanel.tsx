@@ -49,7 +49,10 @@ const SCROLL = 'overflow-y-auto';
 
 const CAL_GRID = 'grid-cols-[14px_1fr_34px_32px_40px_52px]';
 const SUR_GRID = 'grid-cols-[14px_1fr_34px_42px_42px_50px]';
-const REV_GRID = 'grid-cols-[14px_1fr_38px_34px]';
+// 「同比」列内含两行（EPS / 营收，值宽达「+1456.90%」）——原 34px 轨道容不下，
+// 右对齐的 nowrap 文本会向左溢出压到「EPS 预期」列（实机截图确认的挤压）；
+// 60px/96px 按最宽值（9 字符百分数 + 行标签）标定。
+const REV_GRID = 'grid-cols-[16px_1fr_60px_96px]';
 
 export const UsEarningsPanel: React.FC = () => {
   const [calendar, setCalendar] = useState<UsEarningsCalendar | null>(null);
@@ -99,9 +102,11 @@ export const UsEarningsPanel: React.FC = () => {
         </span>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-6 gap-1.5">
+      {/* 三张卡同排等高（与其它 Tab 的 xl:h-[...] 约定一致）：不给行高时三张卡各按
+          内容自然高度撑开（修正卡 40 行实测 1570px），整页被拉成超长条且列表无内部滚动。 */}
+      <div className="grid grid-cols-1 xl:grid-cols-6 gap-1.5 xl:h-[620px]">
         {/* 财报日历 */}
-        <div className="xl:col-span-2 min-w-0 h-full">
+        <div className="xl:col-span-2 min-w-0 h-full min-h-0">
           <SectionCard
             className="!p-2.5 gap-1.5 h-full"
             title={
@@ -187,7 +192,7 @@ export const UsEarningsPanel: React.FC = () => {
         </div>
 
         {/* 超预期榜 */}
-        <div className="xl:col-span-2 min-w-0 h-full">
+        <div className="xl:col-span-2 min-w-0 h-full min-h-0">
           <SectionCard
             className="!p-2.5 gap-1.5 h-full"
             title={
@@ -261,7 +266,7 @@ export const UsEarningsPanel: React.FC = () => {
         </div>
 
         {/* 盈利预期修正 */}
-        <div className="xl:col-span-2 min-w-0 h-full">
+        <div className="xl:col-span-2 min-w-0 h-full min-h-0">
           <SectionCard
             className="!p-2.5 gap-1.5 h-full"
             title={

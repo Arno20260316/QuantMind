@@ -13,7 +13,6 @@ import {
   Sparkles, Clock, RefreshCw, Zap, Activity, Layers, FileText, Users, Coins, BarChart3, Wallet,
 } from 'lucide-react';
 import { message } from 'antd';
-import { SectorHeatmapChart, type SectorHeatmapItem } from '../../market-analysis-shared/SectorHeatmapChart';
 import { UsIndexCards } from '../components/UsIndexCards';
 import { UsBreadthCard } from '../components/UsBreadthCard';
 import { UsHotStocksPanel, UsMarketPulseStrip } from '../components/UsHotStocksPanel';
@@ -27,7 +26,9 @@ import { UsEarningsPanel } from '../components/UsEarningsPanel';
 import { UsAnalystPanel } from '../components/UsAnalystPanel';
 import { UsHoldingsPanel } from '../components/UsHoldingsPanel';
 import { UsValuationPanel } from '../components/UsValuationPanel';
+import { UsSectorHeatmapCard } from '../components/UsSectorHeatmapCard';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
+import { StockTerminalWindow } from '../../market-analysis-shared/components/StockTerminalWindow';
 import {
   getBreadth, getHeatmap, getIndicesOverview, getMarketStats, getStatus, refreshMarket,
 } from '../services/api';
@@ -53,6 +54,8 @@ export const MarketAnalysisUsPage: React.FC = () => {
   const [updateTime, setUpdateTime] = useState('');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // 个股终端浮窗（热力图个股层点击 → 打开）
+  const [windowSymbol, setWindowSymbol] = useState<string | null>(null);
 
   const loadCore = useCallback(async () => {
     setLoading(true);
@@ -94,14 +97,6 @@ export const MarketAnalysisUsPage: React.FC = () => {
       setRefreshing(false);
     }
   };
-
-  const heatmapItems: SectorHeatmapItem[] = heatmap.map((h) => ({
-    name: h.name,
-    value: h.value,
-    pct_change: h.pct_change,
-    leader: h.leader,
-    leader_pct: h.leader_pct,
-  }));
 
   return (
     <div className="w-full h-full overflow-y-auto bg-slate-50/60 px-3 pt-2 pb-20 flex flex-col gap-1.5 font-sans">
@@ -197,21 +192,12 @@ export const MarketAnalysisUsPage: React.FC = () => {
             </div>
           </div>
           <div className="grid grid-cols-1 xl:grid-cols-3 gap-1.5 shrink-0 xl:h-[460px]">
-            <div className="xl:col-span-2 h-full min-h-0 bg-white/90 backdrop-blur-md rounded-2xl p-2.5 border border-slate-200/80 shadow-sm flex flex-col gap-1.5">
-              <div className="flex items-center justify-between">
-                <h3 className="text-[11px] font-extrabold text-slate-800 flex items-center gap-1.5">
-                  <Layers className="w-3.5 h-3.5 text-blue-600" />
-                  <span>GICS 板块热力图（中位涨幅 / 成交额 / 领涨龙头）</span>
-                </h3>
-                <span className="text-[9px] font-mono text-slate-400">{heatmap.length} 个板块</span>
-              </div>
-              {heatmap.length > 0 ? (
-                <div className="flex-1 min-h-0">
-                  <SectorHeatmapChart data={heatmapItems} height="100%" valueLabel="成交额权重" />
-                </div>
-              ) : (
-                <div className="py-6 text-center text-[11px] text-slate-400">热力图加载中…</div>
-              )}
+            <div className="xl:col-span-2 h-full min-h-0">
+              <UsSectorHeatmapCard
+                items={heatmap}
+                onStockClick={(symbol) => setWindowSymbol(symbol)}
+                className="h-full"
+              />
             </div>
             <div className="xl:col-span-1 h-full">
               <UsSectorFundFlowPanel limit={14} className="h-full" />
@@ -245,7 +231,17 @@ export const MarketAnalysisUsPage: React.FC = () => {
       {activeTab === 'earnings' && <UsEarningsPanel />}
       {activeTab === 'analysts' && <UsAnalystPanel />}
       {activeTab === 'holdings' && <UsHoldingsPanel />}
-      {activeTab === 'valuation' && <UsValuationPanel />}
+      {activeTab === 'valuation' && (
+        <UsValuationPanel onStockClick={(symbol) => setWindowSymbol(symbol)} />
+      )}
+
+      {/* 个股终端浮窗（热力图个股层 / 市值分层下钻行点击打开；与搜索框各自独立实例，互不干扰） */}
+      <StockTerminalWindow
+        open={!!windowSymbol}
+        symbol={windowSymbol}
+        market="US"
+        onClose={() => setWindowSymbol(null)}
+      />
     </div>
   );
 };

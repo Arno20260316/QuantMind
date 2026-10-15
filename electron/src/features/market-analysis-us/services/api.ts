@@ -26,9 +26,11 @@ import type {
   UsRecentSplits,
   UsRefreshResult,
   UsSectorFundFlow,
+  UsSectorDrill,
   UsSectorHeatItem,
   UsSectorRotation,
   UsSectorValuationRow,
+  UsSizeTierDrill,
   UsSizeTiers,
   UsUnusualVolume,
   UsValuationOverview,
@@ -73,6 +75,13 @@ export function getBreadth(): Promise<UsBreadthData> {
 
 export function getHeatmap(limit = 40): Promise<UsSectorHeatItem[]> {
   return getJson<UsSectorHeatItem[]>(`/heatmap?limit=${limit}`);
+}
+
+/** 板块下钻：成分个股热力图。`sector` 传 /heatmap 返回的英文类名原值。 */
+export function getHeatmapDrill(sector: string, limit = 300): Promise<UsSectorDrill> {
+  return getJson<UsSectorDrill>(
+    `/heatmap/drill?sector=${encodeURIComponent(sector)}&limit=${limit}`,
+  );
 }
 
 export function getProfitLeaders(limit = 10): Promise<UsProfitLeaders> {
@@ -186,6 +195,12 @@ export function getValuationRankings(
 
 export function getSizeTiers(): Promise<UsSizeTiers> {
   return getJson<UsSizeTiers>('/valuation/size-tiers');
+}
+
+export function getSizeTiersDrill(tier: string, limit = 300): Promise<UsSizeTierDrill> {
+  return getJson<UsSizeTierDrill>(
+    `/valuation/size-tiers/drill?tier=${encodeURIComponent(tier)}&limit=${limit}`,
+  );
 }
 
 export function getValuationOverview(): Promise<UsValuationOverview> {

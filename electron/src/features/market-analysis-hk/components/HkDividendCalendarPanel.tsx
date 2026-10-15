@@ -6,7 +6,7 @@ import type { HkDividendCalendar } from '../types';
 import { getDividendCalendar } from '../services/api';
 import { EmptyHint, SectionCard, fmtInt } from './shared/ui';
 
-export const HkDividendCalendarPanel: React.FC = () => {
+export const HkDividendCalendarPanel: React.FC<{ onPick?: (symbol: string) => void }> = ({ onPick }) => {
   const [data, setData] = useState<HkDividendCalendar | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -42,7 +42,14 @@ export const HkDividendCalendarPanel: React.FC = () => {
             <span className="text-right">派息日</span>
           </div>
           {data.items.map((it, i) => (
-            <div key={it.symbol + it.ex_date} className="grid grid-cols-[1fr_76px_56px] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 items-center">
+            <div
+              key={it.symbol + it.ex_date}
+              onClick={onPick ? () => onPick(it.symbol) : undefined}
+              title={onPick ? `打开 ${it.symbol} 个股终端` : undefined}
+              className={`grid grid-cols-[1fr_76px_56px] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 items-center ${
+                onPick ? 'cursor-pointer hover:bg-purple-50/50 transition-colors' : ''
+              }`}
+            >
               <span className="flex items-center gap-1.5 min-w-0">
                 <span className="text-[9px] font-extrabold text-amber-500 bg-amber-50 border border-amber-100 rounded px-1 py-0.5 flex-shrink-0 whitespace-nowrap">
                   {it.ex_date.slice(5)}

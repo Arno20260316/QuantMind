@@ -54,6 +54,17 @@ def to_iso(ymd: str) -> str:
     return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
 
 
+def iso_date(ymd: str | None) -> str | None:
+    """分区名/快照日期（YYYYMMDD）→ ISO；None 或已是 ISO 原样返回。
+
+    各 feed 模块的输出边界统一用它归一日期（快照源于 dt 分区名，是紧凑
+    格式），避免同一页面上两种日期格式并存。
+    """
+    if not ymd:
+        return ymd
+    return to_iso(ymd) if len(ymd) == 8 and ymd.isdigit() else ymd
+
+
 def to_ymd(iso: str) -> str:
     """YYYY-MM-DD -> YYYYMMDD。"""
     return iso.replace("-", "")

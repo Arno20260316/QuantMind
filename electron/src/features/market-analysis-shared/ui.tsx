@@ -89,22 +89,39 @@ export function SectionCard({
   );
 }
 
-/** 通用排行表行（表格行二三列对齐名/值） */
+/** 通用排行表行（表格行二三列对齐名/值）
+ *
+ * 传 `onClick` 时整行为可点击入口（如点击弹出个股终端浮窗）：
+ * 指针 + hover 高亮；内部子元素（下钻按钮等）的点击用 stopPropagation 隔离。
+ * `title` 供点击行为提示（如「查看个股终端」）。
+ */
 export function RankRow({
   rank,
   name,
   nameSub,
   main,
   right,
+  onClick,
+  title,
 }: {
   rank: number;
   name: string;
   nameSub?: string;
   main: React.ReactNode;
   right?: React.ReactNode;
+  onClick?: () => void;
+  title?: string;
 }) {
+  const clickable = Boolean(onClick);
   return (
-    <div className="flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0 transition-colors hover:bg-slate-50/70">
+    <div
+      onClick={onClick}
+      title={title}
+      role={clickable ? 'button' : undefined}
+      className={`flex items-center gap-2.5 px-1 py-1.5 border-b border-slate-50 last:border-0 transition-colors hover:bg-slate-50/70 ${
+        clickable ? 'cursor-pointer hover:bg-purple-50/60' : ''
+      }`}
+    >
       <span
         className={`w-5 h-5 rounded-md grid place-items-center text-[10px] font-extrabold ${
           rank <= 3 ? 'bg-purple-600 text-white' : 'bg-slate-100 text-slate-500'

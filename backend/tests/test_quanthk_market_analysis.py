@@ -5,7 +5,11 @@
 
 import pytest
 
-from backend.services.api.market_analysis_hk import quanthk_feed
+from backend.services.api.market_analysis_hk import (
+    hk_heatmap_drill,
+    hk_opportunity as opp,
+    quanthk_feed,
+)
 from backend.services.api.market_analysis_shared import display, market_days
 
 
@@ -259,3 +263,111 @@ def test_south_legacy_corrupt_files_skipped(monkeypatch):
     df = quanthk_feed._read_south_safe()
     assert not df.empty
     assert len(df["symbol"].unique()) > 500
+
+
+# ---- 热力图 L2 下钻 ----
+
+def test_hk_heatmap_drill_parent_child_reconcile():
+    """父子对账：L1 行业成交额 == L2 成分求和（无截断时逐位相等）。"""
+    sectors = quanthk_feed.get_sector_heatmap(limit=40)
+    target = next((s for s in sectors if s["name"] == "银行"), None)
+    assert target is not None, "L1 应含「银行」行业"
+    data = hk_heatmap_drill.get_heatmap_drill("银行")
+    assert data is not None
+    assert data["summary"]["truncated"] is False, "银行成分应远少于 300 只"
+    assert data["summary"]["total_amount_yi"] == pytest.approx(
+        target["value"], abs=0.15
+    ), "L2 成分求和应等于 L1 行业面积（同源快照）"
+    assert data["summary"]["stock_count"] == len(data["items"])
+
+
+def test_hk_heatmap_drill_unknown_sector_returns_none():
+    """行业名不存在 → None（router 转 404，前端回退 L1）。"""
+    assert hk_heatmap_drill.get_heatmap_drill("不存在的行业XYZ") is None
+
+
+def test_hk_heatmap_drill_items_shape():
+    """L2 成分股：成交额降序、字段完整、无南向持仓 sb 为 None。"""
+    data = hk_heatmap_drill.get_heatmap_drill("银行")
+    items = data["items"]
+    assert len(items) > 5
+    amounts = [it["amount_yi"] for it in items]
+    assert amounts == sorted(amounts, reverse=True)
+    for it in items:
+        assert it["symbol"].endswith(".HK")
+        assert it["name"]
+        assert -100 <= it["pct_change"] <= 100
+        assert it["sb_chg_d5_pp"] is None or isinstance(it["sb_chg_d5_pp"], float)
+
+
+# ---- 机会雷达（因子复合评分） ----
+
+def test_hk_opportunity_stocks_ranked_and_scored():
+    """个股榜：截面分位 0–100 降序、门槛达标（成交额≥5000万）、≥4 柱覆盖。"""
+    data = opp.get_opportunity_stocks(limit=30)
+    assert data["trade_date"].startswith("20")
+    items = data["items"]
+    assert len(items) == 30
+    scores = [it["opp_score"] for it in items]
+    assert scores == sorted(scores, reverse=True)
+    for it in items:
+        assert 0 <= it["opp_score"] <= 100
+        assert it["pillars_covered"] >= 4
+        assert it["amount_yi"] >= 0.5, "入榜门槛：成交额 ≥ 5000 万港元"
+        assert it["symbol"].endswith(".HK") and it["name"]
+
+
+def test_hk_opportunity_missing_pillar_is_none_not_zero():
+    """柱缺失一律 None（前端显示 —），绝不冒充 0。"""
+    data = opp.get_opportunity_stocks(limit=100)
+    for it in data["items"]:
+        assert set(it["pillars"]) == {"mom", "trend", "south", "ccass", "liq", "risk"}
+        for v in it["pillars"].values():
+            assert v is None or 0 <= v <= 100
+    # 全市场层面：南向仅覆盖港股通标的，必然存在 NaN 柱
+    _, df = opp._build_universe()
+    assert df["pillar_south"].isna().sum() > 0
+
+
+def test_hk_opportunity_sectors_breadth():
+    """行业榜：中位分降序、机会宽度 ∈ [0,1]、前排 ≤3 只。"""
+    data = opp.get_opportunity_sectors(limit=12, min_stocks=8)
+    items = data["items"]
+    assert len(items) >= 3
+    meds = [it["opp_score_median"] for it in items]
+    assert meds == sorted(meds, reverse=True)
+    for it in items:
+        assert 0 <= it["opp_score_median"] <= 100
+        assert 0 <= it["opportunity_breadth"] <= 1
+        assert it["stock_count"] >= 8
+        assert 1 <= len(it["top_stocks"]) <= 3
+        for ts in it["top_stocks"]:
+            assert ts["symbol"].endswith(".HK")
+
+
+def test_hk_risk_watch_symmetric_and_explained():
+    """风险榜：与机会分对称（100−opp），降序且理由字段齐全。"""
+    data = opp.get_risk_watch(limit=20)
+    items = data["items"]
+    assert len(items) == 20
+    risks = [it["risk_score"] for it in items]
+    assert risks == sorted(risks, reverse=True)
+    for it in items:
+        assert 0 <= it["risk_score"] <= 100
+        assert isinstance(it["reasons"], list)
+
+
+def test_hk_opportunity_summary_transparency():
+    """口径元信息：门槛/权重和=1/U 形剔除披露/数据日期齐全。"""
+    s = opp.get_opportunity_summary()
+    assert s["available"] is True
+    assert s["thresholds"]["min_price_hkd"] == 0.5
+    assert s["thresholds"]["min_amount_hkd"] == 5e7
+    assert sum(s["pillar_weights"].values()) == pytest.approx(1.0)
+    assert s["pillar_coverage"]["ccass"] > 0
+    # U 形非单调因子必须如实披露剔除原因
+    assert "ca_broker_pct" in s["excluded_factors"]
+    assert "ca_cust_share_disc" in s["excluded_factors"]
+    assert set(s["data_as_of"]) >= {
+        "l1_factors", "south_factors", "ccass_factors", "quote"
+    }

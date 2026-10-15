@@ -6,7 +6,7 @@ import type { HkAhPairItem } from '../types';
 import { getAhPairs } from '../services/api';
 import { EmptyHint, SectionCard } from './shared/ui';
 
-export const HkAhPanel: React.FC = () => {
+export const HkAhPanel: React.FC<{ onPick?: (symbol: string) => void }> = ({ onPick }) => {
   const [items, setItems] = useState<HkAhPairItem[]>([]);
   const [date, setDate] = useState('');
   const [loading, setLoading] = useState(false);
@@ -48,7 +48,14 @@ export const HkAhPanel: React.FC = () => {
             <span>A股对照</span>
           </div>
           {items.map((it, i) => (
-            <div key={it.h_symbol} className="grid grid-cols-[1fr_52px_1fr] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 items-center">
+            <div
+              key={it.h_symbol}
+              onClick={onPick ? () => onPick(it.h_symbol) : undefined}
+              title={onPick ? `打开 ${it.h_symbol} 个股终端` : undefined}
+              className={`grid grid-cols-[1fr_52px_1fr] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 items-center ${
+                onPick ? 'cursor-pointer hover:bg-purple-50/50 transition-colors' : ''
+              }`}
+            >
               <span className="flex items-center gap-1.5 min-w-0">
                 <span className="text-[9px] font-extrabold text-slate-300 w-4">{String(i + 1).padStart(2, '0')}</span>
                 <span className="text-[10px] font-bold text-slate-800 truncate">{it.h_name}</span>

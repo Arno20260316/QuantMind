@@ -10,7 +10,12 @@ import type {
   HkCcassRankings,
   HkDividendCalendar,
   HkFeedStatus,
+  HkHeatmapDrill,
   HkIndexItem,
+  HkOpportunitySectors,
+  HkOpportunityStocks,
+  HkOpportunitySummary,
+  HkRiskWatch,
   HkRotationItem,
   HkProfitLeaders,
   HkSectorHeatItem,
@@ -56,6 +61,37 @@ export function getBreadth(): Promise<HkBreadthData> {
 
 export function getHeatmap(limit = 40): Promise<HkSectorHeatItem[]> {
   return getJson<HkSectorHeatItem[]>(`/heatmap?limit=${limit}`);
+}
+
+export function getHeatmapDrill(sector: string): Promise<HkHeatmapDrill> {
+  return getJson<HkHeatmapDrill>(`/heatmap/drill?sector=${encodeURIComponent(sector)}`);
+}
+
+// ---- 机会雷达 ----
+
+export function getOpportunityStocks(
+  limit = 30,
+  sector?: string,
+): Promise<HkOpportunityStocks> {
+  const q = sector ? `&sector=${encodeURIComponent(sector)}` : '';
+  return getJson<HkOpportunityStocks>(`/opportunity/stocks?limit=${limit}${q}`);
+}
+
+export function getOpportunitySectors(
+  limit = 12,
+  minStocks = 8,
+): Promise<HkOpportunitySectors> {
+  return getJson<HkOpportunitySectors>(
+    `/opportunity/sectors?limit=${limit}&min_stocks=${minStocks}`,
+  );
+}
+
+export function getRiskWatch(limit = 20): Promise<HkRiskWatch> {
+  return getJson<HkRiskWatch>(`/opportunity/risk?limit=${limit}`);
+}
+
+export function getOpportunitySummary(): Promise<HkOpportunitySummary> {
+  return getJson<HkOpportunitySummary>('/opportunity/summary');
 }
 
 export function getSouthOverview(): Promise<HkSouthOverview> {

@@ -1,18 +1,20 @@
-/** 港股市场分析主页面 —— 恒指脉搏 / 南向资金 / CCASS 席位 / 估值主题 / 轮动比价
+/** 港股市场分析主页面 —— 恒指脉搏 / 机会雷达 / 南向资金 / CCASS 席位 / 估值主题 / 轮动比价
  *
- * 独立市场目录（features/market-analysis-hk/），共享 A 股市场分析的热力图组件
- * （跨市场数据形状一致，见 features/market-analysis/components/ShenwanHeatmapChart）。
+ * 独立市场目录（features/market-analysis-hk/），热力图下钻复用共享组件
+ * SectorHeatmapChart（features/market-analysis-shared/），个股点击统一弹出
+ * 港股个股终端浮窗（StockTerminalWindow market="HK"）。
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Sparkles, Clock, RefreshCw, Zap, Activity, Waves, Building2, Coins, Layers, Landmark, Briefcase,
+  Sparkles, Clock, RefreshCw, Zap, Activity, Waves, Building2, Coins, Layers, Briefcase, Target,
 } from 'lucide-react';
 import { message } from 'antd';
-import { ShenwanHeatmapChart, ShenwanSectorItem } from '../../market-analysis/components/ShenwanHeatmapChart';
 import { HkIndexCards } from '../components/HkIndexCards';
 import { HkBreadthCard } from '../components/HkBreadthCard';
 import { ProfitLeadersCard } from '../components/HkProfitLeaders';
+import { HkHeatmapDrillCard } from '../components/HkHeatmapDrillCard';
+import { HkOpportunityPanel } from '../components/HkOpportunityPanel';
 import { HkSouthPanel } from '../components/HkSouthPanel';
 import { HkCcassPanel } from '../components/HkCcassPanel';
 import { HkValuationPanel } from '../components/HkValuationPanel';
@@ -24,12 +26,17 @@ import { HkAhPanel } from '../components/HkAhPanel';
 import { HkInstitutionalPanel } from '../components/HkInstitutionalPanel';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
 import {
+  StockTerminalWindow,
+  prefetchTerminal,
+} from '../../market-analysis-shared/components/StockTerminalWindow';
+import {
   getBreadth, getHeatmap, getIndicesOverview, getStatus, refreshMarket,
 } from '../services/api';
 import type { HkBreadthData, HkIndexItem, HkSectorHeatItem } from '../types';
 
 const NAV_TABS = [
   { id: 'panorama', label: '恒指脉搏', icon: Activity },
+  { id: 'opportunities', label: '机会雷达', icon: Target },
   { id: 'ccass', label: 'CCASS 席位', icon: Building2 },
   { id: 'south', label: '南向资金', icon: Waves },
   { id: 'valuation', label: '估值主题', icon: Coins },
@@ -46,6 +53,8 @@ export const MarketAnalysisHkPage: React.FC = () => {
   const [updateTime, setUpdateTime] = useState('');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // 个股终端浮窗选中标的（页面统一持有：热力图 L2 色块 / 机会雷达 / 各面板行点击）
+  const [windowSymbol, setWindowSymbol] = useState<string | null>(null);
 
   const loadCore = useCallback(async () => {
     setLoading(true);
@@ -74,6 +83,11 @@ export const MarketAnalysisHkPage: React.FC = () => {
       .catch(() => undefined);
   }, [loadCore]);
 
+  // 预取港股个股终端代码包：首次点击个股时无懒加载等待
+  useEffect(() => {
+    prefetchTerminal('HK');
+  }, []);
+
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
@@ -86,14 +100,6 @@ export const MarketAnalysisHkPage: React.FC = () => {
       setRefreshing(false);
     }
   };
-
-  const heatmapItems: ShenwanSectorItem[] = heatmap.map((h) => ({
-    name: h.name,
-    value: h.value,
-    pct_change: h.pct_change,
-    leader: h.leader,
-    leader_pct: h.leader_pct,
-  }));
 
   return (
     <div className="w-full h-full overflow-y-auto bg-slate-50/60 px-5 pt-4 pb-28 flex flex-col gap-2.5 font-sans">
@@ -172,44 +178,34 @@ export const MarketAnalysisHkPage: React.FC = () => {
         </span>
       </div>
 
-      {/* 恒指脉搏：温度计 + 赚钱效应 Top10（左 1/3）+ 行业热力图（右 2/3） */}
+      {/* 恒指脉搏：温度计 + 赚钱效应 Top10（左 1/3）+ 行业热力图下钻（右 2/3） */}
       {activeTab === 'panorama' && (
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-2.5 items-start">
           <div className="xl:col-span-1 flex flex-col gap-2.5">
             <HkBreadthCard breadth={breadth} loading={loading} />
-            <ProfitLeadersCard />
+            <ProfitLeadersCard onPick={(s) => setWindowSymbol(s)} />
           </div>
-          <div className="xl:col-span-2 bg-white/90 backdrop-blur-md rounded-2xl p-4 border border-slate-200/80 shadow-sm flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                <Landmark className="w-3.5 h-3.5 text-purple-600" />
-                <span>恒生行业热力图（平均涨幅 / 成交额 / 领涨龙头）</span>
-              </h3>
-              <span className="text-[10px] font-mono text-slate-400">
-                {heatmap.length} 个行业
-              </span>
-            </div>
-            {heatmap.length > 0 ? (
-              <ShenwanHeatmapChart data={heatmapItems} height={560} />
-            ) : (
-              <div className="py-8 text-center text-xs text-slate-400">热力图加载中…</div>
-            )}
-          </div>
+          <HkHeatmapDrillCard
+            sectors={heatmap}
+            onStockClick={(symbol) => setWindowSymbol(symbol)}
+            className="xl:col-span-2"
+          />
         </div>
       )}
 
-      {activeTab === 'south' && <HkSouthPanel />}
-      {activeTab === 'ccass' && <HkCcassPanel />}
+      {activeTab === 'opportunities' && <HkOpportunityPanel onPick={(s) => setWindowSymbol(s)} />}
+      {activeTab === 'south' && <HkSouthPanel onPick={(s) => setWindowSymbol(s)} />}
+      {activeTab === 'ccass' && <HkCcassPanel onPick={(s) => setWindowSymbol(s)} />}
       {activeTab === 'valuation' && (
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-2.5 items-start">
           <div className="xl:col-span-1">
-            <HkValuationPanel />
+            <HkValuationPanel onPick={(s) => setWindowSymbol(s)} />
           </div>
           <div className="xl:col-span-1">
-            <HkAhPremiumPanel />
+            <HkAhPremiumPanel onPick={(s) => setWindowSymbol(s)} />
           </div>
           <div className="xl:col-span-1">
-            <HkDividendCalendarPanel />
+            <HkDividendCalendarPanel onPick={(s) => setWindowSymbol(s)} />
           </div>
         </div>
       )}
@@ -222,11 +218,19 @@ export const MarketAnalysisHkPage: React.FC = () => {
             <HkSectorValuationPanel />
           </div>
           <div className="xl:col-span-1 h-full">
-            <HkAhPanel />
+            <HkAhPanel onPick={(s) => setWindowSymbol(s)} />
           </div>
         </div>
       )}
       {activeTab === 'institutional' && <HkInstitutionalPanel />}
+
+      {/* 个股终端浮窗（全页面共用一个实例；搜索框已有独立实例，保留） */}
+      <StockTerminalWindow
+        open={!!windowSymbol}
+        symbol={windowSymbol}
+        market="HK"
+        onClose={() => setWindowSymbol(null)}
+      />
     </div>
   );
 };

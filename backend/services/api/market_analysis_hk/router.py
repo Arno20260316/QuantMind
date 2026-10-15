@@ -18,7 +18,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from backend.services.api.market_analysis_hk import quanthk_feed as feed
+from backend.services.api.market_analysis_hk import (
+    hk_heatmap_drill as drill,
+    hk_opportunity as opp,
+    quanthk_feed as feed,
+)
 from backend.services.api.user_app.middleware.auth import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,22 @@ async def get_sector_heatmap(
         return await asyncio.to_thread(feed.get_sector_heatmap, limit)
     except Exception as exc:
         raise _fatal(exc) from exc
+
+
+@router.get("/heatmap/drill")
+async def get_heatmap_drill(
+    sector: str = Query(..., min_length=1, max_length=60, description="行业名（恒生口径）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """L2 下钻：行业成分股（成交额降序，≤300 只；父子和账，行业名不存在 404）。"""
+    _ = current_user
+    try:
+        result = await asyncio.to_thread(drill.get_heatmap_drill, sector)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"行业不存在: {sector}")
+    return result
 
 
 # ---- 南向资金 ----
@@ -267,6 +287,62 @@ async def get_profit_leaders(
         raise _fatal(exc) from exc
 
 
+# ---- 机会雷达（因子复合评分）----
+
+
+@router.get("/opportunity/stocks")
+async def get_opportunity_stocks(
+    limit: int = Query(default=30, ge=5, le=100),
+    sector: str | None = Query(default=None, max_length=60),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """机会个股榜：六柱因子复合评分降序（含行业排名/触发标签/柱分解）。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(opp.get_opportunity_stocks, limit, sector)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/opportunity/sectors")
+async def get_opportunity_sectors(
+    limit: int = Query(default=12, ge=3, le=31),
+    min_stocks: int = Query(default=8, ge=3, le=50),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """机会行业榜：行业中位机会分 + 机会宽度 + 南向变化 + 前排个股。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(opp.get_opportunity_sectors, limit, min_stocks)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/opportunity/risk")
+async def get_risk_watch(
+    limit: int = Query(default=20, ge=5, le=50),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """风险警示榜：机会分对称反向 + 事实理由标注（弱势/波动/减持/筹码弱）。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(opp.get_risk_watch, limit)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/opportunity/summary")
+async def get_opportunity_summary(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """机会雷达口径元信息：门槛/权重/因子清单/覆盖率/数据日期（分母透明度）。"""
+    _ = current_user
+    try:
+        return await asyncio.to_thread(opp.get_opportunity_summary)
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
 # ---- 机构持仓分析 ----
 
 _INST_CATEGORIES = "^(all|cn_broker|southbound|hk|us_eu|apac|other)$"
@@ -407,6 +483,8 @@ async def trigger_refresh_stream(
                 ("dividend_calendar", feed.get_dividend_calendar, 60, 40),
                 ("profit_leaders", feed.get_profit_leaders, 10),
                 ("rotation", feed.get_sector_rotation, 24),
+                ("opportunity_stocks", opp.get_opportunity_stocks, 30),
+                ("opportunity_sectors", opp.get_opportunity_sectors, 12, 8),
             ]
             for name, func, *args in steps:
                 result = await asyncio.to_thread(func, *args)

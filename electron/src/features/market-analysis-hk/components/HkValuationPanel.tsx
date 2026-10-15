@@ -16,7 +16,7 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]['id'];
 
-export const HkValuationPanel: React.FC = () => {
+export const HkValuationPanel: React.FC<{ onPick?: (symbol: string) => void }> = ({ onPick }) => {
   const [tab, setTab] = useState<TabId>('dividend');
   const [data, setData] = useState<HkValuationRanking | null>(null);
   const [loading, setLoading] = useState(false);
@@ -88,6 +88,8 @@ export const HkValuationPanel: React.FC = () => {
                 rank={i + 1}
                 name={it.name}
                 nameSub={it.symbol}
+                onClick={onPick ? () => onPick(it.symbol) : undefined}
+                title={onPick ? `打开 ${it.symbol} 个股终端` : undefined}
                 main={
                   it.total_market_cap_yi !== undefined && (
                     <span className="text-[10px] font-mono text-slate-400">

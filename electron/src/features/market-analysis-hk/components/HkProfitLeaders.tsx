@@ -6,7 +6,11 @@ import type { HkProfitLeaders } from '../types';
 import { getProfitLeaders } from '../services/api';
 import { EmptyHint, PctText, RankRow, SectionCard, fmtInt } from './shared/ui';
 
-export const ProfitLeadersCard: React.FC<{ height?: number }> = ({ height = 360 }) => {
+export const ProfitLeadersCard: React.FC<{
+  height?: number;
+  /** 点击行 → 打开个股终端浮窗 */
+  onPick?: (symbol: string) => void;
+}> = ({ height = 360, onPick }) => {
   const [data, setData] = useState<HkProfitLeaders | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -49,6 +53,8 @@ export const ProfitLeadersCard: React.FC<{ height?: number }> = ({ height = 360 
               rank={i + 1}
               name={it.name}
               nameSub={it.symbol}
+              onClick={onPick ? () => onPick(it.symbol) : undefined}
+              title={onPick ? `打开 ${it.symbol} 个股终端` : undefined}
               main={
                 <span className="text-[9px] font-mono text-amber-500 flex-shrink-0" title={`评分 = 涨跌幅 + 2×log10(成交额/1亿)`}>
                   {it.score.toFixed(1)}分

@@ -221,6 +221,103 @@ export interface HkFeedStatus {
   industry_count: number;
   south_files: number;
 }
+
+/** 热力图 L2 下钻：行业成分股（成交额降序，父子同源快照） */
+export interface HkDrillItem {
+  symbol: string;
+  name: string;
+  pct_change: number;
+  amount_yi: number;
+  /** 南向 5 日持股变化（百分点）；非港股通标的为 null（显示 —，不冒充 0） */
+  sb_chg_d5_pp: number | null;
+}
+
+export interface HkHeatmapDrill {
+  name: string;
+  trade_date: string;
+  items: HkDrillItem[];
+  summary: { stock_count: number; total_amount_yi: number; truncated: boolean };
+}
+
+// ---- 机会雷达（六柱因子复合评分，研究评分非模型预测） ----
+
+export type HkPillarId = 'mom' | 'trend' | 'south' | 'ccass' | 'liq' | 'risk';
+
+/** 柱分 0–100；null = 该柱无数据（显示 —，绝不显示成 0） */
+export type HkPillarScores = Record<HkPillarId, number | null>;
+
+export interface HkOpportunityStock {
+  symbol: string;
+  name: string;
+  sector: string | null;
+  opp_score: number;
+  pct_change: number;
+  amount_yi: number;
+  pillars: HkPillarScores;
+  pillars_covered: number;
+  tags: string[];
+  sb_chg_d5_pp: number | null;
+  rank_in_sector: number | null;
+  sector_size: number | null;
+}
+
+export interface HkOpportunityStocks {
+  trade_date: string | null;
+  items: HkOpportunityStock[];
+  universe: { eligible: number; scored: number };
+}
+
+export interface HkOpportunitySectorStock {
+  symbol: string;
+  name: string;
+  opp_score: number;
+  pct_change: number;
+}
+
+export interface HkOpportunitySector {
+  name: string;
+  opp_score_median: number;
+  /** 机会宽度：成分机会分 ≥ 70 占比 ∈ [0,1] */
+  opportunity_breadth: number;
+  stock_count: number;
+  south_chg_d5_median_pp: number | null;
+  top_stocks: HkOpportunitySectorStock[];
+}
+
+export interface HkOpportunitySectors {
+  trade_date: string | null;
+  items: HkOpportunitySector[];
+}
+
+export interface HkRiskWatchItem {
+  symbol: string;
+  name: string;
+  sector: string | null;
+  risk_score: number;
+  pct_change: number;
+  amount_yi: number;
+  reasons: string[];
+}
+
+export interface HkRiskWatch {
+  trade_date: string | null;
+  items: HkRiskWatchItem[];
+}
+
+export interface HkOpportunitySummary {
+  available: boolean;
+  trade_date: string | null;
+  pct_base: string;
+  thresholds: { min_price_hkd: number; min_amount_hkd: number; min_pillars: number };
+  pillar_weights: Record<HkPillarId, number>;
+  pillar_coverage: Record<string, number>;
+  listed_total: number;
+  eligible_total: number;
+  factors: { l1: string[]; south: string[]; ccass: string[] };
+  excluded_factors: Record<string, string>;
+  data_as_of: Record<string, string>;
+  disclaimer: string;
+}
 /** 机构持仓分析 —— 资金属性分类（内资 / 港资 / 外资·欧美 / 外资·亚太） */
 
 export type InstitutionalCategoryId =

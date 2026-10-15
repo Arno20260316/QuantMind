@@ -4,7 +4,7 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { Building2, Search, UserSearch, LogIn, LogOut } from 'lucide-react';
+import { Building2, Search, UserSearch, LogIn, LogOut, CandlestickChart } from 'lucide-react';
 import { Input } from 'antd';
 import type { HkCcassHolding, HkCcassMovers, HkCcassRankings } from '../types';
 import { getCcassHolding, getCcassMovers, getCcassRankings } from '../services/api';
@@ -15,7 +15,7 @@ function isBankSeeder(id: string): boolean {
   return id.startsWith('C0');
 }
 
-export const HkCcassPanel: React.FC = () => {
+export const HkCcassPanel: React.FC<{ onPick?: (symbol: string) => void }> = ({ onPick }) => {
   const [rankings, setRankings] = useState<HkCcassRankings | null>(null);
   const [movers, setMovers] = useState<HkCcassMovers | null>(null);
   const [holding, setHolding] = useState<HkCcassHolding | null>(null);
@@ -74,23 +74,28 @@ export const HkCcassPanel: React.FC = () => {
           <EmptyHint loading />
         ) : rankings?.items.length ? (
           <div className="flex flex-col max-h-[480px] overflow-y-auto pr-0.5">
-            <div className="grid grid-cols-[1fr_58px_56px_52px] gap-1.5 px-1 pb-1.5 text-[10px] font-extrabold text-slate-400 border-b border-slate-100 sticky top-0 bg-white/95 backdrop-blur">
+            <div className="grid grid-cols-[1fr_58px_56px_52px_22px] gap-1.5 px-1 pb-1.5 text-[10px] font-extrabold text-slate-400 border-b border-slate-100 sticky top-0 bg-white/95 backdrop-blur">
               <span>标的</span>
               <span className="text-right">前十席</span>
               <span className="text-right">南向席</span>
               <span className="text-right">HHI</span>
+              <span />
             </div>
             {rankings.items.slice(0, 25).map((it, i) => (
-              <button
+              <div
                 key={it.symbol}
-                onClick={() => drill(it.symbol)}
-                className="w-full grid grid-cols-[1fr_58px_56px_52px] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 hover:bg-purple-50/60 transition-colors text-left cursor-pointer"
+                className="group w-full grid grid-cols-[1fr_58px_56px_52px_22px] gap-1.5 px-1 py-1.5 border-b border-slate-50 last:border-0 hover:bg-purple-50/60 transition-colors"
               >
-                <span className="flex items-center gap-1.5 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => drill(it.symbol)}
+                  className="flex items-center gap-1.5 min-w-0 text-left cursor-pointer"
+                  title={`下钻 ${it.symbol} 席位结构`}
+                >
                   <span className="text-[10px] font-extrabold text-slate-300 w-4">{(i + 1).toString().padStart(2, '0')}</span>
                   <span className="text-[11px] font-bold text-slate-800 truncate">{it.name}</span>
                   <span className="text-[9px] font-mono text-slate-400 truncate">{it.symbol}</span>
-                </span>
+                </button>
                 <span className={`text-right text-[11px] font-extrabold font-mono ${it.top10_pct > 90 ? 'text-purple-700' : 'text-slate-700'}`}>
                   {it.top10_pct.toFixed(1)}%
                 </span>
@@ -98,7 +103,15 @@ export const HkCcassPanel: React.FC = () => {
                 <span className={`text-right text-[10px] font-mono ${it.hhi > 0.3 ? 'text-amber-600' : 'text-slate-500'}`}>
                   {it.hhi.toFixed(2)}
                 </span>
-              </button>
+                <button
+                  type="button"
+                  onClick={() => onPick?.(it.symbol)}
+                  className="flex items-center justify-center text-slate-300 hover:text-purple-600 transition-colors cursor-pointer"
+                  title={`打开 ${it.symbol} 个股终端`}
+                >
+                  <CandlestickChart className="w-3 h-3" />
+                </button>
+              </div>
             ))}
           </div>
         ) : (
@@ -143,6 +156,15 @@ export const HkCcassPanel: React.FC = () => {
                 {holding.name}
                 <span className="text-[10px] font-mono text-slate-400">({holding.symbol})</span>
               </span>
+              <button
+                type="button"
+                onClick={() => onPick?.(holding.symbol)}
+                className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-purple-50 text-purple-700 border border-purple-100 hover:bg-purple-100 transition-colors"
+                title={`打开 ${holding.symbol} 个股终端`}
+              >
+                <CandlestickChart className="w-3 h-3" />
+                终端
+              </button>
               <span className="ml-auto text-[9px] font-mono text-slate-400 whitespace-nowrap">{holding.trade_date}</span>
             </div>
             <div className="grid grid-cols-[1fr_64px_56px] gap-1.5 px-1 pb-1 text-[10px] font-extrabold text-slate-400 border-b border-slate-100">
@@ -196,7 +218,18 @@ export const HkCcassPanel: React.FC = () => {
                   name={it.name}
                   nameSub={it.symbol}
                   main={<span className="text-[9px] font-mono text-slate-400">+{it.count}席</span>}
-                  right={<button onClick={() => drill(it.symbol)} className="text-[10px] font-bold text-purple-600 hover:text-purple-800">下钻</button>}
+                  right={
+                    <span className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => onPick?.(it.symbol)}
+                        className="flex items-center text-slate-300 hover:text-purple-600 transition-colors"
+                        title={`打开 ${it.symbol} 个股终端`}
+                      >
+                        <CandlestickChart className="w-3 h-3" />
+                      </button>
+                      <button onClick={() => drill(it.symbol)} className="text-[10px] font-bold text-purple-600 hover:text-purple-800">下钻</button>
+                    </span>
+                  }
                 />
               ))}
             </div>
@@ -220,7 +253,18 @@ export const HkCcassPanel: React.FC = () => {
                   name={it.name}
                   nameSub={it.symbol}
                   main={<span className="text-[9px] font-mono text-slate-400">-{it.count}席</span>}
-                  right={<button onClick={() => drill(it.symbol)} className="text-[10px] font-bold text-purple-600 hover:text-purple-800">下钻</button>}
+                  right={
+                    <span className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => onPick?.(it.symbol)}
+                        className="flex items-center text-slate-300 hover:text-purple-600 transition-colors"
+                        title={`打开 ${it.symbol} 个股终端`}
+                      >
+                        <CandlestickChart className="w-3 h-3" />
+                      </button>
+                      <button onClick={() => drill(it.symbol)} className="text-[10px] font-bold text-purple-600 hover:text-purple-800">下钻</button>
+                    </span>
+                  }
                 />
               ))}
             </div>

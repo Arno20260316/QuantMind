@@ -11,7 +11,7 @@ const PERIODS = [
   { id: '20', label: '20日' },
 ];
 
-export const HkSouthPanel: React.FC = () => {
+export const HkSouthPanel: React.FC<{ onPick?: (symbol: string) => void }> = ({ onPick }) => {
   const [overview, setOverview] = useState<HkSouthOverview | null>(null);
   const [flow, setFlow] = useState<HkSouthFlow | null>(null);
   const [sectors, setSectors] = useState<HkSouthSectorItem[]>([]);
@@ -44,6 +44,8 @@ export const HkSouthPanel: React.FC = () => {
         rank={offset + i + 1}
         name={it.name}
         nameSub={it.symbol}
+        onClick={onPick ? () => onPick(it.symbol) : undefined}
+        title={onPick ? `打开 ${it.symbol} 个股终端` : undefined}
         main={
           <PctText
             value={it.pct_change_abs}

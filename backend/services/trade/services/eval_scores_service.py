@@ -4,7 +4,9 @@
 - 每 60s 轮询：交易日且到点且当日未成功 → ``scripts/eval/run_all.py`` 的 ``run_all()``
   顺序评 因子/模型/策略/账户/每日选股 → ``eval_scores`` 落表；
 - 单卡异常在 ``run_all`` 内部隔离（不阻塞整轮）；整轮无异常才写当日完成标记
-  （``eval:scores:done:{date}``，TTL 3 天），有异常下一轮重试；
+  （``eval:scores:done:{date}``，TTL 3 天）；有异常下一轮重试，但**累计尝试达到
+  预算（默认 5 轮）后带错落标记**——持续性单点错误（重试治不好的那类）不再让
+  整轮每分钟重跑整晚（2026-10-15 实锤：一个模型 pred 缺列烧了 411 轮）；
 - 五卡之后接着跑一次**回填**（``backfill_recent``）——把最近「待回填 ∧ 前向窗口
   已闭合」的每日选股快照重跑，否则这些天会永久停在 pending †；
 - 心跳写 ``scheduler_registry``（体检 C07 可见）。
@@ -13,12 +15,14 @@
   EVAL_SCORES_WORKER_ENABLED      默认 "1"
   EVAL_SCORES_TIME                默认 "16:00"（上海时区）
   EVAL_SCORES_CHECK_INTERVAL_SEC  默认 60
+  EVAL_SCORES_MAX_ATTEMPTS        默认 5（有异常时的重试轮数上限，到时带错落标记）
   EVAL_BACKFILL_DAYS              默认 21（回填回看自然日；0 = 关闭回填）
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -26,7 +30,9 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 _DONE_KEY = "eval:scores:done:{date}"
+_ATTEMPTS_KEY = "eval:scores:attempts:{date}"
 _DONE_TTL_SECONDS = 3 * 24 * 3600
+_MAX_ATTEMPTS_DEFAULT = 5
 
 # 北京时间与 UTC 的固定偏移（A 股无夏令时）——与影子对照/双轨对账同口径
 _CST_OFFSET = timedelta(hours=8)
@@ -55,6 +61,9 @@ def _config() -> dict:
         "enabled": _env_bool("EVAL_SCORES_WORKER_ENABLED", True),
         "time": str(os.getenv("EVAL_SCORES_TIME", "16:00")),
         "interval": max(10, int(os.getenv("EVAL_SCORES_CHECK_INTERVAL_SEC", "60"))),
+        "max_attempts": max(
+            1, _env_int("EVAL_SCORES_MAX_ATTEMPTS", _MAX_ATTEMPTS_DEFAULT)
+        ),
     }
 
 
@@ -78,6 +87,44 @@ def _raw_client(redis) -> object | None:
     if client is not None:
         return client
     return redis if hasattr(redis, "set") else None
+
+
+def _settle_done_marker(
+    client, date_str: str, summary: dict, max_attempts: int
+) -> str:
+    """按本轮结果决定当日完成标记，返回 ``done`` / ``done_with_errors`` / ``retry``。
+
+    - 五卡无异常 → 直接落标记（值 ``"1"``）；
+    - 有异常 → 计一次尝试；未到预算返回 ``retry``（下一轮照常重试，暂时性错误
+      仍会被自愈）；达到预算 K 轮 → **带错落标记**（值为 JSON：attempts + errors
+      摘要），由调用方 WARNING 并接告警面。
+
+    预算的意义是给「持续性单点错误」封顶（重试治不好，只是每分钟重烧全量五卡）；
+    期间任何一轮转好都会走成功分支清盘。
+    """
+    errors = int(summary.get("total_errors") or 0)
+    done_key = _DONE_KEY.format(date=date_str)
+    if errors == 0:
+        client.set(done_key, "1", ex=_DONE_TTL_SECONDS)
+        return "done"
+    attempts_key = _ATTEMPTS_KEY.format(date=date_str)
+    attempts = int(client.incr(attempts_key))
+    client.expire(attempts_key, _DONE_TTL_SECONDS)
+    if attempts < max(1, int(max_attempts)):
+        return "retry"
+    client.set(
+        done_key,
+        json.dumps(
+            {
+                "done": "with_errors",
+                "attempts": attempts,
+                "errors": [str(e) for e in (summary.get("errors") or [])[:10]],
+            },
+            ensure_ascii=False,
+        ),
+        ex=_DONE_TTL_SECONDS,
+    )
+    return "done_with_errors"
 
 
 async def run_eval_scores_once(*, save: bool = True) -> dict:
@@ -161,11 +208,18 @@ async def run_eval_scores_worker() -> None:
                 backfill_errors = (summary.get("backfill") or {}).get("errors") or []
                 if backfill_errors:
                     logger.warning("[EvalScores] 回填未全部成功：%s", backfill_errors)
-                if client is not None and int(summary.get("total_errors") or 0) == 0:
+                if client is not None:
                     try:
-                        client.set(
-                            _DONE_KEY.format(date=date_str), "1", ex=_DONE_TTL_SECONDS
+                        outcome = _settle_done_marker(
+                            client, date_str, summary, cfg["max_attempts"]
                         )
+                        if outcome == "done_with_errors":
+                            logger.warning(
+                                "[EvalScores] 连续 %s 轮存在异常，已达尝试预算：带错落当日"
+                                "完成标记，不再重跑（errors=%s）",
+                                cfg["max_attempts"],
+                                summary.get("errors"),
+                            )
                     except Exception:  # noqa: BLE001
                         pass
         except asyncio.CancelledError:

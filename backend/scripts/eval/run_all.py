@@ -45,9 +45,14 @@ async def _save_result(result: dict[str, Any], *, snapshot_date: Any = None) -> 
 
     if result.get("error"):
         return False
-    # 产物不在盘的缺省卡 score=None **也要写**：它是「旧 A 级现形」的载体，
-    # 不写回旧分就永远留在榜上（语义同 model_card.py --all 的 _save）。
-    if result.get("score") is None and not result.get("artifact_missing"):
+    # 产物不在盘（artifact_missing）/ 在盘但不可评（unscorable）的缺省卡
+    # score=None **也要写**：它们是「旧 A 级现形」的载体，不写回旧分就永远
+    # 留在榜上（语义同 model_card.py --all 的 _save）。
+    if (
+        result.get("score") is None
+        and not result.get("artifact_missing")
+        and not result.get("unscorable")
+    ):
         return False
     return await save_eval_score(
         object_type=str(result["object_type"]),

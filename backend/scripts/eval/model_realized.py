@@ -39,6 +39,7 @@ from backend.scripts.eval.realized_stats import (
     PRED_EVAL_COLUMNS,
     PRED_TEST_SPLIT,
     TRADING_DAYS,
+    PredSchemaError,
     daily_ic,
     decile_stats,
     drop_degenerate_days,
@@ -617,7 +618,7 @@ def read_test_split(path: str | Path) -> pd.DataFrame:
     """
     cols = available_pred_columns(path)
     if not cols:
-        raise ValueError(f"pred.parquet 无可识别评估列: {path}")
+        raise PredSchemaError(f"pred.parquet 无可识别评估列: {path}")
     return normalize_pred_frame(
         pd.read_parquet(path, columns=list(cols)), split=PRED_TEST_SPLIT
     )

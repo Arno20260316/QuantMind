@@ -20,6 +20,7 @@ from backend.scripts.eval.model_card import (
     missing_artifact_card,
     partition_user_models,
     score_model,
+    unscorable_artifact_card,
 )
 from backend.scripts.eval.model_realized import (
     NO_ARTIFACT_NOTE,
@@ -184,3 +185,65 @@ def test_score_model_reports_why_there_is_no_series(tmp_path: Path, monkeypatch)
     sidecar = result["inputs_version"]["evidence"]["series_sidecar"]
     assert sidecar["written"] is False
     assert TIER_NONE in str(sidecar["note"]) or "不产长序列" in str(sidecar["note"])
+
+
+@pytest.mark.unit
+def test_score_model_returns_unscorable_card_when_pred_lacks_label(tmp_path: Path):
+    """pred.parquet 在盘但缺标签列 → 不可评卡（unscorable），不是 error。
+
+    2026-10-15 实锤：stacking 集成模型导出漏 label 列，该错误被当可重试异常，
+    让 EOD 五卡轮每 ~70s 重跑整晚（411 轮）。持续性数据缺陷必须如实缺省。
+    """
+    # Arrange：metadata 齐 + pred 只有三列（真实缺陷形态：无 label/label_return）
+    root = tmp_path / "mdl_bad_pred"
+    root.mkdir(parents=True)
+    meta_file = root / "metadata.json"
+    meta_file.write_text(
+        json.dumps(
+            {
+                "run_id": "run_x",
+                "model_type": "ensemble",
+                "metrics": {"test_rank_ic": 0.05, "test_rank_icir": 0.8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "symbol": ["S001.SZ", "S002.SZ"],
+            "trade_date": pd.to_datetime(["2026-01-05", "2026-01-05"]),
+            "pred": [0.9, 0.1],
+        }
+    ).to_parquet(root / "pred.parquet", index=False)
+
+    # Act
+    result = score_model("mdl_bad_pred", meta_path=meta_file)
+
+    # Assert：如实缺省 + 明示拒绝原因；绝不按 0 算、也绝不当可重试异常
+    assert result.get("error") is None
+    assert result["unscorable"] is True
+    assert result.get("artifact_missing") is False
+    assert result["score"] is None and result["grade"] is None
+    assert result["low_confidence"] is True
+    assert set(result["missing_dims"]) == set(FOUR_DIMS) | {"oos_predictive"}
+    evidence = result["inputs_version"]["evidence"]
+    assert evidence["tier"] == TIER_NONE
+    assert evidence["on_disk"] is True
+    assert "标签列" in evidence["note"]
+    assert result["inputs_version"]["source"] == "pred_unscorable"
+
+
+@pytest.mark.unit
+def test_unscorable_artifact_card_shape_matches_missing_card():
+    """不可评卡与缺省卡同形（前端同一套渲染），field 级锁定。"""
+    card = unscorable_artifact_card(
+        "mdl_bad", "pred 缺标签列（label / label_return 都没有）：拒绝按 0 计算"
+    )
+
+    assert card["object_type"] == "model"
+    assert card["object_id"] == "mdl_bad"
+    assert card["artifact_missing"] is False and card["unscorable"] is True
+    assert card["score"] is None
+    assert "标签列" in card["inputs_version"]["evidence"]["note"]
+    for key in FOUR_DIMS:
+        assert card["dimensions"][key]["detail"]["insufficient"] is True

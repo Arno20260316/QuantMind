@@ -250,6 +250,24 @@ def backtest_display_label(config: dict[str, Any] | None) -> str | None:
     return None
 
 
+def resolve_strategy_labels(
+    rows_by_id: dict[str, Any], ids: list[str]
+) -> dict[str, str | None]:
+    """策略卡展示名（回落链）：**策略表名** → config_json 名 → 标的·区间 → None。
+
+    策略卡 ``object_id`` 是 ``backtest_id``，而回测配置里通常没有策略名
+    （实测解析 4/5 为 None）。配置的 ``strategy_id`` 指向 ``strategies`` 表
+    （数值型才有；``standard_topk`` 这类内置标识无表行），由此取名。
+    ``rows_by_id`` 为 SQL 行映射（含 ``strategy_name`` / ``config_json`` 键）。
+    """
+    out: dict[str, str | None] = {}
+    for i in ids:
+        row = rows_by_id.get(i) or {}
+        name = str(row.get("strategy_name") or "").strip()
+        out[i] = name or backtest_display_label(row.get("config_json"))
+    return out
+
+
 def account_display_label(object_id: str, username: str | None = None) -> str | None:
     """账户 object_id（`{user}:{market}` 口径）→ 可读名。"""
     raw = str(object_id or "").strip()
@@ -305,12 +323,18 @@ async def _resolve_display_names(
                     names[i] = fallback_model_label(i)
             return names
         if object_type == "strategy":
+            # 策略名经 config_json->>'strategy_id' 关联 strategies 表（文本比较，
+            # 免 cast：'standard_topk' 这类非数值标识自然无匹配 → NULL 走回落链）
             rows = (
                 (
                     await session.execute(
                         _text(
-                            "SELECT backtest_id, config_json FROM qlib_backtest_runs "
-                            "WHERE backtest_id = ANY(:ids)"
+                            "SELECT r.backtest_id, r.config_json, "
+                            "(SELECT s.name FROM strategies s "
+                            " WHERE CAST(s.id AS TEXT) = r.config_json->>'strategy_id') "
+                            "AS strategy_name "
+                            "FROM qlib_backtest_runs r "
+                            "WHERE r.backtest_id = ANY(:ids)"
                         ),
                         {"ids": unique},
                     )
@@ -318,8 +342,8 @@ async def _resolve_display_names(
                 .mappings()
                 .all()
             )
-            cfg_by_id = {str(r["backtest_id"]): r["config_json"] for r in rows}
-            return {i: backtest_display_label(cfg_by_id.get(i)) for i in unique}
+            by_id = {str(r["backtest_id"]): r for r in rows}
+            return resolve_strategy_labels(by_id, unique)
         if object_type == "strategy_health":
             # object_id = 策略 id（整型）；展示名取策略名，查无/非数字 → None 由前端回退
             int_ids = [int(i) for i in unique if i.isdigit()]

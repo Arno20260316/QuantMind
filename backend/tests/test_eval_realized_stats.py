@@ -72,6 +72,31 @@ def test_normalize_pred_frame_raises_when_label_column_missing():
 
 
 @pytest.mark.unit
+def test_pred_schema_error_marks_persistent_defect():
+    """schema 拒绝的异常类型是 PredSchemaError（ValueError 子类）——上层（模型卡）
+    据此出「不可评卡」而不是把它当可重试异常：单点缺陷曾让 EOD 轮烧 411 轮
+    （2026-10-15 实锤），拒绝语义本身不变。"""
+    from backend.scripts.eval.realized_stats import (
+        PredSchemaError,
+        normalize_pred_frame,
+    )
+
+    assert issubclass(PredSchemaError, ValueError)
+
+    frame = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "trade_date": pd.to_datetime(["2026-01-05"]),
+            "pred": [0.9],
+        }
+    )
+    with pytest.raises(PredSchemaError, match="标签列"):
+        normalize_pred_frame(frame)
+    with pytest.raises(PredSchemaError, match="缺预测列"):
+        normalize_pred_frame(frame.assign(label=[0.01]).drop(columns=["pred"]))
+
+
+@pytest.mark.unit
 def test_normalize_pred_frame_does_not_mutate_input_and_filters_split():
     from backend.scripts.eval.realized_stats import normalize_pred_frame
 

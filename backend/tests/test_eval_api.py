@@ -116,6 +116,7 @@ def test_display_name_helpers():
         backtest_display_label,
         factor_display_name,
         fallback_model_label,
+        resolve_strategy_labels,
         strategy_health_display_name,
     )
 
@@ -153,6 +154,18 @@ def test_display_name_helpers():
         == "回测 · csi1000 · 2025-09-09 ~ 2026-09-09"
     )
     assert backtest_display_label({}) is None
+
+    # 策略卡展示名（2026-10-15 接线 strategies 表）：策略表名 → config_json 名 → None
+    rows_by_id = {
+        "bt1": {"strategy_name": "minibt·TRIX 三重平滑顺势", "config_json": {}},
+        "bt2": {"strategy_name": None, "config_json": {"strategy_name": "实验室多空"}},
+        "bt3": {"strategy_name": "  ", "config_json": {}},
+    }
+    labels = resolve_strategy_labels(rows_by_id, ["bt1", "bt2", "bt3", "bt_missing"])
+    assert labels["bt1"] == "minibt·TRIX 三重平滑顺势"
+    assert labels["bt2"] == "实验室多空"
+    assert labels["bt3"] is None
+    assert labels["bt_missing"] is None  # 查无此回测 → None（前端回退 backtest_id）
 
     # 账户：{user}:{market} 口径
     assert account_display_label("999:CN") == "A股 模拟账户（用户 999）"

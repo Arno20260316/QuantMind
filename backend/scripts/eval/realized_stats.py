@@ -43,24 +43,34 @@ MIN_IC_DAYS = 20  # 滚动健康：不足 20 个交易日不给 20 日口径
 # ── pred 帧归一 ────────────────────────────────────────────────────────
 
 
+class PredSchemaError(ValueError):
+    """pred 帧 schema 不可评（缺标签/预测/日期列）——**持续性数据缺陷**。
+
+    与普通 ValueError 分开的一层语义：这类缺陷重试治不好（是产物导出路径的
+    bug），上层（模型卡）据此出「不可评卡」（如实缺省 + note 明示原因）；
+    若当可重试异常，单点缺陷会让 EOD 评分轮每分钟重跑整晚（2026-10-15 实锤：
+    一个 stacking 模型 pred 缺列烧了 411 轮）。仍是 ValueError 子类，拒绝语义不变。
+    """
+
+
 def normalize_pred_frame(
     frame: pd.DataFrame, *, split: str | None = None
 ) -> pd.DataFrame:
     """统一 pred schema → ``{symbol, trade_date, label, pred, split, date_key}``。
 
     两代 schema：``label``（当期）与 ``label_return``（早期）。缺标签列或预测列
-    直接报错。入参不被修改（返回新副本）。
+    直接报错（``PredSchemaError``）。入参不被修改（返回新副本）。
     """
     out = frame.copy()
     label_col = next((c for c in LABEL_COLUMNS if c in out.columns), None)
     if label_col is None:
-        raise ValueError(
+        raise PredSchemaError(
             "pred 缺标签列（label / label_return 都没有）：无法评估预测力，拒绝按 0 计算"
         )
     if "pred" not in out.columns:
-        raise ValueError("pred 缺预测列（pred）：无法评估")
+        raise PredSchemaError("pred 缺预测列（pred）：无法评估")
     if "trade_date" not in out.columns:
-        raise ValueError("pred 缺日期列（trade_date）：无法按日聚合")
+        raise PredSchemaError("pred 缺日期列（trade_date）：无法按日聚合")
 
     out["label"] = pd.to_numeric(out[label_col], errors="coerce").astype(float)
     out["pred"] = pd.to_numeric(out["pred"], errors="coerce").astype(float)

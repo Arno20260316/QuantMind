@@ -21,9 +21,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,6 +39,7 @@ from backend.scripts.eval.model_realized import (  # noqa: E402
     insufficient_dims,
     resolve_dims,
 )
+from backend.scripts.eval.realized_stats import PredSchemaError  # noqa: E402
 from backend.shared.eval_scoring import (  # noqa: E402
     DimensionScore,
     combine_dimension_scores,
@@ -241,6 +245,36 @@ def missing_artifact_card(model_id: str, storage_path: str = "") -> dict[str, An
     }
 
 
+def unscorable_artifact_card(
+    model_id: str, reason: str, storage_path: str = ""
+) -> dict[str, Any]:
+    """pred 产物**在盘但不可评**（schema 缺列等持续性缺陷）：出一张如实缺省的卡。
+
+    与 ``missing_artifact_card`` 同形（前端同一套缺省渲染），区别只在
+    ``unscorable=True`` + 证据 note 明示拒绝原因——「拒绝按 0 计算」的原则保留，
+    但不再把它当可重试异常：否则单点缺陷会让 EOD 轮每分钟重跑整晚（2026-10-15
+    实锤）。数据修复后次日重算即恢复出分，无需改动本卡逻辑。
+    """
+    dims = insufficient_dims(reason)
+    combined = combine_dimension_scores(
+        [score_oos({})] + [dims[key] for key in DIM_ORDER], low_confidence=True
+    )
+    return {
+        "object_type": "model",
+        "object_id": model_id,
+        "artifact_missing": False,
+        "unscorable": True,
+        "inputs_version": {
+            "model_id": model_id,
+            "weights": WEIGHTS,
+            "source": "pred_unscorable",
+            "storage_path": storage_path or None,
+            "evidence": {"tier": TIER_NONE, "on_disk": True, "note": reason},
+        },
+        **combined,
+    }
+
+
 def _persist_series(model_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
     """长序列落侧车，返回**不含序列本身**的证据（列表接口就靠只有标量才轻）。"""
     light = {k: v for k, v in evidence.items() if k not in {"series", "series_note"}}
@@ -319,9 +353,17 @@ def score_model(model_id: str, *, meta_path: Path | None = None) -> dict[str, An
         }
     meta = json.loads(Path(meta_file).read_text(encoding="utf-8"))
     metrics, metrics_source = extract_oos_metrics(meta)
-    real_dims, evidence = resolve_dims(
-        model_id, meta=meta, model_dir=meta_file.parent, collect_series=True
-    )
+    try:
+        real_dims, evidence = resolve_dims(
+            model_id, meta=meta, model_dir=meta_file.parent, collect_series=True
+        )
+    except PredSchemaError as exc:
+        # 持续性数据缺陷（pred 导出缺列等）：如实缺省、不当可重试异常——
+        # 否则 EOD 轮因单模型每分钟重跑整晚（2026-10-15 实锤）。
+        logger.warning("[ModelCard] %s pred 不可评：%s", model_id, exc)
+        return unscorable_artifact_card(
+            model_id, str(exc), storage_path=str(meta_file.parent)
+        )
     # 状态依赖区块（§6.3）：随侧车落盘（series 载荷 `regime` 键）——
     # 先算再注入，原始载荷是新 dict，不就地改共享对象。
     regime_block = _regime_dependency(model_id, meta, evidence.get("series"))

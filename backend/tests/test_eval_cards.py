@@ -511,6 +511,103 @@ async def test_save_result_writes_missing_artifact_card(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_save_result_writes_unscorable_card(monkeypatch):
+    """不可评卡（score=None + unscorable）同样必须写回——它是新分缺失的如实载体，
+    不写回旧分永远留在榜上（2026-10-15：pred 缺列的 stacking 模型）。"""
+    from backend.scripts.eval import run_all as run_all_mod
+    from backend.shared import eval_contract
+
+    captured: list[dict] = []
+
+    async def _fake_save_eval_score(**kwargs):
+        captured.append(kwargs)
+        return True
+
+    monkeypatch.setattr(eval_contract, "save_eval_score", _fake_save_eval_score)
+
+    ok = await run_all_mod._save_result(
+        {
+            "object_type": "model",
+            "object_id": "bad_pred",
+            "score": None,
+            "unscorable": True,
+        }
+    )
+    assert ok is True and captured[0]["score"] is None
+    assert len(captured) == 1
+
+
+class _FakeRedis:
+    """原生 client 形态的最小替身（set/incr/expire/exists）。"""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+
+    def set(self, key, value, ex=None):  # noqa: ANN001
+        self.store[str(key)] = str(value)
+        if ex is not None:
+            self.ttls[str(key)] = int(ex)
+
+    def incr(self, key):  # noqa: ANN001
+        self.store[str(key)] = str(int(self.store.get(str(key), "0")) + 1)
+        return int(self.store[str(key)])
+
+    def expire(self, key, ttl):  # noqa: ANN001
+        self.ttls[str(key)] = int(ttl)
+        return True
+
+    def exists(self, key):  # noqa: ANN001
+        return 1 if str(key) in self.store else 0
+
+
+@pytest.mark.unit
+def test_settle_done_marker_attempt_budget(monkeypatch):
+    """完成标记的尝试预算：成功即落；有异常 K 轮内重试、到预算**带错落标记**——
+    持续性单点错误不再让 EOD 轮每分钟重跑整晚（2026-10-15 实锤 411 轮）。"""
+    import json
+
+    from backend.services.trade.services import eval_scores_service as svc
+
+    ok_summary = {"total_errors": 0, "errors": []}
+    bad_summary = {
+        "total_errors": 1,
+        "errors": ["model:x: 评分失败: pred 缺标签列（label / label_return 都没有）"],
+    }
+    done_key = svc._DONE_KEY.format(date="20261014")
+
+    # 成功：直接落 "1"，不产生尝试计数
+    client = _FakeRedis()
+    assert svc._settle_done_marker(client, "20261014", ok_summary, 5) == "done"
+    assert client.store[done_key] == "1"
+    assert svc._ATTEMPTS_KEY.format(date="20261014") not in client.store
+
+    # 有异常：前 K-1 轮 retry（不落完成键、计数递增），第 K 轮带错落标记
+    client2 = _FakeRedis()
+    for _ in range(4):
+        assert svc._settle_done_marker(client2, "20261014", bad_summary, 5) == "retry"
+        assert done_key not in client2.store
+    assert svc._settle_done_marker(client2, "20261014", bad_summary, 5) == "done_with_errors"
+    payload = json.loads(client2.store[done_key])
+    assert payload["done"] == "with_errors"
+    assert payload["attempts"] == 5
+    assert "缺标签列" in payload["errors"][0]
+
+    # 中途转好：成功分支把标记覆盖为干净的 "1"（预算不是「判死刑」）
+    assert svc._settle_done_marker(client2, "20261014", ok_summary, 5) == "done"
+    assert client2.store[done_key] == "1"
+
+    # 预算来自环境变量且有下钳制（0/负数 → 1）
+    monkeypatch.setenv("EVAL_SCORES_MAX_ATTEMPTS", "3")
+    assert svc._config()["max_attempts"] == 3
+    monkeypatch.setenv("EVAL_SCORES_MAX_ATTEMPTS", "0")
+    assert svc._config()["max_attempts"] == 1
+    monkeypatch.delenv("EVAL_SCORES_MAX_ATTEMPTS", raising=False)
+    assert svc._config()["max_attempts"] == 5
+
+
+@pytest.mark.unit
 def test_eval_worker_config_and_time(monkeypatch):
     from backend.services.trade.services import eval_scores_service as svc
 

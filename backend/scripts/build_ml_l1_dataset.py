@@ -65,6 +65,17 @@ def _existing_partitions(root: Path, name: str = "l1_factors") -> set[str]:
     return {p.name[3:] for p in d.glob("dt=*")} if d.is_dir() else set()
 
 
+def _merge_partition(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """已有分区与本次重算结果合并：同 symbol 以新行为准，保留旧有其余品种。
+
+    背景（2026-10-15）：日线源按品种滚动落盘，同一交易日的分区可能先只有
+    少量品种（实测凌晨 2 行）、晚间才补齐（117 行）。增量写必须 merge 而非
+    「已有分区跳过」，否则先到的部分分区被永久冻结。
+    """
+    merged = pd.concat([old, new], ignore_index=True)
+    return merged.drop_duplicates(subset=["symbol"], keep="last")
+
+
 def _select_factor_columns(feats: pd.DataFrame, sym_col: str, date_col: str) -> list[str]:
     """排除 symbol/date、A 股专属列、同步元数据列后剩余的因子列（保持原始列序）。"""
     banned = set(_CN_ONLY_COLS) | set(_META_COLS) | {"raw_close", "factor"}
@@ -133,14 +144,20 @@ def build_l1(market: str, *, start_year: int | None = None, incremental: bool = 
         dt_str = pd.Timestamp(dt_key).strftime("%Y%m%d")
         if dt_str <= "19700101":
             continue
-        if incremental and existing and dt_str in existing:
-            continue  # 增量模式：已有分区一律跳过；--rebuild 才覆盖重写
         renamed = g.rename(columns={sym_col: "symbol"})
         out = renamed[[c for c in col_order if c in renamed.columns]]
         out = out.replace([float("inf"), float("-inf")], None)
         dt_dir = ml_root / "l1_factors" / f"dt={dt_str}"
         dt_dir.mkdir(parents=True, exist_ok=True)
         target = dt_dir / "data.parquet"
+        if incremental and dt_str in existing and target.is_file():
+            # 增量合并（2026-10-15 修）：旧实现「已有分区一律跳过」会把
+            # 先行落盘的部分品种分区永久冻结（详见 _merge_partition docstring）
+            old = pd.read_parquet(target)
+            merged = _merge_partition(old, out)
+            if len(merged) == len(old):
+                continue  # 无新增品种：免无谓重写
+            out = merged
         tmp_path = dt_dir / f".tmp-{target.name}"
         try:
             out.to_parquet(tmp_path, index=False)

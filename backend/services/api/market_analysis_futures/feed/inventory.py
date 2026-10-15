@@ -124,7 +124,10 @@ def get_receipts(variety: str | None = None, days: int = 30) -> dict:
                     "name": STEM_NAME.get(str(variety_name), str(variety_name)),
                     "venue": str(r["venue"]),
                     "venue_name": _VENUE_LABELS.get(str(r["venue"]), str(r["venue"])),
-                    "sector": symbol_meta(f"{variety}0.CN")["sector"],
+                    # sector 必须按行内品种取（曾误用外层参数 variety：
+                    # 无参调用全部行落 None0.CN 兜底 "other"、带参调用全部行
+                    # 被赋成该品种板块）
+                    "sector": symbol_meta(f"{variety_name}0.CN")["sector"],
                     "receipt_qty_wan": _num(float(r["qty"]) / 1e4),
                     "change_wan": _num(
                         float(r["change"]) / 1e4

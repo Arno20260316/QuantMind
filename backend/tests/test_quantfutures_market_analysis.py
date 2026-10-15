@@ -328,6 +328,23 @@ def test_receipts_variety_history():
     assert inventory.get_receipts(None, 10)["history"] is None
 
 
+def test_receipts_sector_from_row_variety():
+    """回归闸：sector 曾误取外层参数 variety——无参调用全部行落 other、
+    带参调用全部行被赋成该品种板块。sector 必须逐行按行内品种解析。"""
+    from backend.shared.futures_universe import symbol_meta
+
+    _require_data()
+    rows = inventory.get_receipts(None, 10)["rows"]
+    assert rows, "仓单行缺失"
+    for r in rows:
+        expected = symbol_meta(f"{r['variety']}0.CN")["sector"]
+        assert r["sector"] == expected, f"{r['variety']} sector 应 {expected} 实 {r['sector']}"
+    # 有参调用不得把参数品种的板块刷到所有行上
+    if len(rows) >= 5:
+        sectors = {r["sector"] for r in rows}
+        assert len(sectors) >= 2, f"行 sector 疑似被同一值污染: {sectors}"
+
+
 # ---- Tab6 内外盘与期现价差 ----
 
 

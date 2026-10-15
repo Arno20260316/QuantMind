@@ -302,7 +302,10 @@ def task_contracts_daily(days: int = 90) -> dict:
     today = date.today()
     months = []
     y, m = today.year, today.month
-    for back in range(12, -3, -1):  # 过去12个月 + 未来3个月
+    # 过去 12 个月 + 当前月 + 未来 12 个月（2026-10-15 扩：原未来 2 个月使
+    # 期限结构曲线上限只有 3 个点——AU 实测仅 2610/2611/2612；交易所实际
+    # 挂牌普遍到次年同月，扩到未来 12 个月后曲线 3 点 → 至多 14 点）
+    for back in range(12, -13, -1):
         tot = y * 12 + (m - 1) - back
         months.append(f"{tot // 12 % 100:02d}{tot % 12 + 1:02d}")
     written, empty = 0, 0

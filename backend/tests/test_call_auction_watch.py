@@ -110,6 +110,46 @@ def test_summarize_empty_and_values():
     assert s["price_min"] == 10.0 and s["price_max"] == 10.8
 
 
+# ── 3b. 日期盲防御 ──────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_guard_stale_rows_drops_future_sequence():
+    from backend.services.live_trading.services.call_auction_watch import (
+        FUTURE_TIME_SLACK_S,
+        guard_stale_rows,
+    )
+
+    now = _tz_now("09:15:30")
+
+    def rows(last_time):
+        return [
+            {"time": "09:15:00", "price": 10.0, "volume": 1, "leave_qty": 0},
+            {"time": last_time, "price": 10.5, "volume": 2, "leave_qty": -1},
+        ]
+
+    # 昨日残留（末帧 09:24:57 晚于现在）→ 全丢 + 证据
+    kept, stale = guard_stale_rows(rows("09:24:57"), now)
+    assert kept == []
+    assert stale == {"stale_dropped_rows": 2, "stale_last_time": "09:24:57"}
+    # 今日实时（末帧早于现在）→ 原样保留
+    kept, stale = guard_stale_rows(rows("09:15:28"), now)
+    assert len(kept) == 2 and stale is None
+    # 边界：恰在裕量内保留、超裕量丢弃
+    from datetime import timedelta
+
+    boundary = (now + timedelta(seconds=FUTURE_TIME_SLACK_S)).strftime("%H:%M:%S")
+    kept, _ = guard_stale_rows(rows(boundary), now)
+    assert len(kept) == 2
+    after = (now + timedelta(seconds=FUTURE_TIME_SLACK_S + 1)).strftime("%H:%M:%S")
+    kept, stale = guard_stale_rows(rows(after), now)
+    assert kept == [] and stale is not None
+    # 空行 / 时间无法解析 → 不误杀
+    assert guard_stale_rows([], now) == ([], None)
+    kept, stale = guard_stale_rows([{"time": "", "price": None}], now)
+    assert len(kept) == 1 and stale is None
+
+
 # ── 4. 名单合并 ─────────────────────────────────────────────────────
 
 
@@ -373,3 +413,55 @@ async def test_run_sample_end_to_end(monkeypatch, tmp_path):
 
     monkeypatch.setattr(caw, "fetch_records", boom)
     assert await caw.run_sample(_tz_now("09:26:00"), "09:25:05") is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_sample_drops_stale_future_records(monkeypatch, tmp_path):
+    """09:15:30 档拿到昨日残留全序列（末帧 09:24:57）→ 守卫丢弃 + 证据进摘要。"""
+    import backend.services.trade_shared.deps as deps
+
+    fake_pipe = _FakePipe()
+    monkeypatch.setattr(
+        deps,
+        "get_redis",
+        lambda: SimpleNamespace(
+            client=SimpleNamespace(pipeline=lambda transaction=False: fake_pipe)
+        ),
+    )
+    monkeypatch.setenv("QM_CALL_AUCTION_ARCHIVE_DIR", str(tmp_path))
+
+    import backend.services.live_trading.services.call_auction_watch as caw
+
+    async def fake_targets(day):
+        return (
+            {
+                "600036.SH": {
+                    "symbol": "600036.SH",
+                    "name": "招商银行",
+                    "roles": ["holding"],
+                }
+            },
+            [],
+        )
+
+    async def fake_fetch(symbols, auction_type):
+        return {
+            "600036.SH": {
+                "Time": ["091500", "092457"],
+                "Price": ["10.0", "10.5"],
+                "Volume": ["100", "300"],
+                "LeaveQty": ["-5", "-1"],
+            }
+        }
+
+    monkeypatch.setattr(caw, "collect_targets", fake_targets)
+    monkeypatch.setattr(caw, "fetch_records", fake_fetch)
+
+    ok = await caw.run_sample(_tz_now("09:15:30"), "09:15:30")
+    assert ok is True
+    hset = [op for op in fake_pipe.ops if op[0] == "hset"]
+    doc = json.loads(hset[0][3])
+    assert doc["summary"]["rows"] == 0
+    assert doc["summary"]["stale_dropped_rows"] == 2
+    assert doc["summary"]["stale_last_time"] == "09:24:57"

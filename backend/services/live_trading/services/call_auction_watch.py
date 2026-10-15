@@ -12,6 +12,12 @@
 次防配额风暴）。**每次调用返回的都是从 09:15:00 起的全序列**——后档天然包含
 前档，最坏情况（进程 09:25 后才起来）只错失「竞价演化」的即时视图，不丢数据本体。
 
+**日期盲防御**（:func:`guard_stale_rows`，2026-10-15 08:18 盘前实测）：竞价开启
+前 SDK 返回**上一交易日**的完整序列且记录无日期字段；守卫按「末帧时间晚于
+当前时刻+裕量」的时间不可能性判陈旧并**显式丢弃**（证据进 summary）。
+残差：09:25:05 档对**停牌股**若 SDK 仍给昨日序列，时间上不可判别（昨日末帧
+09:24:5x 与今日重合）——观测面 = 该票 09:20:30 档是否被守卫判陈旧。
+
 名单口径（2026-10-15 用户定）：**实盘持仓 ∪ 当日候选池**
 - 实盘持仓：``shared.real_positions.load_real_positions``（多券商并集，唯一实现），
   租户 ``QM_HOT_SET_REAL_TENANT``（默认 default）、用户 ``QM_HOT_SET_REAL_USER``
@@ -59,6 +65,10 @@ SAMPLE_GRACE_S = 120
 
 #: 单档最多尝试次数（fetch 失败后重试上限，防配额风暴）。
 MAX_ATTEMPTS_PER_SAMPLE = 3
+
+#: 日期盲防御裕量（秒）：竞价前 SDK 返回**上一交易日**完整序列且记录无日期字段；
+#: 末帧时间晚于「当前时刻+本裕量」的记录在时间上不可能是今日实时序列 → 判陈旧。
+FUTURE_TIME_SLACK_S = 30
 
 #: 采样档 → SDK type（0=早盘+尾盘，1=仅早盘）。收盘档必须 0 才含尾盘竞价。
 SAMPLE_TYPES: dict[str, int] = {
@@ -170,6 +180,28 @@ def normalize_record(record: Mapping[str, Any] | None) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def guard_stale_rows(
+    rows: list[dict[str, Any]], now: datetime
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """日期盲防御：丢弃末帧时间「晚于当前时刻+裕量」的行（=上一交易日残留）。
+
+    竞价开启前（及停牌等无今日序列场景）SDK 会把上一交易日的完整序列当作
+    结果返回，记录里没有日期字段——唯一的判别面就是时间先后不可能性：
+    今日实时序列的末帧不可能晚于现在。返回 ``(保留行, 丢弃证据)``，
+    证据显式进 summary（**绝不静默丢**）。
+    """
+    if not rows:
+        return rows, None
+    now_s = now.hour * 3600 + now.minute * 60 + now.second
+    times = [t for t in (_hms_to_seconds(r.get("time")) for r in rows) if t is not None]
+    if times and max(times) > now_s + FUTURE_TIME_SLACK_S:
+        return [], {
+            "stale_dropped_rows": len(rows),
+            "stale_last_time": rows[-1].get("time"),
+        }
+    return rows, None
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -404,10 +436,14 @@ async def run_sample(now: datetime, sample: str) -> bool:
     per_symbol: dict[str, dict[str, Any]] = {}
     for suffix, target in targets.items():
         rows = normalize_record(_record_for(records, suffix, index))
+        rows, stale = guard_stale_rows(rows, now)
+        summary = summarize(rows)
+        if stale:
+            summary = {"rows": 0, **stale}
         per_symbol[suffix] = {
             "name": target["name"],
             "roles": target["roles"],
-            "summary": summarize(rows),
+            "summary": summary,
             "rows": rows,
         }
 

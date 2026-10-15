@@ -94,13 +94,22 @@ def test_catalog_dataset_mapping_covers_sync_fields():
 
 
 def test_extra_dataset_tasks_exist():
-    # 扩展数据集的分发目标必须是 akshare_futures_extra 中真实存在的 task 函数
-    import backend.scripts.akshare_futures_extra as fut_extra
+    # 扩展数据集的分发目标必须是注册模块中真实存在的 task 函数（注册表为
+    # (模块简称, task 名) 二元组，模块经 _EXTRA_MODULES 解析）
+    import importlib
 
-    for ds, task in EXTRA_DATASET_TASKS.items():
-        assert callable(getattr(fut_extra, f"task_{task}", None)), f"{ds} -> task_{task} 缺失"
+    from backend.scripts.quantfutures_daily_sync import _EXTRA_MODULES
+
+    for ds, (mod_key, task) in EXTRA_DATASET_TASKS.items():
+        mod = importlib.import_module(_EXTRA_MODULES[mod_key])
+        assert callable(getattr(mod, f"task_{task}", None)), (
+            f"{ds} -> {mod_key}.task_{task} 缺失"
+        )
     # 日频全量同步默认附带日频扩展（contracts_daily 请求量大，不默认跑）
     assert "contracts_daily" not in DEFAULT_EXTRA_DATASETS
+    # 回填量中等的三项仅在面板勾选时跑
+    for heavy in ("contract_meta", "exchange_daily", "member_rank_sina"):
+        assert heavy not in DEFAULT_EXTRA_DATASETS
     assert set(DEFAULT_EXTRA_DATASETS) <= set(EXTRA_DATASET_TASKS)
 
 
@@ -112,10 +121,18 @@ def test_run_unknown_dataset_returns_empty_result():
 
 
 def test_normalise_daily_renames_and_coerces():
-    raw = pd.DataFrame([
-        {"date": pd.Timestamp("2026-08-01"), "open": 100.0, "high": 110.0,
-         "low": 95.0, "close": 105.5, "volume": 1000.0},
-    ])
+    raw = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-08-01"),
+                "open": 100.0,
+                "high": 110.0,
+                "low": 95.0,
+                "close": 105.5,
+                "volume": 1000.0,
+            },
+        ]
+    )
     df = _normalise_daily(raw, symbol="CL.FUT")
     assert list(df.columns) == KLINE_COLS
     row = df.iloc[0]
@@ -130,10 +147,18 @@ def test_normalise_daily_renames_and_coerces():
 
 def test_normalise_daily_volume_falls_back_to_position():
     # akshare 部分接口无 volume 列，用 position（持仓量）兜底
-    raw = pd.DataFrame([
-        {"date": pd.Timestamp("2026-08-01"), "open": 100.0, "high": 110.0,
-         "low": 95.0, "close": 105.5, "position": 500},
-    ])
+    raw = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-08-01"),
+                "open": 100.0,
+                "high": 110.0,
+                "low": 95.0,
+                "close": 105.5,
+                "position": 500,
+            },
+        ]
+    )
     df = _normalise_daily(raw, symbol="Au99.99")
     row = df.iloc[0]
     assert row["volume"] == 500
@@ -141,10 +166,18 @@ def test_normalise_daily_volume_falls_back_to_position():
 
 
 def test_normalise_daily_drops_missing_close():
-    raw = pd.DataFrame([
-        {"date": pd.Timestamp("2026-08-01"), "open": 100.0, "high": 110.0,
-         "low": 95.0, "close": None, "volume": 1000.0},
-    ])
+    raw = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-08-01"),
+                "open": 100.0,
+                "high": 110.0,
+                "low": 95.0,
+                "close": None,
+                "volume": 1000.0,
+            },
+        ]
+    )
     df = _normalise_daily(raw, symbol="CL.FUT")
     assert df.empty
 
@@ -156,12 +189,30 @@ def test_normalise_daily_drops_future_dated_placeholder_row():
     today = pd.Timestamp.now().normalize()
     raw = pd.DataFrame(
         [
-            {"date": today - pd.Timedelta(days=2), "open": 80.0, "high": 81.0,
-             "low": 79.0, "close": 80.5, "volume": 100},
-            {"date": today, "open": 80.5, "high": 81.0,
-             "low": 79.5, "close": 80.0, "volume": 50},
-            {"date": today + pd.Timedelta(days=15), "open": 78.75, "high": 78.75,
-             "low": 78.75, "close": 78.75, "volume": 0},
+            {
+                "date": today - pd.Timedelta(days=2),
+                "open": 80.0,
+                "high": 81.0,
+                "low": 79.0,
+                "close": 80.5,
+                "volume": 100,
+            },
+            {
+                "date": today,
+                "open": 80.5,
+                "high": 81.0,
+                "low": 79.5,
+                "close": 80.0,
+                "volume": 50,
+            },
+            {
+                "date": today + pd.Timedelta(days=15),
+                "open": 78.75,
+                "high": 78.75,
+                "low": 78.75,
+                "close": 78.75,
+                "volume": 0,
+            },
         ]
     )
     df = _normalise_daily(raw, symbol="CT.FUT")
@@ -171,24 +222,28 @@ def test_normalise_daily_drops_future_dated_placeholder_row():
 
 def test_write_kline_partition_incremental_dedup(tmp_path):
     root = tmp_path / "1_kline_data" / "daily_forward"
-    chunk1 = pd.DataFrame({
-        "symbol": ["CL.FUT", "AU0.CN"],
-        "time": pd.to_datetime(["2026-08-01", "2026-08-01"]),
-        "close": [70.0, 550.0],
-        "release_id": ["akshare", "akshare"],
-    })
+    chunk1 = pd.DataFrame(
+        {
+            "symbol": ["CL.FUT", "AU0.CN"],
+            "time": pd.to_datetime(["2026-08-01", "2026-08-01"]),
+            "close": [70.0, 550.0],
+            "release_id": ["akshare", "akshare"],
+        }
+    )
     written = _write_kline_partition(root, chunk1)
     assert written == 1
     target = root / "dt=20260801" / "data.parquet"
     assert target.is_file()
 
     # 增量写入同一分区：同一 (symbol, time) 应被覆盖而非新增
-    chunk2 = pd.DataFrame({
-        "symbol": ["CL.FUT"],
-        "time": pd.to_datetime(["2026-08-01"]),
-        "close": [72.0],
-        "release_id": ["akshare"],
-    })
+    chunk2 = pd.DataFrame(
+        {
+            "symbol": ["CL.FUT"],
+            "time": pd.to_datetime(["2026-08-01"]),
+            "close": [72.0],
+            "release_id": ["akshare"],
+        }
+    )
     _write_kline_partition(root, chunk2)
     merged = pd.read_parquet(target)
     assert len(merged) == 2  # CL.FUT 被覆盖，不新增
@@ -197,7 +252,9 @@ def test_write_kline_partition_incremental_dedup(tmp_path):
 
 
 def test_market_console_futures_datasets():
-    from backend.services.api.routers.admin.global_market_console import _default_datasets
+    from backend.services.api.routers.admin.global_market_console import (
+        _default_datasets,
+    )
 
     specs = _default_datasets("FUTURES")
     by_name = {s.dataset: s for s in specs}

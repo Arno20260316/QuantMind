@@ -293,7 +293,8 @@ def _norm_contract_kline(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df[cols].dropna(subset=["close"])
 
 
-def task_contracts_daily() -> dict:
+def task_contracts_daily(days: int = 90) -> dict:
+    """分合约日K。days 仅为统一调用签名（本任务按合约月全量刷新，与天数无关）。"""
     import akshare as ak
 
     out_dir = BASE_DIR / "contracts_daily"
@@ -328,7 +329,8 @@ def task_contracts_daily() -> dict:
 # ---------------- cftc ----------------
 
 
-def task_cftc() -> dict:
+def task_cftc(days: int = 90) -> dict:
+    """CFTC 周度持仓快照（days 未用，统一调用签名）。"""
     import akshare as ak
 
     out_dir = BASE_DIR / "cftc"
@@ -372,7 +374,8 @@ _FX_CURRENCIES = {
 }
 
 
-def task_fx() -> dict:
+def task_fx(days: int = 90) -> dict:
+    """中行外汇牌价快照（days 未用，统一调用签名）。"""
     import akshare as ak
 
     out_dir = BASE_DIR / "fx_daily"

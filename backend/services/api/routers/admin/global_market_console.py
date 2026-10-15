@@ -193,6 +193,98 @@ def _default_datasets(market: str) -> tuple[DatasetSpec, ...]:
                 "symbol",
                 "主流货币兑人民币日度牌价（每100外币，USD/EUR/JPY/HKD 等）",
             ),
+            # 国内扩展（二批）：现货基差/结算参数/交易规则/合约信息/官方行情/
+            # 库存/商品指数/费率/生猪产业链/席位排名
+            DatasetSpec(
+                "spot_basis",
+                "现货基差(生意社)",
+                "2",
+                "base_sector",
+                "2_base_sector/spot_basis",
+                "partition",
+                "现货价+近月/主力基差（~52 品种，回填至 2022）",
+            ),
+            DatasetSpec(
+                "settle_params",
+                "日结算参数",
+                "2",
+                "base_sector",
+                "2_base_sector/settle_params",
+                "partition",
+                "SHFE/INE/CZCE 结算价/保证金率/手续费/涨跌停/限仓（比率已归一为小数）",
+            ),
+            DatasetSpec(
+                "trade_rule",
+                "交易规则",
+                "2",
+                "base_sector",
+                "2_base_sector/trade_rule",
+                "partition",
+                "品种级保证金比例/涨跌停幅/合约乘数/最小变动价位",
+            ),
+            DatasetSpec(
+                "contract_meta",
+                "合约信息",
+                "2",
+                "base_sector",
+                "2_base_sector/contract_meta",
+                "partition",
+                "合约生命周期（上市/到期/交割日/挂牌基准价，SHFE/CZCE/CFFEX/INE）",
+            ),
+            DatasetSpec(
+                "exchange_daily",
+                "官方日行情",
+                "2",
+                "base_sector",
+                "2_base_sector/exchange_daily",
+                "partition",
+                "交易所官方全合约日行情（含真实成交额；SHFE/CZCE/CFFEX/INE）",
+            ),
+            DatasetSpec(
+                "inventory_em",
+                "交易所库存(东财)",
+                "2",
+                "base_sector",
+                "2_base_sector/inventory_em",
+                "symbol",
+                "68 品种交易所库存（东财源，滚动约 3 个月）",
+            ),
+            DatasetSpec(
+                "ccidx_index",
+                "中证商品指数",
+                "2",
+                "base_sector",
+                "2_base_sector/ccidx_index",
+                "single",
+                "中证商品期货指数/价格指数（2022-10 起）",
+            ),
+            DatasetSpec(
+                "fees_info",
+                "合约费率表",
+                "2",
+                "base_sector",
+                "2_base_sector/fees_info",
+                "single",
+                "全合约费率快照（乘数/开平今费/保证金/1手成本）",
+            ),
+            DatasetSpec(
+                "hog_chain",
+                "生猪产业链",
+                "2",
+                "base_sector",
+                "2_base_sector/hog_chain",
+                "symbol",
+                "猪价/饲料成本/供给 15 序列（core/cost/supply 三族长表）",
+            ),
+            DatasetSpec(
+                "member_rank_sina",
+                "席位排名(新浪)",
+                "2",
+                "base_sector",
+                "2_base_sector/member_rank_sina",
+                "partition",
+                "SHFE/CZCE 主力合约席位排名（多空成交；依赖当日 spot_basis 主力合约）",
+            ),
         )
     base = [
         # 1 K线行情
@@ -203,7 +295,7 @@ def _default_datasets(market: str) -> tuple[DatasetSpec, ...]:
             "kline",
             "1_kline_data/daily_forward",
             "partition",
-            "akshare 日线(不复权)"
+            "akshare 日线(不复权)",
         ),
         DatasetSpec(
             "index_daily",
@@ -493,7 +585,9 @@ def _default_datasets(market: str) -> tuple[DatasetSpec, ...]:
         )
     # 本地信号数据集（南向/CCASS 因子等）由内部模块动态提供；模块缺失时跳过
     try:
-        from backend.scripts.build_ml_signal_datasets import SIGNAL_DATASET_SPECS as _sig_specs
+        from backend.scripts.build_ml_signal_datasets import (
+            SIGNAL_DATASET_SPECS as _sig_specs,
+        )
 
         base.extend(DatasetSpec(**spec) for spec in _sig_specs)
     except ModuleNotFoundError as exc:
@@ -688,7 +782,12 @@ def _symbol_choices(spec: DatasetSpec, root: Path, market: str) -> dict[str, Any
     }
 
 
-def _build_catalog_payload(market: str, specs: tuple[DatasetSpec, ...], groups: list[dict[str, Any]], root: Path) -> dict[str, Any]:
+def _build_catalog_payload(
+    market: str,
+    specs: tuple[DatasetSpec, ...],
+    groups: list[dict[str, Any]],
+    root: Path,
+) -> dict[str, Any]:
     """同步组装目录载荷（含全量磁盘扫盘）。
 
     调用方必须经 asyncio.to_thread 执行，禁止在事件循环线程直接调用，

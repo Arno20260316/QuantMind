@@ -59,6 +59,40 @@ def test_due_sample_window_and_done():
     assert due_sample(_tz_now("09:18:00"), set()) is None
 
 
+@pytest.mark.unit
+def test_due_sample_closing_slot_extended_grace():
+    """收盘档宽限显著长于默认 120s：尾盘段发布滞后，宽限内持续重试。"""
+    from backend.services.live_trading.services.call_auction_watch import due_sample
+
+    done_morning = {"09:15:30", "09:20:30", "09:25:05"}
+    assert due_sample(_tz_now("15:10:00"), done_morning) == "15:00:05"
+    assert due_sample(_tz_now("15:30:00"), done_morning) == "15:00:05"
+    # 傍晚远超宽限 → 不再触发
+    assert due_sample(_tz_now("16:30:00"), done_morning) is None
+    # 早盘档宽限不受影响（默认 120s）
+    assert due_sample(_tz_now("09:17:59"), {"09:20:30", "09:25:05", "15:00:05"}) is None
+
+
+@pytest.mark.unit
+def test_closing_retry_tuning_tables():
+    """收盘档重试节流/尝试上限与宽限配套（防高频空转白烧配额）。"""
+    from backend.services.live_trading.services.call_auction_watch import (
+        MAX_ATTEMPTS_PER_SAMPLE,
+        SAMPLE_GRACE_BY_SAMPLE,
+        SAMPLE_GRACE_S,
+        SAMPLE_RETRY_INTERVAL_S,
+        _attempts_cap,
+        _grace_s,
+    )
+
+    assert _grace_s("15:00:05") == SAMPLE_GRACE_BY_SAMPLE["15:00:05"] > 120
+    assert _grace_s("09:15:30") == SAMPLE_GRACE_S == 120  # 默认不变
+    throttled = SAMPLE_RETRY_INTERVAL_S["15:00:05"]
+    assert throttled >= 30  # 收盘档节流（分钟级），不是 5s 轮询节奏
+    assert _attempts_cap("15:00:05") >= _grace_s("15:00:05") // throttled
+    assert _attempts_cap("09:15:30") == MAX_ATTEMPTS_PER_SAMPLE == 3  # 默认不变
+
+
 # ── 2/3. 归一与摘要 ─────────────────────────────────────────────────
 
 
@@ -148,6 +182,28 @@ def test_guard_stale_rows_drops_future_sequence():
     assert guard_stale_rows([], now) == ([], None)
     kept, stale = guard_stale_rows([{"time": "", "price": None}], now)
     assert len(kept) == 1 and stale is None
+
+
+# ── 3c. 尾盘段内容门（收盘档） ──────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_has_tail_segment():
+    from backend.services.live_trading.services.call_auction_watch import (
+        has_tail_segment,
+    )
+
+    morning = {"600036.SH": {"rows": [{"time": "09:24:57"}]}}
+    assert has_tail_segment(morning) is False
+    with_tail = {"600036.SH": {"rows": [{"time": "09:24:57"}, {"time": "14:59:57"}]}}
+    assert has_tail_segment(with_tail) is True
+    assert has_tail_segment({}) is False
+    # 停牌股 rows 空不影响判据：任一标的有尾盘行即视发布
+    mixed = {
+        "600036.SH": {"rows": []},
+        "300750.SZ": {"rows": [{"time": "14:57:00"}]},
+    }
+    assert has_tail_segment(mixed) is True
 
 
 # ── 4. 名单合并 ─────────────────────────────────────────────────────
@@ -465,3 +521,77 @@ async def test_run_sample_drops_stale_future_records(monkeypatch, tmp_path):
     assert doc["summary"]["rows"] == 0
     assert doc["summary"]["stale_dropped_rows"] == 2
     assert doc["summary"]["stale_last_time"] == "09:24:57"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_sample_closing_slot_waits_for_tail(monkeypatch, tmp_path):
+    """收盘档（type=0）内容门：尾盘段未发布 → False 不落盘；发布后 → True 含尾盘。
+
+    2026-10-15 实测背景：15:00:05 当刻 SDK type=0 仍只回早盘段（尾盘发布滞后），
+    早盘本体已由 09:25:05 档存档——收盘档未拿到尾盘前绝不写盘冒充全量。
+    """
+    import backend.services.trade_shared.deps as deps
+
+    fake_pipe = _FakePipe()
+    monkeypatch.setattr(
+        deps,
+        "get_redis",
+        lambda: SimpleNamespace(
+            client=SimpleNamespace(pipeline=lambda transaction=False: fake_pipe)
+        ),
+    )
+    monkeypatch.setenv("QM_CALL_AUCTION_ARCHIVE_DIR", str(tmp_path))
+
+    import backend.services.live_trading.services.call_auction_watch as caw
+
+    async def fake_targets(day):
+        return (
+            {
+                "600036.SH": {
+                    "symbol": "600036.SH",
+                    "name": "招商银行",
+                    "roles": ["holding"],
+                }
+            },
+            [],
+        )
+
+    async def fetch_morning_only(symbols, auction_type):
+        assert auction_type == 0
+        return {
+            "600036.SH": {
+                "Time": ["091500", "092457"],
+                "Price": ["10.0", "10.5"],
+                "Volume": ["100", "300"],
+                "LeaveQty": ["-5", "-1"],
+            }
+        }
+
+    monkeypatch.setattr(caw, "collect_targets", fake_targets)
+    monkeypatch.setattr(caw, "fetch_records", fetch_morning_only)
+
+    ok = await caw.run_sample(_tz_now("15:00:07"), "15:00:05")
+    assert ok is False  # 交回循环按节流间隔重试
+    assert fake_pipe.ops == []  # 不写 Redis
+    assert not list(tmp_path.rglob("*.json"))  # 不写归档
+
+    async def fetch_full(symbols, auction_type):
+        return {
+            "600036.SH": {
+                "Time": ["091500", "092457", "145700", "145957"],
+                "Price": ["10.0", "10.5", "10.8", "10.8"],
+                "Volume": ["100", "300", "50", "120"],
+                "LeaveQty": ["-5", "-1", "10", "0"],
+            }
+        }
+
+    monkeypatch.setattr(caw, "fetch_records", fetch_full)
+    ok = await caw.run_sample(_tz_now("15:12:00"), "15:00:05")
+    assert ok is True
+    doc = json.loads(
+        (tmp_path / "date=20261015" / "sample-150005.json").read_text(encoding="utf-8")
+    )
+    assert doc["symbols"]["600036.SH"]["summary"]["last_time"] == "14:59:57"
+    hset = [op for op in fake_pipe.ops if op[0] == "hset"]
+    assert hset and json.loads(hset[0][3])["sample"] == "15:00:05"

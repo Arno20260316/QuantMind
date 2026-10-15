@@ -12,6 +12,12 @@
 次防配额风暴）。**每次调用返回的都是从 09:15:00 起的全序列**——后档天然包含
 前档，最坏情况（进程 09:25 后才起来）只错失「竞价演化」的即时视图，不丢数据本体。
 
+**收盘档例外（2026-10-15 实测）**：``type=0`` 的尾盘段（14:57–15:00）并非收盘
+当刻即发布——15:00:05 拿到的仍只是早盘序列（与 09:25:05 档逐字节相同）。收盘档
+以 :func:`has_tail_segment` 内容门判定：尾盘段未出现前不落盘、不判完成，在
+:data:`SAMPLE_GRACE_BY_SAMPLE` 宽限内按 :data:`SAMPLE_RETRY_INTERVAL_S` 节流
+重试；早盘本体已由 09:25:05 档存档，重复落盘只会添噪声。
+
 **日期盲防御**（:func:`guard_stale_rows`，2026-10-15 08:18 盘前实测）：竞价开启
 前 SDK 返回**上一交易日**的完整序列且记录无日期字段；守卫按「末帧时间晚于
 当前时刻+裕量」的时间不可能性判陈旧并**显式丢弃**（证据进 summary）。
@@ -42,7 +48,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
@@ -57,14 +63,40 @@ from backend.services.trade.services.daily_pnl_report_task import (
 logger = logging.getLogger(__name__)
 
 #: 采样档（北京时间）：早盘三段（15:30 开场 / 20:30 撤单闸门关闭后 / 25:05 定稿）
-#: + 收盘档（15:00:05 拿尾盘 14:57–15:00 竞价，type=0 一并含早盘）。
+#: + 收盘档（15:00:05 拿尾盘 14:57–15:00 竞价，type=0 一并含早盘）。收盘档注意
+#: **尾盘段发布滞后**（2026-10-15 实测收盘当刻仍只回早盘）：以
+#: :func:`has_tail_segment` 内容门 + :data:`SAMPLE_GRACE_BY_SAMPLE` 宽限重试取全。
 SAMPLE_TIMES: tuple[str, ...] = ("09:15:30", "09:20:30", "09:25:05", "15:00:05")
 
 #: 每档宽限（秒）：到点后窗口内仍可触发（进程晚起/单次失败重试）。
 SAMPLE_GRACE_S = 120
 
+#: 单档宽限覆盖（秒）：收盘档尾盘段发布滞后（2026-10-15 实测 15:00:05 当刻
+#: SDK ``type=0`` 仍只回早盘段，见 :func:`has_tail_segment`）——宽限内以
+#: :data:`SAMPLE_RETRY_INTERVAL_S` 节流重试，直至尾盘段出现或窗口耗尽。
+SAMPLE_GRACE_BY_SAMPLE: dict[str, int] = {"15:00:05": 2100}
+
+
+def _grace_s(sample: str) -> int:
+    """档宽限：默认 :data:`SAMPLE_GRACE_S`，收盘档按覆盖表。"""
+    return SAMPLE_GRACE_BY_SAMPLE.get(sample, SAMPLE_GRACE_S)
+
+
 #: 单档最多尝试次数（fetch 失败后重试上限，防配额风暴）。
 MAX_ATTEMPTS_PER_SAMPLE = 3
+
+#: 单档尝试上限覆盖：收盘档要覆盖整个宽限窗（2100s/60s≈35 次，留余量）。
+MAX_ATTEMPTS_BY_SAMPLE: dict[str, int] = {"15:00:05": 40}
+
+
+def _attempts_cap(sample: str) -> int:
+    """档尝试上限：默认 :data:`MAX_ATTEMPTS_PER_SAMPLE`，收盘档按覆盖表。"""
+    return MAX_ATTEMPTS_BY_SAMPLE.get(sample, MAX_ATTEMPTS_PER_SAMPLE)
+
+
+#: 重试节流（秒）：0=每轮询轮即试（默认，5s 节奏）；收盘档 60s 节流
+#: （等尾盘段发布，不拿 5s 轮询空转白烧 SDK 配额）。
+SAMPLE_RETRY_INTERVAL_S: dict[str, int] = {"15:00:05": 60}
 
 #: 日期盲防御裕量（秒）：竞价前 SDK 返回**上一交易日**完整序列且记录无日期字段；
 #: 末帧时间晚于「当前时刻+本裕量」的记录在时间上不可能是今日实时序列 → 判陈旧。
@@ -116,10 +148,11 @@ def _hms_to_seconds(text: str) -> int | None:
 
 
 def due_sample(now: datetime, done: set[str]) -> str | None:
-    """当前时刻应采的档（对点后 :data:`SAMPLE_GRACE_S` 秒内、且未完成）。
+    """当前时刻应采的档（对点后宽限内、且未完成）。
 
     ``now`` 必须是市场本地钟（北京时间）的 aware datetime；``done`` 为当日
-    已完成档集合。返回第一个到期的档名，无档返回 None。
+    已完成档集合。宽限默认 :data:`SAMPLE_GRACE_S` 秒，收盘档按
+    :data:`SAMPLE_GRACE_BY_SAMPLE` 覆盖。返回第一个到期的档名，无档返回 None。
     """
     now_s = now.hour * 3600 + now.minute * 60 + now.second
     for sample in SAMPLE_TIMES:
@@ -128,7 +161,7 @@ def due_sample(now: datetime, done: set[str]) -> str | None:
         at = _hms_to_seconds(sample)
         if at is None:
             continue
-        if 0 <= now_s - at < SAMPLE_GRACE_S:
+        if 0 <= now_s - at < _grace_s(sample):
             return sample
     return None
 
@@ -204,8 +237,27 @@ def guard_stale_rows(
     return rows, None
 
 
+#: 尾盘段起始时刻（收盘集合竞价 14:57–15:00；HH:MM:SS 字符串字典序可比较）。
+TAIL_SEGMENT_FROM = "14:57:00"
+
+
+def has_tail_segment(per_symbol: Mapping[str, Mapping[str, Any]]) -> bool:
+    """内容门：任一标的含尾盘段行即视尾盘数据已发布（停牌股无尾盘行属正常）。
+
+    2026-10-15 实测：15:00:05 当刻（及收盘后数分钟）SDK ``type=0`` 仍只回早盘段，
+    尾盘段发布滞后——收盘档据此判「未完成」在宽限内重试，绝不以早盘冒充全量
+    （早盘本体已由 09:25:05 档存档，重复落盘只添噪声）。
+    """
+    for item in per_symbol.values():
+        for row in item.get("rows") or []:
+            if str(row.get("time") or "") >= TAIL_SEGMENT_FROM:
+                return True
+    return False
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """逐笔行 → 摘要（末帧即 09:24:5x 定稿参考价/量；不做累计口径推断）。"""
+    """逐笔行 → 摘要（末帧即该档定稿参考价/量：早盘档=09:24:5x；收盘档=14:59:5x
+    尾盘定稿参考价/量；不做累计口径推断）。"""
     if not rows:
         return {"rows": 0}
     first, last = rows[0], rows[-1]
@@ -447,6 +499,16 @@ async def run_sample(now: datetime, sample: str) -> bool:
             "rows": rows,
         }
 
+    # 内容门（收盘档）：type=0 承诺早盘+尾盘；尾盘段未发布前不落盘、不判完成，
+    # 交回循环按 :data:`SAMPLE_RETRY_INTERVAL_S` 节流重试（2026-10-15 实测：
+    # 15:00:05 当刻 SDK 仍只回早盘段，尾盘段滞后发布）。
+    if auction_type == 0 and not has_tail_segment(per_symbol):
+        logger.info(
+            "[CallAuction] %s 尾盘段未发布（SDK type=0 暂只回早盘），宽限内重试",
+            sample,
+        )
+        return False
+
     status = write_outputs(
         day=day,
         sample=sample,
@@ -488,25 +550,32 @@ async def run_call_auction_watch_task() -> None:
     done_day = ""
     done: set[str] = set()
     attempts: dict[str, int] = {}
+    next_try: dict[str, datetime] = {}
     while True:
         try:
             now = datetime.now(TZ)
             day = now.strftime("%Y%m%d")
             if day != done_day:
-                done_day, done, attempts = day, set(), {}
+                done_day, done, attempts, next_try = day, set(), {}, {}
             sample = due_sample(now, done)
+            if sample is not None and now < next_try.get(sample, now):
+                sample = None  # 节流窗内（收盘档等尾盘段发布，别 5s 空转）
             if sample is not None:
                 attempts[sample] = attempts.get(sample, 0) + 1
                 if await _is_trading_day(now.date()):
                     if await run_sample(now, sample):
                         done.add(sample)
-                    elif attempts[sample] >= MAX_ATTEMPTS_PER_SAMPLE:
+                    elif attempts[sample] >= _attempts_cap(sample):
                         logger.warning(
                             "[CallAuction] %s 重试 %s 次仍失败，本档放弃",
                             sample,
                             attempts[sample],
                         )
                         done.add(sample)
+                    else:
+                        wait_s = SAMPLE_RETRY_INTERVAL_S.get(sample, 0)
+                        if wait_s > 0:
+                            next_try[sample] = now + timedelta(seconds=wait_s)
                 else:
                     done.add(sample)  # 非交易日：本档作罢
         except asyncio.CancelledError:

@@ -4,11 +4,12 @@ import dayjs, { Dayjs } from 'dayjs';
 import { ExperimentOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { adminService } from '../../services/adminService';
 
-/** 后端 factor_fill_scheduler.FACTOR_DATASETS 的展示名 */
+/** 后端 factor_fill_scheduler.FACTOR_DATASETS 的展示名（qlib_cache 为缓存兜底行） */
 const DATASET_LABELS: Record<string, string> = {
     l1_factors: 'L1 因子',
     south_factors: '南向因子',
     ccass_factors: 'CCASS 因子',
+    qlib_cache: 'qlib 缓存',
 };
 
 const STATUS_TEXT: Record<string, string> = {

@@ -1,10 +1,13 @@
 """因子数据集定时填充调度器的回归测试。
 
-锁两层行为：
+锁三层行为：
 1. 派发纪律与市场同步调度同款——**标记在派发成功之后写**（先标记再派发会在
    broker 抖动时留下「今天跑过了」的假记录，当天永不重试）。
 2. 「落后才建」判据——因子集追平来源数据必须空跑不重算；来源缺失不得触发
    建造；单数据集失败不拖垮其余数据集。
+3. qlib 缓存兜底（2026-10-15）——夜链 with_qlib 阶段被预算闸对 HK/US 结构性
+   跳过（数据段必超 900s），qlib 缓存长期停更。本调度顺带按同一「落后才建」
+   纪律追齐缓存；qlib 失败不得拖垮因子集结果主链路。
 """
 
 from __future__ import annotations
@@ -199,7 +202,12 @@ def test_idle_calendar_window_skips_with_reason_and_no_marker(
 def _fill_env(
     monkeypatch: pytest.MonkeyPatch, latest: dict[str, str | None]
 ) -> tuple[list[Any], dict[str, Any]]:
-    """latest: {相对目录: 最新分区}; 返回 (builder 调用记录, 落盘的状态对象)。"""
+    """latest: {相对目录: 最新分区}; 返回 (builder 调用记录, 落盘的状态对象)。
+
+    qlib 兜底默认置为「日历追平来源」——既有用例聚焦因子集判据，不受
+    qlib 步骤干扰；qlib 专项用例在各自测试里覆写 _qlib_calendar_last /
+    _rebuild_qlib。
+    """
     calls: list[Any] = []
     saved: dict[str, Any] = {}
 
@@ -212,6 +220,12 @@ def _fill_env(
         "_save_status",
         lambda market, result: saved.update({"market": market, "result": result}),
     )
+    monkeypatch.setattr(
+        sched,
+        "_qlib_calendar_last",
+        lambda market: latest.get("1_kline_data/daily_forward"),
+    )
+    monkeypatch.setattr(sched, "_rebuild_qlib", lambda market: f"/qlib/{market}")
     return calls, saved
 
 
@@ -320,3 +334,109 @@ def test_run_one_dataset_error_does_not_block_others(
     assert result["datasets"]["l1_factors"]["status"] == "error"
     assert result["datasets"]["ccass_factors"]["status"] == "filled"
     assert result["status"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# qlib 缓存兜底（2026-10-15）：夜链 with_qlib 被预算闸结构性跳过后的追齐
+# ---------------------------------------------------------------------------
+
+
+_QLIB_LATEST = {
+    "6_ml_datasets/l1_factors": "20261007",
+    "1_kline_data/daily_forward": "20261007",
+}
+
+
+def test_run_qlib_up_to_date_skips_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
+    """缓存日历追平 daily_forward 最新分区时必须空跑（同「落后才建」纪律）。"""
+    calls, _ = _fill_env(monkeypatch, dict(_QLIB_LATEST))
+    monkeypatch.setattr(sched, "FACTOR_DATASETS", _US_L1)
+    monkeypatch.setattr(sched, "_fill_dataset", lambda market, name: calls.append(name))
+
+    result = sched.run_factor_fill("US", {"datasets": []})
+
+    assert result["qlib"]["status"] == "up_to_date"
+    assert result["qlib"]["calendar"] == "20261007"
+    assert ("qlib", "US") not in calls, "追平即空跑，不得重建"
+
+
+def test_run_qlib_behind_source_rebuilds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """日历落后来源（实测形态：US 止 09-01 vs 数据 10-14）必须触发重建。"""
+    calls, _ = _fill_env(monkeypatch, dict(_QLIB_LATEST))
+    monkeypatch.setattr(sched, "FACTOR_DATASETS", _US_L1)
+    monkeypatch.setattr(sched, "_fill_dataset", lambda market, name: calls.append(name))
+    cal = {"v": "20260901"}
+    monkeypatch.setattr(sched, "_qlib_calendar_last", lambda market: cal["v"])
+
+    def _fake_rebuild(market: str) -> str:
+        calls.append(("qlib", market))
+        cal["v"] = "20261007"  # 重建后日历追平来源
+        return "/qlib/us_data"
+
+    monkeypatch.setattr(sched, "_rebuild_qlib", _fake_rebuild)
+
+    result = sched.run_factor_fill("US", {"datasets": []})
+
+    assert ("qlib", "US") in calls
+    assert result["qlib"]["status"] == "rebuilt"
+    assert result["qlib"]["calendar"] == "20261007"
+    assert result["qlib"]["source_latest"] == "20261007"
+    assert result["qlib"]["provider_uri"] == "/qlib/us_data"
+    assert result["status"] == "ok", "qlib 追齐不影响因子集主状态"
+
+
+def test_run_qlib_calendar_missing_rebuilds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """缓存日历缺失/不可读视为落后，触发重建（ensure 对未构建缓存走全量构建）。"""
+    calls, _ = _fill_env(monkeypatch, dict(_QLIB_LATEST))
+    monkeypatch.setattr(sched, "FACTOR_DATASETS", _US_L1)
+    monkeypatch.setattr(sched, "_fill_dataset", lambda market, name: None)
+    monkeypatch.setattr(sched, "_qlib_calendar_last", lambda market: None)
+
+    def _fake_rebuild(market: str) -> str:
+        calls.append(("qlib", market))
+        return "/qlib/us_data"
+
+    monkeypatch.setattr(sched, "_rebuild_qlib", _fake_rebuild)
+
+    result = sched.run_factor_fill("US", {"datasets": []})
+
+    assert ("qlib", "US") in calls
+    assert result["qlib"]["status"] == "rebuilt"
+
+
+def test_run_qlib_error_does_not_flip_dataset_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """qlib 兜底失败不得把数据集结果翻成 partial/error（失败可见性走 qlib 字段）。"""
+    calls, _ = _fill_env(monkeypatch, dict(_QLIB_LATEST))
+    monkeypatch.setattr(sched, "FACTOR_DATASETS", _US_L1)
+    monkeypatch.setattr(sched, "_qlib_calendar_last", lambda market: "20260901")
+
+    def _boom(market: str) -> str:
+        raise RuntimeError("qlib boom")
+
+    monkeypatch.setattr(sched, "_rebuild_qlib", _boom)
+
+    result = sched.run_factor_fill("US", {"datasets": []})
+
+    assert result["qlib"]["status"] == "error"
+    assert "qlib boom" in result["qlib"]["error"]
+    assert result["status"] == "ok", "数据集本身全部 up_to_date，不受 qlib 拖累"
+
+
+def test_freshness_includes_qlib_cache_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """freshness 增加 qlib_cache 一行（面板按 key 动态渲染，落后时直接变橙）。"""
+    latest = dict(_QLIB_LATEST)
+    latest["1_kline_data/daily_forward"] = "20261007"
+    _fill_env(monkeypatch, latest)
+    monkeypatch.setattr(sched, "FACTOR_DATASETS", _US_L1)
+    monkeypatch.setattr(sched, "_qlib_calendar_last", lambda market: "20261005")
+
+    fr = sched.freshness("US")
+
+    assert fr["l1_factors"]["up_to_date"] is True
+    assert fr["qlib_cache"] == {
+        "latest": "20261005",
+        "source_latest": "20261007",
+        "up_to_date": False,
+    }

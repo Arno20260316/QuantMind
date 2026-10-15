@@ -12,6 +12,12 @@ dispatch_market_sync 顺带检查是否有市场到点，到点则派发填充�
   因子集最新分区 >= 来源数据最新分区时直接跳过（不重算、不空转），
   落后时按各生成器的增量语义补建 —— 正常日子秒级空跑，停更后自动追齐。
 - ccass_factors 生成器全量重算（分钟级），过期判据保证它只在真正落后时重算。
+- qlib 缓存兜底（2026-10-15）：市场夜链的 with_qlib 阶段自带预算闸——数据段
+  耗时超过 MARKET_SYNC_SOFT_TIME_LIMIT/2（默认 900s）即整段跳过。HK（CCASS
+  全市场爬约 1h）与 US（雅虎全量 30min+）结构性超时，qlib 缓存长期停更无人
+  察觉（实测 HK 止 09-11、US 止 09-01），与因子集事故同一失效形态。本调度
+  顺带按同一「落后才建」纪律追齐 qlib 缓存。A 股走自身链路内联维护、期货
+  夜链数据段足够快不受预算闸影响，均不在兜底范围。
 """
 
 from __future__ import annotations
@@ -58,6 +64,13 @@ DEFAULT_SCHEDULE = {
     "time": "04:30",
     "datasets": [],
 }
+
+# 需要 qlib 缓存兜底的市场 → ensure_qlib_cache 的市场名（缓存路径由
+# backend.shared.qlib_paths.resolve_qlib_provider_uri 单一出处解析）
+QLIB_MARKETS = {"HK": "HK", "US": "US"}
+
+# qlib 缓存新鲜度的基准来源（与因子集过期判据同一来源目录）
+QLIB_SOURCE_REL = "1_kline_data/daily_forward"
 
 # 各市场在没有用户配置时的建议触发时间（仅供前端预填，不参与自动触发）。
 # 排在各市场同步建议时间（HK 02:00 / US 05:30）加整条链时长余量之后；
@@ -174,6 +187,74 @@ def _latest_partition_dt(root: Path, rel: str) -> str | None:
     return best
 
 
+def _qlib_calendar_last(market: str) -> str | None:
+    """该市场 qlib 缓存日历（calendars/day.txt）最后交易日，归一为 YYYYMMDD。
+
+    缓存/日历缺失或读取失败一律返回 None——按「落后才建」判据即触发重建
+    （ensure_qlib_cache 对未构建的缓存走全量构建，天然兜底）。
+    """
+    qlib_market = QLIB_MARKETS.get(market)
+    if not qlib_market:
+        return None
+    try:
+        from backend.shared.qlib_paths import resolve_qlib_provider_uri
+
+        cal = Path(resolve_qlib_provider_uri(qlib_market)) / "calendars" / "day.txt"
+        if not cal.is_file():
+            return None
+        last: str | None = None
+        with open(cal, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if s:
+                    last = s
+    except Exception as exc:  # noqa: BLE001 - 读不到日历=落后，交给重建兜底
+        logger.warning("[FactorFill] %s qlib 日历读取失败: %s", market, exc)
+        return None
+    return last.replace("-", "") if last else None
+
+
+def _rebuild_qlib(market: str) -> str:
+    """按 qlib 缓存构建口径重建（日历 + 标的 + 特征整库重写），返回 provider_uri。"""
+    from backend.services.engine.qlib_data_builder import ensure_qlib_cache
+
+    return ensure_qlib_cache(market=QLIB_MARKETS[market])
+
+
+def _catch_up_qlib(market: str, root: Path) -> dict[str, Any]:
+    """qlib 缓存兜底：日历落后 daily_forward 最新分区时重建，追平即空跑。
+
+    背景见模块 docstring 设计要点 3；失败不抛错，以 ``error`` 状态落盘
+    （可见性走 freshness 的 qlib_cache 行与状态 JSON 的 qlib 字段）。
+    """
+    qlib_market = QLIB_MARKETS.get(market)
+    if not qlib_market:
+        return {"status": "not_applicable"}
+    src = _latest_partition_dt(root, QLIB_SOURCE_REL)
+    cal = _qlib_calendar_last(market)
+    if not src:
+        return {"status": "source_missing", "calendar": cal}
+    if cal and cal >= src:
+        return {"status": "up_to_date", "calendar": cal, "source_latest": src}
+    try:
+        provider_uri = _rebuild_qlib(market)
+        logger.info("[FactorFill] %s qlib 缓存已追齐: %s -> %s", market, cal, src)
+        return {
+            "status": "rebuilt",
+            "calendar": _qlib_calendar_last(market),
+            "source_latest": src,
+            "provider_uri": provider_uri,
+        }
+    except Exception as exc:  # noqa: BLE001 - 兜底失败不拖垮因子集结果主链路
+        logger.exception("[FactorFill] %s qlib 缓存兜底重建失败: %s", market, exc)
+        return {
+            "status": "error",
+            "calendar": cal,
+            "source_latest": src,
+            "error": str(exc),
+        }
+
+
 def freshness(market: str) -> dict[str, dict[str, Any]]:
     """每数据集的新鲜度：因子集最新分区 vs 来源最新分区（不触发任何计算）。"""
     root = _data_dir(market)
@@ -185,6 +266,16 @@ def freshness(market: str) -> dict[str, dict[str, Any]]:
             "latest": tgt,
             "source_latest": src,
             "up_to_date": bool(tgt and src and tgt >= src),
+        }
+    # qlib 缓存单列一行（2026-10-15）：面板按 key 动态渲染，夜链预算闸跳过
+    # with_qlib 导致缓存停更时，此处直接呈橙色（缓存日历 vs daily_forward）
+    if market in QLIB_MARKETS:
+        src = _latest_partition_dt(root, QLIB_SOURCE_REL)
+        cal = _qlib_calendar_last(market)
+        out["qlib_cache"] = {
+            "latest": cal,
+            "source_latest": src,
+            "up_to_date": bool(cal and src and cal >= src),
         }
     return out
 
@@ -264,6 +355,10 @@ def run_factor_fill(market: str, cfg: dict[str, Any]) -> dict[str, Any]:
                 "error": str(exc),
             }
             logger.exception("[FactorFill] %s %s 补建失败: %s", market, name, exc)
+
+    # qlib 缓存兜底（2026-10-15）：独立于因子集数据集，任何一次到点运行都顺带
+    # 追齐 qlib 缓存。qlib 失败不影响 datasets 主状态（见 _catch_up_qlib）
+    result["qlib"] = _catch_up_qlib(market, root)
 
     statuses = {v.get("status") for v in result["datasets"].values()}
     if statuses <= {"up_to_date", "filled", "skipped"}:

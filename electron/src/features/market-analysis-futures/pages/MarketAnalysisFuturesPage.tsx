@@ -11,22 +11,25 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Activity, Clock, RefreshCw, Zap, Sparkles, Flame, TrendingUp, Scale, Package, ArrowLeftRight,
+  Activity, Clock, RefreshCw, Zap, Sparkles, Flame, Telescope, TrendingUp, Scale, Package,
+  ArrowLeftRight,
 } from 'lucide-react';
 import { message } from 'antd';
 import { FuturesStatCards } from '../components/FuturesStatCards';
 import { FuturesOverviewPanel } from '../components/FuturesOverviewPanel';
 import { FuturesHeatmapPanel } from '../components/FuturesHeatmapPanel';
+import { FuturesOutlookPanel } from '../components/FuturesOutlookPanel';
 import { FuturesTermPanel } from '../components/FuturesTermPanel';
 import { FuturesPositionsPanel } from '../components/FuturesPositionsPanel';
 import { FuturesInventoryPanel } from '../components/FuturesInventoryPanel';
 import { FuturesSpreadPanel } from '../components/FuturesSpreadPanel';
 import { getOverview, getStatus, refreshMarket } from '../services/api';
-import type { FuturesOverview } from '../types';
+import type { FuturesFeedStatus, FuturesOverview } from '../types';
 
 const NAV_TABS = [
   { id: 'panorama', label: '行情总览', icon: Activity },
   { id: 'heatmap', label: '板块热力', icon: Flame },
+  { id: 'outlook', label: '前瞻视角', icon: Telescope },
   { id: 'term', label: '期限结构', icon: TrendingUp },
   { id: 'positions', label: '持仓分析', icon: Scale },
   { id: 'inventory', label: '仓单库存', icon: Package },
@@ -39,7 +42,9 @@ const DEFAULT_STEM = 'AU';
 export const MarketAnalysisFuturesPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState('panorama');
   const [overview, setOverview] = useState<FuturesOverview | null>(null);
+  const [status, setStatus] = useState<FuturesFeedStatus | null>(null);
   const [stem, setStem] = useState(DEFAULT_STEM);
+  const [outlookSector, setOutlookSector] = useState<string | null>(null);
   const [dataDate, setDataDate] = useState('');
   const [updateTime, setUpdateTime] = useState('');
   const [loading, setLoading] = useState(false);
@@ -51,6 +56,7 @@ export const MarketAnalysisFuturesPage: React.FC = () => {
     try {
       const [ov, st] = await Promise.all([getOverview(), getStatus()]);
       setOverview(ov);
+      setStatus(st);
       setDataDate(ov.trade_date || st.kline_latest_full || st.kline_latest || '');
       setUpdateTime(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
       if (!st.available) message.warning('QuantFutures 数据目录不可用，请检查数据管理页');
@@ -85,6 +91,12 @@ export const MarketAnalysisFuturesPage: React.FC = () => {
     setActiveTab('term');
   };
 
+  // 板块统计点击 → 切到前瞻视角并带板块过滤（从"看异动"到"看因子"闭环）
+  const handlePickSector = (sector: string) => {
+    setOutlookSector(sector);
+    setActiveTab('outlook');
+  };
+
   return (
     <div className="w-full h-full overflow-y-auto bg-slate-50/60 px-5 pt-4 pb-28 flex flex-col gap-2.5 font-sans">
       {/* Banner 顶栏 */}
@@ -102,7 +114,7 @@ export const MarketAnalysisFuturesPage: React.FC = () => {
             <span>QuantFutures 数据引擎</span>
           </span>
           <h1 className="text-base font-extrabold tracking-tight bg-gradient-to-r from-amber-950 via-orange-900 to-slate-900 bg-clip-text text-transparent whitespace-nowrap truncate">
-            期货市场全景 · 期限结构与持仓透视
+            期货市场全景 · 前瞻因子与期限结构透视
           </h1>
           <span className="hidden lg:inline text-[10px] text-slate-400 font-mono whitespace-nowrap">
             国内主力连续 + 国际品种 + 上金所现货
@@ -170,8 +182,23 @@ export const MarketAnalysisFuturesPage: React.FC = () => {
         </span>
       </div>
 
-      {activeTab === 'panorama' && <FuturesOverviewPanel overview={overview} reloadKey={reloadKey} />}
-      {activeTab === 'heatmap' && <FuturesHeatmapPanel reloadKey={reloadKey} onPickStem={handlePickStem} />}
+      {activeTab === 'panorama' && (
+        <FuturesOverviewPanel overview={overview} status={status} reloadKey={reloadKey} />
+      )}
+      {activeTab === 'heatmap' && (
+        <FuturesHeatmapPanel
+          reloadKey={reloadKey}
+          onPickStem={handlePickStem}
+          onPickSector={handlePickSector}
+        />
+      )}
+      {activeTab === 'outlook' && (
+        <FuturesOutlookPanel
+          sector={outlookSector}
+          onSectorChange={setOutlookSector}
+          reloadKey={reloadKey}
+        />
+      )}
       {activeTab === 'term' && (
         <FuturesTermPanel stem={stem} onStemChange={setStem} reloadKey={reloadKey} />
       )}

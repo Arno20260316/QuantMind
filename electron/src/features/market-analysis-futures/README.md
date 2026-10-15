@@ -2,23 +2,27 @@
 
 期货市场分析前端模块 —— 「大盘分析」页顶部市场切换器选「期货」后渲染。
 后端：`backend/services/api/market_analysis_futures/`（`/api/v1/market-analysis-futures`）。
+专业化升级（2026-10-15）实施细案：`docs/期货市场分析专业化升级_细案_20261015.md`。
 
 ## 结构
 
 ```
 market-analysis-futures/
-├── pages/MarketAnalysisFuturesPage.tsx   # 入口：Banner + 统计卡 + 6 Tab（App.tsx 懒加载）
+├── pages/MarketAnalysisFuturesPage.tsx   # 入口：Banner + 统计卡 + 7 Tab（App.tsx 懒加载）
 ├── components/
+│   ├── MiniChart.tsx               # 图表胶囊（echarts 生命周期 + AXIS_LABEL/TOOLTIP_BASE）
 │   ├── FuturesStatCards.tsx        # 三层市场统计卡（全市场/国内/国际/上金所）
-│   ├── FuturesOverviewPanel.tsx    # Tab1 行情总览：涨跌双榜 + 主力榜单 + 板块温度条
-│   ├── FuturesHeatmapPanel.tsx     # Tab2 板块热力：品种 treemap + 9 板块统计
-│   ├── FuturesTermPanel.tsx        # Tab3 期限结构：近远月曲线 + 期限结构榜
-│   ├── FuturesPositionsPanel.tsx   # Tab4 持仓分析：CFTC 双榜 + 增减仓四象限
-│   ├── FuturesInventoryPanel.tsx   # Tab5 仓单库存：注册仓单榜 + 单品种历史
-│   └── FuturesSpreadPanel.tsx      # Tab6 内外盘基差：跨市场价差 9 组 + 贵金属期现
-├── services/api.ts                 # 12 个只读端点 + POST /refresh
+│   ├── FuturesOverviewPanel.tsx    # Tab1 行情总览：涨跌双榜 + 主力榜 + 板块温度 + 基准/成交额/数据质量
+│   ├── FuturesHeatmapPanel.tsx     # Tab2 板块热力：品种 treemap + 9 板块统计（点板块下钻前瞻）
+│   ├── FuturesOutlookPanel.tsx     # Tab3 前瞻视角：五因子等权合成榜 + 品种画像（前瞻榜左/画像右）
+│   ├── FuturesVarietyProfilePanel.tsx # 品种画像：六因子明细 + 期限/基差/库存/量仓/席位净多六图
+│   ├── FuturesTermPanel.tsx        # Tab4 期限结构：近远月曲线（含年化 carry/到期日）+ 期限结构榜
+│   ├── FuturesPositionsPanel.tsx   # Tab5 持仓分析：左 CFTC（投机/商业可切换）+ 右四象限；下接席位榜+明细
+│   ├── FuturesInventoryPanel.tsx   # Tab6 仓单库存：东财库存主榜（默认选第一）+ 注册仓单对照（2×2）
+│   └── FuturesSpreadPanel.tsx      # Tab7 跨市与基差：左列表（内外盘9+贵金属2+现货基差52）右历史曲线
+├── services/api.ts                 # 只读端点 + POST /refresh
 ├── types.ts                        # 与后端 JSON 形状一一对应
-└── format.tsx                      # 本地格式化（「—」口径）+ 结构/象限徽标
+└── format.tsx                      # 本地格式化（「—」口径）+ 结构/象限/周期/前瞻/新鲜度徽标 + PctBar
 ```
 
 ## 口径纪律（改动必读）
@@ -33,15 +37,32 @@ market-analysis-futures/
 6. **四象限为教材口径**：涨+增仓=多头增仓 / 跌+增仓=空头增仓 /
    涨+减仓=空头回补 / 跌+减仓=多头离场（与后端 `positions._quadrant` 同源）。
 7. **CFTC 为周度数据**（每周六发布上一周二数据），报告期另行标注，勿与日频混读。
+8. **前瞻合成口径**（Tab3）：五因子等权截面分位（carry/基差/库存/动量/季节性各 20%，
+   缺失剔除权重重归一，有效因子 <2 不进合成 → composite=null）；三档按本次入板品种
+   的 q33/q67 划分。**member_net（席位净多）为纯事实展示，不入合成**。
+   分位分母=同一次推理/入板的那批品种，**跨板块/跨日不可直接比较**。
+9. **现货基差（Tab7）为品种自身时序口径**：基差率 =(现货−期货主力)/现货，
+   250 日分位是**该品种自己的历史**（与截面分位不同义）；个别品种现期脱钩为源侧
+   报价差异（后端 notes 已注明）。东财库存榜 `out_of_sync` 品种打「停更」标。
+10. **到期参考日**：SHFE/CZCE/INE/CFFEX 取合约元数据；DCE/GFEX 无元数据品种
+    按「当月 15 日」估计并标注（估计）。期限曲线的活跃合约有 7 天新鲜度闸。
 
 ## 交互
 
 - 热力图点击品种色块 → 跳「期限结构」Tab 并载入该品种曲线。
-- 期限结构榜行点击 → 切换曲线品种；选择器按期限榜（有合约数据的品种）列出。
+- 热力图点击板块统计行 → 跳「前瞻视角」Tab 并过滤该板块（前瞻榜保持全局分位口径）。
+- Tab3 前瞻榜点行 → 右侧品种画像（六因子 + 六图）；画像六图共用 `FuturesMiniChart`。
+- Tab5 左卡 CFTC 顶栏切换「投机仓（非商业）/商业仓（套保）」；右卡四象限支持
+  天数（1/3/5/10）与象限筛选；下接「席位净多榜」（默认 RB）+ 席位明细。
+- Tab6 东财库存榜与注册仓单榜**默认选中第一行**，右侧出该品种历史。
+- Tab7 左列三组（内外盘价差 9 / 贵金属期现 2 / 现货基差 52）点选即出右侧
+  价差率（基差率）历史曲线；现货基差历史按需现取（`/basis?symbol=`）；默认选中第一组。
 - Banner「刷新分析」= POST /refresh（清后端缓存重算）+ 递增 `reloadKey` 令各 Tab 重取。
 - 各 Tab 面板首次挂载自取数据；切 Tab 会卸载重取（与港股模块同构）。
 
 ## 展示面用词
 
-展示面只说「位置/方向」：「Back 结构 / Contango」为期限结构术语，页面同时给出
-「近高远低 / 近低远高」白话注解；不存在股票语境下「买入/卖出」执行词。
+展示面只说「位置/方向」：前瞻三档为「靠前/居中/靠后」（`TIER_LABEL`），
+不写「前 20%/后 20%」（分位与绝对阈值两条生成路径并不等价）；「Back 结构 /
+Contango」为期限结构术语，页面同时给出「近高远低 / 近低远高」白话注解；
+不存在股票语境下「买入/卖出」执行词。

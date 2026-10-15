@@ -120,7 +120,16 @@ export const FuturesTermPanel: React.FC<{
               `收盘: <b>${fmt(c.close)}</b>　结算: ${fmt(c.settlement)}`,
               `成交: ${fmt(c.volume_wan)} 万手　持仓: ${fmt(c.oi_wan)} 万手`,
               `持仓额: ${fmt(c.oi_amount_yi)} 亿`,
-            ].join('<br/>');
+              c.expiry_date
+                ? `到期参考: ${c.expiry_date}${c.expiry_estimated ? '（估计）' : ''}${
+                    c.days_to_expiry !== null && c.days_to_expiry !== undefined
+                      ? `　距到期 ${c.days_to_expiry} 天`
+                      : ''
+                  }`
+                : '',
+            ]
+              .filter(Boolean)
+              .join('<br/>');
           },
         },
         series: [
@@ -225,6 +234,35 @@ export const FuturesTermPanel: React.FC<{
               <span className="font-bold text-slate-400">近远月价差</span>
               <PctText value={term.near_far_spread_pct} />
             </span>
+            <span
+              className="flex items-baseline gap-1 whitespace-nowrap"
+              title="年化展期收益 = ln(近月/远月) × 365 / (月差 × 30.44)；正 = Back 结构多头展期收益"
+            >
+              <span className="font-bold text-slate-400">年化 carry</span>
+              <span
+                className={`font-extrabold font-mono ${
+                  term.carry_annual_pct === null || term.carry_annual_pct === undefined
+                    ? 'text-slate-400'
+                    : term.carry_annual_pct > 0
+                      ? 'text-red-600'
+                      : term.carry_annual_pct < 0
+                        ? 'text-green-600'
+                        : 'text-slate-500'
+                }`}
+              >
+                {term.carry_annual_pct === null || term.carry_annual_pct === undefined
+                  ? '—'
+                  : `${term.carry_annual_pct > 0 ? '+' : ''}${fmt(term.carry_annual_pct)}%`}
+              </span>
+            </span>
+            <span className="flex items-baseline gap-1 whitespace-nowrap" title="近月合约距到期参考日天数（无 contract_meta 的品种为「当月 15 日」估计口径）">
+              <span className="font-bold text-slate-400">近月距到期</span>
+              <span className="font-mono text-slate-600">
+                {term.near_days_to_expiry === null || term.near_days_to_expiry === undefined
+                  ? '—'
+                  : `${term.near_days_to_expiry} 天`}
+              </span>
+            </span>
             <span className="flex items-baseline gap-1 whitespace-nowrap">
               <span className="font-bold text-slate-400">总持仓</span>
               <span className="font-extrabold font-mono text-slate-700">{fmt(term.total_oi_wan)} 万手</span>
@@ -240,6 +278,8 @@ export const FuturesTermPanel: React.FC<{
           <Info className="w-3 h-3 flex-shrink-0" />
           <span>
             曲线仅含近期有成交/持仓的活跃合约（7 天新鲜度闸）；价差率 =（近月−远月）/远月，正值为 Back 结构（近高远低）。
+            年化 carry = ln(近月/远月) × 365 /（月差 × 30.44）；到期参考日取合约元数据（SHFE/CZCE/INE/CFFEX），
+            无元数据品种按当月 15 日估计并在悬停中标注。
           </span>
         </div>
       </SectionCard>
@@ -265,7 +305,11 @@ export const FuturesTermPanel: React.FC<{
                 <button
                   key={r.stem}
                   onClick={() => onStemChange(r.stem)}
-                  title={`${r.contracts} 个活跃合约 · 总持仓 ${fmt(r.total_oi_wan)} 万手 · ${meta?.hint ?? ''}`}
+                  title={`${r.contracts} 个活跃合约 · 总持仓 ${fmt(r.total_oi_wan)} 万手 · 年化 carry ${
+                    r.carry_annual_pct === null || r.carry_annual_pct === undefined
+                      ? '—'
+                      : `${fmt(r.carry_annual_pct)}%`
+                  }（截面分位 ${r.carry_pct === null || r.carry_pct === undefined ? '—' : r.carry_pct.toFixed(0)}） · ${meta?.hint ?? ''}`}
                   className={`flex items-center gap-2 px-1.5 py-1.5 rounded-lg border-b border-slate-50 last:border-0 text-left transition-colors cursor-pointer ${
                     active ? 'bg-amber-50/80' : 'hover:bg-slate-50/70'
                   }`}
@@ -277,10 +321,22 @@ export const FuturesTermPanel: React.FC<{
                   >
                     {i + 1}
                   </span>
-                  <span className="text-xs font-bold text-slate-800 whitespace-nowrap">{r.name}</span>
-                  <span className="text-[10px] font-mono text-slate-400">{r.stem}</span>
+                  <span className="flex flex-col leading-tight min-w-0">
+                    <span className="text-xs font-bold text-slate-800 whitespace-nowrap">
+                      {r.name} <span className="text-[9px] font-mono text-slate-400">{r.stem}</span>
+                    </span>
+                    <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">
+                      年化 carry{' '}
+                      {r.carry_annual_pct === null || r.carry_annual_pct === undefined
+                        ? '—'
+                        : `${r.carry_annual_pct > 0 ? '+' : ''}${fmt(r.carry_annual_pct)}%`}
+                      {r.near_days_to_expiry !== null && r.near_days_to_expiry !== undefined
+                        ? ` · 距到期 ${r.near_days_to_expiry} 天`
+                        : ''}
+                    </span>
+                  </span>
                   {meta && <Badge text={meta.label} cls={meta.cls} />}
-                  <span className="ml-auto">
+                  <span className="ml-auto flex-shrink-0">
                     <PctText value={r.near_far_spread_pct} className="text-[11px]" />
                   </span>
                 </button>

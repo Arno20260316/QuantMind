@@ -2,11 +2,15 @@
 
 import { SERVICE_ENDPOINTS } from '../../../config/services';
 import type {
+  FuturesBasis,
   FuturesCftc,
   FuturesCrossMarket,
   FuturesFeedStatus,
   FuturesHeatmap,
+  FuturesInventoryEm,
+  FuturesMembers,
   FuturesOiChanges,
+  FuturesOutlook,
   FuturesOverview,
   FuturesPreciousBasis,
   FuturesRanking,
@@ -14,6 +18,7 @@ import type {
   FuturesSectorStats,
   FuturesTermRanking,
   FuturesTermStructure,
+  FuturesVarietyProfile,
   RankingKind,
 } from '../types';
 
@@ -83,6 +88,41 @@ export function getCrossMarket(days = 60): Promise<FuturesCrossMarket> {
 
 export function getPreciousBasis(days = 60): Promise<FuturesPreciousBasis> {
   return getJson<FuturesPreciousBasis>(`/precious-basis?days=${days}`);
+}
+
+// ---- P1 新增九域端点 ----
+
+export function getOutlook(sector?: string, limit = 120): Promise<FuturesOutlook> {
+  const q = new URLSearchParams();
+  if (sector) q.set('sector', sector);
+  q.set('limit', String(limit));
+  return getJson<FuturesOutlook>(`/outlook?${q.toString()}`);
+}
+
+export function getVariety(symbol: string): Promise<FuturesVarietyProfile> {
+  return getJson<FuturesVarietyProfile>(`/variety?symbol=${encodeURIComponent(symbol)}`);
+}
+
+export function getBasis(symbol?: string, limit = 120, days = 500): Promise<FuturesBasis> {
+  const q = new URLSearchParams();
+  if (symbol) q.set('symbol', symbol);
+  q.set('limit', String(limit));
+  q.set('days', String(days));
+  return getJson<FuturesBasis>(`/basis?${q.toString()}`);
+}
+
+export function getMembers(symbol?: string, limit = 120): Promise<FuturesMembers> {
+  const q = new URLSearchParams();
+  if (symbol) q.set('symbol', symbol);
+  q.set('limit', String(limit));
+  return getJson<FuturesMembers>(`/members?${q.toString()}`);
+}
+
+export function getInventoryEm(symbol?: string, limit = 120): Promise<FuturesInventoryEm> {
+  const q = new URLSearchParams();
+  if (symbol) q.set('symbol', symbol);
+  q.set('limit', String(limit));
+  return getJson<FuturesInventoryEm>(`/inventory?${q.toString()}`);
 }
 
 export function refreshMarket(): Promise<{ status: string; trade_date: string; message: string }> {

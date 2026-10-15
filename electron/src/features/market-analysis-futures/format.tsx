@@ -91,3 +91,73 @@ export function Badge({ text, cls, title }: { text: string; cls: string; title?:
     </span>
   );
 }
+
+// ---- P2 新增：库存周期 / 前瞻三档 / 数据新鲜度 ----
+
+/** 库存周期徽标（theory of storage：累库/去库方向） */
+export const CYCLE_META: Record<string, { label: string; cls: string; hint: string }> = {
+  build: {
+    label: '累库',
+    cls: 'bg-amber-50 text-amber-700 border-amber-200',
+    hint: '20 日库存变化 > +0.5%：库存累积方向',
+  },
+  draw: {
+    label: '去库',
+    cls: 'bg-sky-50 text-sky-700 border-sky-200',
+    hint: '20 日库存变化 < −0.5%：库存去化方向',
+  },
+  flat: {
+    label: '走平',
+    cls: 'bg-slate-100 text-slate-600 border-slate-200',
+    hint: '20 日库存变化在 ±0.5% 内',
+  },
+};
+
+/** 前瞻三档徽标（展示面只说位置：靠前/居中/靠后，无买卖词汇） */
+export const TIER_META: Record<string, { label: string; cls: string }> = {
+  leading: { label: '靠前', cls: 'bg-amber-600 text-white border-amber-600' },
+  mid: { label: '居中', cls: 'bg-white text-slate-600 border-slate-300' },
+  lagging: { label: '靠后', cls: 'bg-slate-100 text-slate-400 border-slate-200' },
+};
+
+/** 数据集新鲜度徽标（/status.datasets 三色） */
+export const FRESHNESS_META: Record<string, { label: string; cls: string }> = {
+  fresh: { label: '新鲜', cls: 'bg-green-50 text-green-700 border-green-200' },
+  stale: { label: '滞后', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  unavailable: { label: '缺失', cls: 'bg-slate-100 text-slate-500 border-slate-200' },
+};
+
+/** 0-100 分位 mini-bar（前瞻因子/历史分位通用；缺失画空槽标「—」） */
+export function PctBar({
+  pct,
+  width = 56,
+  showValue = false,
+  title,
+}: {
+  pct: number | null | undefined;
+  width?: number;
+  showValue?: boolean;
+  title?: string;
+}) {
+  const v = num(pct);
+  const fill = v === null ? null : Math.max(0, Math.min(100, v));
+  const tone =
+    fill === null ? '' : fill >= 67 ? 'bg-amber-600' : fill <= 33 ? 'bg-amber-200' : 'bg-amber-400';
+  return (
+    <span className="inline-flex items-center gap-1.5" title={title}>
+      <span
+        className="inline-block h-1.5 rounded-full bg-slate-100 overflow-hidden align-middle"
+        style={{ width }}
+      >
+        {fill !== null && (
+          <span className={`block h-full rounded-full ${tone}`} style={{ width: `${fill}%` }} />
+        )}
+      </span>
+      {showValue && (
+        <span className="text-[10px] font-mono font-bold text-slate-500 tabular-nums w-7 text-right">
+          {v === null ? '—' : v.toFixed(0)}
+        </span>
+      )}
+    </span>
+  );
+}

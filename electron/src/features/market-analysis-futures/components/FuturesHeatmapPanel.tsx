@@ -30,7 +30,9 @@ function metricValue(it: FuturesHeatItem, metric: Metric): number | null {
 export const FuturesHeatmapPanel: React.FC<{
   reloadKey: number;
   onPickStem: (stem: string) => void;
-}> = ({ reloadKey, onPickStem }) => {
+  /** 板块点击 → 前瞻视角（带板块过滤） */
+  onPickSector: (sector: string) => void;
+}> = ({ reloadKey, onPickStem, onPickSector }) => {
   const [heatmap, setHeatmap] = useState<FuturesHeatmap | null>(null);
   const [sectorStats, setSectorStats] = useState<FuturesSectorStats | null>(null);
   const [metric, setMetric] = useState<Metric>('oi_amount');
@@ -146,6 +148,7 @@ export const FuturesHeatmapPanel: React.FC<{
           <span className="flex items-center gap-1.5">
             <span className="w-3.5 h-3.5 rounded-sm bg-gradient-to-br from-red-400 to-green-400 inline-block" />
             板块统计（国内口径）
+            <span className="text-[9px] font-normal text-slate-400">点击板块看前瞻因子</span>
           </span>
         }
         extra={<DateBadge label="数据日期" date={sectorStats?.trade_date} />}
@@ -155,9 +158,11 @@ export const FuturesHeatmapPanel: React.FC<{
         ) : (
           <div className="flex flex-col">
             {(sectorStats?.sectors ?? []).map((s) => (
-              <div
+              <button
                 key={s.sector}
-                className="flex flex-col gap-0.5 px-1 py-1.5 border-b border-slate-50 last:border-0"
+                onClick={() => onPickSector(s.sector)}
+                title={`查看「${s.name}」板块的前瞻因子板`}
+                className="flex flex-col gap-0.5 px-1 py-1.5 border-b border-slate-50 last:border-0 text-left transition-colors hover:bg-amber-50/60 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold text-slate-800 w-14 whitespace-nowrap">
@@ -183,7 +188,7 @@ export const FuturesHeatmapPanel: React.FC<{
                     </span>
                   )}
                 </div>
-              </div>
+              </button>
             ))}
             <div className="text-[9px] text-slate-400 pt-1.5 leading-snug">
               中位涨幅为板块内国内品种中位数；国际品种/上金所不参与板块聚合（量仓口径不可比）。

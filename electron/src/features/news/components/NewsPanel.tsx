@@ -73,6 +73,7 @@ import {
 } from '../services/newsService';
 import '../styles/news-panel.css';
 import { sanitizeHtml } from '../../../utils/sanitizeHtml';
+import { htmlToPlainText, isPlaceholderSummary } from '../utils/articleDisplay';
 
 const { Text, Title, Paragraph } = Typography;
 const { RangePicker } = DatePicker;
@@ -151,6 +152,10 @@ function saveFilters(state: FilterState) {
     localStorage.setItem(LS_KEY, JSON.stringify(state));
   } catch { /* ignore */ }
 }
+
+// 高频事件 chip 默认折叠到前 N 个（外加当前已选中的），其余收进「更多分类」——
+// 词典大类之外的 top_events 动辄三十几个，全摆出来工具栏要占两屏高
+const HOT_EVENTS_COLLAPSED = 4;
 
 // 新闻大类快捷导航（对应 finance_lexicon 事件大类，点击按 event_tags 筛选）
 const QUICK_EVENT_CHIPS = [
@@ -239,6 +244,12 @@ export const NewsPanel: React.FC = () => {
   const [selectedArticleId, setSelectedArticleId] = useState<number | null>(null);
   const [articleDetail, setArticleDetail] = useState<NewsArticleDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  // 分类行折叠态：热词 chip 默认只出前 4 个 + 已选中的（选了却被折叠会找不到怎么取消）
+  const [catExpanded, setCatExpanded] = useState(false);
+  // 桌面右栏自动开第一篇：只填版面、不写阅读语义 —— autoOpenedRef 记住被自动打开的
+  // 那篇，详情 effect 对它跳过 markRead；用户显式点选即清空（见 List.Item onClick）
+  const autoOpenedRef = useRef<number | null>(null);
 
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([]);
   const [checkedKeys, setCheckedKeys] = useState<React.Key[]>([]);
@@ -555,14 +566,30 @@ export const NewsPanel: React.FC = () => {
   useEffect(() => {
     if (selectedArticleId == null) { setArticleDetail(null); return; }
     setDetailLoading(true);
+    // 「仅自动填充版面」在**发起请求时**定性：等响应回来再查 autoOpenedRef，会被用户中途
+    // 点别篇（click 清空 ref）追溯撤销，把没读过的自动开篇副产物标成已读（2026-10-15 评审）。
+    const autoFilled = autoOpenedRef.current === selectedArticleId;
     newsService.getArticle(selectedArticleId)
       .then((d) => {
         setArticleDetail(d);
-        if (!d.read) newsService.markRead(selectedArticleId, true).catch(() => undefined);
+        // 自动打开只填版面，不算「已读」；用户显式点选后照常写
+        if (!d.read && !autoFilled) {
+          newsService.markRead(selectedArticleId, true).catch(() => undefined);
+        }
       })
       .catch(() => setArticleDetail(null))
       .finally(() => setDetailLoading(false));
   }, [selectedArticleId]);
+
+  // 桌面右栏自动开第一篇：省掉一块「选择文章查看正文」的空洞。只做一次
+  // （autoOpenedRef 非空则不再介入，10s 轮询刷新列表也不会把用户正在读的换掉）；
+  // 仅桌面 —— 移动端打开详情是整屏切换，进来就跳正文会盖掉列表，不动
+  useEffect(() => {
+    if (isMobile || selectedArticleId != null || articles.length === 0) return;
+    if (autoOpenedRef.current != null) return;
+    autoOpenedRef.current = articles[0].id;
+    setSelectedArticleId(articles[0].id);
+  }, [isMobile, articles, selectedArticleId]);
 
   // —— star ——
   const handleStar = useCallback(async (article: NewsArticle, ev: React.MouseEvent) => {
@@ -600,6 +627,17 @@ export const NewsPanel: React.FC = () => {
 
   // —— derived ——
   const totalUnread = useMemo(() => sources.reduce((acc, s) => acc + (s.unread_count || 0), 0), [sources]);
+
+  // 高频事件 chip（词典大类之外）：默认折叠到前 N 个 + 当前已选中的，其余靠「更多分类」展开；
+  // 排序沿用后端 top_events（按文章数降序），不在这里重排
+  const hotEvents = useMemo(
+    () => (stats?.top_events ?? []).filter((e) => !QUICK_EVENT_CHIPS.some((q) => q.value === e.name)),
+    [stats],
+  );
+  const visibleHotEvents = catExpanded
+    ? hotEvents
+    : hotEvents.filter((e, idx) => idx < HOT_EVENTS_COLLAPSED || f.selectedEventTags.includes(e.name));
+  const hiddenHotCount = hotEvents.length - visibleHotEvents.length;
 
   // Build source tree — grouped by backend folders only
   const treeData: DataNode[] = useMemo(() => {
@@ -940,25 +978,30 @@ export const NewsPanel: React.FC = () => {
             </Tag.CheckableTag>
           );
         })}
-        {/* 高频事件标签（词典大类之外，全部展示，含文章数） */}
-        {(stats?.top_events ?? [])
-          .filter((e) => !QUICK_EVENT_CHIPS.some((q) => q.value === e.name))
-          .map((e) => {
-            const active = f.selectedEventTags.includes(e.name);
-            return (
-              <Tag.CheckableTag
-                key={`ev-${e.name}`}
-                checked={active}
-                onChange={(c) => {
-                  if (c) addFilter('selectedEventTags', e.name);
-                  else removeFilter('selectedEventTags', e.name);
-                }}
-                style={{ fontSize: 12, padding: '2px 10px', borderRadius: 12, margin: 0, fontWeight: active ? 600 : 400 }}
-              >
-                {e.name} <span style={{ opacity: 0.5, fontWeight: 400 }}>({e.count.toLocaleString()})</span>
-              </Tag.CheckableTag>
-            );
-          })}
+        {/* 高频事件标签（词典大类之外；默认只出前 4 + 已选中的，其余收进「更多分类」，含文章数） */}
+        {visibleHotEvents.map((e) => {
+          const active = f.selectedEventTags.includes(e.name);
+          return (
+            <Tag.CheckableTag
+              key={`ev-${e.name}`}
+              checked={active}
+              onChange={(c) => {
+                if (c) addFilter('selectedEventTags', e.name);
+                else removeFilter('selectedEventTags', e.name);
+              }}
+              style={{ fontSize: 12, padding: '2px 10px', borderRadius: 12, margin: 0, fontWeight: active ? 600 : 400 }}
+            >
+              {e.name} <span style={{ opacity: 0.5, fontWeight: 400 }}>({e.count.toLocaleString()})</span>
+            </Tag.CheckableTag>
+          );
+        })}
+        {hotEvents.length > HOT_EVENTS_COLLAPSED && (
+          <Button type="link" size="small" className="news-category-more"
+            onClick={() => setCatExpanded(!catExpanded)}
+            style={{ fontSize: 12, padding: 0 }}>
+            {catExpanded ? <>收起 <ArrowUpOutlined /></> : <>更多分类 ({hiddenHotCount}) <ArrowDownOutlined /></>}
+          </Button>
+        )}
         {/* 当前筛选标签：紧跟分类 Tab 之后 */}
         {activeFilterCount > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', marginLeft: 4 }}>
@@ -1023,9 +1066,9 @@ export const NewsPanel: React.FC = () => {
               <div style={{ padding: '6px 16px', borderBottom: '1px solid rgba(226, 232, 240, 0.8)', background: 'rgba(255, 255, 255, 0.85)', fontSize: 12, display: 'flex', gap: 14, color: '#64748b', alignItems: 'center', flexWrap: 'wrap' }}>
                 {activeFilterCount > 0 && <Tag color="processing" style={{ fontSize: 11, margin: 0 }}>已筛选</Tag>}
                 <span>共 <b style={{ color: '#6366f1' }}>{total.toLocaleString()}</b> 篇</span>
-                <span style={{ color: COLOR_BULLISH }}>利好 {stats.sentiment_counts.bullish || 0}</span>
-                <span style={{ color: COLOR_BEARISH }}>利空 {stats.sentiment_counts.bearish || 0}</span>
-                <span style={{ color: COLOR_NEUTRAL }}>中性 {stats.sentiment_counts.neutral || 0}</span>
+                <span style={{ color: COLOR_BULLISH }}>利好 {(stats.sentiment_counts.bullish || 0).toLocaleString()}</span>
+                <span style={{ color: COLOR_BEARISH }}>利空 {(stats.sentiment_counts.bearish || 0).toLocaleString()}</span>
+                <span style={{ color: COLOR_NEUTRAL }}>中性 {(stats.sentiment_counts.neutral || 0).toLocaleString()}</span>
                 {/* 情绪分布横条 */}
                 <span style={{ flex: 1, maxWidth: 160, display: 'inline-flex', height: 6, borderRadius: 3, overflow: 'hidden', background: '#e2e8f0', minWidth: 90 }}>
                   <span style={{ width: pct(stats.sentiment_counts.bullish || 0), background: COLOR_BULLISH, height: '100%' }} />
@@ -1054,9 +1097,19 @@ export const NewsPanel: React.FC = () => {
               <div style={{ flex: 1, overflowY: 'auto' }}>
                 <List size="small" dataSource={articles} renderItem={(a) => {
                   const active = selectedArticleId === a.id;
+                  const summary = (a.summary ?? '').trim();
                   return (
                     <List.Item className={`news-article-item ${active ? 'news-article-active' : ''} ${a.read ? 'news-article-read' : ''}`}
-                      onClick={() => { setSelectedArticleId(a.id); if (isMobile) setMobileDetailOpen(true); }}>
+                      onClick={() => {
+                        // 显式点选 = 用户主动要读：清掉「自动打开免记已读」豁免；
+                        // 点的恰是那篇自动打开的（重选同篇不触发详情 effect）则补记一次已读
+                        if (autoOpenedRef.current != null) {
+                          const wasAutoOpened = autoOpenedRef.current === a.id;
+                          autoOpenedRef.current = null;
+                          if (wasAutoOpened && !a.read) newsService.markRead(a.id, true).catch(() => undefined);
+                        }
+                        setSelectedArticleId(a.id); if (isMobile) setMobileDetailOpen(true);
+                      }}>
                       <div style={{ width: '100%' }}>
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
                           <Avatar src={a.thumbnail} size={28} style={{ flexShrink: 0, marginTop: 2 }}>{(a.source_name || '?')[0]}</Avatar>
@@ -1077,9 +1130,9 @@ export const NewsPanel: React.FC = () => {
                                 {a.title}
                               </Text>
                             </div>
-                            {a.summary && (
-                              <Text style={{ color: '#64748b', fontSize: 12, display: 'block', lineHeight: 1.5, marginBottom: 2 }}>
-                                {a.summary.length > 100 ? `${a.summary.slice(0, 100)}...` : a.summary}
+                            {!isPlaceholderSummary(summary, a.title) && (
+                              <Text className="news-article-summary" style={{ color: '#64748b', fontSize: 12, display: 'block', lineHeight: 1.5, marginBottom: 2 }}>
+                                {summary.length > 100 ? `${summary.slice(0, 100)}…` : summary}
                               </Text>
                             )}
                             {/* Enrichment tags */}
@@ -1196,13 +1249,28 @@ export const NewsPanel: React.FC = () => {
                 </div>
               )}
               {/* 正文：对纯文本做关键词高亮（股票名/事件词标黄） */}
-              {articleDetail.content_html ? (
-                <div className="news-detail-content" style={{ fontSize: 14, lineHeight: 1.8 }} dangerouslySetInnerHTML={{ __html: sanitizeHtml(articleDetail.content_html) }} />
-              ) : (
-                <Paragraph style={{ fontSize: 14, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>
-                  {highlightText(articleDetail.content || articleDetail.summary || '(正文为空)', articleDetail.enrichment)}
-                </Paragraph>
-              )}
+              {(() => {
+                // 正文位三条路：content_html 渲染 HTML → 否则纯文本 content||summary → 都没有给提示。
+                // 2026-10-15 实测财联社源 content_html 与 content 同为占位串「[财联社] 点击标题查看
+                // 详细内容」——只滤纯文本路会让 HTML 路把占位整块印进右栏，两条路都要过占位判据。
+                const html = articleDetail.content_html || '';
+                if (html.trim() !== '' && !isPlaceholderSummary(htmlToPlainText(html), articleDetail.title)) {
+                  return <div className="news-detail-content" style={{ fontSize: 14, lineHeight: 1.8 }} dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }} />;
+                }
+                const body = (articleDetail.content || articleDetail.summary || '').trim();
+                if (isPlaceholderSummary(body, articleDetail.title)) {
+                  return (
+                    <Paragraph type="secondary" style={{ fontSize: 13, lineHeight: 1.8 }}>
+                      {html.trim() !== '' || body !== '' ? '该来源未提供正文，点上方「原文」打开原站阅读。' : '(正文为空)'}
+                    </Paragraph>
+                  );
+                }
+                return (
+                  <Paragraph style={{ fontSize: 14, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>
+                    {highlightText(body, articleDetail.enrichment)}
+                  </Paragraph>
+                );
+              })()}
 
               {/* 相关推荐：同股票/同事件/同行业 */}
               {(() => {

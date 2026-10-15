@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type CSSProperties } from 'react';
 import { LogLine, LogUsage, PositionRecord, TradeRecord } from '../api/client';
 import { logoOf, modelColor } from './ModelCard';
 import { fmtClock, fmtAgo, fmtDateTime, fmtDay, fmtWeekday } from '../utils/datetime';
@@ -230,7 +230,7 @@ export default function ModelChat({
           const summary =
             (pa.summary || r.thought || r.user).replace(/\s+/g, ' ').trim() || '（无内容）';
           return (
-            <div className={`mc-card ${isOpen ? 'open' : ''}`} key={r.seq} style={{ borderColor: modelColor(model) }}>
+            <div className={`mc-card ${isOpen ? 'open' : ''}`} key={r.seq} style={{ borderColor: modelColor(model), '--mc-accent': modelColor(model) } as CSSProperties}>
               <div
                 className="mc-head"
                 onClick={() => toggle(r.seq)}

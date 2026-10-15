@@ -197,3 +197,79 @@
     --qm-model-card-min: 150px;
   }
 }
+
+/* ==========================================================================
+   模型对话卡（盘中实况 / 新闻 tab / 控台模型详情共用 ChatStream）
+   --------------------------------------------------------------------------
+   2026-10-15 用户报「智能体对话的排版再优化、给人看的界面、一目了然」。
+   解析侧的机器码问题（纯 JSON 直出总结条）已在搬运补丁里修（parseAnalysis
+   四级递降）——这一节只管**层级与可读性**，不新造视觉语言：白底、2px 黑描边、
+   Courier 数字、涨红跌绿全部沿用，只补三件事：
+
+     · 卡头挂模型色 4% 淡底（悬停 9%）——一屏十几张卡靠颜色一眼分得开。
+       颜色来自两份渲染器注入的 --mc-accent（ChatStream / ModelChat，
+       = modelColor，唯一出处），不在 CSS 里另写一套模型色表。
+     · 总结条是折叠态唯一的常读区：字号 12.5 / 行高 1.75 / 深灰；折叠时
+       限 4 行（展开不截）——摘要再长也不把列表拉成一面墙。
+     · 决策占比改描边 pill（等宽 tabular-nums）——「30% / 100%」竖列对齐，
+       和左侧涨红跌绿的买卖 tag 分开层级。
+
+   ⚠️ 两条护栏（与上方模型卡小节同源，别删）：
+
+   1) 选择器一律 `.qm-arena-root .mc-list .mc-card …`：ModelChat.css 随页面
+      chunk 在本文件**之后**加载，同特异性晚者赢，少一层就会被静默压回页面默认。
+
+   2) 凡是改 `background` 的元素，悬停态必须在本层**同时重声明**——页面
+      `.mc-head:hover`（0,3,0）压不过本层基态（≥0,4,0），不补悬停就等于把页面
+      的悬停反馈悄悄杀死了（上一节模型卡的注释里记过同类事故）。
+
+   不套 @media (min-width: 481px) 护栏：那层护栏是为 ≤480 页面的模型卡两列布局
+   让位的，而这几个目标类（mc-head / mc-sum-text / pct / section-head）在
+   ModelChat.css 的 @900 / @560 块里都没有小屏变体（只有 mc-meta/mc-decision-body
+   的网格重排），本节的改动对窄屏同样成立。
+   ========================================================================== */
+.qm-arena-root .mc-list .mc-card .mc-head {
+  background: color-mix(in srgb, var(--mc-accent, #666) 4%, #fff);
+  transition: background 0.15s;
+}
+
+.qm-arena-root .mc-list .mc-card .mc-head:hover {
+  background: color-mix(in srgb, var(--mc-accent, #666) 9%, #fff);
+}
+
+.qm-arena-root .mc-list .mc-card .mc-sum-text {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: #2f2f2f;
+}
+
+/* 折叠态限 4 行：展开（.open）= 用户明确要看全文，不截 */
+.qm-arena-root .mc-list .mc-card:not(.open) .mc-sum-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  overflow: hidden;
+}
+
+.qm-arena-root .mc-list .mc-decision-mini-pct {
+  font-family: 'Courier New', Courier, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #333;
+  background: #fff;
+  border: 1px solid #c9c9c9;
+  padding: 0 6px;
+}
+
+/* 小节头：与正文块（#fafafa）拉开一档底色 + 悬停加深。
+   :not(.static) —— 结构化输出那节不可折叠，页面对它的悬停是 transparent，
+   本层若一把覆盖会让「不可点」的头上出现可点反馈（假交互）。 */
+.qm-arena-root .mc-list .mc-card .mc-section-head:not(.static) {
+  padding: 8px 14px;
+  background: #f4f6f8;
+}
+
+.qm-arena-root .mc-list .mc-card .mc-section-head:not(.static):hover {
+  background: #e9edf2;
+}

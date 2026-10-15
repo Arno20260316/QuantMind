@@ -71,3 +71,53 @@ describe('合规尾注（AI 生成免责，单一来源文案）', () => {
     expect(screen.getByText(COMPLIANCE_TOOL_BOUNDARY_TEXT)).toBeInTheDocument();
   });
 });
+
+describe('总结条不直出机器码 + 卡头日期口径（2026-10-15 排版批）', () => {
+  it('纯 JSON 回复：总结条出「本轮 N 项决策」，无原始 JSON 残串', () => {
+    // Arrange：agent 现为纯结构化 JSON 输出（无【】/①②标记）的真实形态
+    const jsonRound: LogLine = {
+      timestamp: '2026-10-15T09:35:26',
+      new_messages: [
+        { role: 'user', content: '【要求】盘中决策……' },
+        {
+          role: 'assistant',
+          content: JSON.stringify({
+            decisions: [{ action: 'sell', code: '600338.SH', name: '西藏珠峰', pct: 1 }],
+          }),
+        },
+      ],
+    };
+
+    // Act
+    render(<ChatStream agents={agentsWith(jsonRound)} />);
+
+    // Assert：总结条是人话，不是 `{"decisions": …`
+    const sum = document.querySelector('.mc-sum-text');
+    expect(sum?.textContent).toContain('本轮 1 项决策');
+    expect(sum?.textContent).toContain('卖出 西藏珠峰 100%');
+    expect(sum?.textContent).not.toContain('{');
+    expect(sum?.textContent).not.toContain('"decisions"');
+  });
+
+  it('卡头日期收口北京口径：aware UTC 换算（01:35Z → 10-15 09:35），无裸 T', () => {
+    const awareRound: LogLine = {
+      timestamp: '2026-10-15T01:35:26Z',
+      new_messages: [
+        { role: 'user', content: '【要求】……' },
+        { role: 'assistant', content: '总结：观望。' },
+      ],
+    };
+
+    render(<ChatStream agents={agentsWith(awareRound)} />);
+
+    const date = document.querySelector('.mc-date');
+    expect(date?.textContent).toBe('10-15 09:35');
+  });
+
+  it('卡头日期：naive（写入侧已按北京墙钟）原样截取，不带 T', () => {
+    render(<ChatStream agents={agentsWith(round())} />); // timestamp 2026-10-10T09:30:00（naive）
+
+    const date = document.querySelector('.mc-date');
+    expect(date?.textContent).toBe('10-10 09:30');
+  });
+});

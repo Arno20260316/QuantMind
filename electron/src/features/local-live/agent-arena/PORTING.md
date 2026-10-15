@@ -1,7 +1,7 @@
 # arena → QuantMind 实盘栏 移植清单（自动生成，勿手改）
 
 - 源：`/home/zbox/quant-Trader/arena/src`（arena 仓库 bd228b7，2026-10-08T12:42:46+09:00，工作区 干净）
-- 生成时间：2026-10-14T15:53:11.260Z
+- 生成时间：2026-10-15T04:16:17.254Z
 - 重新同步：`node electron/src/features/local-live/agent-arena/tools/port-from-arena.mjs`
 
 ## 搬运的文件（68 个）
@@ -104,6 +104,10 @@
 - components/ChatStream.tsx：T3-2：空态也挂免责尾注（列表空时同样是 AI 展示面口径）
 - components/ChatStream.tsx：T3-2（审计 C5）：桥不可达轮挂「无实盘账户数据」横幅（判据=data_gaps 字段；常显不折叠），防 LLM 幻觉持仓点评被当事实读
 - components/ChatStream.tsx：T3-2：列表尾部挂 McDisclaimer（有分析记录时也出免责）
+- components/ChatStream.tsx：卡头样式注入 --mc-accent（模型色变量）：主题层做卡片身份（淡底卡头）用，类型断言走 CSSProperties
+- components/ChatStream.tsx：卡头日期收口 fmtMonthDayClock（datetime.ts 北京口径；裸 slice(5,16) 会留 T 且 aware UTC 偏 8h）
+- components/ChatStream.tsx：卡头日期渲染改 fmtMonthDayClock（见上）
+- components/ChatStream.tsx：卡片挂 --mc-accent（= 模型色）：主题层卡头淡底/悬停加深都读这一只变量，模型色只有一个出处
 - components/CompletedFeed.tsx：持仓时长「天+小时」：小数天不再裸出（1.84 曾显示成 1.84D 0H），小时位取尾数换算，进位 24 折进天数避免 2D 24H
 - components/CompletedFeed.tsx：已完成（A股）卡片角日期：从「只有平仓日」改「买入日 → 平仓日」区间（entry_date 缺失退化为单日）
 - components/CompletedFeed.tsx：已完成（港股）卡片角日期：slice 裸截留下「T」（09-24T14:41），空格分隔
@@ -116,6 +120,8 @@
 - components/LiveDetails.tsx：T6-3：通达信账户快照时刻从裸 slice(0,19) 改 fmtBeijingDateTime（aware UTC 曾被当北京展示）
 - components/ModelCard.tsx：品牌色 --model-accent 由「仅选中时注入」改为**恒注入**：宿主打磨层（qm-arena-theme.css）要靠它给每张卡上左侧竖条/logo 底色（未选中时也得有值）。选中态的 inline 边框/底色/投影逻辑不变
 - components/ModelChat.tsx：A6-③ 工具调用行注释去 baymax_memory 字面量
+- components/ModelChat.tsx：控台模型详情（ModelDetail）同用 mc-card/mc-head 版式但走 ModelChat——不注入 --mc-accent 这里会整面裸奔成灰底（2026-10-15 评审）
+- components/ModelChat.tsx：卡片挂 --mc-accent（= 模型色），与 ChatStream 同一机制（见上条）
 - components/Navbar.tsx ← tools/overrides/Navbar.tsx.tpl（整文件替身）
 - components/RealAccountPanel.tsx：A6-① 美股 IBKR 卡头状态 →「通道已下线」
 - components/RealAccountPanel.tsx：A6-① 美股 IBKR 卡体降级文案 →「通道已下线」
@@ -154,12 +160,17 @@
 - utils/channelStatus.ts：A6-① ibkrChannel 注释与文案 →「已下线」
 - utils/datetime.ts：T6-3：头注释改「aware 换算北京 / naive 原样」规则（原口径是"一律原始截取"）
 - utils/datetime.ts：T6-3：partsOf 先过 beijingPartsOf（aware 换算北京）；naive 落到原样截取分支
+- utils/datetime.ts：新增 fmtMonthDayClock：对话卡头「10-15 09:35」窄位格式（aware → 北京墙钟；旧的裸 slice(5,16) 既留 T 又把 aware UTC 当北京）
+- utils/parseAnalysis.ts：回退说明同步四级递降（旧文案「摘要=首段」已失真）；推理定义补「摘要取用的段落不进推理」
+- utils/parseAnalysis.ts：JSON 区段扫描带原文偏移（剥离用）+ JSON 字段探测 + 决策扼要行助手（纯 JSON 轮出「给人看」的一行）
+- utils/parseAnalysis.ts：段标残渣修复：seg() 只跳 1 个字符（按 ① 设计），【总体总结】等 5 字标记会留「总体总结】」标签进正文（①【总体总结】与仅【】两种真实写法都中招）——clean 里一并剔掉
+- utils/parseAnalysis.ts：无标记回退四级递降：JSON 内 summary 字段 → 散文首段 → 决策扼要行 → 说明句；推理不再回抄 JSON（纯 JSON 轮置空，该节自动隐藏）；摘要↔推理互不重叠（2026-10-15 评审：按摘要实际取用的段号剔除，不再硬编码 slice(1)）
 - 函数式 setState 共 24 处裹 `asUpdater()`（本仓 tsc 的类型简化，运行时无影响）：
-  - `components/ChatStream.tsx:121 setOpen`
-  - `components/ChatStream.tsx:132 setSections`
-  - `components/ChatStream.tsx:232 setExp`
-  - `components/ChatStream.tsx:269 setExp`
-  - `components/ChatStream.tsx:336 setExp`
+  - `components/ChatStream.tsx:122 setOpen`
+  - `components/ChatStream.tsx:133 setSections`
+  - `components/ChatStream.tsx:233 setExp`
+  - `components/ChatStream.tsx:270 setExp`
+  - `components/ChatStream.tsx:337 setExp`
   - `components/CompConfigPanel.tsx:43 setDraft`
   - `components/ModelChat.tsx:166 setOpen`
   - `components/ModelChat.tsx:385 setFolded`

@@ -668,6 +668,79 @@ export const fetchFutuOrders = async (
     find: `<span>买入 {p.buy_time.slice(5)}</span>`,
     replace: `<span>{p.buy_time ? \`买入 \${p.buy_time.slice(5).replace('T', ' ')}\` : '买入日未知'}</span>`,
   },
+
+  // ===== 模型对话「给人看」排版（2026-10-15，用户报「agent 对话排版再优化、一目了然」）=====
+  // 根因：agent 改纯结构化 JSON 输出（{"decisions":[…]}, 无【】/①②标记）后，parseAnalysis
+  // 无标记回退把原始 JSON 当"首段摘要"印进总结条、推理段再回抄一遍——给人看的界面出一屏
+  // 机器码。解析器改四级递降（JSON 内 summary 字段 → 剥离 JSON 后的散文首段 → 决策扼要行
+  // → 说明句），推理段不再回抄；卡头日期收口 datetime.ts 北京口径；模型色变量 --mc-accent
+  // 供主题层做卡片身份。视觉打磨全部在 qm-arena-theme.css（本脚本对 .css 只做 scope）。
+  {
+    file: 'utils/parseAnalysis.ts',
+    why: '回退说明同步四级递降（旧文案「摘要=首段」已失真）；推理定义补「摘要取用的段落不进推理」',
+    find: ` *  无任何标记时回退：摘要=首段，推理=去掉已调用行与决策 JSON 的正文。`,
+    replace: ` *  无任何标记时回退（2026-10-15 起四级递降）：JSON 内 summary 字段 → 剥离 JSON 后的\n *  散文首段 → 决策扼要行（「本轮 N 项决策：…」）→ 说明句；推理=去掉已调用行、JSON 区段\n *  以及被摘要取用的那段之后的正文。`,
+  },
+  {
+    file: 'utils/parseAnalysis.ts',
+    why: 'JSON 区段扫描带原文偏移（剥离用）+ JSON 字段探测 + 决策扼要行助手（纯 JSON 轮出「给人看」的一行）',
+    find: `/** 括号匹配提取文本中所有 JSON 对象 */\nfunction extractJsonBlocks(text: string): unknown[] {\n  const out: unknown[] = [];\n  let i = 0;\n  while (i < text.length) {\n    const s = text.indexOf('{', i);\n    if (s < 0) break;\n    let depth = 0;\n    let inStr = false;\n    let j = s;\n    for (; j < text.length; j++) {\n      const c = text[j];\n      if (inStr) {\n        if (c === '\\\\') j++;\n        else if (c === '"') inStr = false;\n      } else if (c === '"') inStr = true;\n      else if (c === '{') depth++;\n      else if (c === '}') {\n        depth--;\n        if (depth === 0) {\n          j++;\n          break;\n        }\n      }\n    }\n    const raw = text.slice(s, j);\n    try {\n      out.push(JSON.parse(raw));\n    } catch {\n      /* 忽略不可解析片段 */\n    }\n    i = j;\n  }\n  return out;\n}`,
+    replace: `/** 括号匹配扫描文本中所有 JSON 对象（带原文偏移，供剥离 JSON 区段用） */\ninterface JsonSpan {\n  value: unknown;\n  start: number;\n  end: number;\n}\n\nfunction scanJsonBlocks(text: string): JsonSpan[] {\n  const out: JsonSpan[] = [];\n  let i = 0;\n  while (i < text.length) {\n    const s = text.indexOf('{', i);\n    if (s < 0) break;\n    let depth = 0;\n    let inStr = false;\n    let j = s;\n    for (; j < text.length; j++) {\n      const c = text[j];\n      if (inStr) {\n        if (c === '\\\\') j++;\n        else if (c === '"') inStr = false;\n      } else if (c === '"') inStr = true;\n      else if (c === '{') depth++;\n      else if (c === '}') {\n        depth--;\n        if (depth === 0) {\n          j++;\n          break;\n        }\n      }\n    }\n    const raw = text.slice(s, j);\n    try {\n      out.push({ value: JSON.parse(raw), start: s, end: j });\n    } catch {\n      /* 忽略不可解析片段 */\n    }\n    i = j;\n  }\n  return out;\n}\n\n/** 括号匹配提取文本中所有 JSON 对象 */\nfunction extractJsonBlocks(text: string): unknown[] {\n  return scanJsonBlocks(text).map((b) => b.value);\n}\n\n/** 剥离 JSON 区段后的正文（去「已调用」行） */\nfunction proseWithoutJson(text: string, spans: JsonSpan[]): string {\n  const parts: string[] = [];\n  let cursor = 0;\n  for (const s of spans) {\n    parts.push(text.slice(cursor, s.start));\n    cursor = s.end;\n  }\n  parts.push(text.slice(cursor));\n  return parts\n    .join('\\n')\n    .split('\\n')\n    .filter((l) => !/^\\s*已调用/.test(l))\n    .join('\\n')\n    .trim();\n}\n\n/** 段内剥掉 markdown 标题行（#/##…）：真实 agent 输出常以「# 盘前持仓分析（日期）」开头，\n *  标题当摘要=「总结没有」（decision/contract.py 记过这条）——摘要取内容句，标题行不进摘要。 */\nfunction stripHeadingLines(para: string): string {\n  return para\n    .split('\\n')\n    .map((l) => l.trim())\n    .filter((l) => l && !/^#{1,6}\\s/.test(l))\n    .join('\\n')\n    .trim();\n}\n\n/** 从 JSON 块里挑第一个非空字符串字段（模型输出字段名不统一，多别名探测） */\nfunction jsonStrField(blocks: unknown[], keys: string[]): string {\n  for (const b of blocks) {\n    if (!b || typeof b !== 'object' || Array.isArray(b)) continue;\n    const rec = b as Record<string, unknown>;\n    for (const k of keys) {\n      const v = rec[k];\n      if (typeof v === 'string' && v.trim()) return v.trim();\n    }\n  }\n  return '';\n}\n\n/** 决策动作中文化（JSON 里 buy/sell 与中文混用） */\nconst DEC_ACTION_CN: Record<string, string> = {\n  buy: '买入', sell: '卖出', hold: '持有', watch: '观察',\n  add: '加仓', reduce: '减仓', clear: '清仓', open: '开仓', close: '平仓',\n};\n\n/** 决策项 → 一行给人看的扼要（「本轮 3 项决策：卖出 600338.SH 100% · …」） */\nfunction decisionDigest(items: DecItem[]): string {\n  const seg = items.slice(0, 4).map((d) => {\n    const act = DEC_ACTION_CN[String(d.action || '').toLowerCase()] ?? String(d.action || '');\n    const who = d.name || d.code || '';\n    const pct = d.pct != null ? \` \${Math.round(d.pct * 100)}%\` : '';\n    return \`\${act} \${who}\${pct}\`.trim();\n  });\n  return \`本轮 \${items.length} 项决策：\${seg.join(' · ')}\${items.length > 4 ? ' …' : ''}\`;\n}`,
+  },
+  {
+    file: 'utils/parseAnalysis.ts',
+    why: '段标残渣修复：seg() 只跳 1 个字符（按 ① 设计），【总体总结】等 5 字标记会留「总体总结】」标签进正文（①【总体总结】与仅【】两种真实写法都中招）——clean 里一并剔掉',
+    find: `const clean = (x: string) => x.replace(/^[①②③④]?\\s*/, '').replace(/[①②③④]\\s*$/, '').trim();`,
+    replace: `/** 段标与编号剔除：seg() 只跳过一个字符（按 ① 设计），5 字【段标】会残留\n *  「推理论证】」标签（含 ①【段标】写法切片后的「【段标】」形态）——段首一并剔；\n *  段尾孤立编号也回剔。这些串只出现在段标位，正文同形字串概率可忽略。 */\nconst clean = (x: string) =>\n  x\n    .replace(/^[①②③④]?\\s*/, '')\n    .replace(/^【?(?:总体总结|分析链路|推理论证|决策)】\\s*/, '')\n    .replace(/[①②③④]\\s*$/, '')\n    .trim();`,
+  },
+  {
+    file: 'utils/parseAnalysis.ts',
+    why: '无标记回退四级递降：JSON 内 summary 字段 → 散文首段 → 决策扼要行 → 说明句；推理不再回抄 JSON（纯 JSON 轮置空，该节自动隐藏）；摘要↔推理互不重叠（2026-10-15 评审：按摘要实际取用的段号剔除，不再硬编码 slice(1)）',
+    find: `  } else {\n    // 完全无标记：摘要=首段；推理=去掉已调用行与决策 JSON 尾巴全文\n    const firstPar = t.split('\\n\\n')[0] ?? t;\n    out.summary = clean(firstPar).slice(0, 260);\n    const lines = t.split('\\n').filter((l) => !/^\\s*已调用/.test(l));\n    out.reasoning = lines.join('\\n').trim();\n    out.decisions = toDecItems(extractJsonBlocks(t));\n  }`,
+    replace: `  } else {\n    // 完全无标记。2026-10-15：agent 的真实输出两种形态都会走到这里——纯结构化 JSON\n    // （决策轮）与 markdown 报告（分析轮，首段是「# 盘前持仓分析（日期）」标题）。旧\n    // 「摘要=首段」前者把 JSON 印满总结条、后者总结=标题=「没有」（contract.py 记过）。\n    // 四级递降：JSON 内 summary 字段 → 首个**含正文**的段（标题行不算）→ 决策扼要行\n    // → 说明句；推理与摘要**互不重叠**——摘要实际取自哪段，推理就剔哪段。\n    // （2026-10-15 评审修复：旧实现无条件 slice(1)——markdown 报告时摘要句在推理里\n    //   复读；短段+决策 JSON 轮时首段既没进摘要也被吞。）\n    const spans = scanJsonBlocks(t);\n    const blocks = spans.map((s) => s.value);\n    const prose = proseWithoutJson(t, spans);\n    const paras = prose.split('\\n\\n').map((s) => s.trim()).filter(Boolean);\n    const firstPar = paras[0] ?? '';\n    const proseUsable = prose.length >= 4 && !/^[{[]/.test(prose);\n    out.decisions = toDecItems(blocks);\n\n    const recSummary = jsonStrField(blocks, ['summary', 'overall', 'market_view', '总体总结', '市场总结', '总结']);\n    const recReason = jsonStrField(blocks, ['analysis', 'reasoning', 'rationale', 'comment', '推理论证', '分析']);\n    const stripped = proseUsable ? paras.map((p) => stripHeadingLines(p)) : [];\n    const proseIdx = proseUsable ? stripped.findIndex((p) => p.length >= 6) : -1;\n    if (recSummary) out.summary = clean(recSummary).slice(0, 260);\n    else if (proseIdx >= 0) out.summary = clean(stripped[proseIdx]).slice(0, 260);\n    else if (out.decisions.length) out.summary = decisionDigest(out.decisions);\n    else if (spans.length || /^[{[]/.test(t.trim())) out.summary = '结构化输出未能解析（展开查看原始记录）';\n    else out.summary = clean(firstPar).slice(0, 260);\n\n    if (recReason) out.reasoning = recReason;\n    else if (recSummary) out.reasoning = prose; // 摘要来自 JSON 字段：正文段整段进推理\n    else if (proseIdx >= 0) out.reasoning = paras.filter((p, i) => i !== proseIdx && stripHeadingLines(p) !== '').join('\\n\\n'); // 摘要取自该段+纯标题段均不进推理\n    else if (out.decisions.length || spans.length || /^[{[]/.test(t.trim())) out.reasoning = prose; // 摘要=决策扼要/未能解析说明：正文整段进推理（截断 JSON 原文不丢料）\n    else out.reasoning = paras.slice(1).join('\\n\\n'); // 摘要=首段兜底，推理不重复首段\n  }`,
+  },
+  {
+    file: 'utils/datetime.ts',
+    why: '新增 fmtMonthDayClock：对话卡头「10-15 09:35」窄位格式（aware → 北京墙钟；旧的裸 slice(5,16) 既留 T 又把 aware UTC 当北京）',
+    find: `/** \"…T14:45:02…\" → \"14:45:02\"（同日时间列用） */\nexport function fmtClock(iso: string | null | undefined, withSeconds = true): string {\n  const p = partsOf(iso);\n  if (!p) return '—';\n  return withSeconds ? withTwoDigits(p.clock) : p.clock.slice(0, 5);\n}`,
+    replace: `/** \"…T14:45:02…\" → \"14:45:02\"（同日时间列用） */\nexport function fmtClock(iso: string | null | undefined, withSeconds = true): string {\n  const p = partsOf(iso);\n  if (!p) return '—';\n  return withSeconds ? withTwoDigits(p.clock) : p.clock.slice(0, 5);\n}\n\n/** \"…2026-10-15T09:35:26…\" → \"10-15 09:35\"（对话卡头等窄位；只有日期时退化为 \"10-15\"）。\n *  口径同 partsOf：aware 换算北京墙钟、naive 原样——旧的裸 slice(5,16) 两样都不对。 */\nexport function fmtMonthDayClock(iso: string | null | undefined): string {\n  const p = partsOf(iso);\n  if (!p) return iso ? String(iso).slice(5, 16) : '—';\n  const md = \`\${two(p.m)}-\${two(p.d)}\`;\n  return p.clock.length >= 5 ? \`\${md} \${p.clock.slice(0, 5)}\` : md;\n}`,
+  },
+  {
+    file: 'components/ChatStream.tsx',
+    why: '卡头样式注入 --mc-accent（模型色变量）：主题层做卡片身份（淡底卡头）用，类型断言走 CSSProperties',
+    find: `import { useMemo, useState } from 'react';`,
+    replace: `import { useMemo, useState, type CSSProperties } from 'react';`,
+  },
+  {
+    file: 'components/ChatStream.tsx',
+    why: '卡头日期收口 fmtMonthDayClock（datetime.ts 北京口径；裸 slice(5,16) 会留 T 且 aware UTC 偏 8h）',
+    find: `import { renderInline } from '../utils/markdown';`,
+    replace: `import { renderInline } from '../utils/markdown';\nimport { fmtMonthDayClock } from '../utils/datetime';`,
+  },
+  {
+    file: 'components/ChatStream.tsx',
+    why: '卡头日期渲染改 fmtMonthDayClock（见上）',
+    find: `<span className="mc-date">{r.ts ? r.ts.slice(5, 16) : '—'}</span>`,
+    replace: `<span className="mc-date">{r.ts ? fmtMonthDayClock(r.ts) : '—'}</span>`,
+  },
+  {
+    file: 'components/ChatStream.tsx',
+    why: '卡片挂 --mc-accent（= 模型色）：主题层卡头淡底/悬停加深都读这一只变量，模型色只有一个出处',
+    find: `style={{ borderColor: modelColor(r.model) }}`,
+    replace: `style={{ borderColor: modelColor(r.model), '--mc-accent': modelColor(r.model) } as CSSProperties}`,
+  },
+  {
+    file: 'components/ModelChat.tsx',
+    why: '控台模型详情（ModelDetail）同用 mc-card/mc-head 版式但走 ModelChat——不注入 --mc-accent 这里会整面裸奔成灰底（2026-10-15 评审）',
+    find: `import { useMemo, useState } from 'react';`,
+    replace: `import { useMemo, useState, type CSSProperties } from 'react';`,
+  },
+  {
+    file: 'components/ModelChat.tsx',
+    why: '卡片挂 --mc-accent（= 模型色），与 ChatStream 同一机制（见上条）',
+    find: `style={{ borderColor: modelColor(model) }}`,
+    replace: `style={{ borderColor: modelColor(model), '--mc-accent': modelColor(model) } as CSSProperties}`,
+  },
 ];
 
 // ────────────────────────────── 闭包解析 ──────────────────────────────

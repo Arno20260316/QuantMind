@@ -152,6 +152,8 @@
 
 .news-tree-label {
   flex: 1;
+  /* flex 子项默认 min-width:auto —— 长源名不肯缩，会把右侧未读徽标顶出栏外被裁掉 */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -204,8 +206,10 @@
   border-left-color: #4f46e5 !important;
 }
 
-.news-article-read {
-  opacity: 0.65;
+/* 已读态：不再整行降透明度（连缩略图与标签一起糊掉，扫列表分不清「灰」是已读
+   还是加载中），只把标题转灰；未读仍是加粗深色标题，一眼区分 */
+.news-article-item.news-article-read .news-article-title {
+  color: #94a3b8;
 }
 
 .news-article-title {

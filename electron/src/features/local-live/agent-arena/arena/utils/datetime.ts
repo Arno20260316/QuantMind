@@ -46,6 +46,15 @@ export function fmtClock(iso: string | null | undefined, withSeconds = true): st
   return withSeconds ? withTwoDigits(p.clock) : p.clock.slice(0, 5);
 }
 
+/** "…2026-10-15T09:35:26…" → "10-15 09:35"（对话卡头等窄位；只有日期时退化为 "10-15"）。
+ *  口径同 partsOf：aware 换算北京墙钟、naive 原样——旧的裸 slice(5,16) 两样都不对。 */
+export function fmtMonthDayClock(iso: string | null | undefined): string {
+  const p = partsOf(iso);
+  if (!p) return iso ? String(iso).slice(5, 16) : '—';
+  const md = `${two(p.m)}-${two(p.d)}`;
+  return p.clock.length >= 5 ? `${md} ${p.clock.slice(0, 5)}` : md;
+}
+
 /** 日历日（按 UTC+8 记录的日期部分，不做时区换算） */
 export function fmtDay(iso: string | null | undefined): string {
   const p = partsOf(iso);

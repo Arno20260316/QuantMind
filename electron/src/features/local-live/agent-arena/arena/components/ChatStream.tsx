@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type CSSProperties } from 'react';
 import { LogLine } from '../api/client';
 import { logoOf, modelColor, shortName } from './ModelCard';
 import { renderInline } from '../utils/markdown';
+import { fmtMonthDayClock } from '../utils/datetime';
 import './ModelChat.css';
 import { modeOf } from '../utils/modeTag';
 import { FillLike, renderActionTags } from '../utils/actionTags';
@@ -166,7 +167,7 @@ export default function ChatStream({
           <div
             className={`mc-card ${isOpen ? 'open' : ''}`} data-card={i}
             key={`${r.model}-${r.ts ?? i}`}
-            style={{ borderColor: modelColor(r.model) }}
+            style={{ borderColor: modelColor(r.model), '--mc-accent': modelColor(r.model) } as CSSProperties}
           >
             <div
               className="mc-head"
@@ -195,7 +196,7 @@ export default function ChatStream({
               <span className="mc-status" style={isReview ? { background: '#0d8a6b' } : undefined}>
                   {isReview ? '📋 复盘' : r.thought ? '已分析' : '仅提示'}
                 </span>
-              <span className="mc-date">{r.ts ? r.ts.slice(5, 16) : '—'}</span>
+              <span className="mc-date">{r.ts ? fmtMonthDayClock(r.ts) : '—'}</span>
               <span className={`mc-expand ${isOpen ? 'open' : ''}`}>{isOpen ? '▼' : '▶'}</span>
             </div>
             {r.dataGaps?.includes('account_unreachable') && (

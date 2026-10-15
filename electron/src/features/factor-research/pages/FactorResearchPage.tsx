@@ -26,6 +26,9 @@ import { SnapshotPanel } from '../components/SnapshotPanel';
 import { ScanPanel } from '../components/ScanPanel';
 import { RegisterToTrainingModal } from '../components/RegisterToTrainingModal';
 import { FactorReportPanel } from '../components/factor-report/FactorReportPanel';
+
+/** 排行榜去重阈值（与筛选页默认 |ρ| ≥ 0.9 同口径；改这里须同步筛选页语义） */
+const LEADERBOARD_DEDUP_RHO = 0.9;
 import { useAppSelector } from '../../../store';
 
 type Tab = 'leaderboard' | 'single' | 'compare' | 'compose' | 'screening' | 'factor-report';
@@ -79,6 +82,8 @@ const FactorResearchPage: React.FC = () => {
   const [catalogMeta, setCatalogMeta] = useState<Record<string, unknown>>({});
   const [lbMeta, setLbMeta] = useState<Record<string, unknown>>({});
   const meta = useMemo(() => ({ ...catalogMeta, ...lbMeta }), [catalogMeta, lbMeta]);
+  /** 排行榜去重开关（口径同筛选页 |ρ| ≥ 0.9；切换触发一次后端重算 + 重排名） */
+  const [lbDedup, setLbDedup] = useState(false);
   const [range, setRange] = useState<RangeValue>({ preset: 'all', start: null, end: null });
   const [tagFilter, setTagFilter] = useState<string[]>([]);
   /** 左侧目录可收起：目录固定 248px，榜单列多时让它给表格让宽度（会话内记忆即可） */
@@ -283,7 +288,7 @@ const FactorResearchPage: React.FC = () => {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    getLeaderboard(rangeParams, lbN, dataset)
+    getLeaderboard(rangeParams, lbN, dataset, lbDedup ? LEADERBOARD_DEDUP_RHO : 0)
       .then((lb) => {
         if (!alive) return;
         setRows(lb.leaderboard);
@@ -308,7 +313,7 @@ const FactorResearchPage: React.FC = () => {
     return () => {
       alive = false;
     };
-  }, [rangeParams, lbN, dataset, reloadKey]);
+  }, [rangeParams, lbN, dataset, lbDedup, reloadKey]);
 
   useEffect(() => {
     if (!activeCode && rows.length) setActiveCode(rows[0].code);
@@ -595,6 +600,8 @@ const FactorResearchPage: React.FC = () => {
                 onSendCompose={() => setTab('compose')}
                 onOpenSingle={openSingle}
                 meta={meta}
+                dedup={lbDedup}
+                onToggleDedup={() => setLbDedup((v) => !v)}
                 onRegisterToTraining={canRegister ? () => setRegisterTarget({ codes: selected, dataset }) : undefined}
               />
             ) : tab === 'single' ? (

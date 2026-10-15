@@ -27,6 +27,7 @@ import pandas as pd
 
 from backend.services.engine.factor_research import (
     analysis,
+    dedup as dedup_lib,
     discovery,
     scorecard,
     store,
@@ -305,8 +306,14 @@ def leaderboard(
     end: str | None = None,
     n: int = 30,
     dataset: str = "classic",
+    dedup: float = 0.0,
 ) -> dict:
-    """排行榜。n=业绩 KPI 的持仓数（默认 30；标签恒按 top-30 基准自动判定）。"""
+    """排行榜。n=业绩 KPI 的持仓数（默认 30；标签恒按 top-30 基准自动判定）。
+
+    dedup > 0：同源去重（|ρ| ≥ dedup 的因子只保留榜单更靠前者，口径同筛选页），
+    剔除后重新编号 rank 1..N（composite 原值不动）；相关矩阵缺失抛
+    ``store.DedupMatrixMissing``（路由译 409）。
+    """
     ctx = _range_ctx_full(start, end, dataset)  # 用到 series30/env_tags/time_tags
     p, ic = ctx["panel"], ctx["ic"]
     fmeta = _meta_map(dataset)
@@ -359,13 +366,45 @@ def leaderboard(
         ["insufficient", "suspicious", "composite", "code"],
         ascending=[True, True, False, True],
     ).reset_index(drop=True)
+    dedup_info: dict[str, object] = {"applied": False}
+    if dedup and float(dedup) > 0:
+        threshold = float(dedup)
+        bundle = store.dedup_corr(dataset)
+        if bundle is None:
+            raise store.DedupMatrixMissing(
+                f"去重相关矩阵缺失（dataset={dataset}）：private 请先运行 "
+                "backend/scripts/build_factor_panel_corr.py；"
+                "classic 请重建经典快照（build_factor_research.py）"
+            )
+        names, matrix = bundle
+        codes_all = df["code"].tolist()
+        # 榜单序贪心：先见者（榜单更靠前）优先保留——与筛选页同一种「留代表」，
+        # 判据各自随页（筛选页按强度序，这里按 composite 榜单序）
+        kept, dropped, _dup_of = dedup_lib.greedy_dedup(
+            codes_all, names, matrix, threshold
+        )
+        keep_set = set(kept)
+        df = df[df["code"].isin(keep_set)].reset_index(drop=True)
+        dedup_info = {
+            "applied": True,
+            "threshold": threshold,
+            "n_before": len(codes_all),
+            "dropped": len(dropped),
+            "covered": len(set(codes_all) & set(names)),
+        }
     df["rank"] = np.arange(1, len(df) + 1)
     out = store._sanitize(df.to_dict("records"))
     m = store.factors_meta() if dataset == "private" else store.metrics()
     meta_out = (m or {}).get("meta", {})
     return {
         "leaderboard": out,
-        "meta": {**meta_out, "range": _range_meta(ctx), "top_n": n, "dataset": dataset},
+        "meta": {
+            **meta_out,
+            "range": _range_meta(ctx),
+            "top_n": n,
+            "dataset": dataset,
+            "dedup": dedup_info,
+        },
     }
 
 

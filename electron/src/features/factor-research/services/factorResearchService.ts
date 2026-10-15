@@ -62,13 +62,14 @@ export function getCatalog(dataset: FactorDataset = 'classic'): Promise<CatalogR
   return requestJson<CatalogResponse>(`/catalog?dataset=${dataset}`);
 }
 
-/** 排行榜（区间内重算 KPI/超额/IC + 持仓画像 + 标签 + 综合分；n=持仓数） */
-export function getLeaderboard(range?: RangeParams, n = 30, dataset: FactorDataset = 'classic'): Promise<LeaderboardResponse> {
+/** 排行榜（区间内重算 KPI/超额/IC + 持仓画像 + 标签 + 综合分；n=持仓数；dedup>0 = 去重，口径同筛选页） */
+export function getLeaderboard(range?: RangeParams, n = 30, dataset: FactorDataset = 'classic', dedup = 0): Promise<LeaderboardResponse> {
   const qs = new URLSearchParams();
   if (range?.start) qs.set('start', range.start);
   if (range?.end) qs.set('end', range.end);
   if (n && n !== 30) qs.set('n', String(n));
   qs.set('dataset', dataset);
+  if (dedup > 0) qs.set('dedup', String(dedup));
   return requestJson<LeaderboardResponse>(`/leaderboard?${qs.toString()}`, {}, 120000);
 }
 

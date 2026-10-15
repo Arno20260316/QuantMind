@@ -96,9 +96,22 @@ export interface LeaderboardRow extends FactorKpi {
   suspicious?: boolean;
 }
 
+/** 排行榜去重元信息（每次响应都下发；applied=false 表示本次未开启去重） */
+export interface LeaderboardDedupMeta {
+  applied: boolean;
+  /** 剔除阈值（|ρ| ≥ threshold 视为同源重复） */
+  threshold?: number;
+  /** 去重前榜上行数 */
+  n_before?: number;
+  /** 本次剔除（同源重复）行数 */
+  dropped?: number;
+  /** 相关矩阵覆盖的因子数（未覆盖者不参与去重、必保留） */
+  covered?: number;
+}
+
 export interface LeaderboardResponse {
   leaderboard: LeaderboardRow[];
-  meta: Record<string, unknown> & { range?: RangeMeta };
+  meta: Record<string, unknown> & { range?: RangeMeta; dedup?: LeaderboardDedupMeta };
 }
 
 /** 左侧目录选中的分类限定（l2 为 null = 整个大类）；null = 全部因子 */

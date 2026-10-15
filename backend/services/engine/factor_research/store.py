@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 
 TTL_SECONDS = 600  # 快照读取缓存（构建脚本重跑后 10 分钟内自动失效）
@@ -39,6 +40,14 @@ class SnapshotMissing(FileNotFoundError):
     文案里的「缺失」二字判（`_snapshot_guard`），而**数据目录缺失**（6_ml_datasets
     未挂载/未生成）的报错也含这两个字，会被一并翻译成「请点快照-一键计算」——
     用户点了也只是白等一次几分钟的重建，真正的原因（数据没挂上）一个字都没提。
+    """
+
+
+class DedupMatrixMissing(RuntimeError):
+    """去重相关矩阵缺失（private 未跑 build_factor_panel_corr.py / classic 无 corr.parquet）。
+
+    与 ``SnapshotMissing`` 分开的原因同前：这不是「点快照-一键计算」能修的，
+    路由据此给**各自**的重建指引（409），不把用户指向错误的按钮。
     """
 
 
@@ -151,6 +160,32 @@ def ic_table(dataset: str = "classic") -> pd.DataFrame | None:
 
 def corr_table() -> pd.DataFrame | None:
     return load_parquet("corr.parquet")
+
+
+def dedup_corr(dataset: str = "classic") -> tuple[list[str], np.ndarray] | None:
+    """去重相关矩阵 ``(names, 方阵)``；产物缺失返回 None（调用方抛 DedupMatrixMissing）。
+
+    classic：``corr.parquet`` 长表（build_factor_research 生成；覆盖 73/82 名字，
+    未覆盖者去重时按覆盖回退必保留）；
+    private：``cross_corr.npz``（``backend/scripts/build_factor_panel_corr.py``
+    生成，全量因子；面板重建后须重跑该脚本）。
+    """
+    from backend.services.engine.factor_research import dedup as dedup_lib
+
+    if dataset == "classic":
+        df = corr_table()
+        if df is None or len(df) == 0:
+            return None
+        return dedup_lib.matrix_from_pairs(df)
+    p = artifact_dir(dataset) / "cross_corr.npz"
+
+    def _rd():
+        if not p.exists():
+            return None
+        with np.load(p, allow_pickle=False) as z:
+            return [str(s) for s in z["names"]], np.asarray(z["matrix"])
+
+    return _cached_obj(_file_key(p, "npz"), _rd)
 
 
 def benchmark_table(dataset: str = "classic") -> pd.DataFrame | None:

@@ -15,7 +15,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.services.engine.factor_research import service
-from backend.services.engine.factor_research.store import FactorDataset, SnapshotMissing
+from backend.services.engine.factor_research.store import (
+    DedupMatrixMissing,
+    FactorDataset,
+    SnapshotMissing,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/factor-research", tags=["Factor Research"])
@@ -42,6 +46,9 @@ async def _run(fn, *args):
     except FileNotFoundError as e:
         _snapshot_guard(e)
         raise  # pragma: no cover - _snapshot_guard 必然抛出
+    except DedupMatrixMissing as e:
+        # 409 + 可操作文案：这是离线矩阵没建（与快照无关，不是「一键计算」能修的）
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
 
 @router.get("/catalog")
@@ -56,12 +63,15 @@ async def get_leaderboard(
     end: str | None = None,
     n: int = 30,
     dataset: FactorDataset = "classic",
+    dedup: float = 0.0,
 ):
     """排行榜：区间内重算 KPI/超额/RankIC + 持仓画像 + 双标签 + 综合分。
 
     n = 业绩 KPI 的持仓数（默认 30）；标签恒按 top-30 判定；全列返回，前端排序。
+    dedup > 0：同源去重（|ρ| ≥ dedup 只留榜单更靠前者，口径同筛选页）+ rank 重编号；
+    相关矩阵缺失 → 409（先去运行 build_factor_panel_corr.py）。
     """
-    return await _run(service.leaderboard, start, end, n, dataset)
+    return await _run(service.leaderboard, start, end, n, dataset, dedup)
 
 
 @router.get("/factor/{code}")

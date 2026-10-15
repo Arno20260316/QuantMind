@@ -59,6 +59,8 @@ function renderTab(
       onOpenSingle={vi.fn()}
       meta={{}}
       dataset="private"
+      dedup={false}
+      onToggleDedup={vi.fn()}
       {...over}
     />,
   );

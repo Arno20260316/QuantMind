@@ -13,8 +13,8 @@
  * 全库截面口径，分类只是过滤视图）；顶部徽章可一键清除。
  */
 import React, { useMemo, useState } from 'react';
-import { ArrowRightLeft, CheckSquare, Filter, Layers, Loader2, PackagePlus, Search, Square, Star, X } from 'lucide-react';
-import type { CategoryFilter, LeaderboardRow } from '../types/factorResearch';
+import { ArrowRightLeft, CheckSquare, Combine, Filter, Layers, Loader2, PackagePlus, Search, Square, Star, X } from 'lucide-react';
+import type { CategoryFilter, LeaderboardDedupMeta, LeaderboardRow } from '../types/factorResearch';
 import { Card, ENV_TAGS, TIME_TAGS, TagChip, fmtNum, fmtPct } from './common';
 import {
   COL_FILTERS,
@@ -48,6 +48,9 @@ interface Props {
   onSendCompose: () => void;
   onOpenSingle: (code: string) => void;
   meta: Record<string, unknown>;
+  /** 去重开关（口径同筛选页：|ρ| ≥ 0.9 的同源因子只留榜单更靠前者）；页面持有状态与取数 */
+  dedup: boolean;
+  onToggleDedup: () => void;
   /** 仅管理员可见：把勾选因子写进训练因子目录草稿。非管理员不传（不渲染）。 */
   onRegisterToTraining?: () => void;
 }
@@ -107,8 +110,11 @@ const TagToggle: React.FC<{ tag: string; count: number; on: boolean; onClick: ()
 export const LeaderboardTab: React.FC<Props> = ({
   rows, loading, error, selected, tagFilter, n, onNChange, onToggle, onToggleTag,
   categoryFilter, onClearCategoryFilter, onClearTagFilter, dataset,
-  onSendCompare, onSendCompose, onOpenSingle, meta, onRegisterToTraining,
+  onSendCompare, onSendCompose, onOpenSingle, meta, dedup, onToggleDedup,
+  onRegisterToTraining,
 }) => {
+  const dedupMeta = meta.dedup as LeaderboardDedupMeta | undefined;
+  const dedupDropped = dedupMeta?.applied ? dedupMeta.dropped : undefined;
   const [sortKey, setSortKey] = useState<string>('composite');
   const [asc, setAsc] = useState(false);
   const [filters, setFilters] = useState<LeaderboardFilters>(EMPTY_LEADERBOARD_FILTERS);
@@ -343,6 +349,25 @@ export const LeaderboardTab: React.FC<Props> = ({
           <Star className="w-2.5 h-2.5" fill={favsOnly ? 'currentColor' : 'none'} />
           自选 {favs.length}
         </button>
+        <button
+          data-testid="lb-dedup"
+          onClick={onToggleDedup}
+          aria-pressed={dedup}
+          title={
+            dedup
+              ? `取消去重：恢复全量榜单（当前已剔除同源重复因子并重新排名${dedupDropped != null ? `，剔除 ${dedupDropped} 个` : ''}）`
+              : '去重（与筛选页同口径）：|ρ| ≥ 0.9 的同源因子只保留榜单更靠前的一个，剔除后重新排名'
+          }
+          className={`flex items-center gap-0.5 rounded-full border px-2 py-0.5 text-[10px] font-bold transition-colors ${
+            dedup
+              ? 'border-sky-300 bg-sky-50 text-sky-600'
+              : 'border-slate-200 text-slate-500 hover:border-sky-200 hover:text-sky-500'
+          }`}
+        >
+          <Combine className="w-2.5 h-2.5" />
+          去重 |ρ|≥0.9
+          {dedup && dedupDropped != null && ` · 剔除 ${dedupDropped}`}
+        </button>
         {categoryFilter && (
           <button
             onClick={onClearCategoryFilter}
@@ -409,6 +434,8 @@ export const LeaderboardTab: React.FC<Props> = ({
             <b>标签</b>：点一个只看它；同组多选取并集（环境内 / 时效内），两组同时选取得交集。
             点行内标签、市值风格芯片同样能直接筛。
             <b>自选</b>：行首 ★ 收藏（按数据集记住），「自选 N」一键只看收藏。
+            <b>去重</b>：一键剔同源（|ρ| ≥ 0.9，逐月截面 Spearman 均值口径，与筛选页一致）——
+            成对的重复因子只留榜单更靠前的一个，其余不再显示、名次重新连续编号（综合分不重算）。
             <b>排序</b>：点列头文字（如「最大回撤」看最抗跌、「年化」看最赚钱）。
             点左侧目录的分类名（L1/L2）= 只看该类，再点一次或点「分类」徽章取消；
             勾选因子后一键带入对比 / 合成

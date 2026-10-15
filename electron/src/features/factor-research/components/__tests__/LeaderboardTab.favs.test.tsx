@@ -63,6 +63,8 @@ function renderTab(over: Partial<React.ComponentProps<typeof LeaderboardTab>> = 
       onOpenSingle={vi.fn()}
       meta={{}}
       dataset="private"
+      dedup={false}
+      onToggleDedup={vi.fn()}
       {...over}
     />,
   );

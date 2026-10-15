@@ -56,6 +56,13 @@ class StrategyConfig:
     # 首日（day_index=0）必调仓建仓；1 = 每个交易日都调仓。
     rebalance_days: int = 1
 
+    # ── 基本面 / ST 过滤（模拟盘托管链路；回放路径不读这些字段，不受影响）──
+    # f_ 约束（去前缀，如 {"pe_ttm_max": 80}），由 FundamentalAligner 按交易日
+    # features_daily 快照执行；与回测 recording_strategy、实盘 manual_execution 同口径。
+    fundamental_constraints: dict[str, Any] = field(default_factory=dict)
+    # 是否剔除 ST 标的（仅 CN；ST 名单来自本地 instrument_detail 快照）。
+    exclude_st: bool = True
+
 
 @dataclass
 class Quote:

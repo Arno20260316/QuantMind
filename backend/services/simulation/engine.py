@@ -73,8 +73,21 @@ _STRATEGY_KWARG_KEYS = (
 )
 
 
+def _to_bool(value: Any, default: bool) -> bool:
+    """宽松布尔解析（前端可能传 "true"/1/True）。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _extract_strategy_config_kwargs(code_str: str) -> dict[str, Any]:
-    """从策略代码 STRATEGY_CONFIG.kwargs 提取选股参数（topk/n_drop 等）。"""
+    """从策略代码 STRATEGY_CONFIG.kwargs 提取选股参数（topk/n_drop 等）。
+
+    除白名单键外，``f_`` 前缀的基本面约束与 ``exclude_st`` 开关一并透出，
+    由下游 FundamentalAligner / ST 名单执行（与实盘 manual_execution 同口径）。
+    """
     import ast
 
     if not code_str or not str(code_str).strip():
@@ -100,7 +113,13 @@ def _extract_strategy_config_kwargs(code_str: str) -> dict[str, Any]:
         for key in _STRATEGY_KWARG_KEYS:
             if key in cfg and key not in merged:
                 merged[key] = cfg[key]
-        return {k: merged[k] for k in _STRATEGY_KWARG_KEYS if k in merged}
+        return {
+            key: merged[key]
+            for key in merged
+            if key in _STRATEGY_KWARG_KEYS
+            or key == "exclude_st"
+            or (isinstance(key, str) and key.startswith("f_"))
+        }
     return {}
 
 
@@ -120,6 +139,9 @@ class ExecutionReport:
     orders: list[dict[str, Any]] = field(default_factory=list)
     account_snapshot: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # 选股宇宙过滤审计（与实盘 manual_execution 的 raw/fundamental 计数对齐）
+    st_filtered_count: int = 0
+    fundamental_filtered_count: int = 0
 
 
 async def count_sim_orders_today(db: AsyncSession, tenant: str, uid_int: int) -> int:
@@ -464,7 +486,15 @@ class SimulationEngine:
                     )
                     return report
 
-                # 5. 调仓计算
+                # 5. 调仓计算（先过 ST + 基本面宇宙过滤，持仓 ST 经调仓差分自然卖出）
+                signals, st_dropped, fundamental_dropped = (
+                    await self._apply_universe_filters(
+                        signals, strategy_config, market=market
+                    )
+                )
+                report.signal_count = len(signals)
+                report.st_filtered_count = st_dropped
+                report.fundamental_filtered_count = fundamental_dropped
                 orders = self.rebalance_calculator.calculate(
                     signals=signals,
                     strategy=strategy_config,
@@ -623,6 +653,86 @@ class SimulationEngine:
             report.error = str(e)
             return report
 
+    async def _apply_universe_filters(
+        self,
+        signals: list[Any],
+        strategy: StrategyConfig,
+        market: Any = None,
+    ) -> tuple[list[Any], int, int]:
+        """选股宇宙过滤（模拟盘托管链路唯一入口）。
+
+        顺序：ST 剔除 → f_ 基本面约束（FundamentalAligner，按当日 features_daily
+        快照，250 天回看；与回测 recording_strategy、实盘 manual_execution 同口径）。
+        持仓中的 ST/不达标标的会被自然移出目标集，经调仓差分卖出。
+        数据缺失时两路均为 fail-open（不过滤），绝不清空组合。
+        返回 (过滤后信号, st 剔除数, 基本面剔除数)。
+        """
+        st_dropped = 0
+        fundamental_dropped = 0
+        if not signals:
+            return signals, 0, 0
+        constraints = dict(getattr(strategy, "fundamental_constraints", None) or {})
+        exclude_st = bool(getattr(strategy, "exclude_st", True))
+        if not constraints and not exclude_st:
+            return signals, 0, 0
+        market_value = str(getattr(market, "value", market) or "CN")
+
+        if exclude_st and market_value == "CN":
+            try:
+                from backend.services.simulation.services.local_market_data import (
+                    get_local_market_data,
+                )
+
+                market_data = get_local_market_data(market)
+                st_set = await asyncio.to_thread(market_data.st_symbols)
+            except Exception as exc:
+                logger.warning("SimulationEngine: ST 名单读取失败，本轮跳过 ST 过滤: %s", exc)
+                st_set = frozenset()
+            if st_set:
+                norm_st = {StockCodeUtil.normalize(str(s)) for s in st_set}
+                norm_st.discard("")
+                kept = [
+                    s
+                    for s in signals
+                    if StockCodeUtil.normalize(str(getattr(s, "symbol", ""))) not in norm_st
+                ]
+                st_dropped = len(signals) - len(kept)
+                if st_dropped:
+                    logger.info(
+                        "SimulationEngine: ST 过滤 %d → %d", len(signals), len(kept)
+                    )
+                signals = kept
+
+        if constraints and signals:
+            try:
+                from backend.shared.fundamental_aligner import fundamental_aligner
+
+                kept_symbols = await asyncio.to_thread(
+                    fundamental_aligner.filter_instruments,
+                    datetime.now().date(),
+                    [str(getattr(s, "symbol", "")) for s in signals],
+                    constraints,
+                )
+                norm_kept = {StockCodeUtil.normalize(str(s)) for s in kept_symbols}
+                kept = [
+                    s
+                    for s in signals
+                    if StockCodeUtil.normalize(str(getattr(s, "symbol", ""))) in norm_kept
+                ]
+                fundamental_dropped = len(signals) - len(kept)
+                if fundamental_dropped:
+                    logger.info(
+                        "SimulationEngine: 基本面过滤 %d → %d 约束=%s",
+                        len(signals),
+                        len(kept),
+                        sorted(constraints),
+                    )
+                signals = kept
+            except Exception as exc:
+                logger.warning("SimulationEngine: 基本面过滤失败，本轮跳过: %s", exc)
+
+        return signals, st_dropped, fundamental_dropped
+
     async def _load_strategy_config(
         self,
         db: AsyncSession,
@@ -667,6 +777,13 @@ class SimulationEngine:
                 for key in _STRATEGY_KWARG_KEYS:
                     if key not in params and key in code_kwargs:
                         params[key] = code_kwargs[key]
+                # f_ 基本面约束与 exclude_st 开关同样透出（parameters 显式值优先）
+                for key, value in code_kwargs.items():
+                    if key not in params and (
+                        key == "exclude_st"
+                        or (isinstance(key, str) and key.startswith("f_"))
+                    ):
+                        params[key] = value
                 try:
                     _weight_mode = WeightMode(params.get("weight_mode", "equal"))
                 except ValueError:
@@ -696,6 +813,17 @@ class SimulationEngine:
                     force_exit_on_limit_down=bool(
                         params.get("force_exit_on_limit_down", True)
                     ),
+                    # f_ 基本面约束（去前缀）+ ST 开关：调仓前由
+                    # _apply_universe_filters 经 FundamentalAligner / ST 名单执行。
+                    # 优先级 params_override > parameters > 代码 kwargs（沿用上文）。
+                    fundamental_constraints={
+                        key[2:]: value
+                        for key, value in params.items()
+                        if isinstance(key, str)
+                        and key.startswith("f_")
+                        and value is not None
+                    },
+                    exclude_st=_to_bool(params.get("exclude_st", True), True),
                 )
         except Exception as e:
             logger.warning("SimulationEngine: 加载策略配置失败 %s, 使用默认配置", e)
@@ -726,6 +854,12 @@ class SimulationEngine:
             ):
                 if params_override.get(flag) is not None:
                     setattr(config, flag, bool(params_override[flag]))
+            # f_ 基本面约束与 exclude_st 同样接受前端覆盖（最高优先级）
+            for key, value in params_override.items():
+                if isinstance(key, str) and key.startswith("f_") and value is not None:
+                    config.fundamental_constraints[key[2:]] = value
+            if params_override.get("exclude_st") is not None:
+                config.exclude_st = _to_bool(params_override["exclude_st"], True)
             logger.info(
                 "SimulationEngine: 应用参数覆盖, topk=%d n_drop=%d weight_mode=%s",
                 config.topk,

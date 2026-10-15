@@ -171,3 +171,34 @@ describe('FactorRankList：选中项被筛选挡住', () => {
     expect(screen.queryByTestId('frl-selected-hidden')).toBeNull();
   });
 });
+
+describe('FactorRankList：IC 缺失（null，全退化因子）', () => {
+  // 2026-10-15 factor1300 事故：全退化因子（整列 NaN）后端给 null，
+  // 前端必须渲染「—」而不是崩（旧代码直接 .toFixed(3) 会 TypeError）。
+  test('null IC 渲染「—」徽章且不抛错，排序沉底', () => {
+    renderList({
+      factors: [
+        f({ name: 'good', display_name: '正常因子', ic_mean: 0.05, ls_mean: 0.02 }),
+        f({ name: 'degen', display_name: '退化因子', ic_mean: null, ls_mean: null }),
+      ],
+    });
+
+    const row = screen.getByTestId('frl-item-degen');
+    expect(row.textContent).toContain('—');
+    expect(row.querySelector('[title="IC —"]')).toBeTruthy();
+    expect(order()).toEqual(['good', 'degen']); // 空值沉底，升降序都不翻
+  });
+
+  test('切到 IC（带方向）排序：null 仍沉底，不参与数值比较', () => {
+    renderList({
+      factors: [
+        f({ name: 'degen', ic_mean: null, ls_mean: null }),
+        f({ name: 'pos', ic_mean: 0.03, ls_mean: 0.01 }),
+        f({ name: 'neg', ic_mean: -0.07, ls_mean: -0.02 }),
+      ],
+    });
+
+    fireEvent.change(screen.getByTestId('frl-sort'), { target: { value: 'ic' } });
+    expect(order()).toEqual(['pos', 'neg', 'degen']);
+  });
+});

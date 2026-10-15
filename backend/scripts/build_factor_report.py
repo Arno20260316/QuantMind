@@ -80,6 +80,7 @@ from backend.shared.quantdb_paths import resolve_quantdb_subdir  # noqa: E402
 from backend.services.engine.factor_report.service import (  # noqa: E402
     DEFAULT_LONG_GROUP as DEF_LONG,
     DEFAULT_SHORT_GROUP as DEF_SHORT,
+    _json_safe,
 )
 
 N_QUANTILES = 10
@@ -1153,12 +1154,15 @@ def main() -> int:
                               for h, v in by_h.items()},
             "display_name": display_name,
             "category_name": category_name,
-            "ic_mean": round(float(merged["ic_mean"][j]), 5),
+            # 全退化因子（整列 NaN）的 nanmean 是 NaN —— 与 ic_by_horizon 同款守卫，
+            # 非有限一律 None（写进 JSON 的 NaN token 会让读侧整个端点 500）
+            "ic_mean": (None if not np.isfinite(merged["ic_mean"][j])
+                        else round(float(merged["ic_mean"][j]), 5)),
             "icir": round(float(merged["icir"][j]), 4),
             "t_value": round(float(merged["t_value"][j]), 2),
             "win_rate": round(float(merged["win_rate"][j]), 4),
             "quantiles": [round(float(v), 5) for v in q_mean[:, j]],
-            "ls_mean": round(float(ls[j]), 5),
+            "ls_mean": None if not np.isfinite(ls[j]) else round(float(ls[j]), 5),
             "monotonicity": None if not np.isfinite(mono[j]) else round(float(mono[j]), 3),
             "turnover": round(float(merged["turnover"][j]), 4),
             # 7 指标环的全库分位基准（默认分组口径，见上方计算处注释）
@@ -1220,8 +1224,13 @@ def main() -> int:
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # 写侧净化：快照里绝不出现 NaN/±Inf。py json.dump 默认把 NaN 写成裸 token，
+    # starlette 读侧 allow_nan=False 直接 500（2026-10-15 factor1300 实测），
+    # 净化函数与读侧 load_snapshot 共用一份实现（service._json_safe）。
+    payload = _json_safe(payload)
     with open(out, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
+        # allow_nan=False 兜底：净化漏网时构建当场失败（显式），而不是写出毒快照（静默）
+        json.dump(payload, f, ensure_ascii=False, allow_nan=False)
     log.info(f"快照已写出：{out}（{out.stat().st_size / 1e6:.1f} MB，用时 {time.time() - t0:.0f}s）")
 
     # 逐块报「有多少因子真的出数」—— 空块不能以「构建成功」的姿态过关（零项即失败）
@@ -1236,9 +1245,13 @@ def main() -> int:
         if n_ok == 0:
             log.warning(f"截面附加块 {key} 全为 NaN —— 检查取数是否降级（不是「该因子无效」）")
 
-    top = sorted(items, key=lambda x: abs(x["ic_mean"]), reverse=True)[:5]
+    top = sorted(
+        items, key=lambda x: abs(x["ic_mean"]) if x["ic_mean"] is not None else -1.0, reverse=True
+    )[:5]
     for it in top:
-        log.info(f"  {it['name']:>12} IC={it['ic_mean']:+.4f} ICIR={it['icir']:+.3f} LS={it['ls_mean']:+.4f} 换手={it['turnover']:.2f}")
+        ic_v = f"{it['ic_mean']:+.4f}" if it["ic_mean"] is not None else "   n/a"
+        ls_v = f"{it['ls_mean']:+.4f}" if it["ls_mean"] is not None else "   n/a"
+        log.info(f"  {it['name']:>12} IC={ic_v} ICIR={it['icir']:+.3f} LS={ls_v} 换手={it['turnover']:.2f}")
     return 0
 
 

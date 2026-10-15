@@ -53,6 +53,38 @@ DEFAULT_LONG_GROUP = 3
 DEFAULT_SHORT_GROUP = 9
 DEFAULT_COST_BPS = 20.0
 
+# 快照进程内缓存：路径 → (mtime_ns, size, 已净化的对象)。
+# quantdb 库快照最大 10MB+（1125×1125 相关矩阵），每次请求重新解析 + 递归净化
+# 的代价不可忽略；构建脚本重写文件（mtime/size 变化）即自动失效。
+_SNAPSHOT_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
+
+
+def _json_safe(obj: Any) -> Any:
+    """递归把非有限 float（NaN/±Inf）换成 None —— 快照出 JSON 的合法边界。
+
+    starlette 的 JSONResponse 用 ``allow_nan=False``：快照里一个 NaN token
+    就让**整个端点** 500（2026-10-15 factor1300 两个全 NaN 因子的
+    ic_mean/ls_mean 实测：/summary 500，页面回退展示旧数据集数据）。
+    写侧（build_factor_report.py 落盘前）与读侧（load_snapshot）共用本函数；
+    None 的语义 = 缺失（前端显示「—」），绝不折算成 0。
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _finite_or_none(v: Any) -> float | None:
+    """单值出 JSON：非数值或非有限 → None（detail 序列的逐点净化）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
 
 def normalize_dataset(dataset: str | None) -> str:
     key = str(dataset or "").strip()
@@ -69,13 +101,23 @@ def series_path(dataset: str = DEFAULT_DATASET) -> Path:
 
 
 def load_snapshot(dataset: str = DEFAULT_DATASET) -> dict[str, Any] | None:
-    """读取快照；不存在返回 None（页面据此提示「尚未生成」）。"""
+    """读取快照；不存在返回 None（页面据此提示「尚未生成」）。
+
+    返回对象已按 ``_json_safe`` 净化（非有限 float → None，含存量毒快照），
+    并按文件 mtime/size 进程内缓存 —— 构建脚本重写文件即自动失效。
+    """
     path = snapshot_path(dataset)
     if not path.exists():
         return None
     try:
+        st = path.stat()
+        cached = _SNAPSHOT_CACHE.get(str(path))
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            snap = _json_safe(json.load(f))
+        _SNAPSHOT_CACHE[str(path)] = (st.st_mtime_ns, st.st_size, snap)
+        return snap
     except Exception as e:  # noqa: BLE001
         log.warning(f"因子报告快照解析失败({dataset}): {e}")
         return None
@@ -204,7 +246,7 @@ def _detail_from_series(
         "schema_version": meta.get("schema_version"),
         "blocks": blocks,
         "dates": dates,
-        "quantile_mean": [float(v) for v in np.nanmean(q_mat, axis=0)],
+        "quantile_mean": [_finite_or_none(v) for v in np.nanmean(q_mat, axis=0)],
         "quantile_curves": [[float(v) for v in curves[:, j]] for j in range(N_QUANTILES)],
         "ls_curve": [float(v) for v in curves[:, -1] / np.maximum(curves[:, 0], 1e-9)],
         "ic_series": [None if not np.isfinite(v) else float(v) for v in ic_arr],
@@ -212,7 +254,7 @@ def _detail_from_series(
         "ic_mean": float(np.nanmean(ic_arr)) if np.isfinite(ic_arr).any() else None,
         "ic_std": float(np.nanstd(ic_arr)) if np.isfinite(ic_arr).any() else None,
         "turnover_dates": dates,
-        "turnover_series": [float(v) for v in turnover],
+        "turnover_series": [_finite_or_none(v) for v in turnover],
         "turnover_mean": float(np.nanmean(turnover)) if np.isfinite(turnover).any() else None,
         "coverage_mean": float(df["coverage"].mean()),
         "n_dates": len(dates),
@@ -397,7 +439,7 @@ def compute_detail(
         "empty": False,
         "source": "partition_scan",
         "dates": dates,
-        "quantile_mean": [float(v) for v in np.nanmean(q_mat, axis=0)],
+        "quantile_mean": [_finite_or_none(v) for v in np.nanmean(q_mat, axis=0)],
         "quantile_curves": [[float(v) for v in curves[:, j]] for j in range(N_QUANTILES)],
         "ls_curve": [float(v) for v in curves[:, -1] / np.maximum(curves[:, 0], 1e-9)],
         "ic_series": [None if not np.isfinite(v) else float(v) for v in ic_arr],
@@ -429,7 +471,7 @@ def correlation_slice(dataset: str, names: list[str]) -> dict[str, Any]:
     picked = [n for n in names if n in idx]
     if not picked:
         return {"available": True, "dataset": ds, "factors": [], "matrix": []}
-    rows = [[float(matrix[idx[a]][idx[b]]) for b in picked] for a in picked]
+    rows = [[_finite_or_none(matrix[idx[a]][idx[b]]) for b in picked] for a in picked]
     return {"available": True, "dataset": ds, "factors": picked, "matrix": rows}
 
 

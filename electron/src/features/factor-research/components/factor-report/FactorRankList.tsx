@@ -34,8 +34,9 @@ const LIBRARY_LABELS: Record<string, string> = {
   gtja191: 'GTJA191',
 };
 
-/** IC 强弱的色阶（红=正向预测力，绿=反向 —— 与站内涨跌色一致） */
-function icColor(v: number): string {
+/** IC 强弱的色阶（红=正向预测力，绿=反向 —— 与站内涨跌色一致）；缺失给中性灰 */
+function icColor(v: number | null): string {
+  if (v === null || !Number.isFinite(v)) return 'rgba(148, 163, 184, 0.9)';
   const a = Math.min(Math.abs(v) / 0.08, 1);
   return v >= 0
     ? `rgba(225, 29, 72, ${0.12 + a * 0.75})`
@@ -64,6 +65,12 @@ const MAX_TURNOVER_OPTS = ['', '20', '30', '50', '80'];
 const favKey = (ds: string): string => `qm:factor-report:favs:${ds}`;
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/** IC 徽章文本：缺失（null）显示「—」，绝不折算成 0（后端 None = 缺失契约） */
+const fmtIcBadge = (v: number | null | undefined): string => {
+  const n = num(v);
+  return n === null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(3)}`;
+};
 
 function valueOf(f: FactorSummary, key: SortKey): number | string | null {
   switch (key) {
@@ -325,9 +332,9 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
                   <span
                     className="shrink-0 rounded px-1.5 py-[1px] text-[10px] font-mono font-bold text-white"
                     style={{ backgroundColor: icColor(f.ic_mean) }}
-                    title={`IC ${f.ic_mean}`}
+                    title={`IC ${fmtIcBadge(f.ic_mean)}`}
                   >
-                    {f.ic_mean >= 0 ? '+' : ''}{f.ic_mean.toFixed(3)}
+                    {fmtIcBadge(f.ic_mean)}
                   </span>
                 </div>
                 <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-400 font-mono">

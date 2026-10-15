@@ -8,14 +8,15 @@ export interface FactorSummary {
   display_name?: string | null;
   /** 中文分类（如「动量」「换手与流动性」「信息不对称与毒性」） */
   category_name?: string | null;
-  ic_mean: number;
+  /** 主前瞻期的截面 IC 均值；全退化因子（整列 NaN）后端给 null = 缺失，显示「—」 */
+  ic_mean: number | null;
   icir: number;
   t_value: number;
   win_rate: number;
   /** 10 个分位的平均前瞻收益（升序：Q1 = 因子值最小） */
   quantiles: number[];
-  /** 多空价差（Q10 − Q1） */
-  ls_mean: number;
+  /** 多空价差（Q10 − Q1）；全退化因子后端给 null = 缺失 */
+  ls_mean: number | null;
   /** 分位收益单调性（分位序号与收益的秩相关，±1 表示完美单调） */
   monotonicity: number | null;
   /**

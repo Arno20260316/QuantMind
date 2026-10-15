@@ -188,6 +188,18 @@ def _normalise_daily(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = df.rename(columns=_COL_MAP)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["time"])
+    # 丢弃未来日期行：新浪国际期货历史接口对个别品种会夹带一条未来日期的
+    # 占位行（实测 CT@2026-10-30：OHLC 全相同、volume=0），不拦会在
+    # _write_kline_partition 凭空造出 dt=<未来日> 幽灵分区且每次同步重生。
+    today = pd.Timestamp.now().normalize()
+    future = df["time"] > today
+    if future.any():
+        log.warning(
+            "丢弃未来日期行 %s: %s",
+            symbol,
+            sorted(str(d) for d in df.loc[future, "time"].dt.date.unique()),
+        )
+        df = df.loc[~future]
     df["symbol"] = symbol
     for c in ("open", "high", "low", "close"):
         if c not in df.columns:

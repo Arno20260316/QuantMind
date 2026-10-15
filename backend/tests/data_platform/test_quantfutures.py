@@ -149,6 +149,26 @@ def test_normalise_daily_drops_missing_close():
     assert df.empty
 
 
+def test_normalise_daily_drops_future_dated_placeholder_row():
+    # 新浪国际期货历史接口对个别品种（实测 CT，2026-10-15 实锤）夹带一条
+    # 未来日期的占位行（OHLC 全相同、volume=0），不拦会在 _write_kline_partition
+    # 凭空造出 dt=<未来日> 分区，且每次同步重生（幽灵分区根因）。
+    today = pd.Timestamp.now().normalize()
+    raw = pd.DataFrame(
+        [
+            {"date": today - pd.Timedelta(days=2), "open": 80.0, "high": 81.0,
+             "low": 79.0, "close": 80.5, "volume": 100},
+            {"date": today, "open": 80.5, "high": 81.0,
+             "low": 79.5, "close": 80.0, "volume": 50},
+            {"date": today + pd.Timedelta(days=15), "open": 78.75, "high": 78.75,
+             "low": 78.75, "close": 78.75, "volume": 0},
+        ]
+    )
+    df = _normalise_daily(raw, symbol="CT.FUT")
+    assert len(df) == 2  # 未来行被丢，历史与今日行保留
+    assert df["time"].max() <= today
+
+
 def test_write_kline_partition_incremental_dedup(tmp_path):
     root = tmp_path / "1_kline_data" / "daily_forward"
     chunk1 = pd.DataFrame({

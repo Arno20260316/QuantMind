@@ -118,7 +118,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
 
@@ -161,6 +160,10 @@ from backend.services.trade.services.decision_round_io import (
     maybe_write_watch,
     record_round_dialogue,
     record_round_position,
+)
+from backend.services.trade.services.decision_round_notes import (
+    exec_summary,
+    round_highlights,
 )
 
 logger = logging.getLogger(__name__)
@@ -600,7 +603,7 @@ async def _run_once_inner(
             # 规则表——``write_watch_plan`` 是整组替换，用它去覆盖等于把 09:00 挂上的
             # 止损全清掉，还给一批**从未买入**的标的 arm 上规则（本条见 P2.8 评审 H3：
             # 原先守护段写在 aborted 判定之前，一次瞬时在读途账失败就会清空守护层）。
-            aborted, summary = _exec_summary(outcome)
+            aborted, summary = exec_summary(outcome)
             submitted = int(summary.get("submitted", 0) or 0)
             if aborted and not submitted:
                 logger.warning(
@@ -719,6 +722,9 @@ async def _run_once_inner(
             legs=int(summary.get("legs", 0) or 0),
             audit_rows=audit_rows,
             watch_armed=len(getattr(watch_result, "armed", ()) or ()),
+            # 中止轮的要点行同样要给（腿都标「未发出」）：告警旁一句「本来要做什么」，
+            # 值班不必翻审计表就知道这轮缺的是什么。
+            meta={"highlights": round_highlights(decisions, outcome)},
         )
     # 轮终注记（2026-10-10 审计 H3/M10）：「跑成了但零产出」必须在读侧与「一切正常」
     # 区分开——空池要能看出是**设计内的看空清空**还是供给链断了；交易时段内一条腿
@@ -756,13 +762,17 @@ async def _run_once_inner(
             "noops": int(summary.get("noops", 0) or 0),
             "watches": int(summary.get("watches", 0) or 0),
             "duplicates": int(summary.get("duplicates", 0) or 0),
+            # 本轮要点（▸ 段的数据源）：摘要在计数之外要说人话——方向/标的/股数/
+            # 理由（2026-10-15 用户点名「通知了、不给建议吗」）。提炼纪律见
+            # ``decision_round_notes.round_highlights``；空列表=没可说的事，不是取不到。
+            "highlights": round_highlights(decisions, outcome),
             # 执行段自己的注记（如「虚拟现金未建模，未判」）——是说明不是错误，
             # 与 ``errors`` 分开：把 note 混进 errors 会让状态键红得没有意义。
             "plan_notes": list(summary.get("notes") or [])[:5],
             "pool": {
                 "file": pool_file,
                 # 原始行数（供给面）。**必须显式带出来**：告警侧靠「键在不在」区分
-                # 「真的是 0 行」与「取不到」（同 ``_exec_summary`` 纪律）。
+                # 「真的是 0 行」与「取不到」（同 ``exec_summary`` 纪律）。
                 "rows": len(pool_rows),
                 "shown": len(kept_rows),
                 "dropped": len(dropped_rows),
@@ -779,21 +789,3 @@ async def _run_once_inner(
             },
         },
     )
-
-
-def _exec_summary(outcome: Any) -> tuple[str, dict[str, Any]]:
-    """执行段结果 → ``(aborted, summary)``。
-
-    契约是 ``outcome.summary()``（ExecutionOutcome 的方法），但**映射也收**——只认
-    方法的话，一个带 ``summary`` dict 的实现会让这一轮以 ``legs=0/submitted=0`` 收尾：
-    状态键显示「ok、没动腿」，而真单已经出去了。「取不到」与「真的是 0」在这里必须
-    分开，否则状态键会说谎。
-    """
-    src = getattr(outcome, "summary", None)
-    if callable(src):
-        summary = dict(src() or {})
-    elif isinstance(src, Mapping):
-        summary = dict(src)
-    else:
-        summary = {}
-    return str(getattr(outcome, "aborted", "") or ""), summary

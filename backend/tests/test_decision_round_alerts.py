@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
+from backend.shared.decision.contract import SCHEMA_INTRADAY
 from backend.services.trade.services import decision_round_alerts as A
 from backend.services.trade.services import decision_round_runner as RUNNER
 from backend.services.trade.services import decision_round_tick as TICK
@@ -34,6 +35,7 @@ from backend.services.trade.services.decision_round_core import (
     AgentRun,
     RoundDeps,
     RoundResult,
+    RoundSlot,
 )
 
 DAY = date(2026, 9, 24)
@@ -275,7 +277,7 @@ def test_non_session_zero_submit_is_silent() -> None:
 
 def test_results_without_the_new_meta_are_not_judged() -> None:
     """**向后兼容的判据**：meta 缺 ``rows``/``in_session``（老结果、替身）时一律不判
-    ——「取不到」不许被当成「空池/零产出」报出来（同 ``_exec_summary`` 纪律）。"""
+    ——「取不到」不许被当成「空池/零产出」报出来（同 ``exec_summary`` 纪律）。"""
     assert A.round_alert(_result(decisions=0, legs=0, submitted=0)) is None
     # 只带一半（有 pool.rows 没 in_session）：空池照报，零提交仍不判
     half = _result(
@@ -622,8 +624,8 @@ async def test_a_broken_account_lookup_does_not_break_the_round(monkeypatch) -> 
 # （上面几组）只覆盖「出事了」，安静的调仓轮在状态键之外没有痕迹。摘要出口给
 # 每轮一条时间轴：日志每轮都落，QQ 只推动钱或本该动钱的轮（``summary_due``），
 # 失败告警已送达的轮不重复推。
-def _pool_meta(rows=30, shown=12, dropped=18, direction="看多") -> dict:
-    return {
+def _pool_meta(rows=30, shown=12, dropped=18, direction="看多", **extra) -> dict:
+    meta = {
         "pool": {
             "file": "pool.json",
             "rows": rows,
@@ -633,6 +635,8 @@ def _pool_meta(rows=30, shown=12, dropped=18, direction="看多") -> dict:
         },
         "in_session": True,
     }
+    meta.update(extra)
+    return meta
 
 
 def test_summary_carries_the_pool_rows_and_legs() -> None:
@@ -841,6 +845,96 @@ async def test_tick_does_not_double_push_when_the_alert_went_out(
     assert len(out) == 1 and len(notifier.calls) == 1  # 告警照发
     assert calls == []  # 摘要 QQ 不双响
     assert any("值班摘要" in r.getMessage() for r in caplog.records)
+
+
+# ── 决策要点（2026-10-15）：摘要不只报计数，要报「做了什么」 ──────────────
+# 用户原话：「光这些通知、通知了、不给建议吗」。▸ 段的数据源是生产侧写进
+# ``meta["highlights"]`` 的要点行（提炼纪律在 ``decision_round_notes.round_highlights``）；
+# 本层只管渲染：取不到（老结果/替身）就不渲染，绝不给空段编占位。
+def test_summary_renders_the_decision_highlights() -> None:
+    """有 highlights 时逐条渲染成 ▸ 行；位置：计数行之后、「说明」之前。"""
+    body = A.round_summary(
+        _result(
+            decisions=2,
+            legs=1,
+            submitted=1,
+            note="提交完成",
+            meta=_pool_meta(
+                highlights=[
+                    "买入 中国石油(SH601857) 800股 @12.33（60 日新高放量）",
+                    "卖出 中国核电(SH601985) 500股 @9.18（跌破 20 日线）",
+                ]
+            ),
+        )
+    )
+    assert body is not None
+    assert "▸ 买入 中国石油(SH601857) 800股 @12.33（60 日新高放量）" in body
+    assert "▸ 卖出 中国核电(SH601985) 500股 @9.18（跌破 20 日线）" in body
+    assert body.index("决策 2") < body.index("▸") < body.index("说明：")
+
+
+def test_summary_without_highlights_adds_no_bullet_lines() -> None:
+    """取数纪律：老结果/替身没有 highlights ⇒ 无 ▸ 段，也不编占位行。"""
+    body = A.round_summary(_result(legs=0, submitted=0, meta=_pool_meta()))
+    assert body is not None and "▸" not in body
+
+
+def test_highlight_lines_are_flattened_to_one_line() -> None:
+    """要点行是**一行**：生产侧漏了折叠也不能让一条 ▸ 把卡片排版炸开。"""
+    body = A.round_summary(
+        _result(
+            legs=1,
+            submitted=1,
+            meta=_pool_meta(highlights=["买入 中国石油(SH601857) 800股\n@12.33"]),
+        )
+    )
+    assert body is not None
+    assert "▸ 买入 中国石油(SH601857) 800股 @12.33" in body
+
+
+def test_a_wake_round_carries_the_clock_mark() -> None:
+    """唤醒轮（盘中合成的临时槽，不在计划表）标题与正文都带 ⏰。
+
+    它是「被行情/事件叫醒」而非按表跑的轮——判据 = 槽位 HHMM 不在 ``SLOTS``；
+    计划表内的守护槽必须**不**带标记（防判据恒真的正向对照）。
+    """
+    wake = RoundSlot("1255", SCHEMA_INTRADAY)
+    assert A._label(_result(slot=wake)).startswith("⏰12:55")
+    body = A.round_summary(_result(slot=wake, legs=1, submitted=1))
+    assert body is not None and "⏰" in body
+    # 正向对照：计划表内的守护槽（10:00 intraday）一点也不沾
+    assert "⏰" not in A._label(_result(slot=SLOT_INTRADAY))
+    planned = A.round_summary(_result(slot=SLOT_INTRADAY, legs=1, submitted=1))
+    assert planned is not None and "⏰" not in planned
+
+
+@pytest.mark.asyncio
+async def test_a_wake_round_push_carries_the_clock_and_the_highlights(
+    monkeypatch,
+) -> None:
+    """端到端渲染：唤醒轮摘要标题带 ⏰、正文带 ▸ 要点（本改造的验收点）。"""
+    sent: list[tuple[str, str]] = []
+
+    async def _record(title: str, content: str) -> bool:
+        sent.append((title, content))
+        return True
+
+    monkeypatch.setattr(A, "_send_summary_qq", _record)
+    pushed = await A.summarize_round(
+        _result(
+            slot=RoundSlot("1255", SCHEMA_INTRADAY),
+            legs=1,
+            submitted=1,
+            meta=_pool_meta(
+                highlights=["买入 中国石油(SH601857) 800股 @12.33（放量突破）"]
+            ),
+        ),
+        alerted=False,
+    )
+    assert pushed is True and len(sent) == 1
+    title, content = sent[0]
+    assert "⏰" in title and "12:55" in title
+    assert "▸ 买入 中国石油(SH601857) 800股 @12.33（放量突破）" in content
 
 
 # ── 停滞：worker 活着，但整天一轮都没跑成 ──────────────────────────────

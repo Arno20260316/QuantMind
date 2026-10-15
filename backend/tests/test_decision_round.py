@@ -25,7 +25,16 @@ from pathlib import Path
 import pytest
 
 from backend.shared.decision.context import DirectionBlock, PoolRow
-from backend.shared.decision.contract import SCHEMA_INTRADAY, SCHEMA_REBALANCE
+from backend.shared.decision.contract import (
+    BUY,
+    HOLD,
+    SELL,
+    WATCH,
+    SCHEMA_INTRADAY,
+    SCHEMA_REBALANCE,
+    Decision,
+)
+from backend.shared.decision.execution import ExecutionPlan, Leg, Veto
 from backend.shared.decision.llm_call import decide_with_retry
 from backend.shared.decision.watch_writer import WatchWriteResult
 from backend.shared.decision_blocks import INDEX_CODES, SeriesSummary
@@ -34,10 +43,15 @@ from backend.services.trade.services import decision_round as R
 from backend.services.trade.services import decision_round_alerts as A
 from backend.services.trade.services import decision_round_feeds as F
 from backend.services.trade.services import decision_round_io as IO
+from backend.services.trade.services import decision_round_notes as NOTES
 from backend.services.trade.services import decision_round_runner as RUN
 from backend.services.trade.services import decision_round_tick as TICK
 from backend.services.trade.services import decision_round_wake as W
 from backend.services.trade.services.decision_round import run_once
+from backend.services.trade.services.decision_executor import (
+    ExecutionOutcome,
+    LegReceipt,
+)
 from backend.services.trade.services.decision_round_tick import round_tick, wake_tick
 from backend.services.trade.services.decision_round_io import (
     CLAIM_AUTO,
@@ -602,6 +616,270 @@ def test_merge_outcomes_prefers_first_and_warns(caplog):
     assert merged[0]["armed"] is True  # 先到的那一段留下
     assert merged[1]["reject_reason"] == "x"  # 不相交的序号照常合并
     assert any("审计序号冲突" in r.message for r in caplog.records)
+
+
+# ══ B2. 本轮要点（▸ 段）：摘要/告警的人话行 ═════════════════════════════
+# 用户 2026-10-15 原话：「光这些通知、通知了、不给建议吗」——决策轮摘要此前只有
+# 计数（轮次/池/决策/腿/提交），零标的、零方向、零理由。要点行把「这一轮到底打算
+# 做什么 / 做成了什么」压进摘要与告警：数据**全取本轮真件**（决策给标的与理由，
+# 腿给股数与限价，回执给终态，否决给拦因），取不到的段就省——绝不替模型编理由；
+# hold 与三无（无腿、无回执、无否决）决策不出行（条数在「决策 N」里）。
+def _outcome(*, legs=(), vetoes=(), receipts=(), aborted="") -> ExecutionOutcome:
+    """要点取数吃的执行段同形（真 ``ExecutionOutcome``：plan/receipts/aborted）。"""
+    return ExecutionOutcome(
+        round_id="rnd-20260924-0935",
+        plan=ExecutionPlan(legs=tuple(legs), vetoes=tuple(vetoes)),
+        receipts=tuple(receipts),
+        aborted=aborted,
+    )
+
+
+def test_highlights_render_a_submitted_leg_with_qty_price_and_reason():
+    decisions = (
+        Decision(action=BUY, code="SH601857", name="中国石油", reason="放量突破 60 日新高"),
+    )
+    leg = Leg(
+        index=0,
+        symbol="SH601857",
+        side="buy",
+        quantity=800,
+        limit_price=12.33,
+        reason="放量突破",
+    )
+    rec = LegReceipt(
+        index=0,
+        symbol="SH601857",
+        side="buy",
+        quantity=800,
+        limit_price=12.33,
+        success=True,
+        order_id="o-1",
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(legs=(leg,), receipts=(rec,)))
+    assert lines == ["买入 中国石油(SH601857) 800股 @12.33（放量突破 60 日新高）"]
+
+
+def test_highlights_name_the_veto_rule_for_a_blocked_decision():
+    decisions = (Decision(action=SELL, code="SH601985", name="中国核电"),)
+    veto = Veto(
+        index=0,
+        symbol="SH601985",
+        side="sell",
+        rule="l2.vcash",
+        reason="可用资金不足",
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(vetoes=(veto,)))
+    assert lines == ["卖出 中国核电(SH601985)（被拦 l2.vcash：可用资金不足）"]
+
+
+def test_highlights_render_failures_and_duplicates_as_such():
+    decisions = (
+        Decision(action=BUY, code="SH600036", name="招商银行", reason="r1"),
+        Decision(action=BUY, code="SH600519", name="贵州茅台", reason="r2"),
+    )
+    legs = (
+        Leg(
+            index=0,
+            symbol="SH600036",
+            side="buy",
+            quantity=100,
+            limit_price=35.5,
+            reason="r1",
+        ),
+        Leg(
+            index=1,
+            symbol="SH600519",
+            side="buy",
+            quantity=100,
+            limit_price=1400.0,
+            reason="r2",
+        ),
+    )
+    receipts = (
+        LegReceipt(
+            index=0,
+            symbol="SH600036",
+            side="buy",
+            quantity=100,
+            limit_price=35.5,
+            success=False,
+            message="券商拒单：涨跌停价不可委托",
+        ),
+        LegReceipt(
+            index=1,
+            symbol="SH600519",
+            side="buy",
+            quantity=100,
+            limit_price=1400.0,
+            success=True,
+            duplicate=True,
+        ),
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(legs=legs, receipts=receipts))
+    assert lines[0] == (
+        "买入 招商银行(SH600036) 100股 @35.50（失败：券商拒单：涨跌停价不可委托）"
+    )
+    assert lines[1] == (
+        "买入 贵州茅台(SH600519) 100股 @1400.00（此前轮已在途，未重复提交）"
+    )
+
+
+def test_highlights_skip_hold_and_traceless_decisions():
+    """hold 与三无决策不出行：它们**没有**「本来要做」可言（计数仍在「决策 N」里）。"""
+    decisions = (
+        Decision(action=HOLD, code="SH600000"),
+        Decision(action=SELL, code="SH600036", name="招商银行", reason="减仓"),
+    )
+    assert NOTES.round_highlights(decisions, _outcome()) == []
+
+
+def test_highlights_mark_planned_but_unsent_legs():
+    """aborted 轮的腿（计划了、一张没发）：要点行要写「未发出」而不是沉默。"""
+    decisions = (
+        Decision(action=SELL, code="SH601985", name="中国核电", reason="跌破止损"),
+    )
+    leg = Leg(
+        index=0,
+        symbol="SH601985",
+        side="sell",
+        quantity=500,
+        limit_price=9.18,
+        reason="跌破止损",
+    )
+    lines = NOTES.round_highlights(
+        decisions,
+        _outcome(legs=(leg,), aborted="在途委托不可信：本轮不下单（fail-closed）"),
+    )
+    assert lines == ["卖出 中国核电(SH601985) 500股 @9.18（未发出）"]
+
+
+def test_highlights_render_watch_rules_with_the_stops():
+    decisions = (
+        Decision(
+            action=WATCH,
+            code="SH601985",
+            name="中国核电",
+            stop_loss=9.2,
+            take_profit=10.6,
+        ),
+    )
+    assert NOTES.round_highlights(decisions, _outcome()) == [
+        "守望 中国核电(SH601985)（止损 9.20，止盈 10.60）"
+    ]
+
+
+def test_highlights_cap_and_roll_up_the_remainder():
+    decisions = tuple(
+        Decision(action=BUY, code=f"SH60010{i}", name=f"股{i}", reason="r")
+        for i in range(7)
+    )
+    legs = tuple(
+        Leg(
+            index=i,
+            symbol=f"SH60010{i}",
+            side="buy",
+            quantity=100,
+            limit_price=10.0,
+            reason="r",
+        )
+        for i in range(7)
+    )
+    receipts = tuple(
+        LegReceipt(
+            index=i,
+            symbol=f"SH60010{i}",
+            side="buy",
+            quantity=100,
+            limit_price=10.0,
+            success=True,
+        )
+        for i in range(7)
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(legs=legs, receipts=receipts))
+    assert len(lines) == 6  # 5 条 + 汇总条
+    assert lines[4].startswith("买入 股4(SH600104)")
+    assert lines[-1] == "…另有 2 条（见审计行）"
+
+
+def test_highlights_are_empty_when_the_outcome_gives_nothing():
+    """取数纪律 + 兜底：没有 plan 的执行段（老形态/替身）取不到就不编；None 也不抛。"""
+    decisions = (Decision(action=BUY, code="SH601857", name="中国石油", reason="x"),)
+    assert NOTES.round_highlights(decisions, FakeOutcome()) == []
+    assert NOTES.round_highlights(decisions, None) == []
+
+
+@pytest.mark.asyncio
+async def test_ok_round_meta_carries_the_execution_highlights():
+    """接线（OK 路径）：meta 带上 highlights——摘要/QQ 的 ▸ 段据此说人话。"""
+    outcome = ExecutionOutcome(
+        round_id="rnd-20260924-0935",
+        plan=ExecutionPlan(
+            legs=(
+                Leg(
+                    index=0,
+                    symbol="600036.SH",
+                    side="buy",
+                    quantity=100,
+                    limit_price=35.5,
+                    reason="加仓",
+                ),
+            )
+        ),
+        receipts=(
+            LegReceipt(
+                index=0,
+                symbol="600036.SH",
+                side="buy",
+                quantity=100,
+                limit_price=35.5,
+                success=True,
+                order_id="o-1",
+            ),
+        ),
+    )
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        ),
+        outcome=None,
+    )
+    result = await run_once(
+        SLOT_0935, deps=replace(h.deps, run_exec=_exec_returning(outcome)), now=NOW
+    )
+    assert result.status == R.STATUS_OK
+    assert result.meta["highlights"] == ["买入 600036.SH 100股 @35.50（加仓）"]
+
+
+@pytest.mark.asyncio
+async def test_aborted_round_meta_carries_the_planned_highlights():
+    """接线（aborted 路径）：计划了腿却没发——要点行标注「未发出」，不留白。"""
+    outcome = ExecutionOutcome(
+        round_id="rnd-20260924-0935",
+        plan=ExecutionPlan(
+            legs=(
+                Leg(
+                    index=0,
+                    symbol="600036.SH",
+                    side="buy",
+                    quantity=100,
+                    limit_price=35.5,
+                    reason="加仓",
+                ),
+            )
+        ),
+        aborted="在途账读不到：本轮不提交腿",
+    )
+    h = make_harness(
+        decision_text=decisions_json(
+            {"action": "buy", "code": "600036.SH", "pct": 0.2, "reason": "加仓"}
+        ),
+        outcome=None,
+    )
+    result = await run_once(
+        SLOT_0935, deps=replace(h.deps, run_exec=_exec_returning(outcome)), now=NOW
+    )
+    assert result.status == R.STATUS_ABORTED
+    assert result.meta["highlights"] == ["买入 600036.SH 100股 @35.50（未发出）"]
 
 
 # ══ C. 闸门行 ↔ 池行往返（「功能不能少」的守卫） ═══════════════════════
@@ -3887,14 +4165,16 @@ async def test_default_round_deps_refuse_a_degraded_trading_day_verdict(monkeypa
 
 # ══ H. 分层与体量的源码守卫 ══════════════════════════════════════════
 def test_modules_stay_within_the_file_budget_and_layering():
-    """八块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动、
-    blocks/feeds 只装配与取数（补块：Stage 2 第一/第二批）、wake 只判据（纯逻辑）。
+    """九块分工：core 无 IO、io 无编排、round 只编排、tick 只调度、runner 只驱动、
+    blocks/feeds 只装配与取数（补块：Stage 2 第一/第二批）、wake 只判据（纯逻辑）、
+    notes 只取数（执行段 summary 形状归一 + 摘要 ▸ 要点行）。
 
     每块 < 800 行——``round`` 曾在一个文件里同时装「一轮里发生了什么」与「哪些槽位
     该跑」（900 行），拆出 ``tick`` 才回到预算内；``round``/``io`` 后来都顶到预算
     顶，「分数/regime → 提示词补块」的装配于是拆出 ``blocks``，第二批的取数面拆出
     ``feeds``（都与 io 同层：可被 round import，彼此与上层互不反向 import）；唤醒
-    判据（丙1）是纯函数，单独成 ``wake`` 供 tick 编排层 import。
+    判据（丙1）是纯函数，单独成 ``wake`` 供 tick 编排层 import；摘要要点与
+    ``exec_summary`` 是读侧纯函数（2026-10-15），拆出 ``notes``（叶子：只标准库）。
     """
     from pathlib import Path
 
@@ -3915,6 +4195,7 @@ def test_modules_stay_within_the_file_budget_and_layering():
             "alerts",
             "wake",
             "feeds",
+            "notes",
         )
     }
     for name, text in src.items():
@@ -4002,6 +4283,19 @@ def test_modules_stay_within_the_file_budget_and_layering():
             "decision_round_tick import",
             "decision_round_runner import",
             "decision_round_feeds import",
+        ),
+        # 摘要取数叶子（2026-10-15 从 round 拆出，压 800 行预算）：只许标准库。
+        # 谁都能 import 它（round 在编排里调它），它谁也不许往回拉——碰了 IO 就
+        # 不再是纯函数，「要点提炼绝不抛」这条兜底就失去可单测的立身之处。
+        "notes": (
+            "decision_round_io import",
+            "services.trade.services.decision_round import",
+            "decision_round_tick import",
+            "decision_round_runner import",
+            "decision_round_feeds import",
+            "decision_round_blocks import",
+            "decision_round_wake import",
+            "decision_round_core import",
         ),
     }
     for layer, markers in forbidden.items():

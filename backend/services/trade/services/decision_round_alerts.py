@@ -12,7 +12,7 @@
 空候选池、或池里有票却一条腿都没提交——此前在状态键、日志、告警三面全是绿的。
 判据在 :func:`round_alert` 尾部（``empty_pool`` / ``no_legs_rejected``），
 取数依赖轮次写进 ``meta`` 的两个显式字段（``pool.rows`` 与 ``in_session``）：
-**字段缺失 = 取不到，不判**（老结果/替身不许被误报成空池，同 ``_exec_summary`` 纪律）。
+**字段缺失 = 取不到，不判**（老结果/替身不许被误报成空池，同 ``exec_summary`` 纪律）。
 
 2026-10-10 审计 T2-5 补了**第三类**不可见：上面两类都是「出事才响」，而**跑得正常
 的一轮在状态键之外没有任何读者**——面板没有决策页、QQ 不响、日志不留摘要，值班
@@ -56,6 +56,7 @@ from backend.shared.alert_delivery import (
 from backend.shared.decision.contract import SCHEMA_REBALANCE
 from backend.services.trade.services.decision_round_core import (
     SLOTS,
+    SLOTS_BY_HHMM,
     STATUS_ABORTED,
     STATUS_ERROR,
     STATUS_LLM_FAILED,
@@ -117,9 +118,26 @@ MANUAL_DIAGNOSE_HINT = (
 RoundAlert = Alert
 
 
+def _is_wake(result: RoundResult) -> bool:
+    """是不是**唤醒轮**（盘中唤醒 tick 合成的临时槽，不在 ``SLOTS`` 计划表里）。
+
+    判据只认「槽位 HHMM 不在计划表」这一条：唤醒轮的 ``RoundResult.slot`` 就是
+    合成出来的那个 ``RoundSlot``（``decision_round_tick._wake_cycle``）。与某个
+    计划槽恰好同分的唤醒轮不标记——宁可漏标，不可给按表跑的轮错标。
+    """
+    hhmm = getattr(result.slot, "hhmm", None)
+    return bool(hhmm) and hhmm not in SLOTS_BY_HHMM
+
+
 def _label(result: RoundResult) -> str:
-    """人话里的轮次名：``09:35 rebalance「pro」``（家段缺省不带，免得空引号）。"""
+    """人话里的轮次名：``09:35 rebalance「pro」``（家段缺省不带，免得空引号）。
+
+    唤醒轮（见 :func:`_is_wake`）在时刻前加 ``⏰``：值班看到就知道这一轮是被
+    行情/事件**叫醒**跑的，而不是按表跑的。
+    """
     slot = result.slot.label if result.slot else "?"
+    if _is_wake(result):
+        slot = f"⏰{slot}"
     who = f"「{result.agent}」" if result.agent else ""
     return f"{slot}{who}"
 
@@ -188,7 +206,7 @@ def round_alert(result: RoundResult) -> RoundAlert | None:
     direction_text = str(pool.get("direction") or "").strip()
 
     # ① 空池：供给链送来「0 个候选」。只在 meta **显式带 rows** 时判——「取不到」
-    #    与「真的是 0」必须分开（同 ``_exec_summary`` 纪律），老结果/替身不判，
+    #    与「真的是 0」必须分开（同 ``exec_summary`` 纪律），老结果/替身不判，
     #    免得把「不知道」报成「空池」。
     if "rows" in pool and int(pool.get("rows") or 0) == 0:
         if _BEARISH_MARKER in direction_text:
@@ -487,6 +505,11 @@ async def alert_round(
 # 上面全部函数的判据都是「哪一步做砸了」；本节的判据反过来：**跑完就得有句话**。
 # 一条安静的调仓轮（池有票、模型出了决策、腿提交成功）此前在状态键之外没有读者，
 # 值班复盘时连「这轮纳没纳过」都要手翻 Redis。摘要出口给它的就是这条时间轴。
+#
+# 2026-10-15 补：正文从「只报计数」升级为「计数 + ▸ 本轮要点」——用户原话
+# 「光这些通知、通知了、不给建议吗」。要点行由生产侧（``decision_round``）从本轮
+# 真件提炼后放进 ``meta["highlights"]``；**取不到就不渲染**（不编占位行）。唤醒轮
+# （盘中合成的临时槽）在标题与正文带 ``⏰``。
 
 #: 状态 → 摘要里的人话（``skipped`` 不产摘要，见 :func:`round_summary`）。
 _STATUS_WORD = {
@@ -503,6 +526,10 @@ def round_summary(result: RoundResult) -> str | None:
     T2-5 验收点：正文必须含**池行数**与**腿数**（``pool.rows`` / ``legs``）——
     「今天这轮到底看没看到东西」要能一眼答出来。取数纪律同 ``round_alert``：
     ``meta`` 里没有 ``pool`` 就如实写「未记录」，绝不把「不知道」编成「0 行」。
+
+    2026-10-15 增：``meta["highlights"]``（``decision_round_notes.round_highlights``
+    提炼的执行要点）逐条渲染成 ``▸`` 行——摘要要报「做了什么」而非只有计数；
+    没有/取不到就不渲染（不编占位）。唤醒轮首行带 ``⏰唤醒``。
     """
     if result.status == STATUS_SKIPPED:
         return None
@@ -524,8 +551,9 @@ def round_summary(result: RoundResult) -> str | None:
             seg += "（" + "，".join(bits) + "）"
     else:
         seg = "池 —（未记录）"
+    wake_tag = " ｜ ⏰唤醒" if _is_wake(result) else ""
     lines = [
-        f"轮次 {result.round_id} ｜ 状态：{word}",
+        f"轮次 {result.round_id} ｜ 状态：{word}{wake_tag}",
         seg,
         (
             f"决策 {int(result.decisions or 0)} ｜ 腿 {int(result.legs or 0)} ｜ "
@@ -534,6 +562,12 @@ def round_summary(result: RoundResult) -> str | None:
     ]
     if int(result.watch_armed or 0) > 0:
         lines.append(f"守护规则 {int(result.watch_armed)} 条")
+    highlights = meta.get("highlights")
+    if isinstance(highlights, (list, tuple)):
+        for row in highlights:
+            text = " ".join(str(row).split())
+            if text:
+                lines.append(f"▸ {text}")
     note = str(result.note or "").strip()
     if note:
         lines.append(f"说明：{note}")

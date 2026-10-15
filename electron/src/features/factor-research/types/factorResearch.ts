@@ -7,6 +7,10 @@ export interface FactorMeta {
   display_name?: string;
   l1: string;
   l2: string;
+  /** 语义类别 id（私人库由后端 taxonomy 富化；经典库无此字段） */
+  category?: string;
+  /** 语义类别中文名（与 category 同时下发） */
+  category_name?: string;
   /** 1=正（越大越好），-1=负 */
   direction: number;
   description: string;
@@ -68,6 +72,10 @@ export interface LeaderboardRow extends FactorKpi {
   name_cn: string;
   l1: string;
   l2: string;
+  /** 语义类别 id（私人库；经典库无） */
+  category?: string;
+  /** 语义类别中文名（与 category 同时下发；经典库为空串，显示回退 l2） */
+  category_name?: string;
   composite: number;
   eff_z: number;
   perf_z: number;
@@ -97,6 +105,10 @@ export interface LeaderboardResponse {
 export interface CategoryFilter {
   l1: string;
   l2: string | null;
+  /** 语义类别限定（私人库树第三级；与 l2 互斥使用） */
+  category?: string | null;
+  /** 类别中文名（仅用于筛选芯片显示；过滤键是 category id） */
+  categoryLabel?: string | null;
 }
 
 export interface StockRow {

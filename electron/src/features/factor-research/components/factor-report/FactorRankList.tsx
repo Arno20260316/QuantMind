@@ -86,6 +86,7 @@ function valueOf(f: FactorSummary, key: SortKey): number | string | null {
 export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selected, onSelect, dataset, loading }) => {
   const [keyword, setKeyword] = useState('');
   const [library, setLibrary] = useState<string>('all');
+  const [category, setCategory] = useState<string>('all');
   const [sortKey, setSortKey] = useState<SortKey>('abs');
   const [sortAsc, setSortAsc] = useState(DEFAULT_ASC.abs);
   const [minIcir, setMinIcir] = useState('');
@@ -114,11 +115,12 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
   };
 
   const filtersActive =
-    !!keyword.trim() || library !== 'all' || !!minIcir || !!minIc || !!maxTurnover || dir !== 'all' || favsOnly;
+    !!keyword.trim() || library !== 'all' || category !== 'all' || !!minIcir || !!minIc || !!maxTurnover || dir !== 'all' || favsOnly;
 
   const resetFilters = () => {
     setKeyword('');
     setLibrary('all');
+    setCategory('all');
     setMinIcir('');
     setMinIc('');
     setMaxTurnover('');
@@ -135,6 +137,20 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
     return seen;
   }, [factors]);
 
+  // 分类筛选动态化：只列当前数据里真实出现的语义类别（带计数，多者在前）
+  const categories = useMemo(() => {
+    const m = new Map<string, { name: string; count: number }>();
+    for (const f of factors) {
+      if (!f.category) continue;
+      const e = m.get(f.category) ?? { name: f.category_name || f.category, count: 0 };
+      e.count += 1;
+      m.set(f.category, e);
+    }
+    return [...m.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .map(([id, e]) => ({ id, name: e.name, count: e.count }));
+  }, [factors]);
+
   const shown = useMemo(() => {
     const kw = keyword.trim().toUpperCase();
     const minIcirV = minIcir === '' ? null : Number(minIcir);
@@ -142,7 +158,13 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
     const maxTurnV = maxTurnover === '' ? null : Number(maxTurnover);
     const filtered = factors.filter((f) => {
       if (library !== 'all' && f.library !== library) return false;
-      if (kw && !f.name.toUpperCase().includes(kw) && !String(f.display_name || '').toUpperCase().includes(kw)) {
+      if (category !== 'all' && f.category !== category) return false;
+      if (
+        kw &&
+        !f.name.toUpperCase().includes(kw) &&
+        !String(f.display_name || '').toUpperCase().includes(kw) &&
+        !String(f.category_name || '').toUpperCase().includes(kw)
+      ) {
         return false;
       }
       const ic = num(f.ic_mean);
@@ -169,7 +191,7 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
       return sortAsc ? c : -c;
     });
     return keyed.map((x) => x.f);
-  }, [factors, keyword, library, dir, minIcir, minIc, maxTurnover, favsOnly, favs, sortKey, sortAsc]);
+  }, [factors, keyword, library, category, dir, minIcir, minIc, maxTurnover, favsOnly, favs, sortKey, sortAsc]);
 
   const shownNames = useMemo(() => new Set(shown.map((f) => f.name)), [shown]);
   const selectedHidden = selected !== null && !shownNames.has(selected);
@@ -204,6 +226,20 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
               {LIBRARY_LABELS[lib] || lib}
             </button>
           ))}
+          {categories.length > 0 && (
+            <select
+              data-testid="frl-category"
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              title="按语义类别筛选（量价/财务/成长等，与因子研究左栏同一口径）"
+              className={`${miniSelect} ml-auto max-w-[9rem]`}
+            >
+              <option value="all">分类：全部</option>
+              {categories.map((c) => (
+                <option key={c.id} value={c.id}>{`${c.name} (${c.count})`}</option>
+              ))}
+            </select>
+          )}
         </div>
 
         {/* 研究控制台：排序 + 质量门槛 + 方向 + 自选 */}
@@ -338,6 +374,11 @@ export const FactorRankList: React.FC<FactorRankListProps> = ({ factors, selecte
                   </span>
                 </div>
                 <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-400 font-mono">
+                  {f.category_name && (
+                    <span className="max-w-[5.5rem] truncate text-indigo-400" title={f.category_name}>
+                      {f.category_name}
+                    </span>
+                  )}
                   {f.display_name && <span className="truncate text-slate-500">{f.name}</span>}
                   <span>ICIR {f.icir.toFixed(2)}</span>
                   <span>换手 {(f.turnover * 100).toFixed(0)}%</span>

@@ -186,3 +186,42 @@ def test_相关性切片容忍None值(monkeypatch):
 
     assert res["matrix"][0][1] is None
     json.dumps(res, allow_nan=False)
+
+
+# ── 读取时富化（taxonomy 12 类 + 机械名中文回填）──────────────────────────
+
+def test_enrich_rows_覆盖字典口径并回填机械名():
+    # factor1300 事故面：字典对 f13_/Alpha101_ 只会给「其他因子」、
+    # display_name 是「f13 0129」这类机械名 —— 富化后必须换成真分类与中文名
+    rows = [
+        {"name": "f13_0001", "display_name": "f13 0001", "category_name": "其他因子"},
+        {"name": "Alpha101_001", "display_name": "Alpha101 001", "category_name": "其他因子"},
+    ]
+
+    out = service.enrich_rows(rows)
+
+    assert out[0]["category"] == "valuation"
+    assert out[0]["category_name"] == "估值"
+    assert out[0]["display_name"] == "市盈率TTM"
+    assert out[1]["category"] == "alpha_classic"
+    # Alpha101_1 是非中文名 —— 不采纳，机械名保持原样（不伪造中文）
+    assert out[1]["display_name"] == "Alpha101 001"
+
+
+def test_enrich_rows_已有中文名不覆盖且不动原对象():
+    row = {"name": "f13_0129", "display_name": "字典真名（含汉字）"}
+
+    out = service.enrich_rows([row])
+
+    assert out[0]["display_name"] == "字典真名（含汉字）"
+    assert "category" not in row  # 不可变：原 dict 未被污染
+
+
+def test_enrich_rows_未知代码落兜底桶():
+    row = {"name": "rd_div_resonance", "display_name": None}
+
+    out = service.enrich_rows([row])
+
+    assert out[0]["category"] == "other"
+    assert out[0]["category_name"] == "其他/未分类"
+    assert out[0]["display_name"] is None

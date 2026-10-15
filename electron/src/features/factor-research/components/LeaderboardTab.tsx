@@ -350,7 +350,11 @@ export const LeaderboardTab: React.FC<Props> = ({
             className="flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-bold text-blue-600 hover:bg-blue-100"
           >
             分类：{categoryFilter.l1}
-            {categoryFilter.l2 ? ` / ${categoryFilter.l2}` : ''}
+            {categoryFilter.category
+              ? ` / ${categoryFilter.categoryLabel || categoryFilter.category}`
+              : categoryFilter.l2
+                ? ` / ${categoryFilter.l2}`
+                : ''}
             <X className="w-2.5 h-2.5" />
           </button>
         )}
@@ -511,7 +515,7 @@ export const LeaderboardTab: React.FC<Props> = ({
                             </span>
                           )}
                           <span className="shrink-0 text-[9px] text-slate-300 whitespace-nowrap">
-                            {r.l1.slice(0, 2)} / {r.l2}
+                            {r.l1.slice(0, 2)} / {r.category_name || r.l2}
                           </span>
                           {r.insufficient && (
                             <span className="shrink-0 rounded-full bg-amber-50 border border-amber-100 px-1.5 py-[1px] text-[9px] font-bold text-amber-600">

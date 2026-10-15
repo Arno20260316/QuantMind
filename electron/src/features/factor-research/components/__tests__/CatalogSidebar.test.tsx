@@ -10,7 +10,7 @@
  */
 import React from 'react';
 import { describe, test, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import { CatalogSidebar } from '../CatalogSidebar';
 import type { CategoryFilter, FactorMeta, LeaderboardRow } from '../../types/factorResearch';
 
@@ -187,5 +187,80 @@ describe('CatalogSidebar：标签筛选与排行榜同语义', () => {
     expect(screen.getByText('因子TA')).toBeTruthy();
     expect(screen.getByText('因子TB')).toBeTruthy();
     expect(screen.getByText('因子TC')).toBeTruthy();
+  });
+});
+
+/**
+ * 语义类别（私人库第三级）：后端 taxonomy 富化 category/category_name 后，
+ * 树模式第三级 = 中文类别（带计数），点类别名发 {l1, l2:null, category, categoryLabel}；
+ * 经典库无 category 字段 → 回退原有 l2 分组（上面第一组用例已覆盖该回退路径）。
+ */
+describe('CatalogSidebar：语义类别分组（私人库）', () => {
+  const CAT_FACTORS: FactorMeta[] = [
+    meta({ code: 'm1', name_cn: '动量一', l1: '库甲', l2: 'libx', category: 'momentum', category_name: '动量趋势' }),
+    meta({ code: 'm2', name_cn: '动量二', l1: '库甲', l2: 'libx', category: 'momentum', category_name: '动量趋势' }),
+    meta({ code: 'v1', name_cn: '波动一', l1: '库甲', l2: 'libx', category: 'volatility', category_name: '波动风险' }),
+    meta({ code: 'o1', name_cn: '未分类一', l1: '库甲', l2: 'libx', category: 'other', category_name: '其他/未分类' }),
+  ];
+  const CAT_ROWS = CAT_FACTORS.map((f, i) => lbRow(f.code, 0.5 - i * 0.1));
+
+  function renderCat(over: { categoryFilter?: CategoryFilter | null; onSelectCategory?: (f: CategoryFilter | null) => void } = {}) {
+    render(
+      <CatalogSidebar
+        factors={CAT_FACTORS}
+        l1Order={['库甲']}
+        rowsByCode={new Map(CAT_ROWS.map((r) => [r.code, r]))}
+        selected={[]}
+        activeCode={null}
+        tagFilter={[]}
+        categoryFilter={over.categoryFilter ?? null}
+        onSelectCategory={over.onSelectCategory ?? vi.fn()}
+        onToggle={vi.fn()}
+        onOpen={vi.fn()}
+      />,
+    );
+  }
+
+  test('第三级显示中文类别名与计数；点类别名发 {l1, l2:null, category, categoryLabel}', () => {
+    const onSelectCategory = vi.fn();
+    renderCat({ onSelectCategory });
+
+    expect(screen.getByText('动量趋势')).toBeTruthy();
+    expect(screen.getByText('波动风险')).toBeTruthy();
+    // 类别组计数（动量 2 个）显示在该组头里
+    const head = screen.getByText('动量趋势').closest('button') as HTMLElement;
+    expect(within(head).getByText('2')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('动量趋势'));
+    expect(onSelectCategory).toHaveBeenCalledWith({
+      l1: '库甲', l2: null, category: 'momentum', categoryLabel: '动量趋势',
+    });
+    // 不再发 l2 过滤（私人库 l2 冗余；限定键是 category id）
+    expect(onSelectCategory.mock.calls[0][0].l2).toBeNull();
+  });
+
+  test('已限定的类别再点一次 = 取消限定', () => {
+    const onSelectCategory = vi.fn();
+    renderCat({
+      onSelectCategory,
+      categoryFilter: { l1: '库甲', l2: null, category: 'momentum', categoryLabel: '动量趋势' },
+    });
+
+    fireEvent.click(screen.getByText('动量趋势'));
+    expect(onSelectCategory).toHaveBeenCalledWith(null);
+    // 大类行不应误判为「已限定」（限定在类别层）
+    fireEvent.click(screen.getByText('库甲'));
+    expect(onSelectCategory).toHaveBeenLastCalledWith({ l1: '库甲', l2: null });
+  });
+
+  test('类别组按固定展示顺序渲染（量价在前、兜底桶垫底）', () => {
+    renderCat();
+
+    const order = ['动量趋势', '波动风险', '其他/未分类'];
+    const nodes = order.map((t) => screen.getByText(t));
+    for (let i = 1; i < nodes.length; i++) {
+      const pos = nodes[i - 1].compareDocumentPosition(nodes[i]);
+      expect(pos & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
   });
 });

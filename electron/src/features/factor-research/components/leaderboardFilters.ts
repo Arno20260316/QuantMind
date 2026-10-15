@@ -95,7 +95,14 @@ export function applyLeaderboardFilters(
   const q = filters.name.trim().toLowerCase();
   const ind = filters.industry.trim();
   return rows.filter((r) => {
-    if (categoryFilter && !(r.l1 === categoryFilter.l1 && (!categoryFilter.l2 || r.l2 === categoryFilter.l2))) {
+    if (
+      categoryFilter &&
+      !(
+        r.l1 === categoryFilter.l1 &&
+        (!categoryFilter.l2 || r.l2 === categoryFilter.l2) &&
+        (!categoryFilter.category || r.category === categoryFilter.category)
+      )
+    ) {
       return false;
     }
     if (q && !(r.name_cn.toLowerCase().includes(q) || r.code.toLowerCase().includes(q))) return false;

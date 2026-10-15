@@ -123,6 +123,31 @@ def load_snapshot(dataset: str = DEFAULT_DATASET) -> dict[str, Any] | None:
         return None
 
 
+def enrich_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """因子行**读取时富化**（不改快照文件，返回新 list，可回滚）：
+
+    - ``category`` / ``category_name`` 一律以 ``factor_research.taxonomy`` 为准：
+      快照里的字典口径对 f13_ / Alpha101_ 这类代码只会给「其他因子」（factor1300
+      实测 1125/1125 全落该值），与研究侧 12 类口径并存会互相打架，故统一覆盖；
+    - ``display_name`` 仅在**不含汉字**（机械名，如「f13 0129」）且词表有真中文名时
+      升级（f13_0001 → 市盈率TTM；Alpha101_1 这类非中文名不采纳，照旧）；
+      已含汉字的名字（字典口径）不覆盖。
+    """
+    from backend.services.engine.factor_research import taxonomy
+
+    out: list[dict[str, Any]] = []
+    for x in items:
+        code = str(x.get("name") or "")
+        cat = taxonomy.category_for(code)
+        row = {**x, "category": cat.id, "category_name": cat.name}
+        if not taxonomy.has_chinese(str(row.get("display_name") or "")):
+            cn = taxonomy.chinese_name(code)
+            if cn:
+                row["display_name"] = cn
+        out.append(row)
+    return out
+
+
 def _partition_dates(dataset: str, limit: int | None = None) -> list[str]:
     """可用的分区日期（升序）。limit 表示只取最近 N 个。"""
     root = dataset_dir(normalize_dataset(dataset))

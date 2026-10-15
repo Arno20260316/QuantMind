@@ -107,6 +107,8 @@ async def factor_summary(
     total = len(items)
     if limit:
         items = items[:limit]
+    # 读取时富化（taxonomy 12 类 + 机械名中文回填）：只富化要返回的那批
+    items = service.enrich_rows(items)
     return {"available": True, "dataset": ds, "meta": snap.get("meta") or {}, "total": total, "factors": items}
 
 

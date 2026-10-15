@@ -111,3 +111,38 @@ describe('matchTagFilter（组内 OR / 组间 AND）', () => {
     expect(matchTagFilter('牛市进攻型', '近期转强', ['牛市进攻型', '近期转强'])).toBe(true);
   });
 });
+
+/**
+ * 语义类别限定（私人库树第三级）：按 category id 过滤、与 l2 互斥。
+ * 经典库行没有 category 字段 —— 带类别的限定必须把它们全部排除（undefined ≠ id），
+ * 否则切换数据集后残留的类别限定会静默放行一批本不该出现的因子。
+ */
+describe('applyLeaderboardFilters：语义类别限定', () => {
+  const CAT_ROWS: LeaderboardRow[] = [
+    row({ code: 'm1', l1: '库甲', l2: 'libx', category: 'momentum' }),
+    row({ code: 'v1', l1: '库甲', l2: 'libx', category: 'volatility' }),
+    row({ code: 'm2', l1: '库乙', l2: 'liby', category: 'momentum' }),
+    row({ code: 'c1', l1: '经典', l2: '子类一' }), // 无 category（经典库回退行）
+  ];
+  const runCat = (f: Parameters<typeof applyLeaderboardFilters>[3]) =>
+    applyLeaderboardFilters(CAT_ROWS, EMPTY_LEADERBOARD_FILTERS, [], f);
+
+  test('仅类别限定：跨 l1 命中所有该类别行', () => {
+    expect(runCat({ l1: '库甲', l2: null, category: 'momentum' }).map((r) => r.code)).toEqual(['m1']);
+    // l2=null 是「整个大类」的意思，不是 l2 必须为空
+    expect(runCat({ l1: '库乙', l2: null, category: 'momentum' }).map((r) => r.code)).toEqual(['m2']);
+  });
+
+  test('类别 + l1 必须同时成立', () => {
+    expect(runCat({ l1: '库甲', l2: null, category: 'volatility' }).map((r) => r.code)).toEqual(['v1']);
+    expect(runCat({ l1: '库乙', l2: null, category: 'volatility' })).toEqual([]);
+  });
+
+  test('无 category 字段的行（经典库）不匹配任何类别限定', () => {
+    expect(runCat({ l1: '经典', l2: null, category: 'momentum' })).toEqual([]);
+  });
+
+  test('经典库回退路径（l2 限定）不受影响', () => {
+    expect(runCat({ l1: '经典', l2: '子类一' }).map((r) => r.code)).toEqual(['c1']);
+  });
+});

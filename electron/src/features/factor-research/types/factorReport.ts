@@ -8,6 +8,8 @@ export interface FactorSummary {
   display_name?: string | null;
   /** 中文分类（如「动量」「换手与流动性」「信息不对称与毒性」） */
   category_name?: string | null;
+  /** 语义类别 id（taxonomy 12 类，与因子研究左栏同一口径；后端读取时富化下发） */
+  category?: string | null;
   /** 主前瞻期的截面 IC 均值；全退化因子（整列 NaN）后端给 null = 缺失，显示「—」 */
   ic_mean: number | null;
   icir: number;

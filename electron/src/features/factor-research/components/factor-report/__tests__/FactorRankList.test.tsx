@@ -202,3 +202,39 @@ describe('FactorRankList：IC 缺失（null，全退化因子）', () => {
     expect(order()).toEqual(['pos', 'neg', 'degen']);
   });
 });
+
+describe('FactorRankList：分类（taxonomy 语义类别，2026-10-15）', () => {
+  const CATS: FactorSummary[] = [
+    f({ name: 'v1', display_name: '市盈率TTM', category: 'valuation', category_name: '估值', ic_mean: 0.05 }),
+    f({ name: 'v2', display_name: '市净率', category: 'valuation', category_name: '估值', ic_mean: 0.04 }),
+    f({ name: 'm1', display_name: '动量一', category: 'momentum', category_name: '动量趋势', ic_mean: 0.06 }),
+  ];
+
+  test('行上显示类别名', () => {
+    renderList({ factors: CATS });
+    expect(screen.getByTestId('frl-item-v1').textContent).toContain('估值');
+  });
+
+  test('分类下拉按类别过滤，选项带计数（多者在前）', () => {
+    renderList({ factors: CATS });
+    const sel = screen.getByTestId('frl-category') as HTMLSelectElement;
+    expect(Array.from(sel.options).map((o) => o.textContent)).toEqual([
+      '分类：全部',
+      '估值 (2)',
+      '动量趋势 (1)',
+    ]);
+    fireEvent.change(sel, { target: { value: 'momentum' } });
+    expect(order()).toEqual(['m1']);
+  });
+
+  test('搜索命中类别名', () => {
+    renderList({ factors: CATS });
+    fireEvent.change(screen.getByPlaceholderText(/搜索因子/), { target: { value: '动量趋势' } });
+    expect(order()).toEqual(['m1']);
+  });
+
+  test('无 category 字段的行（旧响应/经典行）不出现分类下拉', () => {
+    renderList(); // 默认 FACTORS 都不带 category
+    expect(screen.queryByTestId('frl-category')).toBeNull();
+  });
+});

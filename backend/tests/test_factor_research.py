@@ -493,3 +493,48 @@ def test_holdings_profile_uses_factor_own_last_month():
     assert med == 430.0  # median(800, 60) —— 断更前最后截面
     assert style == "中盘"
     assert {r["name"] for r in top} == {"银行", "医药"}
+
+
+# ---------------------------------------------------------------------------
+# 目录/元数据读取时富化（taxonomy 接线：类别 id/中文 + name_cn 回填）
+# ---------------------------------------------------------------------------
+def _fake_private_meta() -> dict:
+    return {
+        "factors": [
+            {"code": "f13_0001", "name_cn": "f13_0001", "l1": "因子清单1300", "l2": "factor1300"},
+            {"code": "gtja_042", "name_cn": "gtja_042", "l1": "Alpha 因子库", "l2": "alpha_library"},
+            {"code": "真实名", "name_cn": "已有真名", "l1": "因子清单1300", "l2": "factor1300"},
+        ],
+        "l1_order": ["因子清单1300", "Alpha 因子库"],
+        "l2_order": {},
+    }
+
+
+def test_catalog_private_富化类别与中文名(monkeypatch):
+    """catalog('private')：category/category_name 由 taxonomy 下发；
+    name_cn 等于代码的（私人库构建脚本的历史口径）回填词表中文名。"""
+    fake = _fake_private_meta()
+    monkeypatch.setattr(service.store, "factors_meta", lambda: fake)
+
+    out = service.catalog("private")
+    by = {x["code"]: x for x in out["factors"]}
+
+    assert by["f13_0001"]["category"] == "valuation"
+    assert by["f13_0001"]["category_name"] == "估值"
+    assert by["f13_0001"]["name_cn"] == "市盈率TTM"  # 词表回填（原值等于代码）
+    assert by["gtja_042"]["category"] == "alpha_classic"
+    assert by["真实名"]["name_cn"] == "已有真名"  # 已有真名不覆盖
+
+
+def test_meta_map_private_富化且不污染缓存对象(monkeypatch):
+    """_meta_map('private') 的 category 供 leaderboard/detail/compare/compose 全链使用；
+    enrich 返回新 dict，store 缓存对象不得被写入 category。"""
+    fake = _fake_private_meta()
+    monkeypatch.setattr(service.store, "factors_meta", lambda: fake)
+
+    m = service._meta_map("private")
+
+    assert m["f13_0001"]["category"] == "valuation"
+    assert m["gtja_042"]["category_name"] == "经典Alpha库"
+    for e in fake["factors"]:  # 原对象不可变
+        assert "category" not in e

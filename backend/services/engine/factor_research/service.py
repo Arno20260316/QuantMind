@@ -30,6 +30,7 @@ from backend.services.engine.factor_research import (
     discovery,
     scorecard,
     store,
+    taxonomy,
 )
 from backend.services.engine.factor_research.catalog import BY_CODE, FACTORS, L1_ORDER
 
@@ -66,7 +67,12 @@ def catalog(dataset: str = "classic") -> dict:
             raise store.SnapshotMissing(
                 "私人因子库快照缺失（请先一键计算，产物 factor_research_private/factors.json）"
             )
-        items = [{**e, "env_tag": "", "time_tag": ""} for e in f.get("factors", [])]
+        # 语义类别/中文名**读取时富化**（taxonomy 单一实现；不动 factors.json 产物、可回滚）。
+        # 私人库 l2 实测零信息量（每库恒等于库名），前端第三级树改按 category 分组。
+        items = [
+            {**taxonomy.enrich(e), "env_tag": "", "time_tag": ""}
+            for e in f.get("factors", [])
+        ]
         return {
             "factors": items,
             "l1_order": f.get("l1_order", []),
@@ -285,10 +291,12 @@ def _holdings_profile(
 
 
 def _meta_map(dataset: str) -> dict[str, dict]:
-    """code → 元数据（经典：catalog.py；私人：factors.json）。"""
+    """code → 元数据（经典：catalog.py；私人：factors.json，读取时经 taxonomy 富化）。"""
     if dataset == "private":
         f = store.factors_meta() or {}
-        return {e["code"]: e for e in f.get("factors", [])}
+        # 富化后 → leaderboard / factor_detail / compare / compose 全链带
+        # category/category_name（enrich 返回新 dict，不改 store 缓存对象）
+        return {e["code"]: taxonomy.enrich(e) for e in f.get("factors", [])}
     return BY_CODE
 
 
@@ -328,6 +336,9 @@ def leaderboard(
                 "name_cn": meta.get("name_cn", code),
                 "l1": meta.get("l1", ""),
                 "l2": meta.get("l2", ""),
+                # 经典库无 category（前端回退 l2 分组）；private 行带语义类别供点选过滤
+                "category": meta.get("category", ""),
+                "category_name": meta.get("category_name", ""),
                 **kpi,
                 "excess_300": ex.get("000300.SH"),
                 "excess_800": ex.get("000906.SH"),

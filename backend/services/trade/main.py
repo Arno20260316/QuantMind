@@ -1094,6 +1094,9 @@ from backend.services.trade.routers.risk_ctl import router as risk_ctl_router
 from backend.services.trade.routers.decision_roster import (
     router as decision_roster_router,
 )
+from backend.services.trade.routers.call_auction import (
+    router as call_auction_router,
+)
 
 app.include_router(tdx_config_router, prefix="/api/v1", tags=["TDX-Bridge"])
 app.include_router(tdx_quote_feed_router, prefix="/api/v1", tags=["TDX-Bridge"])
@@ -1103,6 +1106,7 @@ app.include_router(qmt_mirror_router, prefix="/api/v1", tags=["QMT-Mirror"])
 app.include_router(qmt_sltp_router, prefix="/api/v1", tags=["QMT-SLTP"])
 app.include_router(risk_ctl_router, prefix="/api/v1", tags=["Risk-Control"])
 app.include_router(decision_roster_router, prefix="/api/v1", tags=["Decision-Round"])
+app.include_router(call_auction_router, prefix="/api/v1", tags=["Call-Auction"])
 
 app.add_middleware(
     CORSMiddleware,

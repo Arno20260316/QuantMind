@@ -75,6 +75,12 @@ const LIB_LABEL: Record<string, string> = {
   tdxgs: '通达信公式',
   factor_research: '因子研究',
   factor_defs: '因子清单库',
+  features_daily: '每日特征',
+  cand_factors: '候选因子池',
+  factor1300: '因子清单1300',
+  gap_mined: '空档挖掘',
+  l1_batch1_factors: 'L1 批量',
+  rd_mined: 'RD 挖掘',
   // 早期子库名，保留以免历史快照显示成裸标识符
   alpha101: 'Alpha101',
   gtja191: 'GTJA191',

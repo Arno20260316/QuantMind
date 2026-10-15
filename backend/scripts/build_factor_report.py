@@ -312,7 +312,12 @@ def compute_one_date(args: tuple) -> dict | None:
     y_by_h = ys   # 两种模式都已与 merged 逐行对齐（labels_table 来自 merged 列，close_fwd 用 left join）
 
     cols = [c for c in factor_cols if c not in meta_ignore]
-    X = merged[cols].to_numpy(dtype=np.float32)
+    # reindex 而非直接取列：factor_cols 取窗口内**最新分区**的 schema，旧分区可能有
+    # 列代际断层（实测 features_daily ≤20260630 分区无 is_st/free_float_shares，
+    # 且旧代标签列名不同）。缺列补 NaN、多余列丢弃、列序固定 —— 缺列列 = 全退化列，
+    # 下游（gram 按 n_factors 固定宽累加、IC null 净化）与 factor1300 全退化先例同口径；
+    # 直接 merged[cols] 会 KeyError 炸掉整天（甚至整个构建）。
+    X = merged.reindex(columns=cols).to_numpy(dtype=np.float32)
     # 主前瞻期由任务参数**显式**给出。曾写成 ``horizons[0]``，而 --horizons 默认首项是
     # fwd_ret_1，于是 meta 记 fwd_ret_5、headline 指标（ic_mean/quantiles/ls_mean…）
     # 算的却是 fwd_ret_1 —— 静默错期，2026-09-19 修。

@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
-"""因子筛选：质量门槛 + 同源去重（多库联合：alpha_library ∪ tdxgs ∪ jq110 ∪ alpha360 ∪ l1_factors ∪ l2_factors ∪ factor_research）
+"""因子筛选：质量门槛 + 同源去重（多库联合：13 库 ∪ factor_research）
 
 输入（均已存在，无需重新计算因子值）：
   <dataset>/report/factor_report.json   —— 因子报告快照（IC/ICIR/换手 + 库内相关矩阵）
-      数据集：alpha_library(429) / tdxgs(88) / jq110(109) / alpha360(360) /
-              l1_factors(110) / l2_factors(211，2022 起——缺分区的库在早期日期按「无数据」参与，
-              其列逐期成对排除，不再跳过整天）；l1_l2_factors 为两者拼接，不入筛选避免重复
+      数据集（顺序 = 私人库扫描 discovery.AUTO_PRIORITY + 未列目录字母序，
+      跨库重名**先到先得**，两处顺序必须逐字一致）：
+      l1_factors(110) / l2_factors(211，2022 起——缺分区的库在早期日期按「无数据」参与，
+      其列逐期成对排除，不再跳过整天) / alpha_library(429) / alpha360(360) /
+      jq110(109) / tdxgs(88) / features_daily(41，前视收益标签已排除) /
+      cand_factors(238) / factor1300(1125) / factor_defs(1336，让位 cand 同名 238 后 1098) /
+      gap_mined(69) / l1_batch1_factors(8) / rd_mined(122)；
+      l1_l2_factors 为 L1∪L2 冗余并集，不入筛选避免重复
   factor_research/{metrics.json,corr.parquet,monthly_scores.parquet}  —— 82 因子研究库
-  <dataset>/dt=*/data.parquet            —— 月末采样做「跨库」相关（单遍联合，缓存 npz）
+  <dataset>/dt=*/data.parquet            —— 月末采样做「跨库」相关（单遍联合，只读候选列，缓存 npz）
 
 筛选逻辑：
   1. 质量门槛：|IC 均值| ≥ min_ic 且 |ICIR| ≥ min_icir（各库同一把尺）；
-  2. 去重（贪心直接去重）：候选按强度（|ICIR|，同分比 |IC|）降序，逐个与**已保留**因子比
-     直接相关 |ρ|（联合矩阵，月末截面 Spearman 均值）：≥ 阈值（默认 0.9）者剔除并标注
-     duplicate_of（取其最相关的已保留因子）与 |ρ|；否则保留。
+  2. 联合相关（只算候选列）：月末截面 Spearman 逐期均值。pandas 逐对 Pearson 与
+     矩阵里还有哪些列无关 → 候选子矩阵与全宽矩阵**逐位相等**（不是近似）——先过
+     门槛再算相关，把 corr 的 O(k²) 从全量 4078² 压到候选²，结果不变；
+  3. 去重（贪心直接去重）：候选按强度（|ICIR|，同分比 |IC|）降序，逐个与**已保留**因子比
+     直接相关 |ρ|（联合矩阵）：≥ 阈值（默认 0.9）者剔除并标注 duplicate_of（取其最相
+     关的已保留因子）与 |ρ|；否则保留。
      不用并查集传递闭包——那会把「只通过链式中等相关相连」的因子误并成巨簇（曾出现
      318 成员巨型簇，CLOSE24 与代表 MOM60 直接 ρ 仅 0.54）。
-  3. 已知同构对（a101≈gtja、TDXGS_MA≈a158_MA、JQ110_ROC≈a158_ROC 等）由直接相关自然捕获。
+  4. 已知同构对（a101≈gtja、TDXGS_MA≈a158_MA、JQ110_ROC≈a158_ROC 等）由直接相关自然捕获。
 
 输出（<quantdb>/factor_research/screening/）：
   factor_selection.json       机器可读：kept（按库分组）/ dropped（原因/重复对象）/ 门槛与统计
   筛选报告_YYYYMMDD.md         人读报告（各库清单 + 去重明细）
   kept_features.txt           训练可直接消费的特征名清单（每行一个）
-  cross_corr.npz              联合相关缓存（--refresh-cross 重算）
+  cross_corr.npz              候选列联合相关缓存（--refresh-cross 重算；候选集变化时
+                              完全一致→直用 / 子集→切片复用 / 其余→重算）
 
 用法：
   python3 backend/scripts/screen_factors.py                       # 默认门槛（全库联合）
   python3 backend/scripts/screen_factors.py --min-ic 0.03 --min-icir 0.3 --corr 0.85
   python3 backend/scripts/screen_factors.py --skip-cross          # 只用库内矩阵（快，无跨库去重）
   python3 backend/scripts/screen_factors.py --libraries alpha_library,tdxgs   # 只筛部分库
+  python3 backend/scripts/screen_factors.py --cross-workers 16    # 调联合相关并行度（默认 min(8, CPU)）
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,25 +77,40 @@ cluster_by_correlation = (
     _fr_clusters.cluster_by_correlation
 )  # 供 --method cluster 备用（默认不用）
 
+# 顺序 = discovery.AUTO_PRIORITY + 未列目录按字母序 —— 与私人库扫描的先到先得去重
+# **必须逐字一致**：cand_factors 与 factor_defs 有 238 列全同名，顺序一分叉，
+# 「参与面与私人库对齐」的承诺就静默失效（2026-10-15 全量扩展时钉死）。
 REPORT_DATASETS = [
-    "alpha_library",
-    "tdxgs",
-    "jq110",
-    "alpha360",
     "l1_factors",
     "l2_factors",
+    "alpha_library",
+    "alpha360",
+    "jq110",
+    "tdxgs",
+    "features_daily",  # DAILY_FEATURES_MARK
+    "cand_factors",  # CAND_FACTORS_MARK
+    "factor1300",
+    "factor_defs",
     "gap_mined",  # GAP_MINED_MARK
+    "l1_batch1_factors",  # L1_BATCH1_MARK
+    "rd_mined",  # RD_MINED_MARK
 ]
 OURS = "factor_research"
 DATASET_LABEL = {
-    "alpha_library": "Alpha 库（Alpha101 / GTJA191 / Alpha158）",
-    "tdxgs": "TDXGS 通达信技术指标",
-    "jq110": "JQ110 聚宽因子",
-    "alpha360": "Alpha360 原始量价回溯",
     "l1_factors": "L1 因子（量价/换手/波动等基础因子）",
     "l2_factors": "L2 因子（逐笔微观结构，2022 起）",
+    "alpha_library": "Alpha 库（Alpha101 / GTJA191 / Alpha158）",
+    "alpha360": "Alpha360 原始量价回溯",
+    "jq110": "JQ110 聚宽因子",
+    "tdxgs": "TDXGS 通达信技术指标",
+    "features_daily": "每日特征（技术+估值）",
+    "cand_factors": "候选因子池",
+    "factor1300": "因子清单1300（收藏公式物化库）",
+    "factor_defs": "因子清单库（日频可复现部分）",
+    "gap_mined": "空档挖掘因子（股东机构/财务PIT/板块概念/两融/L2二阶/新闻情绪）",
+    "l1_batch1_factors": "L1 批量因子（batch1）",
+    "rd_mined": "RD-Agent 挖掘因子",
     "factor_research": "因子研究（行情+财务+行为）",
-    "gap_mined": "空档挖掘因子（股东机构/财务PIT/板块概念/两融/L2二阶/新闻情绪）",  # GAP_MINED_MARK
 }
 
 
@@ -144,15 +170,150 @@ def _load_ours() -> tuple[list[str], np.ndarray, dict[str, dict]]:
     return names, M, metrics
 
 
+def _dedup_first_wins(
+    blocks: list[tuple[str, list[str], np.ndarray]],
+) -> tuple[list[tuple[str, list[str], np.ndarray]], dict[str, int]]:
+    """跨库重名按 blocks 顺序先到先得；返回 (去重后 blocks, {库: 让位列数})。
+
+    顺序语义与私人库扫描（discovery.AUTO_PRIORITY + 未列目录按字母序）逐字一致——
+    cand_factors 与 factor_defs 全部 238 列同名，cand 在前全取、factor_defs 让位
+    （1336→1098）；两处顺序一旦分叉，「参与面 = 私人库 4011」就静默失效。
+    让位库的库内矩阵同步用 np.ix_ 裁到保留列——只裁名字不裁矩阵会让列序错位，
+    后续相关全部算错且无一层会报错。
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, list[str], np.ndarray]] = []
+    dropped: dict[str, int] = {}
+    for ds, nms, mat in blocks:
+        keep = [i for i, n in enumerate(nms) if n not in seen]
+        if len(keep) != len(nms):
+            dropped[ds] = len(nms) - len(keep)
+        keep_names = [nms[i] for i in keep]
+        seen.update(keep_names)
+        out.append((ds, keep_names, mat[np.ix_(keep, keep)]))
+    return out, dropped
+
+
+def _gate_candidates(
+    names_all: list[str],
+    metrics: dict[str, dict],
+    min_ic: float,
+    min_icir: float,
+) -> tuple[list[str], dict[str, str]]:
+    """质量门槛：|IC 均值| ≥ min_ic 且 |ICIR| ≥ min_icir（各库同一把尺）。
+
+    顺序沿 names_all —— 候选列表序即最终联合矩阵列序（缓存/切片都依赖这个序）。
+    None 指标 = 未计算或退化，按剔除处理并记录原因。
+    """
+    gated_out: dict[str, str] = {}
+    candidates: list[str] = []
+    for n in names_all:
+        m = metrics[n]
+        ic, icir = m.get("ic_mean"), m.get("icir")
+        if ic is None or icir is None:
+            gated_out[n] = "无 IC/ICIR 指标（未计算或退化）"
+            continue
+        if abs(ic) < min_ic:
+            gated_out[n] = f"|IC|={abs(ic):.4f} < {min_ic}"
+            continue
+        if abs(icir) < min_icir:
+            gated_out[n] = f"|ICIR|={abs(icir):.3f} < {min_icir}"
+            continue
+        candidates.append(n)
+    return candidates, gated_out
+
+
+def _matrix_from_cache(
+    cached_names: list[str], cached_matrix: np.ndarray, wanted: list[str]
+) -> np.ndarray | None:
+    """联合相关缓存复用：完全一致 → 直用；候选 ⊂ 缓存 → 按位切片。
+
+    切片合法的前提 = 逐对 Pearson 与其他列无关（子矩阵逐位相等，非近似）。
+    缓存未覆盖全部候选列（新增库/新因子）或形状不符 → None（调用方重算）。
+    """
+    if cached_matrix.shape != (len(cached_names), len(cached_names)):
+        return None
+    if cached_names == wanted:
+        return cached_matrix
+    if set(wanted) <= set(cached_names):
+        sel = pd.Index(cached_names).get_indexer(wanted)
+        return cached_matrix[np.ix_(sel, sel)]
+    return None
+
+
+# ---- 候选列联合相关：worker 只读候选列，父进程按日期池化（imap 保序）----
+_CROSS_WORKER_STATE: dict = {}
+
+
+def _init_cross_worker(state: dict) -> None:
+    _CROSS_WORKER_STATE.clear()
+    _CROSS_WORKER_STATE.update(state)
+
+
+def _cross_corr_one_date(task: tuple[str, pd.DataFrame]) -> np.ndarray | None:
+    """单期候选列相关矩阵（Pool worker 与串行共用）。
+
+    列序 = 状态里的候选列序（blocks 依次 + our_use）；行数 < 60 的期返回 None
+    （沿用「有效样本不足不参与」口径）。逐对 Pearson 与其他列在不在矩阵里无关，
+    所以这里的候选子矩阵 == 全宽矩阵的同位子矩阵（逐位相等）。
+    """
+    dt, our_d = task
+    root = Path(_CROSS_WORKER_STATE["root"])
+    ds_names: list[str] = _CROSS_WORKER_STATE["ds_names"]
+    our_use: list[str] = _CROSS_WORKER_STATE["our_use"]
+    comb = None
+    for ds, use in _CROSS_WORKER_STATE["blocks"]:
+        f = root / "6_ml_datasets" / ds / f"dt={dt}" / "data.parquet"
+        if not f.exists():
+            continue  # 该库当日期无分区（如 L2 早于 2022）→ 其列本期为 NaN，成对排除
+        try:
+            part = pd.read_parquet(f, columns=["symbol", *use]).set_index("symbol")
+        except Exception:  # noqa: BLE001
+            # 列代际断层降级：旧分区缺新列名（实测 features_daily ≤20260630 分区
+            # 无 is_st/free_float_shares、标签列旧名）——整块静默 continue 会让该库
+            # 所有因子在 82 期里只剩几期可比（min_periods=50 全军 NaN，一个都不
+            # 去重、直进 kept）。退化为「可用列交集 + 缺列补 NaN」。
+            try:
+                import pyarrow.parquet as pq
+
+                have = set(pq.ParquetFile(f).schema_arrow.names)
+                cols = [c for c in use if c in have]
+                part = pd.read_parquet(f, columns=["symbol", *cols]).set_index("symbol")
+                part = part.reindex(columns=use)
+            except Exception:  # noqa: BLE001
+                continue
+        comb = part if comb is None else comb.join(part, how="inner")
+    if comb is None:
+        return None
+    comb = comb.reindex(columns=ds_names)  # 缺失库的候选列补 NaN
+    comb = comb.join(our_d, how="inner").reindex(columns=[*ds_names, *our_use])
+    if len(comb) < 60:
+        return None
+    return comb.rank().corr(min_periods=50).to_numpy(dtype=np.float64)
+
+
 def _union_cross_corr(
-    blocks: list[tuple[str, list[str]]], our_names: list[str], max_dates: int = 0
+    blocks: list[tuple[str, list[str]]],
+    our_names: list[str],
+    candidates: list[str],
+    max_dates: int = 0,
+    workers: int = 1,
 ) -> tuple[np.ndarray, int]:
     """单遍联合相关：各库分区 × factor_research 打分，月末截面 Spearman 逐期均值。
 
-    blocks: [(dataset, 因子名列表)]；返回 (全库联合相关均值矩阵, 使用的期数)。
-    列顺序 = blocks 依次拼接 + our_names。
+    blocks: [(dataset, 因子名列表)]；candidates: 参与列子集（**过门槛候选**，
+    names_all 序）；返回 (候选列联合相关均值矩阵, 使用的期数)。
+    workers>1 时按日期池化，父进程按日期序累加（imap 保序）——与串行逐位一致。
     """
     root = resolve_quantdb_dir()
+    cand_set = set(candidates)
+    cross = [(ds, [n for n in names if n in cand_set]) for ds, names in blocks]
+    ds_names = [n for _, use in cross for n in use]
+    our_use = [n for n in our_names if n in cand_set]
+    k = len(ds_names) + len(our_use)
+    if k == 0:
+        return np.empty((0, 0)), 0
+
     scores = pd.read_parquet(
         root / OURS / "monthly_scores.parquet",
         columns=["trade_date", "symbol", "factor_code", "score"],
@@ -163,54 +324,69 @@ def _union_cross_corr(
     dates = sorted(groups)
     if max_dates:
         dates = dates[-max_dates:]
+    del scores
 
-    all_names = [n for _, names in blocks for n in names] + list(our_names)
-    n_all = len(all_names)
-    acc = np.zeros((n_all, n_all))
-    cnt = np.zeros((n_all, n_all))
-    offsets = []
-    off = 0
-    for _, names in blocks:
-        offsets.append((off, off + len(names)))
-        off += len(names)
-    used = 0
-    t_batch = time.time()
-    ds_names = [n for _, names in blocks for n in names]
+    # 期任务：our_d 在父进程先 pivot（省 N 份重复计算）；worker 端只取候选列。
+    tasks: list[tuple[str, pd.DataFrame]] = []
     for d in dates:
         dt = pd.Timestamp(d).strftime("%Y%m%d")
-        comb = None
-        for (ds, names), _span in zip(blocks, offsets, strict=True):
-            f = root / "6_ml_datasets" / ds / f"dt={dt}" / "data.parquet"
-            if not f.exists():
-                continue  # 该库当日期无分区（如 L2 早于 2022）→ 其列本期为 NaN，成对排除
-            try:
-                part = pd.read_parquet(f, columns=["symbol", *names]).set_index(
-                    "symbol"
-                )
-            except Exception:  # noqa: BLE001
-                continue
-            comb = part if comb is None else comb.join(part, how="inner")
-        if comb is None:
-            continue
-        comb = comb.reindex(columns=ds_names)  # 缺失库的列补 NaN
-        our_d = groups[d].pivot_table(
-            index="symbol", columns="factor_code", values="score", aggfunc="last"
+        our_d = (
+            groups[d]
+            .pivot_table(
+                index="symbol", columns="factor_code", values="score", aggfunc="last"
+            )
+            .reindex(columns=our_names)
         )
-        our_d = our_d.reindex(columns=our_names)
-        comb = comb.join(our_d, how="inner").reindex(columns=[*ds_names, *our_names])
-        if len(comb) < 60:
-            continue
-        rk = comb.rank()
-        cm = rk.corr(min_periods=50).to_numpy(dtype=np.float64)
+        tasks.append((dt, our_d))
+
+    state = {
+        "root": str(root),
+        "blocks": cross,
+        "ds_names": ds_names,
+        "our_use": our_use,
+    }
+    acc = np.zeros((k, k))
+    cnt = np.zeros((k, k))
+    used = 0
+    total = len(tasks)
+    t_batch = time.time()
+
+    def _accumulate(cm: np.ndarray | None) -> None:
+        nonlocal used
+        if cm is None:
+            return
         good = np.isfinite(cm)
         acc[good] += cm[good]
         cnt[good] += 1
         used += 1
-        if used % 10 == 0:
+
+    def _tick(i: int) -> None:
+        if i % 10 == 0 or i == total:
             print(
-                f"      {used}/{len(dates)} 期（{time.time() - t_batch:.0f}s/10期）",
+                f"      {i}/{total} 期（{time.time() - t_batch:.0f}s，有效 {used}）",
                 flush=True,
             )
+
+    if workers > 1 and total > 1:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("fork")  # fork：worker 继承父进程已导入的 pandas/numpy
+        with ctx.Pool(
+            processes=min(workers, total),
+            initializer=_init_cross_worker,
+            initargs=(state,),
+        ) as pool:
+            for i, cm in enumerate(
+                pool.imap(_cross_corr_one_date, tasks, chunksize=1), 1
+            ):
+                _accumulate(cm)
+                _tick(i)
+    else:
+        _init_cross_worker(state)
+        for i, task in enumerate(tasks, 1):
+            _accumulate(_cross_corr_one_date(task))
+            _tick(i)
+
     with np.errstate(invalid="ignore"):
         mean = np.where(cnt > 0, acc / np.maximum(cnt, 1), np.nan)
     np.fill_diagonal(mean, 1.0)
@@ -230,6 +406,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--skip-cross", action="store_true", help="跳过跨库相关（仅库内矩阵，快）"
+    )
+    ap.add_argument(
+        "--cross-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 4),
+        help="联合相关的按日期并行进程数（1=串行；默认 min(8, CPU)）",
     )
     ap.add_argument(
         "--refresh-cross", action="store_true", help="忽略联合相关缓存，重算"
@@ -260,92 +442,103 @@ def main() -> int:
         print(f"[1/5] {ds}: {len(nms)} 因子（报告矩阵 {mat.shape}）")
         blocks.append((ds, nms, mat))
         names_all.extend(nms)
-        metrics.update(mets)
+        for n, m in mets.items():
+            metrics.setdefault(n, m)  # 首见为准——与跨库去重的先到先得同序
     if use_ours:
         nms, mat, mets = _load_ours()
         print(f"[2/5] {OURS}: {len(nms)} 因子")
         blocks.append((OURS, nms, mat))
         names_all.extend(nms)
-        metrics.update(mets)
+        for n, m in mets.items():
+            metrics.setdefault(n, m)
     if not names_all:
         raise SystemExit("没有可筛选的库（--libraries 为空或缺报告快照）")
 
-    dup_names = len(names_all) - len(set(names_all))
-    if dup_names:
-        raise SystemExit(f"存在跨库重名 {dup_names} 个（命名空间冲突）")
+    # ---- 跨库重名：按库序先到先得（口径与私人库扫描 discovery.AUTO_PRIORITY 同序）----
+    # 曾直接 SystemExit 拒绝重名——现在 cand_factors 与 factor_defs 有 238 列合法同名，
+    # 让位是设计行为而非冲突。metrics 已用 setdefault 保持首见为准，与这里的保留列一致。
+    blocks, dedup_dropped = _dedup_first_wins(blocks)
+    for ds, n_drop in dedup_dropped.items():
+        print(f"      跨库重名：{ds} 让位 {n_drop} 列（先到先得，同名由高优先库提供）")
+    names_all = [n for _, nms, _ in blocks for n in nms]
 
-    # ---- 联合相关矩阵 ----
+    # ---- 质量门槛（先于联合相关）----
+    # 逐对 Pearson 与矩阵里还有哪些列无关 → 先过门槛、只对候选列算相关：候选子矩阵
+    # 与全宽矩阵逐位相等（不是近似），corr 的 O(k²) 从全量 4078² 压到候选规模。
+    print("[3/5] 质量门槛 ...")
+    candidates, gated_out = _gate_candidates(
+        names_all, metrics, args.min_ic, args.min_icir
+    )
+    print(f"      候选 {len(candidates)}（门槛剔除 {len(gated_out)}）")
+    idx_all = {n: i for i, n in enumerate(names_all)}
+    pos_cand = {n: i for i, n in enumerate(candidates)}
+
+    # ---- 联合相关矩阵（候选列子集）----
     off = {}
     pos = 0
     for ds, nms, _ in blocks:
         off[ds] = (pos, pos + len(nms))
         pos += len(nms)
-    M = np.full((len(names_all), len(names_all)), np.nan)
     if args.skip_cross or not use_ours:
         note = (
             "--skip-cross"
             if args.skip_cross
             else "未选 factor_research（跨库相关以其打分为基准）"
         )
-        print(f"[3/5] 跳过跨库相关（{note}）：库内矩阵拼接")
+        print(f"[4/5] 跳过跨库相关（{note}）：库内矩阵拼接")
+        M_full = np.full((len(names_all), len(names_all)), np.nan)
         for ds, _nms, mat in blocks:
             a, b = off[ds]
-            M[a:b, a:b] = mat
+            M_full[a:b, a:b] = mat
+        sel = [idx_all[n] for n in candidates]
+        M = M_full[np.ix_(sel, sel)]
         cross_note = f"未计算跨库（{note}；仅库内去重）"
     else:
         cache_file = resolve_quantdb_dir() / OURS / "screening" / "cross_corr.npz"
-        cache_hit = False
+        M = None
         if cache_file.exists() and not args.refresh_cross:
             try:
                 z = np.load(cache_file, allow_pickle=False)
                 valid = "names" in z and "matrix" in z and "used" in z
             except Exception:  # noqa: BLE001
                 valid = False
-            if valid and [str(x) for x in z["names"]] == names_all:
-                M = z["matrix"]
-                cross_note = f"联合月末截面 Spearman 均值（{int(z['used'])} 期，缓存）"
-                print(f"[3/5] 载入联合相关缓存（{int(z['used'])} 期）")
-                cache_hit = True
+            if valid:
+                M = _matrix_from_cache(
+                    [str(x) for x in z["names"]], z["matrix"], candidates
+                )
+            if M is not None:
+                cross_note = (
+                    f"联合月末截面 Spearman 均值（{int(z['used'])} 期，缓存复用）"
+                )
+                print(f"[4/5] 载入联合相关缓存（{int(z['used'])} 期，{M.shape}）")
             else:
-                print("[3/5] 联合相关缓存缺失/不兼容/与本次库集合不一致，重算")
-        if not cache_hit:
+                print("[4/5] 缓存缺失/不兼容/未含全部候选列，重算联合相关")
+        if M is None:
             cross_blocks = [(ds, nms) for ds, nms, _ in blocks if ds != OURS]
             our_names = [n for ds, nms, _ in blocks if ds == OURS for n in nms]
             if cross_blocks:
                 print(
-                    "[3/5] 计算联合跨库相关（各库分区 × factor_research 打分，月末截面）..."
+                    f"[4/5] 计算联合跨库相关（候选 {len(candidates)} 列，月末截面，"
+                    f"{args.cross_workers} 路并行）..."
                 )
-                M, used = _union_cross_corr(cross_blocks, our_names)
+                M, used = _union_cross_corr(
+                    cross_blocks, our_names, candidates, workers=args.cross_workers
+                )
             else:
-                M, used = _union_cross_corr([(OURS, our_names)], [])
+                M, used = _union_cross_corr(
+                    [(OURS, our_names)], [], candidates, workers=args.cross_workers
+                )
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
-                cache_file, matrix=M, used=used, names=np.array(names_all, dtype=str)
+                cache_file, matrix=M, used=used, names=np.array(candidates, dtype=str)
             )
             cross_note = f"联合月末截面 Spearman 均值（{used} 期）"
             print(
                 f"      完成：{used} 期 × {M.shape}（{time.time() - t0:.0f}s，已缓存）"
             )
 
-    # ---- 门槛 + 联合去重 ----
-    print("[4/5] 质量门槛 + 联合去重 ...")
-    gated_out: dict[str, str] = {}
-    candidates: list[str] = []
-    for n in names_all:
-        m = metrics[n]
-        ic, icir = m.get("ic_mean"), m.get("icir")
-        if ic is None or icir is None:
-            gated_out[n] = "无 IC/ICIR 指标（未计算或退化）"
-            continue
-        if abs(ic) < args.min_ic:
-            gated_out[n] = f"|IC|={abs(ic):.4f} < {args.min_ic}"
-            continue
-        if abs(icir) < args.min_icir:
-            gated_out[n] = f"|ICIR|={abs(icir):.3f} < {args.min_icir}"
-            continue
-        candidates.append(n)
-
-    idx_all = {n: i for i, n in enumerate(names_all)}
+    # ---- 联合去重（候选 × 已保留，贪心直接去重）----
+    print("[5/5] 联合去重 ...")
 
     def _strength(n: str) -> float:
         m = metrics[n]
@@ -355,10 +548,10 @@ def main() -> int:
     kept: list[str] = []
     dup_of: dict[str, tuple[str, float]] = {}
     for n in order:
-        i = idx_all[n]
+        i = pos_cand[n]
         hits: list[tuple[str, float]] = []
         for k in kept:
-            rho = M[i, idx_all[k]]
+            rho = M[i, pos_cand[k]]
             if np.isfinite(rho) and abs(rho) >= args.corr:
                 hits.append((k, abs(float(rho))))
         if hits:
@@ -394,7 +587,6 @@ def main() -> int:
     )
 
     # ---- 落盘 ----
-    print("[5/5] 落盘 ...")
     out_dir = resolve_quantdb_dir() / OURS / "screening"
     out_dir.mkdir(parents=True, exist_ok=True)
 

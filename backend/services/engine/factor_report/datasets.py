@@ -25,6 +25,27 @@ from backend.shared.quantdb_paths import resolve_quantdb_subdir
 _ID_COLS = ("symbol", "date", "time", "dt")
 _OHLCV_COLS = ("open", "high", "low", "close", "volume", "amount")
 
+# 前视收益（未来收益标签），**不是因子**，各模式构建时必须排除——
+# 进了因子轴就会以 |IC|≈1 霸榜、经 kept 清单漏进训练面板（P0 泄露）。
+# features_daily 实测两代命名：≤20260918 分区叫 return_Nd，20260930 起改
+# future_return_Nd；两代全列，防旧分区漏网。
+_FUTURE_RETURN_COLS = (
+    "future_return_1d",
+    "future_return_3d",
+    "future_return_5d",
+    "future_return_10d",
+    "future_return_20d",
+    "future_return_60d",
+)
+_LEGACY_RETURN_COLS = (
+    "return_1d",
+    "return_3d",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "return_60d",
+)
+
 DATASETS: dict[str, dict] = {
     "alpha_library": {
         "label": "Alpha 库（Alpha101 / GTJA191 / Alpha158）",
@@ -139,6 +160,49 @@ DATASETS: dict[str, dict] = {
         "library_rule": "fixed:factor1300",
         "universe": "A股全市场 · 因子清单1300（行情列取自 L1 因子库）",
         "build_start": "20160104",
+    },
+    # CAND_FACTORS_MARK: 候选因子池（2026-10-15 纳入筛选/体检）。
+    # 与 factor_defs **同名 238 列**（后者为其超集来源：快照 1336 − 238 = 私人库 1098，
+    # 实测集合双向相等）。私人库扫描按字母序 cand_factors 先于 factor_defs 先到先得，
+    # 筛选侧 REPORT_DATASETS 同序去重保持一致。close 与 l1_factors 同日同股比值恒 1.0。
+    "cand_factors": {
+        "label": "候选因子池（238）",
+        "dir_parts": ("6_ml_datasets", "cand_factors"),
+        "label_mode": "close_fwd",
+        "meta_cols": _ID_COLS + _OHLCV_COLS,
+        "library_rule": "fixed:cand_factors",
+        "universe": "A股全市场 · 候选因子池（与因子清单库同名同源）",
+        "build_start": "20160104",
+    },
+    # DAILY_FEATURES_MARK: 每日特征（技术+估值）（2026-10-15 纳入筛选/体检）。
+    # ⚠️ 列代际三朝（实测）：≤20260630 分区 50 列（无 is_st/free_float_shares，旧名
+    # return_Nd + Symbol_val/close_val）；20260918 分区 78 列；20260930 起标签改名
+    # future_return_Nd。因子列取窗口内**最新分区**的 schema → 41 个；
+    # 构建 worker 对旧分区缺列走 reindex 补 NaN（全退化口径）。close 与 l1 实测恒等。
+    "features_daily": {
+        "label": "每日特征（技术+估值）",
+        "dir_parts": ("6_ml_datasets", "features_daily"),
+        "label_mode": "close_fwd",
+        "meta_cols": _ID_COLS
+        + ("close", "close_val")
+        + _LEGACY_RETURN_COLS
+        + _FUTURE_RETURN_COLS,
+        "library_rule": "fixed:features_daily",
+        "universe": "A股全市场 · 每日特征（技术+估值，41 因子；前视收益列已排除）",
+        "build_start": "20160104",
+    },
+    # L1_BATCH1_MARK: l1_batch1_factors（2026-10-15 纳入筛选/体检）。
+    # 8 个批量因子、2584 分区稳定 11 列、无 OHLCV → donor 取 l1_factors；
+    # 后缀式 symbol 与 l1 同日 5211/5211 全交集（20261009 实测）。
+    "l1_batch1_factors": {
+        "label": "L1 批量因子（batch1，8）",
+        "dir_parts": ("6_ml_datasets", "l1_batch1_factors"),
+        "label_mode": "close_fwd_donor",
+        "donor_parts": ("6_ml_datasets", "l1_factors"),
+        "meta_cols": _ID_COLS,
+        "library_rule": "fixed:l1_batch1_factors",
+        "universe": "A股全市场 · l1_batch1 批量因子（行情列取自 L1 因子库）",
+        "build_start": "20160219",
     },
 }
 

@@ -3,9 +3,10 @@
  * 期末净值 vs 持仓数扫描 + 月频 IC + 最新截面个股表（含行业/市值分布）。
  */
 import React, { useEffect, useMemo, useState } from 'react';
-import { Plus, X } from 'lucide-react';
+import { ArrowUpRight, LineChart, Plus, X } from 'lucide-react';
 import { getFactorDetail } from '../services/factorResearchService';
 import type { FactorDataset, RangeParams } from '../services/factorResearchService';
+import { getFactorDatasets } from '../services/factorReportService';
 import type { FactorDetail, FactorKpi } from '../types/factorResearch';
 import { Card, DistBars, fmtNum, fmtPct, IcChart, NScanChart, NavChart, TagChip } from './common';
 
@@ -13,6 +14,11 @@ interface Props {
   code: string | null;
   range: RangeParams;
   dataset: FactorDataset;
+  /**
+   * 「因子报告」跳转：父级切到因子报告页签并按 (报告数据集, 因子名) 深链
+   * —— 与筛选页的「报告」按钮同一入口（openReport）。不传则不渲染按钮。
+   */
+  onOpenReport?: (reportDataset: string, code: string) => void;
 }
 
 const N_PRESETS = [5, 10, 30, 50];
@@ -44,13 +50,21 @@ function KpiRow({ label, kpi, color, excess300 }: {
   );
 }
 
-export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset }) => {
+export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset, onOpenReport }) => {
   const [detail, setDetail] = useState<FactorDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [nsList, setNsList] = useState<number[]>([10, 30]);
   const [addN, setAddN] = useState('');
   const [benchOn, setBenchOn] = useState<string[]>(['000300.SH']);
+  /**
+   * 因子报告那边**有快照**的数据集（dataset → label）。只有它才能证明
+   * 「因子报告」入口点了会落到这个因子上：报告快照是另一个脚本按自己的清单
+   * 生成的，数据集没快照或没这个因子时，入口要么指向重建横幅要么指向一屏
+   * 「该因子不在快照里」。取不到（失败/未加载）= 没有入口 —— 与筛选页同口径
+   * （少一个按钮，好过渲染一个点了不落到本因子的跳转）。
+   */
+  const [reportDatasets, setReportDatasets] = useState<Map<string, string> | null>(null);
 
   useEffect(() => {
     setNsList([10, 30]);
@@ -69,12 +83,40 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset }) => {
     return () => { alive = false; };
   }, [code, nsList.join(','), range.start, range.end, dataset]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 报告数据集可用性：只有该因子确有来源库时才去问（经典库连请求都不发）。
+  // 清单一次成功即服务所有库（dataset → label 是全局面，与当前库无关）——
+  // 拿到后不再重复问。失败**不落任何状态**：换因子（code 变）就是一次新的
+  // 定位机会，会再试一次 —— 引擎重启/超时恢复后入口能自愈，而不是整个会话
+  // 都不出现（catalog 这个端点逐数据集扫盘，不适合每次换因子都问一遍）。
+  useEffect(() => {
+    const lib = detail?.source_library;
+    if (!lib || reportDatasets) return;
+    let alive = true;
+    getFactorDatasets()
+      .then((res) => {
+        if (!alive) return;
+        const m = new Map<string, string>();
+        (res.items || []).forEach((d) => { if (d.available) m.set(d.dataset, d.label); });
+        setReportDatasets(m);
+      })
+      .catch(() => undefined); // 取不到 = 不渲染入口（不是错误面，因子页本身完好）
+    return () => { alive = false; };
+  }, [detail?.source_library, code, reportDatasets]);
+
   const colors = useMemo(() => {
     const base = ['#2563eb', '#e11d48', '#059669', '#d97706', '#7c3aed', '#0891b2'];
     const m = new Map<number, string>();
     nsList.forEach((n, i) => m.set(n, base[i % base.length]));
     return m;
   }, [nsList]);
+
+  /** 「因子报告」跳转目标：来源库在可用报告数据集里才有值（label 顺带作提示文案）。 */
+  const reportTarget = useMemo(() => {
+    const lib = detail?.source_library || '';
+    if (!lib) return null;
+    const label = reportDatasets?.get(lib);
+    return label ? { dataset: lib, label } : null;
+  }, [detail?.source_library, reportDatasets]);
 
   const addVariant = (n: number) => {
     if (!Number.isFinite(n) || n < 1 || n > 100) return;
@@ -101,7 +143,27 @@ export const SingleFactorTab: React.FC<Props> = ({ code, range, dataset }) => {
       ) : detail ? (
         <>
           {/* 定义 */}
-          <Card title="因子定义" className="shrink-0">
+          <Card
+            title="因子定义"
+            className="shrink-0"
+            extra={
+              // !loading：换因子时旧卡面会停留到新数据落地，此刻按钮仍属**上一个**
+              // 因子 —— 藏起来，别让一次点击跳到刚离开的那个因子的报告。
+              reportTarget && onOpenReport && !loading ? (
+                <button
+                  type="button"
+                  data-testid="open-factor-report"
+                  onClick={() => onOpenReport(reportTarget.dataset, detail.code)}
+                  title={`在因子报告「${reportTarget.label}」里打开 ${detail.code}`}
+                  className="flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 text-[10px] font-bold text-indigo-600 hover:bg-indigo-100"
+                >
+                  <LineChart className="w-3 h-3" />
+                  因子报告
+                  <ArrowUpRight className="w-3 h-3" />
+                </button>
+              ) : undefined
+            }
+          >
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-base font-extrabold text-slate-800">{detail.name_cn}</span>

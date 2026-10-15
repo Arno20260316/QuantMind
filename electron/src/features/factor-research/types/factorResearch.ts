@@ -172,6 +172,12 @@ export interface FactorDetail {
   description: string;
   formula: string;
   wind_source: string;
+  /**
+   * 来源库目录名（= 因子报告的数据集名，如 l1_factors / alpha_library）。
+   * 后端读时由 discovery.source_of(wind_source) 现算；经典 demo 的
+   * wind_source 是 Wind 字段名，反查为空串。「因子报告」跳转入口按它定位。
+   */
+  source_library?: string;
   available: boolean;
   env_tag: string;
   time_tag: string;

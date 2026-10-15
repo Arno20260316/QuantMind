@@ -542,6 +542,10 @@ def factor_detail(
         "description": meta["description"],
         "formula": meta["formula"],
         "wind_source": meta["wind_source"],
+        # 来源库目录名（= 因子报告数据集名）：前端「因子报告」跳转入口据此定位。
+        # 用 discovery.source_of 现算 —— 与扫描侧同一条反查（唯一实现）；经典
+        # demo 的 wind_source 是 Wind 字段名，反查得空串 → 前端不渲染入口。
+        "source_library": discovery.source_of(meta.get("wind_source", "")),
         "available": bool(meta["available"]),
         "env_tag": ctx["env_tags"].get(code, meta.get("env_tag", "")),
         "time_tag": ctx["time_tags"].get(code, meta.get("time_tag", "")),

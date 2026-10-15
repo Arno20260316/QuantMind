@@ -605,7 +605,13 @@ const FactorResearchPage: React.FC = () => {
                 onRegisterToTraining={canRegister ? () => setRegisterTarget({ codes: selected, dataset }) : undefined}
               />
             ) : tab === 'single' ? (
-              <SingleFactorTab code={activeCode} range={rangeParams} dataset={dataset} />
+              <SingleFactorTab
+                code={activeCode}
+                range={rangeParams}
+                dataset={dataset}
+                // 单因子详情的「因子报告」入口复用筛选页的深链通道（同一个 openReport）。
+                onOpenReport={openReport}
+              />
             ) : tab === 'compare' ? (
               <CompareTab codes={selected} onRemove={toggleSelected} nameOf={nameOf} range={rangeParams} dataset={dataset} />
             ) : tab === 'screening' ? (

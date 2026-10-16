@@ -260,6 +260,10 @@ export interface HkSmCategoryRow {
   net5_days: number | null;
   net20_yi: number | null;
   net20_days: number | null;
+  /** v2：类别方向技能（bp，买 +exc / 卖 −exc，事件层口径）；南向与 other 为 null */
+  skill_bp: number | null;
+  vw_skill_bp: number | null;
+  n_lead_events: number | null;
   admitted: boolean | null;
   best: {
     h10_ic: number | null;
@@ -389,6 +393,8 @@ export interface HkSmSeatItem {
   category: string;
   category_label: string | null;
   kind: string | null;
+  /** 窗口（/seats items 依查询窗；/seat/{id} windows 各键对应行同带） */
+  window?: string | null;
   n_events: number | null;
   n_buy: number | null;
   n_sell: number | null;
@@ -402,7 +408,26 @@ export interface HkSmSeatItem {
   shrunk_hit: number | null;
   stability: boolean | null;
   eligible: boolean | null;
+  first_event_date: string | null;
   last_event_date: string | null;
+  /** v2：方向技能（bp，买 +exc / 卖 −exc） */
+  skill_bp: number | null;
+  /** v2：技能 t 值（skill / 标准误） */
+  skill_t: number | null;
+  /** v2：90% 单侧下界（skill − 1.28×SE）；仅 n_exc10 ≥ 5 给出，更小样本「—」沉底 */
+  lb_skill_bp: number | null;
+  /** v2：|Δvalue| 加权技能（大钱口径） */
+  vw_skill_bp: number | null;
+  /** v2：fwd_exc_5 / fwd_exc_20 裸超额均值（稳健性横看） */
+  exc5_bp: number | null;
+  exc20_bp: number | null;
+  /** v2：买/卖单侧事件的事后超额均值（原始符号，不翻转） */
+  buy_exc_bp: number | null;
+  sell_exc_bp: number | null;
+  /** v2：该席事件去重标的数（专精 vs 分散） */
+  n_symbols: number | null;
+  /** v2：单笔分量级 = mean(|Δvalue|) / 1e6（百万 HKD） */
+  avg_value_m: number | null;
 }
 
 export interface HkSmSeatsResponse {
@@ -551,7 +576,7 @@ export interface HkSmSeatsQuery {
   /** 事件窗口：'20' | '60' | 'all'（后端 "0"/缺省 → 全史） */
   window?: string;
   category?: string | null;
-  /** 排序：shrunk_hit | avg_exc | n */
+  /** 排序：lb_skill（默认，90% 下界）| skill | vw_skill | avg_exc | shrunk_hit | n */
   sort?: string;
   minEvents?: number;
   limit?: number;
@@ -561,10 +586,114 @@ export function getHkSmSeats(q: HkSmSeatsQuery = {}): Promise<HkSmSeatsResponse>
   const params = new URLSearchParams();
   params.set('window', q.window ?? '60');
   if (q.category) params.set('category', q.category);
-  params.set('sort', q.sort ?? 'shrunk_hit');
+  params.set('sort', q.sort ?? 'lb_skill');
   params.set('min_events', String(Math.max(Math.trunc(q.minEvents ?? 5), 1)));
   params.set('limit', String(Math.min(Math.max(Math.trunc(q.limit ?? 30), 1), 100)));
   return hkSmGet<HkSmSeatsResponse>(`/smart-money/seats?${params.toString()}`);
+}
+
+// ---- 席位档案与持续性审计（v2：解答「哪些机构更有优势」的钻取面）----
+
+export interface HkSmSeatMonthlyRow {
+  month: string;
+  n: number | null;
+  skill_bp: number | null;
+  vw_skill_bp: number | null;
+  hit: number | null;
+}
+
+export interface HkSmSeatSymbolRow {
+  symbol: string;
+  name: string | null;
+  n: number | null;
+  skill_bp: number | null;
+  vw_skill_bp: number | null;
+  last_event_date: string | null;
+}
+
+export interface HkSmSeatEventRow {
+  date: string | null;
+  symbol: string;
+  name: string | null;
+  kind: string | null;
+  direction: number | null;
+  delta_value: number | null;
+  value_yi: number | null;
+  delta_pct: number | null;
+  price: number | null;
+  transfer_suspect: boolean | null;
+  first_of_episode: boolean | null;
+  fwd_exc_5_bp: number | null;
+  fwd_exc_10_bp: number | null;
+  fwd_exc_20_bp: number | null;
+}
+
+export interface HkSmSeatProfileResponse {
+  participant: {
+    participant_id: string;
+    participant_name: string | null;
+    category: string;
+    category_label: string | null;
+    kind: string | null;
+    first_event_date: string | null;
+    last_event_date: string | null;
+  };
+  as_of: string | null;
+  generated_at: string | null;
+  /** 三窗统计行（键 '20' | '60' | 'all'） */
+  windows: Record<string, HkSmSeatItem | undefined>;
+  monthly: HkSmSeatMonthlyRow[];
+  top_symbols: HkSmSeatSymbolRow[];
+  recent_events: HkSmSeatEventRow[];
+  notes: HkSmNotes;
+}
+
+export interface HkSmPersistenceScatterPoint {
+  participant_id: string;
+  name: string | null;
+  category: string | null;
+  n1: number | null;
+  n2: number | null;
+  skill1_bp: number | null;
+  skill2_bp: number | null;
+}
+
+export interface HkSmPersistenceQuartile {
+  q: number;
+  n_seats: number | null;
+  n_events: number | null;
+  forward_skill_bp: number | null;
+  forward_hit: number | null;
+}
+
+export interface HkSmPersistenceCategoryHalf {
+  category: string;
+  n: number | null;
+  first_half_vw_skill_bp: number | null;
+  second_half_vw_skill_bp: number | null;
+}
+
+export interface HkSmPersistenceResponse {
+  generated_at: string | null;
+  as_of: string | null;
+  split_date: string | null;
+  scatter: HkSmPersistenceScatterPoint[];
+  spearman: { h10: number | null; h20: number | null; hit: number | null };
+  quartiles: HkSmPersistenceQuartile[];
+  category_halves: HkSmPersistenceCategoryHalf[];
+  method: Record<string, string>;
+}
+
+/** 席位档案：三窗统计 + 月度战绩 + 活跃标的 + 最近事件（查无 → 404 seat_not_found） */
+export function getHkSmSeatProfile(participantId: string): Promise<HkSmSeatProfileResponse> {
+  return hkSmGet<HkSmSeatProfileResponse>(
+    `/smart-money/seat/${encodeURIComponent(participantId.trim().toUpperCase())}`,
+  );
+}
+
+/** 持续性审计：散点/秩相关/四分位 OOS/类别前后半（构建期实算，原样透传） */
+export function getHkSmPersistence(): Promise<HkSmPersistenceResponse> {
+  return hkSmGet<HkSmPersistenceResponse>('/smart-money/persistence');
 }
 
 export function getHkSmConsensus(limit = 50): Promise<HkSmConsensusResponse> {

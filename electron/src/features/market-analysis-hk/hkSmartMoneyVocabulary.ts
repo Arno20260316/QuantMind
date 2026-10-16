@@ -74,11 +74,20 @@ export function windowLabel(id: string): string {
   return SEAT_WINDOW_OPTIONS.find((o) => o.id === id)?.label ?? id;
 }
 
-/** 席位榜排序 chips（与后端 sort 参数同集） */
+/** 席位榜排序 chips（与后端 sort 参数同集；v2 默认按 90% 下界） */
 export const SEAT_SORT_OPTIONS: Array<{ id: string; label: string }> = [
-  { id: 'shrunk_hit', label: '历史胜率' },
-  { id: 'avg_exc', label: '平均超额' },
-  { id: 'n', label: '事件数' },
+  { id: 'lb_skill', label: '按90%下界' },
+  { id: 'skill', label: '按技能' },
+  { id: 'vw_skill', label: '按大钱技能' },
+  { id: 'n', label: '按事件数' },
+];
+
+/** 席位榜样本量门槛 chips（v2 默认 n≥50；「全部」= 读侧契约下限 SEAT_MIN_EVENTS=5） */
+export const SEAT_MIN_OPTIONS: Array<{ id: number; label: string; title: string }> = [
+  { id: 30, label: 'n≥30', title: '仅看事件数 ≥ 30 的席位' },
+  { id: 50, label: 'n≥50', title: '仅看事件数 ≥ 50 的席位（默认：小样本噪声沉底）' },
+  { id: 100, label: 'n≥100', title: '仅看事件数 ≥ 100 的席位（最扎实的一档）' },
+  { id: 5, label: '全部', title: '不设额外门槛（仍不低于读侧契约 n≥5）' },
 ];
 
 /** 口径脚注（面板口径卡与榜单行 tooltip 共用同一句话） */
@@ -94,6 +103,17 @@ export const FWD_NOTE =
   '事后超额 = 事件日 T+1 收盘入场、持有 10 日的市场调整超额（封存展示列，不参与信号构造）';
 export const ADMIT_NOTE =
   '入柱 = 通过 h10 双过闸（IC 显著 ∧ 尾部 q5−q1 同号）；「零入柱」为真裁定（数据结论），不是链路故障';
+
+/** v2 口径注（机构优势面与席位抽屉共用；与后端 hk_smart_money.py 文案一致） */
+export const SKILL_NOTE =
+  '方向技能 = 买入事件 +事后超额 / 卖出事件 −事后超额（方向对不对）；同样是事后统计——持续性审计显示席位层弱持续，榜单是描述性盘点，不是可跟随信号';
+export const LB_NOTE =
+  '90% 下界 = 技能均值 − 1.28×标准误：小样本自动沉底，榜默认按此排序；样本 < 5 不给下界（「—」比假标 90% 诚实）';
+export const VW_NOTE = '大钱技能 = 按 |变动金额| 加权的方向技能：笔数与分量级分离，防小额高频刷榜';
+export const PERSIST_NOTE =
+  '持续性审计：把全史切成前/后半场，检验「前半强的席位后半是否还强」。实测秩相关约 0.12（弱正）——优势可盘点、难以直接跟随，这是数据结论不是故障';
+export const SAMPLE_NOTE = '样本纪律：默认只看事件数 ≥ 50 的席位；「全部」档会混入小样本噪声，请连同 n 阅读';
+export const PROFILE_WINDOW_NOTE = '窗口统计口径与席位榜一字不差：episode 首日 ∧ 非过户嫌疑；样本 = fwd_exc_10 可测事件';
 
 /** 缺失安全数值格式化：null/NaN → 「—」，绝不显示 0 */
 export function fmtNum(v: number | null | undefined, digits = 2): string {
@@ -152,6 +172,15 @@ export function fmtShares(v: number | null | undefined): string {
 export function fmtHkdWan(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(Number(v))) return MISSING;
   return `${fmtNum(Number(v) / 1e4, 0)}万`;
+}
+
+/** 单笔分量级（接口单位=百万 HKD）→ 亿/万自适应；缺失「—」 */
+export function fmtValueM(v: number | null | undefined): string {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return MISSING;
+  const n = Number(v);
+  const abs = Math.abs(n);
+  if (abs >= 100) return `${fmtNum(n / 100, 2)}亿`;
+  return `${fmtNum(n * 100, 0)}万`;
 }
 
 /** 金额/超额符号着色（港股口径：红涨绿跌，仅用于数值正负）；0 与缺失走中性 */

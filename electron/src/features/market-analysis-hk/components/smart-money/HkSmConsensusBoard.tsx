@@ -7,14 +7,16 @@
 import React from 'react';
 import { Users } from 'lucide-react';
 import type { HkSmConsensusItem, HkSmConsensusResponse } from '../../services/api';
-import { EmptyHint, RankRow, SectionCard, fmtInt } from '../shared/ui';
-import { categoryLabel, fmtNum, fmtScore, scoreCls } from '../../hkSmartMoneyVocabulary';
+import { EmptyHint, FaceCard, RankRow } from '../../../market-analysis-shared/ui';
+import { categoryLabel, fmtInt, fmtNum, fmtScore, scoreCls } from '../../hkSmartMoneyVocabulary';
 
 interface HkSmConsensusBoardProps {
   data: HkSmConsensusResponse | null;
   loading: boolean;
   error: string | null;
   onPick: (symbol: string) => void;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 /** 柱名（category::variant）→ 中文展示名 */
@@ -54,8 +56,10 @@ export const HkSmConsensusBoard: React.FC<HkSmConsensusBoardProps> = ({
   loading,
   error,
   onPick,
+  bare = false,
 }) => (
-  <SectionCard
+  <FaceCard
+    bare={bare}
     icon={<Users className="w-3.5 h-3.5 text-purple-600" />}
     title="共识榜"
     extra={
@@ -113,5 +117,5 @@ export const HkSmConsensusBoard: React.FC<HkSmConsensusBoardProps> = ({
         </p>
       </div>
     )}
-  </SectionCard>
+  </FaceCard>
 );

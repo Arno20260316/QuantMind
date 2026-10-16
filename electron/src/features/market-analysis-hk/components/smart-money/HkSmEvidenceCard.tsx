@@ -7,12 +7,21 @@
 import React from 'react';
 import { AlertTriangle, FlaskConical } from 'lucide-react';
 import type { HkSmCalibration, HkSmEvidenceResponse } from '../../services/api';
-import { EmptyHint, SectionCard, fmtInt } from '../shared/ui';
-import { ADMIT_NOTE, MISSING, fmtHkdWan, fmtNum, fmtShares } from '../../hkSmartMoneyVocabulary';
+import { EmptyHint, FaceCard } from '../../../market-analysis-shared/ui';
+import {
+  ADMIT_NOTE,
+  MISSING,
+  fmtHkdWan,
+  fmtInt,
+  fmtNum,
+  fmtShares,
+} from '../../hkSmartMoneyVocabulary';
 
 interface HkSmEvidenceCardProps {
   evidence: HkSmEvidenceResponse | null;
   loading: boolean;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 const METHOD_LABELS: Record<string, string> = {
@@ -104,15 +113,20 @@ function CalibrationTable({ cal }: { cal: HkSmCalibration }) {
   );
 }
 
-export const HkSmEvidenceCard: React.FC<HkSmEvidenceCardProps> = ({ evidence, loading }) => {
+export const HkSmEvidenceCard: React.FC<HkSmEvidenceCardProps> = ({
+  evidence,
+  loading,
+  bare = false,
+}) => {
   if (!evidence) {
     return (
-      <SectionCard
+      <FaceCard
+        bare={bare}
         icon={<FlaskConical className="w-3.5 h-3.5 text-purple-600" />}
         title="证据台 · 裁定与标定"
       >
         <EmptyHint loading={loading} text="证据面不可用" />
-      </SectionCard>
+      </FaceCard>
     );
   }
 
@@ -123,7 +137,8 @@ export const HkSmEvidenceCard: React.FC<HkSmEvidenceCardProps> = ({ evidence, lo
   const methodEntries = Object.entries(evidence.method ?? {});
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<FlaskConical className="w-3.5 h-3.5 text-purple-600" />}
       title="证据台 · 裁定与标定"
       extra={
@@ -269,6 +284,6 @@ export const HkSmEvidenceCard: React.FC<HkSmEvidenceCardProps> = ({ evidence, lo
           ))}
         </div>
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

@@ -36,7 +36,7 @@ diff -rq "$BASE" "$LOC" | grep -v '__pycache__\|/build/\|egg-info'
 |---|---|
 | 内容不同 | 23 |
 | ├ 其中换行符噪声（非补丁） | 2 |
-| └ **实质本地补丁** | **21**（批次 0 核定 19 + 2026-10-07 embedding 修复新增 2） |
+| └ **实质本地补丁** | **22**（批次 0 核定 19 + 2026-10-07 embedding 修复新增 2 + 2026-10-16 输出粒度频率分派新增 1） |
 | 本地新增（文件/目录） | 9（含 1 个新 `.py`、若干构建产物与运行期数据） |
 | 本地删除 | 1 |
 
@@ -129,6 +129,19 @@ provider=`BAAI` 并抛 `BadRequestError: LLM Provider NOT provided`。实测确�
 | `.github/workflows/pr.yml` | `node-version: '22'` → `'16'`（降级） |
 | `README.md` | 删除 25 行（上游 Agent² RL-Bench 宣传段） |
 | `rdagent/scenarios/rl/autorl_bench/README.md` | 8 行实质差异 |
+
+### A7 · 输出粒度评估器频率分派（1 处）— 2026-10-16
+
+| 文件 | 改了什么 |
+|---|---|
+| `rdagent/components/coder/factor_coder/eva_utils.py` | `FactorDatetimeDailyEvaluator` → `FactorDatetimeFreqEvaluator`（旧名保留别名）：新增模块级 `_expected_bar_seconds()` 读 QuantMind 注入的 `QM_MINING_BAR_SECONDS`（单源 `mining_config.FREQ_SPECS`）；=0（缺省）与上游逐字一致，>0（1min=60）要求输出含该间隔的日内时间戳、纯日频输出判错。`FactorValueEvaluator.evaluate` 变量 `daily_check_result` → `freq_check_result` |
+
+**动因**：2026-10-16 的 1min 挖掘 56 分钟零产出（任务 `7432918e08a14141`，38 连 FAIL、
+「not daily」×92）——本评估器硬编码「1min 间隔 = 一定错」，与提示词「输出分钟粒度」
+互补振荡，evo 轮耗尽触发 `skip_loop_error` 静默跳轮。频率分派后两个裁判同源
+（同一份 `QM_MINING_BAR_SECONDS`，fork 只认数值、不认频率词表）。
+
+**回归防线**：`backend/tests/test_factor_eval_freq_dispatch.py`（容器内真 import rdagent）。
 
 > 本仓库的 GitHub Actions 早已不在用量内（vendored），A6 属可忽略项。
 
@@ -332,3 +345,4 @@ RD-Agent **自带** `.gitignore`，vendoring 时 `git add rd-agent/` 让这些�
 | 2026-10-07 | **A2 假 embedding 已修复**（`base.py` 还原上游 + `litellm.py` 转发凭证 + `embedding.py` 新增解析）。补丁数 19 → 21；§5 转为已排除并附量化验收；DeepSeek 无 embedding 接口已独立验证（404） |
 | 2026-10-07 | **批次 1b 打开记忆**：新增 `rd_agent/kb_env.py`（拒绝相对路径）+ launcher 接线 + 4 例真实检索验收。§5 新增 1b 小节，并**订正**初版的一处错误归因——插入期语义去重是上游自己注释掉的（与基线 0 行差异），近重复累积与 embedding 真假无关 |
 | 2026-10-07 | **1a/1b 代码审查修复**：① HIGH —— 用户级 embedding 配置在 `launcher.py` 断链（`llm_env_overrides()` 写出 `EMBEDDING_*`，唯一消费者没读，界面显示"已保存"而挖掘始终用容器级 .env），已接线 + 端到端回归测试；② `embedding_channel_is_explicit()` 修掉 `LLM_SETTINGS.embedding_model` 非空默认值导致的守卫恒真；③ 订正 §3 三处计数（19→21、A2 4→3，按基线全树重算核对）；④ 前端保存改条件提交、请求/响应日志脱敏（密钥不再进控制台）。测试 31 → 48。**另修一条基线自带的密钥泄漏**：`LiteLLMAPIBackend.__init__` 明文打印 `LITELLM_SETTINGS`（含 `openai_api_key`）到 stdout 与落盘 `.pkl`，见 §3 A2 的 ⚠️ 注 |
+| 2026-10-16 | **A7 输出粒度频率分派**：1min 挖掘零产出根因（输出粒度评估器硬编码日频 vs 提示词要求分钟输出 → 互补振荡）修复；评估器按 `QM_MINING_BAR_SECONDS` 分派，缺省行为与上游逐字一致。补丁 21 → 22 |

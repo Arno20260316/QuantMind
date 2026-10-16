@@ -51,8 +51,32 @@ SUPPORTED_FREQS: tuple[str, ...] = (FREQ_DAY, FREQ_MINUTE)
 MINUTE_MARKETS: tuple[str, ...] = ("a_share",)
 #: 任务级频率 env 键（与窗口变量同族；缺省 = day）
 ENV_FREQ = "QM_MINING_FREQ"
+#: 任务级 bar 间隔 env 键（秒；0 = 日频）。fork（rdagent 评估器补丁）**只读这个
+#: 数值**——频率词表（day/1min/…）只活在 backend，新增频率不需要动 fork。
+ENV_BAR_SECONDS = "QM_MINING_BAR_SECONDS"
 #: 任务指纹 env 键（P3 去重指纹 → 统计派稳定因子 id 的身份来源；空 = 退回任务级）
 ENV_TASK_FINGERPRINT = "QM_MINING_TASK_FINGERPRINT"
+
+
+@dataclass(frozen=True)
+class FreqSpec:
+    """一条挖掘频率的完整规格——频率族单源（数据面/契约面/提示词/物化共用）。
+
+    ``value_collapse`` 是物化面的日频折叠规则：日内频率的因子值须折叠为
+    日频列入库，``"last"`` = 每交易日最后一根**有效** bar 的值（收盘时点
+    快照）；日频天然无需折叠（``None``）。
+    """
+
+    freq: str
+    bar_seconds: int  # 0 = 日频（输出粒度无日内约束）
+    label: str
+    value_collapse: str | None
+
+
+FREQ_SPECS: dict[str, FreqSpec] = {
+    FREQ_DAY: FreqSpec(FREQ_DAY, 0, "日频", None),
+    FREQ_MINUTE: FreqSpec(FREQ_MINUTE, 60, "分钟级", "last"),
+}
 
 #: 无检验区间时，挖掘区间按自然日切分为 train / valid / test 的比例。
 _SEG_TRAIN_RATIO = 0.70
@@ -93,7 +117,11 @@ def normalize_freq(value: str | None, *, market: str | None = None) -> str:
         raise ValueError(
             f"不支持的挖掘频率 {value!r}（可选：{'、'.join(SUPPORTED_FREQS)}）"
         )
-    if freq == FREQ_MINUTE and market is not None and str(market).lower() not in MINUTE_MARKETS:
+    if (
+        freq == FREQ_MINUTE
+        and market is not None
+        and str(market).lower() not in MINUTE_MARKETS
+    ):
         raise ValueError(f"分钟级挖掘暂只支持 A 股（收到市场 {market}）")
     return freq
 
@@ -102,6 +130,27 @@ def freq_from_env(env: Mapping[str, str] | None = None) -> str:
     """读任务环境里的挖掘频率（``QM_MINING_FREQ``）；未设置/空 = day。"""
     src: Mapping[str, str] = os.environ if env is None else env
     return normalize_freq(src.get(ENV_FREQ))
+
+
+def freq_spec(freq: str | None, *, market: str | None = None) -> FreqSpec:
+    """频率串 → FreqSpec（校验走 ``normalize_freq``，词表唯一出口）。"""
+    return FREQ_SPECS[normalize_freq(freq, market=market)]
+
+
+def bar_seconds_from_env(env: Mapping[str, str] | None = None) -> int:
+    """读任务环境里的 bar 间隔秒数（``QM_MINING_BAR_SECONDS``）；缺省/非法 = 0 = 日频。
+
+    与 fork 侧（rdagent 评估器补丁）同款缺省语义：读不到、读不动的值一律按
+    日频处理——绝不把坏配置猜成日内频率去卡别人的输出粒度。
+    """
+    src: Mapping[str, str] = os.environ if env is None else env
+    raw = str(src.get(ENV_BAR_SECONDS) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 def task_fingerprint_from_env(env: Mapping[str, str] | None = None) -> str:
@@ -180,7 +229,9 @@ def clamp_to_data_end(window: Window, data_end: date | None) -> Window:
     return Window(window.start, data_end)
 
 
-def _reject_beyond_guard(window: Window | None, *, label: str, data_end: date | None) -> None:
+def _reject_beyond_guard(
+    window: Window | None, *, label: str, data_end: date | None
+) -> None:
     """末端保护退让后窗口反了 → 显式报错（消息给出可用的最晚终点）。"""
     if window is None or window.start <= window.end:
         return
@@ -368,7 +419,10 @@ def task_env(
         env["QM_VALIDATION_WINDOW_START"] = v_start
         env["QM_VALIDATION_WINDOW_END"] = v_end
     if freq is not None:
-        env[ENV_FREQ] = normalize_freq(freq)
+        spec = freq_spec(freq)
+        env[ENV_FREQ] = spec.freq
+        # bar 间隔数值随频率同写：fork 评估器（输出粒度契约）只认这一个数。
+        env[ENV_BAR_SECONDS] = str(spec.bar_seconds)
     return {k: v for k, v in env.items() if v}
 
 

@@ -411,7 +411,12 @@ async def _load_panel_metric_candidates(
         "COALESCE(universe, '') AS universe, user_id, "
         "metadata_json->>'rre' AS rre, "
         "metadata_json->>'ann_turnover' AS ann_turnover, "
-        "metadata_json->>'ann_return_net' AS ann_return_net "
+        "metadata_json->>'ann_return_net' AS ann_return_net, "
+        # 频率 provenance（原生分钟挖掘）：分钟因子走分钟 face + 日频折叠
+        "metadata_json->>'native_freq' AS native_freq, "
+        "metadata_json->>'mining_window_start' AS mining_window_start, "
+        "metadata_json->>'mining_window_end' AS mining_window_end, "
+        "metadata_json->>'task_id' AS task_id "
         "FROM rd_agent_factors "
         f"WHERE {where} ORDER BY created_at"
     )
@@ -566,7 +571,7 @@ async def _run_panel_metric_stage(args: argparse.Namespace) -> dict[str, Any]:
     """--panels / --metrics 合并一趟：因子代码每因子只执行一次，两个产物共享。"""
     from backend.scripts.rd_mined_materialize import (
         _compute_factor_values,
-        _resolve_h5,
+        _resolve_face,
     )
     from backend.services.engine.mining_plugins import pool_panels
 
@@ -600,7 +605,7 @@ async def _run_panel_metric_stage(args: argparse.Namespace) -> dict[str, Any]:
             continue
         try:
             if h5_path is None:
-                h5_path = _resolve_h5(args.h5_path)
+                h5_path = _resolve_face(args.h5_path, row)
                 logger.info("daily_pv.h5 = %s", h5_path)
             values = _compute_factor_values(row, h5_path, timeout=args.timeout)
             if values.empty:

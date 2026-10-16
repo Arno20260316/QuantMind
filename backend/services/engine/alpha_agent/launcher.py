@@ -40,10 +40,12 @@ from backend.services.engine.alpha_agent.algorithm_registry import (
 from backend.services.engine.alpha_agent.data_snapshot import snapshot_data_versions
 from backend.services.engine.alpha_agent.hw_lock import advisory_running_capacity
 from backend.services.engine.alpha_agent.mining_config import (
+    ENV_BAR_SECONDS,
     ENV_FREQ,
     ENV_TASK_FINGERPRINT,
     FREQ_MINUTE,
     Window,
+    freq_spec,
     normalize_freq,
     parse_window,
     resolve_windows,
@@ -1738,8 +1740,13 @@ class AlphaAgentLauncher:
         # 挖掘频率：与窗口**独立**注入。分钟任务缺窗口时由 wrapper 响亮失败
         # （MinuteDataError），但频率标记必须先到——否则子进程按日线默认跑完，
         # 产出一批"自称分钟因子"的东西，正是 P1.5 要消灭的失败态。
+        # bar 秒数随频率同写（与 task_env 同走 freq_spec 单源）：fork 评估器的
+        # 输出粒度分派只认 QM_MINING_BAR_SECONDS 这一个数——漏发 = 评估器按日频
+        # 裁判分钟输出，与提示词面互补振荡（2026-10-16 实证的零产出病根）。
         if task.freq:
-            env[ENV_FREQ] = task.freq
+            spec = freq_spec(task.freq)
+            env[ENV_FREQ] = spec.freq
+            env[ENV_BAR_SECONDS] = str(spec.bar_seconds)
 
         # P3 任务指纹：统计派落库的稳定因子 id 靠它定身份（同配置重跑幂等刷新
         # 同一行）。空指纹不注入——runner 会如实退回任务级身份，而不是拿空串

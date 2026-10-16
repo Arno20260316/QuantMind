@@ -129,11 +129,13 @@ def _write_day_provider(
             )
         MP._write_bin(feat / "close.day.bin", 0, closes)
         MP._write_bin(feat / "volume.day.bin", 0, np.full(len(cal), 5e5, dtype="<f4"))
-    rows = [
-        f"{code}\t{DAY1.isoformat()}\t2026-10-09" for code in codes
-    ]
-    (day / "instruments" / "csi300.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
-    (day / "instruments" / "all.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    rows = [f"{code}\t{DAY1.isoformat()}\t2026-10-09" for code in codes]
+    (day / "instruments" / "csi300.txt").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+    (day / "instruments" / "all.txt").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
     if extra_instrument_pool:
         # 日线有、分钟没有的池：应被"空池不落地"规则跳过（不写出空文件）
         (day / "instruments" / "csi500.txt").write_text(
@@ -142,7 +144,9 @@ def _write_day_provider(
     return day
 
 
-def _read_field(feat_dir: Path, field: str, freq: str = "1min") -> tuple[int, np.ndarray]:
+def _read_field(
+    feat_dir: Path, field: str, freq: str = "1min"
+) -> tuple[int, np.ndarray]:
     return MP._read_bin(feat_dir / f"{field}.{freq}.bin")
 
 
@@ -240,7 +244,11 @@ def test_price_fields_multiplied_by_daily_step_factor(env):
 
     _, sh_close = _read_field(env["provider"] / "features" / "sh600000", "close")
     expected_sh = np.array(
-        [_raw_close("sh600000", d, b) * _day_factor("sh600000", d) for d in (DAY1, DAY2) for b in BARS],
+        [
+            _raw_close("sh600000", d, b) * _day_factor("sh600000", d)
+            for d in (DAY1, DAY2)
+            for b in BARS
+        ],
         dtype="<f4",
     )
     np.testing.assert_allclose(sh_close, expected_sh, rtol=1e-6)
@@ -256,7 +264,9 @@ def test_last_minute_close_matches_day_bin_close(env):
         m_start, m_close = _read_field(bp / "features" / code, "close", "1min")
         d_start, d_close = _read_field(bp / "features" / code, "close", "day")
         for day in (DAY1, DAY2):
-            last_pos = max(i for i, ts in enumerate(cal) if ts.startswith(day.isoformat()))
+            last_pos = max(
+                i for i, ts in enumerate(cal) if ts.startswith(day.isoformat())
+            )
             day_pos = day_cal.index(day.isoformat())
             assert m_close[last_pos - m_start] == pytest.approx(
                 d_close[day_pos - d_start], rel=1e-6
@@ -268,7 +278,9 @@ def test_volume_and_amount_kept_raw(env):
     _, vol = _read_field(env["provider"] / "features" / "sz000001", "volume")
     assert vol[0] == pytest.approx(1000.0)
     _, amount = _read_field(env["provider"] / "features" / "sz000001", "amount")
-    assert amount[0] == pytest.approx(_raw_close("sz000001", DAY1, BARS[0]) * 1000.0 / 1e4)
+    assert amount[0] == pytest.approx(
+        _raw_close("sz000001", DAY1, BARS[0]) * 1000.0 / 1e4
+    )
 
 
 def test_day_layer_copied_with_calendar_and_benchmark(env):
@@ -310,7 +322,9 @@ def test_instruments_end_is_coverage_end_when_day_calendar_has_no_successor(tmp_
         "provider": tmp_path / "qlib" / "cn_data_1min",
     }
     _build(env)
-    for line in (env["provider"] / "instruments" / "csi300.txt").read_text().splitlines():
+    for line in (
+        (env["provider"] / "instruments" / "csi300.txt").read_text().splitlines()
+    ):
         _, _, end = line.split("\t")
         assert end == DAY2.isoformat()
 
@@ -379,12 +393,16 @@ def test_yuan_denominated_source_still_builds(tmp_path):
 
 def test_ensure_hits_fresh_provider_and_rebuilds_on_source_change(env):
     pdir, first = MP.ensure_minute_provider(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"]
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
     )
     assert first is not None
     assert pdir == env["provider"]
     _, second = MP.ensure_minute_provider(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"]
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
     )
     assert second is None  # 新鲜：零重建
 
@@ -396,17 +414,23 @@ def test_ensure_hits_fresh_provider_and_rebuilds_on_source_change(env):
     os.utime(parquet, ns=(st.st_mtime_ns + 10**9, st.st_mtime_ns + 10**9))
 
     _, third = MP.ensure_minute_provider(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"]
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
     )
     assert third is not None  # 源变化 → 重建
     _, close = _read_field(env["provider"] / "features" / "sh600000", "close")
-    assert close[-1] == pytest.approx((_raw_close("sh600000", DAY2, BARS[-1]) + 0.5) * 1.5, rel=1e-5)
+    assert close[-1] == pytest.approx(
+        (_raw_close("sh600000", DAY2, BARS[-1]) + 0.5) * 1.5, rel=1e-5
+    )
 
 
 def test_failed_build_keeps_previous_provider_intact(env):
     _build(env)
     before = MP.read_minute_meta(env["provider"])
-    before_close = _read_field(env["provider"] / "features" / "sh600000", "close")[1].copy()
+    before_close = _read_field(env["provider"] / "features" / "sh600000", "close")[
+        1
+    ].copy()
     with pytest.raises(MP.MinuteProviderError):
         _build(env, symbols=["sh601988"])  # 源里没有该标的
     assert MP.is_minute_provider_ready(env["provider"])
@@ -419,10 +443,14 @@ def test_failed_build_keeps_previous_provider_intact(env):
 
 def test_status_reports_ready_coverage_and_stale(env):
     MP.ensure_minute_provider(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"]
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
     )
     status = MP.minute_provider_status(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"],
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
         universe="csi300",
     )
     assert status["ready"] is True
@@ -440,7 +468,9 @@ def test_status_reports_ready_coverage_and_stale(env):
     st = parquet.stat()
     os.utime(parquet, ns=(st.st_mtime_ns + 10**9, st.st_mtime_ns + 10**9))
     status2 = MP.minute_provider_status(
-        provider_dir=env["provider"], source_dir=env["source"], day_provider_dir=env["day"],
+        provider_dir=env["provider"],
+        source_dir=env["source"],
+        day_provider_dir=env["day"],
         universe="csi300",
     )
     assert status2["stale"] is True
@@ -461,7 +491,9 @@ def test_status_reports_error_when_source_missing(env):
 
 
 def test_scan_source_coverage_reports_missing_symbols(env):
-    scan = MP.scan_source_coverage(env["source"], [*CODES, "sh601988"], universe="csi300")
+    scan = MP.scan_source_coverage(
+        env["source"], [*CODES, "sh601988"], universe="csi300"
+    )
     assert scan.symbols_found == CODES
     assert scan.symbols_missing == ("sh601988",)
     assert scan.coverage.days == 2
@@ -475,10 +507,24 @@ def test_scan_source_coverage_keeps_auction_bar(tmp_path):
     src = tmp_path / "quantdb" / "1_kline_data" / "min1_kline"
     src.mkdir(parents=True)
     rows = [
-        {"time": datetime(2026, 1, 5, 9, 25), "open": 1.0, "high": 1.0, "low": 1.0,
-         "close": 1.0, "volume": 1.0, "amount": 1.0},
-        {"time": datetime(2026, 1, 5, 9, 30), "open": 1.0, "high": 1.0, "low": 1.0,
-         "close": 1.0, "volume": 1.0, "amount": 1.0},
+        {
+            "time": datetime(2026, 1, 5, 9, 25),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+            "amount": 1.0,
+        },
+        {
+            "time": datetime(2026, 1, 5, 9, 30),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+            "amount": 1.0,
+        },
     ]
     pd.DataFrame(rows).to_parquet(src / "600000.SH.parquet")
     scan = MP.scan_source_coverage(src, ["sh600000"])
@@ -498,7 +544,9 @@ def test_read_minute_frame_columns_and_window(env):
 
     day2 = MP.read_minute_frame(env["provider"], CODES, start=DAY2, end=DAY2)
     assert len(day2) == 5 * len(CODES)
-    assert {str(t.date()) for t in day2.index.get_level_values("datetime")} == {"2026-01-06"}
+    assert {str(t.date()) for t in day2.index.get_level_values("datetime")} == {
+        "2026-01-06"
+    }
 
     assert MP.read_minute_frame(env["provider"], CODES, start=DAY3).empty
 
@@ -610,7 +658,9 @@ def test_duplicate_timestamps_are_deduped_with_warning(tmp_path):
     report = _build(env)
     assert any("重复时间戳" in w for w in report.warnings)
     _, close = _read_field(env["provider"] / "features" / "sh600000", "close")
-    assert close[-1] == pytest.approx((_raw_close("sh600000", DAY2, BARS[-1]) + 0.7) * 1.5, rel=1e-5)
+    assert close[-1] == pytest.approx(
+        (_raw_close("sh600000", DAY2, BARS[-1]) + 0.7) * 1.5, rel=1e-5
+    )
 
 
 def test_missing_day_factor_falls_back_to_one_with_warning(tmp_path):
@@ -676,9 +726,7 @@ def test_terminal_usable_start_takes_block_after_last_hole():
     assert MP.terminal_usable_start([DAY1, DAY2, HOLE_AFTER]) == HOLE_AFTER
     # 两个空洞：取**最后一个**空洞之后（末端连续块）
     later = date(2026, 6, 1)
-    assert (
-        MP.terminal_usable_start([DAY1, DAY2, HOLE_AFTER, later]) == later
-    )
+    assert MP.terminal_usable_start([DAY1, DAY2, HOLE_AFTER, later]) == later
     assert MP.terminal_usable_start([]) is None
 
 
@@ -733,3 +781,53 @@ def test_build_warns_about_source_hole(tmp_path):
     assert len(hole_warnings) == 1
     assert f"{DAY2} → {HOLE_AFTER}" in hole_warnings[0]
     assert str(HOLE_AFTER) in hole_warnings[0]
+
+
+# ── 7. 挖掘/物化共用的“数据面”助手（原生分钟挖掘 2026-10-16） ─────────
+
+
+def test_resolve_face_symbols_sorted_and_capped(env):
+    _build(env)
+    symbols = MP.resolve_face_symbols(env["provider"])
+    assert symbols == sorted(symbols)
+    assert set(symbols) == {"sh600000", "sz000001"}
+    assert MP.resolve_face_symbols(env["provider"], debug=True) == symbols[:50]
+
+
+def test_resolve_face_symbols_empty_provider_raises(tmp_path):
+    with pytest.raises(MP.MinuteProviderError, match="没有已构建标的"):
+        MP.resolve_face_symbols(tmp_path / "nope")
+
+
+def test_face_h5_cache_path_single_naming(env):
+    """命名单源：挖掘侧与物化侧共拼同一路径（各拼各的 = 口径漂移无报错）。"""
+    path = MP.face_h5_cache_path(env["provider"], DAY1, DAY2)
+    assert path.name == f"minute_pv_all_{DAY1.isoformat()}_{DAY2.isoformat()}.h5"
+    assert path.parent == env["provider"] / "h5_cache"
+    dbg = MP.face_h5_cache_path(env["provider"], DAY1, DAY2, debug=True)
+    assert dbg.name.startswith("minute_pv_debug_")
+
+
+def test_build_face_h5_writes_atomically_and_reuses_cache(env):
+    _build(env)
+    symbols = MP.resolve_face_symbols(env["provider"])
+    face = MP.build_face_h5(env["provider"], symbols, DAY1, DAY2)
+    assert face.is_file()
+    assert face.read_bytes()[:8] == b"\x89HDF\r\n\x1a\n"
+    frame = pd.read_hdf(face, key="data")
+    assert isinstance(frame.index, pd.MultiIndex)
+    assert frame.index.nlevels == 2
+    assert not list(face.parent.glob("*.tmp-*"))  # 原子换名不留残渣
+
+    mtime = face.stat().st_mtime_ns
+    again = MP.build_face_h5(env["provider"], symbols, DAY1, DAY2)
+    assert again == face
+    assert face.stat().st_mtime_ns == mtime  # 命中缓存零重写
+
+
+def test_build_face_h5_empty_window_raises(env):
+    """窗口落在覆盖外 → 空帧 → 响亮抛，绝不回退旧缓存。"""
+    _build(env)
+    symbols = MP.resolve_face_symbols(env["provider"])
+    with pytest.raises(MP.MinuteProviderError, match="分钟数据面为空"):
+        MP.build_face_h5(env["provider"], symbols, date(2027, 1, 1), date(2027, 1, 2))

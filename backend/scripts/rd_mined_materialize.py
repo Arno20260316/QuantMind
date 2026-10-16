@@ -18,6 +18,13 @@
 6. 收尾对齐各分区列集（训练读取层无 union_by_name，列漂移会响亮失败）；
 7. ``--register`` 时刷新字段注册并发布/更新训练目录版本（列集未变则跳过）。
 
+分钟级因子（``metadata.native_freq = 1min``，2026-10-16 原生分钟挖掘特性）：
+执行数据面 = 挖掘任务同款分钟 face（``--h5-path`` → provider 分钟 face 按
+metadata 挖掘窗口），输出按「每交易日最后一根**有效** bar」折叠为日频列后
+走完全相同的物化链路（查重/门禁/写库/注册均不变）；拿不到分钟数据面时
+响亮失败，**绝不**用日频 daily_pv.h5 兜底。设计全文
+``docs/分钟级因子挖掘_原生频率参数化_实施细案_20261016.md`` §5.5。
+
 清单文件 ``_materialize_manifest.json`` 记录逐因子状态（materialized /
 rejected_duplicate / error），支持断点续跑；``--force`` 重做。
 
@@ -70,6 +77,11 @@ _project_root = Path(__file__).resolve().parents[2]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from backend.services.engine.alpha_agent.mining_config import (  # noqa: E402
+    FREQ_DAY,
+    freq_spec,
+    normalize_freq,
+)
 from backend.services.engine.alpha_agent.statistical import (  # noqa: E402
     incremental as incremental_gate,
 )
@@ -96,6 +108,8 @@ _CORR_REJECT = 0.5
 _MIN_PAIRS_PER_DAY = 20
 _MIN_SAMPLE_DAYS = 5
 _EXEC_TIMEOUT_S = 900
+# 分钟 face 行数 ≈ 240× 日频（1min）且历史更长：执行时限按小时计
+_EXEC_TIMEOUT_MINUTE_S = 1800
 
 # T-FM-02 替换机制：值级查重命中**恰好 1 列**时，若新因子
 # |IC| ≥ 0.10 且 ≥ 1.3× 被顶替列 |IC|（同窗口同 fwd 口径），
@@ -567,8 +581,155 @@ def _execute_factor_code(
         return rows
 
 
-def _to_canonical(frame: pd.DataFrame) -> pd.Series:
-    """执行结果 → 单列 Series，``(trade_date str, symbol 前缀式)`` 两层索引。"""
+# ── 频率 provenance（原生分钟挖掘，细案 20261016 §5.5） ────────────────
+
+
+def _row_native_freq(row: Mapping[str, Any]) -> str:
+    """因子挖掘频率：``metadata.native_freq``；缺省/词表外一律 ``day``（旧行为）。
+
+    查询侧以扁平列 ``native_freq`` 取（与 pfs/rre 同风格），兼容 metadata
+    字典形状；词表外值不猜——按日频走旧链路（不变量 A）。
+    """
+    raw = row.get("native_freq")
+    if raw in (None, ""):
+        meta = row.get("metadata")
+        if isinstance(meta, Mapping):
+            raw = meta.get("native_freq")
+    try:
+        return normalize_freq(raw)
+    except ValueError:
+        logger.warning("metadata.native_freq 非法（%r），按日频处理", raw)
+        return FREQ_DAY
+
+
+def _row_mining_window(row: Mapping[str, Any]) -> tuple[date, date] | None:
+    """挖掘窗口（分钟 face 的取数边界）：metadata 扁平键 → task_state.json 兜底。
+
+    窗口 provenance 由 run_rd_agent ``_task_provenance_meta`` 写进 metadata；
+    本特性上线前挖掘的因子 metadata 无窗口键，用任务启动快照兜底。两处都
+    取不到 → None（调用方决定响亮失败）。
+    """
+    start = str(row.get("mining_window_start") or "").strip()
+    end = str(row.get("mining_window_end") or "").strip()
+    if not (start and end):
+        task_id = str(row.get("task_id") or "").strip()
+        if not task_id:
+            return None
+        state = _alpha_agent_log_dir() / task_id / "task_state.json"
+        try:
+            data = json.loads(state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        start = str(data.get("mining_start") or "").strip()
+        end = str(data.get("mining_end") or "").strip()
+    try:
+        return date.fromisoformat(start[:10]), date.fromisoformat(end[:10])
+    except ValueError:
+        logger.warning("挖掘窗口无法解析（start=%r end=%r）", start, end)
+        return None
+
+
+def _alpha_agent_log_dir() -> Path:
+    env = str(os.getenv("QM_ALPHA_AGENT_LOG_DIR") or "").strip()
+    if env:
+        return Path(env)
+    # 与 launcher.DEFAULT_LOG_DIR（/data/alpha_agent_logs）同布局：
+    # 从 QuantDB 数据目录（/data/quantdb）反推 /data
+    return _quantdb_dir().parent / "alpha_agent_logs"
+
+
+def _provenance_fields(native_freq: str, native_rows: int | None) -> dict[str, Any]:
+    """物化清单/元数据的频率 provenance 键。
+
+    日频因子只带 ``native_freq``（与旧清单条目兼容）；分钟因子另带折叠
+    口径与有效分钟行数。
+    """
+    fields: dict[str, Any] = {"native_freq": native_freq}
+    if native_freq != FREQ_DAY:
+        fields["value_collapse"] = freq_spec(native_freq).value_collapse
+        if native_rows is not None:
+            fields["native_rows"] = int(native_rows)
+    return fields
+
+
+def _exec_timeout(row: Mapping[str, Any], default_s: int) -> int:
+    """执行时限：分钟 face 行数≈240×日频，下限抬到 ``_EXEC_TIMEOUT_MINUTE_S``。"""
+    if _row_native_freq(row) == FREQ_DAY:
+        return int(default_s)
+    return max(int(default_s), _EXEC_TIMEOUT_MINUTE_S)
+
+
+def _collapse_intraday(series: pd.Series) -> tuple[pd.Series, int]:
+    """分钟值 → 日频折叠：每交易日最后一根**有效** bar 的值（细案 §6）。
+
+    输入 = 执行输出的原始 Series（两级 MultiIndex，第 0 层时间戳含日内
+    时刻）。时间戳**全部**为零点（日频输出穿上分钟外衣）→ 显式拒绝，
+    绝不让日频输出静默顶替分钟输出。返回 ``(折叠后 canonical Series,
+    有效分钟行数)``。
+    """
+    from backend.shared.stock_utils import StockCodeUtil
+
+    if not isinstance(series.index, pd.MultiIndex) or series.index.nlevels != 2:
+        raise ValueError("因子值索引不是 (datetime, instrument) 两层 MultiIndex")
+    ts = pd.to_datetime(series.index.get_level_values(0), errors="coerce")
+    if bool(ts.isna().all()):
+        raise ValueError("因子值时间戳全部无法解析")
+    intraday = (ts.hour != 0) | (ts.minute != 0) | (ts.second != 0)
+    if not bool(intraday.any()):
+        raise ValueError(
+            "分钟因子输出了纯日频时间戳（全部为 00:00:00）——拒绝按分钟折叠，"
+            "因子代码须在分钟 bar 上计算"
+        )
+    values = pd.to_numeric(pd.Series(series.to_numpy()), errors="coerce").to_numpy(
+        dtype="float64", na_value=np.nan
+    )
+    keep = (
+        ts.notna()  # DatetimeIndex.notna() 本就返回 ndarray
+        & ~np.isnan(values)
+        & ~np.isinf(values)  # ±inf（除零产物）与 NaN 同罪
+    )
+    native_rows = int(keep.sum())
+    if native_rows == 0:
+        return (
+            pd.Series(
+                dtype="float64",
+                index=pd.MultiIndex.from_arrays(
+                    [[], []], names=["trade_date", "symbol"]
+                ),
+            ),
+            0,
+        )
+    frame = pd.DataFrame(
+        {
+            "ts": ts.to_numpy()[keep],
+            "trade_date": np.asarray(ts.strftime("%Y-%m-%d"), dtype=object)[keep],
+            "symbol": np.asarray(
+                [
+                    StockCodeUtil.to_prefix(str(v))
+                    for v in series.index.get_level_values(1)
+                ],
+                dtype=object,
+            )[keep],
+            "value": values[keep],
+        }
+    )
+    frame = frame.sort_values(["symbol", "ts"], kind="stable")
+    collapsed = frame.groupby(["trade_date", "symbol"])["value"].last()
+    return collapsed, native_rows
+
+
+def _to_canonical(frame: pd.DataFrame, *, native_freq: str = FREQ_DAY) -> pd.Series:
+    """执行结果 → 单列 Series，``(trade_date str, symbol 前缀式)`` 两层索引。
+
+    ``native_freq != "day"``（分钟级）：按 ``FREQ_SPECS`` 的折叠规则先折叠
+    为日频值（"last" = 每交易日最后一根有效 bar），有效分钟行数挂
+    ``Series.attrs["native_rows"]`` 供 provenance 落库。日频分支与旧实现
+    逐字一致（回归不变量 A）。
+    """
+    if native_freq != FREQ_DAY:
+        collapsed, native_rows = _collapse_intraday(frame.iloc[:, 0])
+        collapsed.attrs["native_rows"] = native_rows
+        return collapsed
     from backend.shared.stock_utils import StockCodeUtil
 
     series = frame.iloc[:, 0]
@@ -593,6 +754,7 @@ def _to_canonical(frame: pd.DataFrame) -> pd.Series:
 def _compute_factor_values(
     row: Mapping[str, Any], h5_path: Path, *, timeout: int
 ) -> pd.Series:
+    """执行因子代码取全历史值；分钟因子按行 provenance 自动折叠为日频。"""
     fd, tmp_name = tempfile.mkstemp(suffix=".parquet", prefix="rd_mined_values_")
     os.close(fd)
     tmp = Path(tmp_name)
@@ -603,7 +765,7 @@ def _compute_factor_values(
         frame = pd.read_parquet(tmp)
     finally:
         tmp.unlink(missing_ok=True)
-    return _to_canonical(frame)
+    return _to_canonical(frame, native_freq=_row_native_freq(row))
 
 
 _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
@@ -660,6 +822,52 @@ def _generate_shared_h5(cache_path: Path) -> None:
             str(_quantdb_dir()), str(Path(tmp) / "daily_pv.h5"), debug=False
         )
     logger.info("daily_pv.h5 已生成/复用：%s", cache_path)
+
+
+def _resolve_minute_face(h5_path: str | None, row: Mapping[str, Any]) -> Path:
+    """分钟因子的数据面：任务口 h5 → 按挖掘窗口的 provider 分钟 face。
+
+    **绝无日频兜底**（不变量 C）：拿不到分钟数据面时响亮失败——用日频
+    daily_pv.h5 顶替会造出一列值全错的因子且全链无报错。
+    """
+    if h5_path:
+        path = Path(h5_path)
+        if path.is_file() and _h5_is_valid(path):
+            return path
+        logger.warning(
+            "分钟任务 --h5-path 不可用（%s），改用 provider 分钟 face", h5_path
+        )
+    window = _row_mining_window(row)
+    if window is None:
+        raise RuntimeError(
+            "分钟因子缺挖掘窗口 provenance（metadata.mining_window_* 与 "
+            "task_state.json 均无），无法定位分钟数据面——拒绝日频兜底"
+        )
+    from backend.services.engine import minute_qlib_provider as MP
+
+    provider_dir, _ = MP.ensure_minute_provider(
+        universe=MP.DEFAULT_UNIVERSE,
+        log=lambda msg: logger.info("[minute] %s", msg),
+    )
+    symbols = MP.resolve_face_symbols(provider_dir)
+    face = MP.build_face_h5(provider_dir, symbols, window[0], window[1])
+    if not _h5_is_valid(face):  # pragma: no cover - 缓存被写坏的防御
+        raise RuntimeError(f"分钟 face 非有效 HDF5：{face}")
+    logger.info(
+        "分钟 face = %s（%s ~ %s，%d 只标的）",
+        face,
+        window[0],
+        window[1],
+        len(symbols),
+    )
+    return face
+
+
+def _resolve_face(h5_path: str | None, row: Mapping[str, Any]) -> Path:
+    """按因子频率解析执行数据面（物化/验证/池重建共用的唯一入口）。"""
+    if _row_native_freq(row) == FREQ_DAY:
+        return _resolve_h5(h5_path)
+    return _resolve_minute_face(h5_path, row)
 
 
 def _write_factor(values: pd.Series, column: str) -> int:
@@ -798,7 +1006,13 @@ async def _query_candidates(
         "metadata_json->'quality'->>'pfs' AS pfs, "
         "metadata_json->>'rre' AS rre, "
         "metadata_json->>'ann_turnover' AS ann_turnover, "
-        "metadata_json->>'ann_return_net' AS ann_return_net "
+        "metadata_json->>'ann_return_net' AS ann_return_net, "
+        # 频率 provenance（原生分钟挖掘）：native_freq 决定数据面与折叠口径，
+        # 窗口/task_id 用于分钟 face 定位（task_state.json 兜底）。
+        "metadata_json->>'native_freq' AS native_freq, "
+        "metadata_json->>'mining_window_start' AS mining_window_start, "
+        "metadata_json->>'mining_window_end' AS mining_window_end, "
+        "metadata_json->>'task_id' AS task_id "
         "FROM rd_agent_factors "
         f"WHERE {where} ORDER BY created_at"
     )
@@ -1504,12 +1718,15 @@ async def _run(args: argparse.Namespace) -> int:
     controls: pd.DataFrame | None = None
     controls_fwd: pd.Series | None = None
     sample_days: list[str] | None = None
-    h5_path: Path | None = None
+    # (频率, 窗口) → 数据面缓存：同一批里日频/分钟/不同窗口各自只解析一次
+    faces: dict[tuple[str, str, str], Path] = {}
     for idx, row in enumerate(todo, 1):
         factor_id = str(row.get("factor_id") or "")
         name = str(row.get("factor_name") or "")
         base_column = feature_column_name(name)
         column = _disambiguate_column(base_column, factor_id, owners)
+        native_freq = _row_native_freq(row)
+        native_rows: int | None = None
         logger.info(
             "[%d/%d] %s（%s）→ %s%s",
             idx,
@@ -1520,10 +1737,21 @@ async def _run(args: argparse.Namespace) -> int:
             "（列名冲突，已消歧）" if column != base_column else "",
         )
         try:
-            if h5_path is None:
-                h5_path = _resolve_h5(args.h5_path)
-                logger.info("daily_pv.h5 = %s", h5_path)
-            values = _compute_factor_values(row, h5_path, timeout=args.timeout)
+            window = _row_mining_window(row)
+            face_key = (
+                native_freq,
+                window[0].isoformat() if window else "",
+                window[1].isoformat() if window else "",
+            )
+            face = faces.get(face_key)
+            if face is None:
+                face = _resolve_face(args.h5_path, row)
+                faces[face_key] = face
+                logger.info("数据面（%s）= %s", native_freq, face)
+            values = _compute_factor_values(
+                row, face, timeout=_exec_timeout(row, args.timeout)
+            )
+            native_rows = values.attrs.get("native_rows")
             if values.empty:
                 raise RuntimeError("因子值为全空")
             rho: float | None = None
@@ -1608,6 +1836,7 @@ async def _run(args: argparse.Namespace) -> int:
                             ),
                             "at": _now_iso(),
                         }
+                        entry.update(_provenance_fields(native_freq, native_rows))
                         # 被顶替过的因子重跑被拒：下架标记必须随身（评审 H1）
                         entry = _carry_supersede(manifest.get(factor_id), entry)
                         # 写序统一（评审 M1）：metadata 先行、成功才落 manifest
@@ -1713,6 +1942,7 @@ async def _run(args: argparse.Namespace) -> int:
                     "code_fp": code_fingerprint(str(row.get("factor_code") or "")),
                     "at": _now_iso(),
                 }
+                entry.update(_provenance_fields(native_freq, native_rows))
                 # 被顶替过的因子重跑被拒：下架标记必须随身（评审 H1）
                 entry = _carry_supersede(manifest.get(factor_id), entry)
                 # 写序统一（评审 M1）：metadata 先行、成功才落 manifest
@@ -1749,6 +1979,7 @@ async def _run(args: argparse.Namespace) -> int:
                 "code_fp": code_fingerprint(str(row.get("factor_code") or "")),
                 "at": _now_iso(),
             }
+            entry.update(_provenance_fields(native_freq, native_rows))
             if replacement.replace:
                 # 受理顶替的裁量数字与拒入路径同账（评审 M6）：凭什么顶替
                 # 要可审——拒入条目有 replacement 明细而受理没有，账面对称。
@@ -1819,6 +2050,7 @@ async def _run(args: argparse.Namespace) -> int:
                 "error": str(exc)[:500],
                 "at": _now_iso(),
             }
+            entry.update(_provenance_fields(native_freq, native_rows))
             # 被顶替过的因子重跑再失败：下架标记必须随身（评审 H1）
             entry = _carry_supersede(manifest.get(factor_id), entry)
             # 写序统一（评审 M1）：metadata 先行；error 本非终态，

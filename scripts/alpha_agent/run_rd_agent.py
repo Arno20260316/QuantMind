@@ -27,6 +27,29 @@ logging.basicConfig(
 logger = logging.getLogger("rd_agent_run")
 
 
+def _task_provenance_meta() -> dict:
+    """任务级 provenance：挖掘频率 + 挖掘窗口（物化面据此选数据面，不再猜）。
+
+    频率词表单源 ``alpha_agent.mining_config``（env 由 launcher 经 ``task_env``
+    注入）；窗口 env 未设置时不写键（旧任务 metadata 形状不变）。非法频率
+    兜底为 day：wrapper 启动时已用同一 env 拦过非法值，走到落库这一步不可
+    能还是坏配置——provenance 是增益层，绝不因它丢因子。
+    """
+    try:
+        from backend.services.engine.alpha_agent.mining_config import freq_from_env
+
+        native_freq = freq_from_env()
+    except Exception:  # noqa: BLE001 - 见 docstring：兜底不拦落库
+        native_freq = "day"
+    meta: dict = {"native_freq": native_freq}
+    start = str(os.environ.get("QM_MINING_WINDOW_START") or "").strip()
+    end = str(os.environ.get("QM_MINING_WINDOW_END") or "").strip()
+    if start and end:
+        meta["mining_window_start"] = start
+        meta["mining_window_end"] = end
+    return meta
+
+
 async def persist_factors(factors: list[dict], task_id: str, user_id: str, market: str, universe: str = "csi300") -> int:
     """持久化因子到数据库"""
     if not factors:
@@ -52,6 +75,7 @@ async def persist_factors(factors: list[dict], task_id: str, user_id: str, marke
                 "task_id": task_id,
                 "category": f.get("category", market),
             }
+            metadata.update(_task_provenance_meta())
             if f.get("formulation"):
                 metadata["formulation"] = f["formulation"]
             if f.get("description"):
@@ -603,6 +627,7 @@ def main():
                         "task_id": args.task_id,
                         "category": f.get("category", args.market),
                     }
+                    metadata.update(_task_provenance_meta())
                     if f.get("formulation"):
                         metadata["formulation"] = f["formulation"]
                     if f.get("description"):

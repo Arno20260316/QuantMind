@@ -150,6 +150,23 @@ class TestEvalCriteriaBlock:
         # 多头口径与评估器一致：截面 rank 前 30%
         assert "30%" in text
 
+    def test_minute_head_inserted_and_day_body_byte_identical(self):
+        """分钟任务在头行与正文之间插口径段；正文段与日频逐字一致（不变量 A）。"""
+        day = render_eval_criteria_block()
+        minute = render_eval_criteria_block("1min")
+        assert minute != day
+        marker = "你的因子将由统一回测框架"
+        assert day.count(marker) == 1 and minute.count(marker) == 1
+        # 正文段逐字不动——分钟口径是插入的增益层，不重写日频语义
+        assert minute.split(marker)[1] == day.split(marker)[1]
+        head = minute[: minute.index(marker)]
+        # 三个要害：IC 口径=下一根 1 分钟 bar / 输出必须分钟粒度（与评估器
+        # 分派同源的防振荡提示）/ 入库按最后一根有效 bar 折叠
+        assert "分钟" in head
+        assert "粒度" in head
+        assert "最后一根" in head and "折叠" in head
+        assert render_eval_criteria_block("day") == day
+
 
 class TestWrapperStageInjection:
     """接线：静态后缀→背景键（冻结）；阶段块→假设规范键（每轮实时加载）。

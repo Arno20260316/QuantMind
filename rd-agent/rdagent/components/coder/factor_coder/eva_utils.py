@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from abc import abstractmethod
 from typing import Dict, Tuple
 
@@ -214,7 +215,31 @@ class FactorOutputFormatEvaluator(FactorEvaluator):
         return "Failed to evaluate output format after multiple attempts.", False
 
 
-class FactorDatetimeDailyEvaluator(FactorEvaluator):
+def _expected_bar_seconds() -> int:
+    """本进程期望的输出 bar 间隔（秒）。
+
+    QuantMind 注入的任务级 env ``QM_MINING_BAR_SECONDS``（单源见
+    ``backend/services/engine/alpha_agent/mining_config.py`` 的 ``FREQ_SPECS``）；
+    fork 只认这个数值、不认频率词表。缺省/非法/负数一律 → 0 = 日频模式
+    （与上游行为一致，benchmark 等非挖掘场景不受影响）。
+    """
+    try:
+        return max(0, int(os.environ.get("QM_MINING_BAR_SECONDS", "") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+class FactorDatetimeFreqEvaluator(FactorEvaluator):
+    """输出时间粒度检查——按挖掘频率分派（QuantMind fork 补丁 A7）。
+
+    - 日频模式（``QM_MINING_BAR_SECONDS`` 缺省/0）：与上游**逐字一致**——
+      输出出现 1 分钟间隔判「not daily」；
+    - 日内模式（>0）：要求输出时间戳含该间隔（如 1min 挖掘出现 60s 相邻
+      bar）；纯日频输出判错，反馈文案明说「在分钟 bar 上重算、每 bar 输出
+      一个值」。此前评估器硬编码「1min 间隔 = 一定错」而提示词要求分钟
+      输出，两个裁判互补振荡 → evo 轮耗尽零产出（2026-10-16 实证）。
+    """
+
     def evaluate(
         self,
         implementation: Workspace,
@@ -236,12 +261,28 @@ class FactorDatetimeDailyEvaluator(FactorEvaluator):
             )
 
         time_diff = pd.to_datetime(gen_df.index.get_level_values("datetime")).to_series().diff().dropna().unique()
+        bar_seconds = _expected_bar_seconds()
+        if bar_seconds > 0:
+            if pd.Timedelta(seconds=bar_seconds) in time_diff:
+                return (
+                    f"The generated dataframe is at the required intraday granularity ({bar_seconds}s per bar).",
+                    True,
+                )
+            return (
+                f"The generated dataframe is not at the required intraday granularity ({bar_seconds}s per bar): "
+                "its timestamps are daily-level. Recompute the factor on the intraday bars and output one value per bar.",
+                False,
+            )
         if pd.Timedelta(minutes=1) in time_diff:
             return (
                 "The generated dataframe is not daily. The implementation is definitely wrong. Please check the implementation.",
                 False,
             )
         return "The generated dataframe is daily.", True
+
+
+#: 旧类名别名（上游名；库内/外部既有 import 不受影响）
+FactorDatetimeDailyEvaluator = FactorDatetimeFreqEvaluator
 
 
 class FactorRowCountEvaluator(FactorEvaluator):
@@ -423,12 +464,12 @@ class FactorValueEvaluator(FactorEvaluator):
         feedback_str, _ = FactorOutputFormatEvaluator(self.scen).evaluate(implementation, gt_implementation)
         conclusions.append(feedback_str)
         if version == 1:
-            feedback_str, daily_check_result = FactorDatetimeDailyEvaluator(self.scen).evaluate(
+            feedback_str, freq_check_result = FactorDatetimeFreqEvaluator(self.scen).evaluate(
                 implementation, gt_implementation
             )
             conclusions.append(feedback_str)
         else:
-            daily_check_result = None
+            freq_check_result = None
 
         # Check dataframe format
         if gt_implementation is not None:
@@ -466,7 +507,7 @@ class FactorValueEvaluator(FactorEvaluator):
             row_result is not None
             and row_result <= 0.99
             or output_format_result is False
-            or daily_check_result is False
+            or freq_check_result is False
             or inf_evaluate_res is False
         ):
             decision_from_value_check = False

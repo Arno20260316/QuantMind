@@ -67,7 +67,7 @@ from backend.scripts.rd_mined_materialize import (  # noqa: E402
     _compute_factor_values,
     _now_iso,
     _quantdb_dir,
-    _resolve_h5,
+    _resolve_face,
 )
 from backend.services.engine.mining_plugins import validation  # noqa: E402
 from backend.services.engine.mining_plugins import validation_store  # noqa: E402
@@ -135,7 +135,12 @@ async def _query_factors(
         "SELECT factor_id, factor_name, factor_code, "
         "COALESCE(market, :default_market) AS market, "
         "COALESCE(universe, '') AS universe, user_id, status, "
-        "metadata_json->'orthogonality' AS orthogonality "
+        "metadata_json->'orthogonality' AS orthogonality, "
+        # 频率 provenance（原生分钟挖掘）：分钟因子走分钟 face + 日频折叠
+        "metadata_json->>'native_freq' AS native_freq, "
+        "metadata_json->>'mining_window_start' AS mining_window_start, "
+        "metadata_json->>'mining_window_end' AS mining_window_end, "
+        "metadata_json->>'task_id' AS task_id "
         "FROM rd_agent_factors WHERE " + " AND ".join(clauses) + " ORDER BY created_at"
     )
     async with get_session(read_only=True) as session:
@@ -290,6 +295,17 @@ def _pit_stage(row: Mapping[str, Any], *, timeout: int) -> dict | None:
     说明：真前视因子若在截断后于探针日整列变 NaN（如 ``shift(-k)`` 型），
     判定为 ``unknown/no_probe_section`` → 报告降级而**非通过**（未知 ≠ 通过）。
     """
+    from backend.scripts.rd_mined_materialize import _row_native_freq
+    from backend.services.engine.alpha_agent.mining_config import FREQ_DAY
+
+    if _row_native_freq(row) != FREQ_DAY:
+        # 探针面是日频 QuantDB 抽样——分钟因子在这里对不上粒度（会在分钟
+        # 折叠的粒度闸响亮失败）。显式降级并说明，不当异常刷屏。
+        logger.info(
+            "[%s] PIT 截断探针暂不适用于分钟因子（探针面为日频抽样）→ 降级",
+            row.get("factor_id"),
+        )
+        return None
     quantdb_dir = _quantdb_dir()
     with tempfile.TemporaryDirectory(prefix="mining_pit_") as tmp:
         full_h5 = Path(tmp) / "daily_pv_full.h5"
@@ -409,7 +425,7 @@ async def validate_one(
     if market == DEFAULT_MARKET and kind == "functional":
         values: pd.Series | None = None
         try:
-            h5 = _resolve_h5(h5_path)
+            h5 = _resolve_face(h5_path, row)
             values = _compute_factor_values(row, h5, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 — 值执行失败：衰减/PIT 双降级
             h5_error = _h5_error_text(exc)

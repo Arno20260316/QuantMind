@@ -210,9 +210,7 @@ def _frame_from_two_blocks(
 
     names = list(f64_names) + list(f32_names)
     blocks = [
-        new_block_2d(
-            f64_vals.T, placement=BlockPlacement(np.arange(0, len(f64_names)))
-        )
+        new_block_2d(f64_vals.T, placement=BlockPlacement(np.arange(0, len(f64_names))))
     ]
     if f32_names:
         base = len(f64_names)
@@ -419,38 +417,30 @@ class RDLoopWrapper:
             )
         self._minute_window = (start, end)
 
-        meta = MP.read_minute_meta(provider_dir) or {}
-        symbols = sorted(str(s) for s in meta.get("built_symbols", []))
-        if not symbols:
-            raise MinuteDataError(f"分钟 provider 没有已构建标的：{provider_dir}")
-        if debug:
-            symbols = symbols[:50]
+        # 标的清单 / 缓存路径 / 构建逻辑全部走 minute_qlib_provider 公共函数：
+        # 物化面（rd_mined_materialize）按同一命名取同一份文件，两份实现各拼一个
+        # 文件名 = 缓存命中内容可能不同的两份 h5（口径漂移且全程无报错）。
+        try:
+            symbols = MP.resolve_face_symbols(provider_dir, debug=debug)
+        except MP.MinuteProviderError as exc:
+            raise MinuteDataError(str(exc)) from exc
 
-        cache_dir = Path(provider_dir) / "h5_cache"
-        cache_path = cache_dir / (
-            f"minute_pv_{'debug' if debug else 'all'}_{start.isoformat()}_{end.isoformat()}.h5"
-        )
+        cache_path = MP.face_h5_cache_path(provider_dir, start, end, debug=debug)
         if cache_path.is_file():
             logger.info("[%s] minute h5 cache hit: %s", self.market, cache_path)
             self._link_h5(str(cache_path), output_path)
             return True
 
         try:
-            frame = MP.read_minute_frame(provider_dir, symbols, start=start, end=end)
-            if frame.empty:
-                logger.error("[%s] minute frame 为空：%s", self.market, provider_dir)
-                return False
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = f"{cache_path}.tmp-{os.getpid()}"
-            frame.to_hdf(tmp_path, key="data", mode="w")
-            os.replace(tmp_path, cache_path)
+            cache_path = MP.build_face_h5(
+                provider_dir, symbols, start, end, debug=debug
+            )
             self._link_h5(str(cache_path), output_path)
             logger.info(
-                "[%s] Generated minute h5: %s (%d rows, %d cols, %s~%s)",
+                "[%s] Generated minute h5: %s (%d symbols, %s~%s)",
                 self.market,
                 cache_path,
-                len(frame),
-                frame.shape[1],
+                len(symbols),
                 start,
                 end,
             )
@@ -578,7 +568,7 @@ class RDLoopWrapper:
                 f"User's research direction/hypothesis: {direction}\n"
                 "请围绕此方向进行因子探索。Focus factor exploration on this theme.\n"
             )
-        suffix += render_eval_criteria_block()
+        suffix += render_eval_criteria_block(self._freq())
         suffix += self._minute_prompt_block()
         suffix += self._pool_context_block()
         suffix += self._experience_context_block()
@@ -1404,9 +1394,7 @@ class RDLoopWrapper:
             if L2_DATASET in datasets:
                 planned = l2_factor_columns(quantdb_dir)
                 if not planned:
-                    logger.info(
-                        "[%s] l2_factors 列清单为空，跳过 L2 接入", self.market
-                    )
+                    logger.info("[%s] l2_factors 列清单为空，跳过 L2 接入", self.market)
             else:
                 planned = []
                 logger.info(
@@ -1459,9 +1447,7 @@ class RDLoopWrapper:
             if f32_vals is not None:
                 # 快路径：L2 已直写 f32_vals 前段，这里只补富化尾段
                 for i, c in enumerate(enrich_cols):
-                    f32_vals[:, len(l2_cols) + i] = df[c].to_numpy(
-                        dtype="float32"
-                    )
+                    f32_vals[:, len(l2_cols) + i] = df[c].to_numpy(dtype="float32")
                 try:
                     combined = _frame_from_two_blocks(
                         f64_vals,

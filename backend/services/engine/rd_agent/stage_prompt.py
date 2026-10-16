@@ -28,6 +28,12 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.services.engine.alpha_agent.mining_config import (
+    FREQ_DAY,
+    FREQ_MINUTE,
+    normalize_freq,
+)
+
 #: 阶段块渲染标题（``rd_loop_wrapper`` 的 patched_load 用它做防重复注入守卫）
 STAGE_BLOCK_MARKER = "阶段化挖掘课程"
 
@@ -219,17 +225,34 @@ def render_stage_block(*, total_loops: int | None, current_loop: int | None) -> 
     return "\n".join(lines) + "\n"
 
 
-def render_eval_criteria_block() -> str:
+def render_eval_criteria_block(freq: str = FREQ_DAY) -> str:
     """静态评估口径块——口径与 ``mining_plugins`` 评估器/门禁同源，不得臆造。
+
+    ``freq=FREQ_MINUTE`` 时前置「分钟口径段」：挖掘回路 IC = 下一根 1min bar
+    的前向收益、**输出必须分钟粒度**（与 fork 侧输出粒度评估器读同一份
+    ``QM_MINING_BAR_SECONDS`` 契约，两面不许互相打架——2026-10-16 的
+    「分钟输出被日频裁判判错」振荡即两面失配所致）；入库按日频折叠后
+    适用下文日频口径。日频分支与旧文本逐字一致。
 
     事实出处：多头 = 截面 rank 前 30%（``evaluators/turnover_cost``）、
     双边成本 0.2%（``factor_research.analysis.COST_RATE`` 单一出处，
     ``r_net = r − 换手×0.002``）、|ρ|≥0.5 值级查重硬拒（``rd_mined_materialize._CORR_REJECT``，
-    T-FM-03 2026-10-11 起；0.4–0.5 灰区告警）。
+    T-FM-03 2026-10-11 起；0.4–0.5 灰区告警）；折叠规则 = ``mining_config.FREQ_SPECS``
+    的 ``value_collapse``。
     """
+    head = "\n\n====== 评估口径 / Evaluation Criteria ======\n"
+    if normalize_freq(freq) == FREQ_MINUTE:
+        head += (
+            "本任务为**分钟级挖掘**：因子表达式与生成的代码在 1 分钟 bar 上计算，"
+            "挖掘回路内的 IC 口径 = 「下一根 1 分钟 bar 的前向收益」在分钟截面"
+            "（同一 bar 的股票池）上的秩相关。\n"
+            "**输出必须是分钟粒度**的因子值（每根计算 bar 一个值、索引为分钟时间戳）；"
+            "只输出每日一个值 / 日线序列会被输出粒度检查直接判错。\n"
+            "因子入库时按「每交易日最后一根**有效** bar 的值」折叠为日频列，"
+            "入库评估与训练都用这份折叠值——以下口径均作用于折叠后的日频值：\n"
+        )
     return (
-        "\n\n====== 评估口径 / Evaluation Criteria ======\n"
-        "你的因子将由统一回测框架以「截面多头组合」口径评估"
+        head + "你的因子将由统一回测框架以「截面多头组合」口径评估"
         "（多头 = 每日截面 rank 前 30%，按双边 0.2% 从收益中扣除交易成本）。"
         "请围绕以下口径设计，不要只盯单点 IC：\n"
         "- rankIC：因子值与未来收益的截面秩相关；单日高 IC 可能只是噪声，追求跨时间稳定。\n"

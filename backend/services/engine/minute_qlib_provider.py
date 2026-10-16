@@ -177,7 +177,9 @@ class MinuteDataFacts:
         head = "、".join(
             f"{a.isoformat()} ~ {b.isoformat()}" for a, b in self.gaps[:limit]
         )
-        return head if len(self.gaps) <= limit else f"{head}、…（共 {len(self.gaps)} 段）"
+        return (
+            head if len(self.gaps) <= limit else f"{head}、…（共 {len(self.gaps)} 段）"
+        )
 
 
 @dataclass(frozen=True)
@@ -211,7 +213,9 @@ class BuildReport:
 # ── 路径解析 ─────────────────────────────────────────────────────────
 
 
-def resolve_minute_provider_dir(provider_dir: str | os.PathLike[str] | None = None) -> Path:
+def resolve_minute_provider_dir(
+    provider_dir: str | os.PathLike[str] | None = None,
+) -> Path:
     """分钟 provider 目录：显式参数 > ``QM_QLIB_MINUTE_DIR`` > 默认。"""
     if provider_dir is not None:
         return Path(provider_dir)
@@ -241,7 +245,9 @@ def resolve_minute_source_dir(source_dir: str | os.PathLike[str] | None = None) 
     return Path("/data/quantdb").joinpath(*_DEFAULT_SOURCE_REL)
 
 
-def resolve_day_provider_dir(day_provider_dir: str | os.PathLike[str] | None = None) -> Path:
+def resolve_day_provider_dir(
+    day_provider_dir: str | os.PathLike[str] | None = None,
+) -> Path:
     """day 层来源目录（日线 qlib provider）：显式参数 > ``QM_MINUTE_DAY_PROVIDER``
     > ``shared.qlib_paths`` 解析出的 A 股目录。"""
     if day_provider_dir is not None:
@@ -315,7 +321,7 @@ def calendar_gaps(
     ordered = sorted(set(days))
     return tuple(
         (prev, cur)
-        for prev, cur in zip(ordered, ordered[1:])
+        for prev, cur in zip(ordered, ordered[1:], strict=False)
         if (cur - prev).days > max_gap_days
     )
 
@@ -554,7 +560,9 @@ def _read_minute_calendar(provider_dir: Path) -> np.ndarray:
     """读 ``calendars/1min.txt`` → ``datetime64[us]`` 数组。"""
     path = provider_dir / "calendars" / f"{MINUTE_FREQ}.txt"
     if not path.is_file():
-        raise MinuteProviderError(f"分钟 provider 未就绪（缺 1min 日历）：{provider_dir}")
+        raise MinuteProviderError(
+            f"分钟 provider 未就绪（缺 1min 日历）：{provider_dir}"
+        )
     values = [
         ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()
     ]
@@ -637,6 +645,79 @@ def read_minute_frame(
     return out.sort_index()
 
 
+def resolve_face_symbols(
+    provider_dir: str | os.PathLike[str], *, debug: bool = False
+) -> list[str]:
+    """分钟数据面的标的清单（meta ``built_symbols``；debug 取前 50，同旧惯例）。
+
+    空 = provider 没有已构建标的，显式抛——调用方不许拿空清单造一份空数据面。
+    """
+    meta = read_minute_meta(provider_dir) or {}
+    symbols = sorted(str(s) for s in meta.get("built_symbols", []))
+    if not symbols:
+        raise MinuteProviderError(f"分钟 provider 没有已构建标的：{provider_dir}")
+    return symbols[:50] if debug else symbols
+
+
+def face_h5_cache_path(
+    provider_dir: str | os.PathLike[str],
+    start: date,
+    end: date,
+    *,
+    debug: bool = False,
+) -> Path:
+    """分钟数据面 h5 的共享缓存路径。
+
+    挖掘侧（``RDLoopWrapper._generate_minute_h5``）与物化侧
+    （``rd_mined_materialize``）**必须**走这一个函数拿路径——两份实现各拼
+    一个文件名 = 缓存命中两份内容可能不同的文件（口径漂移且全程无报错）。
+    """
+    variant = "debug" if debug else "all"
+    return (
+        Path(provider_dir)
+        / "h5_cache"
+        / (f"minute_pv_{variant}_{start.isoformat()}_{end.isoformat()}.h5")
+    )
+
+
+def build_face_h5(
+    provider_dir: str | os.PathLike[str],
+    symbols: Sequence[str],
+    start: date,
+    end: date,
+    *,
+    debug: bool = False,
+) -> Path:
+    """构建（或复用）分钟数据面 h5，返回缓存路径；原子落盘（.tmp-<pid> 换名）。
+
+    窗口应已收敛在 provider 覆盖内（挖掘侧由 wrapper 校验；物化侧的窗口
+    来自因子 metadata = 挖掘窗口，天然在覆盖内），这里不再重复校验；构建
+    失败（空帧/写盘错）如实抛 ``MinuteProviderError``，绝不回退旧缓存——
+    拿错窗口的数据面物化出的值没有任何人会发现。
+    """
+    cache_path = face_h5_cache_path(provider_dir, start, end, debug=debug)
+    if cache_path.is_file():
+        return cache_path
+    frame = read_minute_frame(provider_dir, symbols, start=start, end=end)
+    if frame.empty:
+        raise MinuteProviderError(
+            f"分钟数据面为空：{provider_dir}（{start.isoformat()}~{end.isoformat()}）"
+        )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{cache_path}.tmp-{os.getpid()}"
+    frame.to_hdf(tmp_path, key="data", mode="w")
+    os.replace(tmp_path, cache_path)
+    logger.info(
+        "[minute] 数据面 h5 已构建：%s（%d 行 / %d 标的 / %s~%s）",
+        cache_path,
+        len(frame),
+        len(symbols),
+        start,
+        end,
+    )
+    return cache_path
+
+
 def detect_amount_scale(
     amount: np.ndarray, volume: np.ndarray, close: np.ndarray
 ) -> tuple[float, float]:
@@ -703,7 +784,9 @@ def _swap_into_place(tmp_dir: Path, provider_dir: Path) -> None:
         os.replace(tmp_dir, provider_dir)
 
 
-def _read_source_frame(path: Path, code: str, warnings: list[str]) -> pd.DataFrame | None:
+def _read_source_frame(
+    path: Path, code: str, warnings: list[str]
+) -> pd.DataFrame | None:
     """读一个标的的源 parquet（按 time 排序、去重），失败/空回 None。"""
     try:
         df = pd.read_parquet(path, columns=list(_SOURCE_COLUMNS))
@@ -819,7 +902,7 @@ def build_minute_provider(
         )
 
         built_symbols: list[str] = []
-        for code, times in times_by_symbol.items():
+        for code, _times in times_by_symbol.items():
             df = _read_source_frame(_suffix_file(src_dir, code), code, warnings)
             if df is None:
                 continue
@@ -1134,12 +1217,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.status:
-        print(json.dumps(minute_provider_status(
-            provider_dir=args.provider_dir or None,
-            source_dir=args.source_dir or None,
-            day_provider_dir=args.day_provider or None,
-            universe=args.universe,
-        ), ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                minute_provider_status(
+                    provider_dir=args.provider_dir or None,
+                    source_dir=args.source_dir or None,
+                    day_provider_dir=args.day_provider or None,
+                    universe=args.universe,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
 
     out_dir, report = ensure_minute_provider(
@@ -1150,19 +1239,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         force=args.force,
         log=lambda msg: print(msg, flush=True),
     )
-    print(json.dumps({
-        "provider_dir": str(out_dir),
-        "built": report is not None,
-        "report": None if report is None else {
-            "symbols": report.symbols,
-            "bars": report.bars,
-            "days": report.days,
-            "first": report.first.isoformat(),
-            "last": report.last.isoformat(),
-            "elapsed_seconds": report.elapsed_seconds,
-            "warnings": list(report.warnings),
-        },
-    }, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "provider_dir": str(out_dir),
+                "built": report is not None,
+                "report": None
+                if report is None
+                else {
+                    "symbols": report.symbols,
+                    "bars": report.bars,
+                    "days": report.days,
+                    "first": report.first.isoformat(),
+                    "last": report.last.isoformat(),
+                    "elapsed_seconds": report.elapsed_seconds,
+                    "warnings": list(report.warnings),
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

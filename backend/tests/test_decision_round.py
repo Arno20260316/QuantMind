@@ -636,7 +636,9 @@ def _outcome(*, legs=(), vetoes=(), receipts=(), aborted="") -> ExecutionOutcome
 
 def test_highlights_render_a_submitted_leg_with_qty_price_and_reason():
     decisions = (
-        Decision(action=BUY, code="SH601857", name="中国石油", reason="放量突破 60 日新高"),
+        Decision(
+            action=BUY, code="SH601857", name="中国石油", reason="放量突破 60 日新高"
+        ),
     )
     leg = Leg(
         index=0,
@@ -656,7 +658,7 @@ def test_highlights_render_a_submitted_leg_with_qty_price_and_reason():
         order_id="o-1",
     )
     lines = NOTES.round_highlights(decisions, _outcome(legs=(leg,), receipts=(rec,)))
-    assert lines == ["买入 中国石油(SH601857) 800股 @12.33（放量突破 60 日新高）"]
+    assert lines == ["买入 中国石油(SH601857) 800股 @¥12.33（放量突破 60 日新高）"]
 
 
 def test_highlights_name_the_veto_rule_for_a_blocked_decision():
@@ -717,10 +719,10 @@ def test_highlights_render_failures_and_duplicates_as_such():
     )
     lines = NOTES.round_highlights(decisions, _outcome(legs=legs, receipts=receipts))
     assert lines[0] == (
-        "买入 招商银行(SH600036) 100股 @35.50（失败：券商拒单：涨跌停价不可委托）"
+        "买入 招商银行(SH600036) 100股 @¥35.50（失败：券商拒单：涨跌停价不可委托）"
     )
     assert lines[1] == (
-        "买入 贵州茅台(SH600519) 100股 @1400.00（此前轮已在途，未重复提交）"
+        "买入 贵州茅台(SH600519) 100股 @¥1400.00（此前轮已在途，未重复提交）"
     )
 
 
@@ -750,7 +752,64 @@ def test_highlights_mark_planned_but_unsent_legs():
         decisions,
         _outcome(legs=(leg,), aborted="在途委托不可信：本轮不下单（fail-closed）"),
     )
-    assert lines == ["卖出 中国核电(SH601985) 500股 @9.18（未发出）"]
+    assert lines == ["卖出 中国核电(SH601985) 500股 @¥9.18（未发出）"]
+
+
+def test_highlights_backfill_name_for_code_only_decision(monkeypatch):
+    """2026-10-16：模型只给 code（无 name）时用 ``stock_display_name`` 补中文名。"""
+    monkeypatch.setattr(
+        "backend.shared.stock_display_name.resolve",
+        lambda symbol, hint="": {"SH601985": "中国核电"}.get(
+            str(symbol or "").strip().upper(), ""
+        ),
+    )
+    decisions = (Decision(action=SELL, code="SH601985", reason="跌破止损"),)
+    leg = Leg(
+        index=0,
+        symbol="SH601985",
+        side="sell",
+        quantity=500,
+        limit_price=9.18,
+        reason="跌破止损",
+    )
+    rec = LegReceipt(
+        index=0,
+        symbol="SH601985",
+        side="sell",
+        quantity=500,
+        limit_price=9.18,
+        success=True,
+        order_id="o-2",
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(legs=(leg,), receipts=(rec,)))
+    assert lines == ["卖出 中国核电(SH601985) 500股 @¥9.18（跌破止损）"]
+
+
+def test_highlights_code_only_unresolvable_degrades_to_display_code(monkeypatch):
+    """名字解析不到时只显示规范代码（后缀→前缀），绝不编名。"""
+    monkeypatch.setattr(
+        "backend.shared.stock_display_name.resolve", lambda symbol, hint="": ""
+    )
+    decisions = (Decision(action=SELL, code="600036.SH", reason="减仓"),)
+    leg = Leg(
+        index=0,
+        symbol="600036.SH",
+        side="sell",
+        quantity=100,
+        limit_price=35.5,
+        reason="减仓",
+    )
+    rec = LegReceipt(
+        index=0,
+        symbol="600036.SH",
+        side="sell",
+        quantity=100,
+        limit_price=35.5,
+        success=True,
+        order_id="o-3",
+    )
+    lines = NOTES.round_highlights(decisions, _outcome(legs=(leg,), receipts=(rec,)))
+    assert lines == ["卖出 SH600036 100股 @¥35.50（减仓）"]
 
 
 def test_highlights_render_watch_rules_with_the_stops():
@@ -809,8 +868,14 @@ def test_highlights_are_empty_when_the_outcome_gives_nothing():
 
 
 @pytest.mark.asyncio
-async def test_ok_round_meta_carries_the_execution_highlights():
+async def test_ok_round_meta_carries_the_execution_highlights(monkeypatch):
     """接线（OK 路径）：meta 带上 highlights——摘要/QQ 的 ▸ 段据此说人话。"""
+    monkeypatch.setattr(
+        "backend.shared.stock_display_name.resolve",
+        lambda symbol, hint="": {"600036.SH": "招商银行"}.get(
+            str(symbol or "").strip().upper(), ""
+        ),
+    )
     outcome = ExecutionOutcome(
         round_id="rnd-20260924-0935",
         plan=ExecutionPlan(
@@ -847,12 +912,20 @@ async def test_ok_round_meta_carries_the_execution_highlights():
         SLOT_0935, deps=replace(h.deps, run_exec=_exec_returning(outcome)), now=NOW
     )
     assert result.status == R.STATUS_OK
-    assert result.meta["highlights"] == ["买入 600036.SH 100股 @35.50（加仓）"]
+    assert result.meta["highlights"] == [
+        "买入 招商银行(SH600036) 100股 @¥35.50（加仓）"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_aborted_round_meta_carries_the_planned_highlights():
+async def test_aborted_round_meta_carries_the_planned_highlights(monkeypatch):
     """接线（aborted 路径）：计划了腿却没发——要点行标注「未发出」，不留白。"""
+    monkeypatch.setattr(
+        "backend.shared.stock_display_name.resolve",
+        lambda symbol, hint="": {"600036.SH": "招商银行"}.get(
+            str(symbol or "").strip().upper(), ""
+        ),
+    )
     outcome = ExecutionOutcome(
         round_id="rnd-20260924-0935",
         plan=ExecutionPlan(
@@ -879,7 +952,9 @@ async def test_aborted_round_meta_carries_the_planned_highlights():
         SLOT_0935, deps=replace(h.deps, run_exec=_exec_returning(outcome)), now=NOW
     )
     assert result.status == R.STATUS_ABORTED
-    assert result.meta["highlights"] == ["买入 600036.SH 100股 @35.50（未发出）"]
+    assert result.meta["highlights"] == [
+        "买入 招商银行(SH600036) 100股 @¥35.50（未发出）"
+    ]
 
 
 # ══ C. 闸门行 ↔ 池行往返（「功能不能少」的守卫） ═══════════════════════

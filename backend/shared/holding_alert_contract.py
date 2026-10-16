@@ -393,17 +393,30 @@ _DIGEST_RISK_LABELS: dict[str, str] = {
 }
 
 
+def _resolve_display_name(symbol: str) -> str:
+    """alert 未带名字时的兜底解析（``stock_display_name``）；失败 → 空串，绝不抛。"""
+    try:
+        from backend.shared.stock_display_name import resolve
+
+        return str(resolve(symbol) or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def format_holding_digest_line(alert: Mapping[str, Any]) -> str:
     """预警 → QQ 摘要**单行**（批量降噪用，见 ``backend/shared/qq_digest``）。
 
     形如 ``▼ 麦格米特(SZ002851) 分数 +0.021 → -0.008（日频分）``（分数类）或
     ``⚑ 麦格米特(SZ002851) 盘中异动``（风险类）。分数类带频度后缀，与站内
     标题同一口径（``_freq_tag``，审计 M11——摘要漏标会被读成盘中实况）。
-    代码统一前缀式（与前端/委托台账/成交回执一致）；名字缺失退化为代码。
+    代码统一前缀式（与前端/委托台账/成交回执一致）；名字缺失先走
+    ``stock_display_name`` 兜底（alert 写入方漏名字时），再退化为代码。
     纯函数、绝不抛。
     """
     symbol = str(alert.get("symbol") or "").strip()
     name = str(alert.get("stock_name") or "").strip()
+    if not name and symbol:
+        name = _resolve_display_name(symbol)
     prefix = symbol
     if symbol:
         try:

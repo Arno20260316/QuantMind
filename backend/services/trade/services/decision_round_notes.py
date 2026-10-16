@@ -107,7 +107,7 @@ def round_highlights(decisions: Sequence[Any], outcome: Any) -> list[str]:
             px = _highlight_price(getattr(src, "limit_price", None))
             sizing = f" {qty}股" if qty else ""
             if px:
-                sizing += f" @{px}"
+                sizing += f" @¥{px}"
             money.append(f"{word} {label}{sizing}{_highlight_extra(rec, veto, leg, d)}")
         lines = money + guards
         if len(lines) > _HIGHLIGHT_LIMIT:
@@ -120,12 +120,36 @@ def round_highlights(decisions: Sequence[Any], outcome: Any) -> list[str]:
 
 
 def _highlight_label(d: Any) -> str:
-    """``名称(代码)``（缺哪半用哪半；两半都缺返回空串 = 调用点回退构件 symbol）。"""
+    """``名称(代码)``（缺哪半补哪半；补不齐才退化为单体）。两半都缺返回空串。
+
+    代码统一显示形态（A股前缀式/港股 ``NNNN.HK``/美股 ticker）；只有一半时
+    用另一半经 ``stock_display_name`` 补齐（2026-10-16：模型偶尔只给 name 或
+    只给 code，旧实现让裸码上卡）。纯函数、绝不抛。
+    """
     name = _highlight_text(getattr(d, "name", ""))
     code = _highlight_text(getattr(d, "code", ""))
     if name and code:
-        return f"{name}({code})"
-    return name or code
+        return f"{name}({_display_code(code)})"
+    if code:
+        try:
+            from backend.shared.stock_display_name import display_code, resolve
+
+            shown = display_code(code) or code
+            resolved = resolve(code)
+            return f"{resolved}({shown})" if resolved else shown
+        except Exception:  # noqa: BLE001 - 要点面绝不因名字解析失败
+            return code
+    return name
+
+
+def _display_code(code: str) -> str:
+    """代码 → 显示形态（``stock_display_name``）；失败回原样，绝不丢身份。"""
+    try:
+        from backend.shared.stock_display_name import display_code
+
+        return display_code(code) or code
+    except Exception:  # noqa: BLE001
+        return code
 
 
 def _highlight_text(value: Any, *, limit: int = _HIGHLIGHT_TEXT_MAX) -> str:

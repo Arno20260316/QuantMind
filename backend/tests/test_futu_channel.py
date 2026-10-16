@@ -216,12 +216,26 @@ def test_to_futu_code_maps_hk_and_passes_others():
 def test_aggregate_positions_merges_same_code_after_normalize():
     # Arrange：同一标的两种写法（HK.700 / HK.00700）必须归并到一条
     rows = [
-        {"code": "HK.700", "qty": 100, "can_sell_qty": 100, "market_val": 40000.0,
-         "cost_price": 380.0, "nominal_price": 400.0, "stock_name": "腾讯控股",
-         "currency": "HKD"},
-        {"code": "HK.00700", "qty": 100, "can_sell_qty": 50, "market_val": 41000.0,
-         "cost_price": 390.0, "nominal_price": 410.0, "stock_name": "腾讯控股",
-         "currency": "HKD"},
+        {
+            "code": "HK.700",
+            "qty": 100,
+            "can_sell_qty": 100,
+            "market_val": 40000.0,
+            "cost_price": 380.0,
+            "nominal_price": 400.0,
+            "stock_name": "腾讯控股",
+            "currency": "HKD",
+        },
+        {
+            "code": "HK.00700",
+            "qty": 100,
+            "can_sell_qty": 50,
+            "market_val": 41000.0,
+            "cost_price": 390.0,
+            "nominal_price": 410.0,
+            "stock_name": "腾讯控股",
+            "currency": "HKD",
+        },
         {"code": "HK.00700", "qty": 0, "market_val": 0, "realized_pl": 88.0},
     ]
     # Act
@@ -237,8 +251,18 @@ def test_aggregate_positions_merges_same_code_after_normalize():
 @pytest.mark.parametrize(
     ("row", "is_closed"),
     [
-        ({"code": "HK.700", "qty": 0, "realized_pl": 120.5, "cost_price": 380.0,
-          "nominal_price": 400.0, "stock_name": "腾讯控股", "currency": "HKD"}, True),
+        (
+            {
+                "code": "HK.700",
+                "qty": 0,
+                "realized_pl": 120.5,
+                "cost_price": 380.0,
+                "nominal_price": 400.0,
+                "stock_name": "腾讯控股",
+                "currency": "HKD",
+            },
+            True,
+        ),
         ({"code": "HK.700", "qty": 0, "realized_pl": "N/A"}, False),  # 'N/A' → 0
         ({"code": "HK.700", "qty": 0, "realized_pl": 0}, False),
         ({"code": "HK.700", "qty": 100, "realized_pl": 500.0}, False),  # 持仓行
@@ -254,8 +278,14 @@ def test_parse_closed_row_judgement(row, is_closed):
 
 def test_parse_order_row_normalizes_and_defaults():
     parsed = fp._parse_order_row(
-        {"order_id": "O1", "code": "HK.0700", "stock_name": "腾讯控股",
-         "trd_side": "BUY", "price": "N/A", "dealt_qty": 0}
+        {
+            "order_id": "O1",
+            "code": "HK.0700",
+            "stock_name": "腾讯控股",
+            "trd_side": "BUY",
+            "price": "N/A",
+            "dealt_qty": 0,
+        }
     )
     assert parsed["code"] == "00700.HK"
     assert parsed["price"] == 0.0
@@ -264,8 +294,14 @@ def test_parse_order_row_normalizes_and_defaults():
 
 def test_parse_snapshot_row_day_change():
     code, snap = fp._parse_snapshot_row(
-        {"code": "HK.00700", "stock_name": "腾讯控股", "last_price": 404.0,
-         "prev_close_price": 400.0, "volume": 10, "turnover": 4040.0}
+        {
+            "code": "HK.00700",
+            "stock_name": "腾讯控股",
+            "last_price": 404.0,
+            "prev_close_price": 400.0,
+            "volume": 10,
+            "turnover": 4040.0,
+        }
     )
     assert code == "00700.HK"
     assert snap["day_chg"] == pytest.approx(1.0)
@@ -317,8 +353,13 @@ def test_account_both_single_leg_failure_is_null(fake_futu):
 def _place_payload(**over):
     payload = {
         "env": "SIMULATE",
-        "order": {"code": "00700.HK", "price": 400.0, "quantity": 100,
-                  "order_type": "NORMAL", "trd_side": "BUY"},
+        "order": {
+            "code": "00700.HK",
+            "price": 400.0,
+            "quantity": 100,
+            "order_type": "NORMAL",
+            "trd_side": "BUY",
+        },
     }
     payload.update(over)
     return payload
@@ -438,8 +479,12 @@ def test_futu_routes_registered_in_arena_package(monkeypatch):
 
 def test_account_envelope_carries_env(client, live_mod, monkeypatch):
     async def fake_account(env="SIMULATE"):
-        return {"total_asset": 1.0, "cash": 1.0, "market_value": 0.0,
-                "positions": {"00700.HK": {"volume": 1}}}
+        return {
+            "total_asset": 1.0,
+            "cash": 1.0,
+            "market_value": 0.0,
+            "positions": {"00700.HK": {"volume": 1}},
+        }
 
     monkeypatch.setattr(live_mod, "query_account", fake_account)
     res = client.get(f"{BASE}/futu/account", params={"env": "real"})
@@ -477,7 +522,11 @@ def test_account_both_partial_leg_null(client, live_mod, monkeypatch):
 
 def test_account_both_all_down_503(client, live_mod, monkeypatch):
     async def fake_both():
-        return {"real": None, "simulate": None, "errors": {"REAL": "a", "SIMULATE": "b"}}
+        return {
+            "real": None,
+            "simulate": None,
+            "errors": {"REAL": "a", "SIMULATE": "b"},
+        }
 
     monkeypatch.setattr(live_mod, "query_account_both", fake_both)
     res = client.get(f"{BASE}/futu/account-both")
@@ -539,9 +588,17 @@ def place_spy(monkeypatch, live_mod):
 
 
 def _place_body(**over):
-    body = {"env": "SIMULATE", "market": "HK",
-            "order": {"code": "00700.HK", "price": 400.0, "quantity": 100,
-                      "order_type": "NORMAL", "trd_side": "BUY"}}
+    body = {
+        "env": "SIMULATE",
+        "market": "HK",
+        "order": {
+            "code": "00700.HK",
+            "price": 400.0,
+            "quantity": 100,
+            "order_type": "NORMAL",
+            "trd_side": "BUY",
+        },
+    }
     body.update(over)
     return body
 
@@ -550,7 +607,8 @@ def test_place_real_gate_disabled_403(client, monkeypatch, place_spy):
     # Arrange：闸门关（默认）+ 凭据齐备——仍必须 403
     monkeypatch.delenv("ENABLE_REAL_TRADING", raising=False)
     monkeypatch.setattr(
-        "backend.services.trade.services.futu_live.trade_pwd_md5_configured", lambda: True
+        "backend.services.trade.services.futu_live.trade_pwd_md5_configured",
+        lambda: True,
     )
     # Act
     res = client.post(f"{BASE}/futu/place", json=_place_body(env="REAL"))
@@ -585,12 +643,39 @@ def test_place_simulate_passes_without_gate(client, monkeypatch, place_spy):
     ("patch", "detail_part"),
     [
         ({"order": {"price": 1.0, "quantity": 1, "trd_side": "BUY"}}, "order.code"),
-        ({"order": {"code": "00700.HK", "price": 1.0, "quantity": 0,
-                    "trd_side": "BUY"}}, "quantity"),
-        ({"order": {"code": "00700.HK", "price": 0, "quantity": 1,
-                    "trd_side": "BUY"}}, "price"),
-        ({"order": {"code": "00700.HK", "price": 1.0, "quantity": 1,
-                    "trd_side": "HOLD"}}, "trd_side"),
+        (
+            {
+                "order": {
+                    "code": "00700.HK",
+                    "price": 1.0,
+                    "quantity": 0,
+                    "trd_side": "BUY",
+                }
+            },
+            "quantity",
+        ),
+        (
+            {
+                "order": {
+                    "code": "00700.HK",
+                    "price": 0,
+                    "quantity": 1,
+                    "trd_side": "BUY",
+                }
+            },
+            "price",
+        ),
+        (
+            {
+                "order": {
+                    "code": "00700.HK",
+                    "price": 1.0,
+                    "quantity": 1,
+                    "trd_side": "HOLD",
+                }
+            },
+            "trd_side",
+        ),
     ],
 )
 def test_place_validation_400(client, place_spy, patch, detail_part):
@@ -665,13 +750,18 @@ def qq_spy(monkeypatch):
     return spy
 
 
-def test_place_receipt_pushed_to_hk_channel(client, place_spy, qq_spy):
+def test_place_receipt_pushed_to_hk_channel(client, place_spy, qq_spy, monkeypatch):
+    # 名称解析 patch 成确定性（真名表随数据落盘，不该决定测试结果）
+    import backend.shared.stock_display_name as sdn
+
+    monkeypatch.setattr(sdn, "resolve", lambda symbol, hint="": "腾讯控股")
     res = client.post(f"{BASE}/futu/place", json=_place_body())
     assert res.status_code == 200
     assert qq_spy["notify"], "下单回执必须外发（用户裁决：成交/委托结果是通知事件）"
     title, _, channel = qq_spy["notify"][0]
     assert channel == "hk"
-    assert "00700.HK" in title and "100股" in title
+    # 2026-10-16 排版：中文名 + 4 位补零港码 + HK$ 币种（设计 §4.6）
+    assert "腾讯控股(0700.HK)" in title and "100股 @HK$400" in title
 
 
 def test_place_us_market_routes_to_us_channel(client, place_spy, qq_spy):
@@ -753,7 +843,9 @@ class TestHardTimeout:
             signal.alarm(0)
         assert time.monotonic() - t0 < 3, "超时点就该炸，不该陪跑到 sleep 结束"
         assert "1s" in str(ei.value)
-        assert "OpenD" in str(ei.value), "错误信息要指向根因（未登录），不是泛泛的 timeout"
+        assert "OpenD" in str(ei.value), (
+            "错误信息要指向根因（未登录），不是泛泛的 timeout"
+        )
 
     def test_default_stays_below_every_caller_timeout(self):
         """默认值必须明显小于调用方超时（futu_live 45s / 循环降级 30s），否则看门狗白装。"""
@@ -779,9 +871,17 @@ class TestHardTimeout:
         """
         out = tmp_path / "probe.json"
         monkeypatch.setattr(
-            sys, "argv",
-            ["futu_subprocess.py", "futu-opend", "11111", "/tmp/k",
-             "account_both", "{}", str(out)],
+            sys,
+            "argv",
+            [
+                "futu_subprocess.py",
+                "futu-opend",
+                "11111",
+                "/tmp/k",
+                "account_both",
+                "{}",
+                str(out),
+            ],
         )
         # 只求 import 通过：测的是失败路径，不是真 SDK（真 SDK 在容器里）
         fake = types.ModuleType("futu")
@@ -798,7 +898,9 @@ class TestHardTimeout:
             raise TimeoutError(msg)
 
         monkeypatch.setattr(fp, "_open_ctx", _boom)
-        monkeypatch.setattr(fp.os, "_exit", lambda code=0: (_ for _ in ()).throw(SystemExit(code)))
+        monkeypatch.setattr(
+            fp.os, "_exit", lambda code=0: (_ for _ in ()).throw(SystemExit(code))
+        )
 
         try:
             with pytest.raises(SystemExit) as ei:
@@ -807,5 +909,68 @@ class TestHardTimeout:
             signal.alarm(0)  # main 装的看门狗别漏给后续测试
         assert ei.value.code == 2, "超时路径要以非 0 退出（且 os._exit 绕开 SDK 线程）"
         assert json.loads(out.read_text(encoding="utf-8")) == {
-            "success": False, "message": msg,
+            "success": False,
+            "message": msg,
         }, "失败必须落盘：调用方按文件内容判失败，不依赖退出码"
+
+
+# ── 委托回执排版（2026-10-16 QQ 中文名与排版设计 §4.6）────────────────
+
+
+def test_place_detail_hk_carries_name_and_currency(monkeypatch):
+    """实拍改前 ``买入 00700 500股``；改后带中文名 + ``HK$`` 币种前缀。"""
+    import backend.shared.stock_display_name as sdn
+
+    monkeypatch.setattr(sdn, "resolve", lambda symbol, hint="": "腾讯控股")
+    from backend.services.api.routers.agent_arena import futu_family
+
+    detail = futu_family._place_detail(
+        {"trd_side": "BUY", "code": "00700", "quantity": 500, "price": 465.5},
+        "HK",
+    )
+    # 港股显示键归一 4 位补零（平台约定），不是 00700.HK
+    assert detail == "买入 腾讯控股(0700.HK) 500股 @HK$465.5"
+
+
+def test_place_detail_us_uses_dollar_and_ticker(monkeypatch):
+    import backend.shared.stock_display_name as sdn
+
+    monkeypatch.setattr(sdn, "resolve", lambda symbol, hint="": "甲骨文")
+    from backend.services.api.routers.agent_arena import futu_family
+
+    detail = futu_family._place_detail(
+        {"trd_side": "SELL", "code": "US.ORCL", "quantity": 100, "price": 188.5},
+        "US",
+    )
+    assert detail == "卖出 甲骨文(ORCL) 100股 @$188.5"
+
+
+def test_place_detail_market_order_has_no_price_segment(monkeypatch):
+    """市价单 price=0 → 不印 ``@HK$0``（假价会被读成成交价）。"""
+    import backend.shared.stock_display_name as sdn
+
+    monkeypatch.setattr(sdn, "resolve", lambda symbol, hint="": "腾讯控股")
+    from backend.services.api.routers.agent_arena import futu_family
+
+    detail = futu_family._place_detail(
+        {"trd_side": "BUY", "code": "00700", "quantity": 500, "price": 0},
+        "HK",
+    )
+    assert detail == "买入 腾讯控股(0700.HK) 500股"
+
+
+def test_place_detail_resolver_down_falls_back_to_typed_code(monkeypatch):
+    """名称服务坏了只该少一个名字：回执照发，代码原样上台（绝不编造）。"""
+    import backend.shared.stock_display_name as sdn
+
+    def _boom(symbol, hint=""):
+        raise RuntimeError("name service down")
+
+    monkeypatch.setattr(sdn, "resolve", _boom)
+    from backend.services.api.routers.agent_arena import futu_family
+
+    detail = futu_family._place_detail(
+        {"trd_side": "BUY", "code": "00700", "quantity": 500, "price": 465.5},
+        "HK",
+    )
+    assert detail == "买入 00700 500股 @HK$465.5"

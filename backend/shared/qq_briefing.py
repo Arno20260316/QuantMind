@@ -239,8 +239,9 @@ def compose_briefing(
     total = len(ranked)
     shown = ranked[: max(1, int(max_lines))]
     hidden = total - len(shown)
-    market_cn = str(market or "CN").strip().upper()
-    prefix = "" if market_cn == "CN" else f"{market_label} · "
+    # 每张卡都带市场词（CN→「A股」，经 market_labels 单源传入）：三卡同档并发时消歧
+    label = str(market_label or "").strip()
+    prefix = f"{label} · " if label else ""
     title = f"📰 情报速览 · {prefix}{slot.label} · {slot.hhmm} · {total}条"
     tail = f"另有 {hidden} 条 · " if hidden > 0 else ""
     body = "\n".join(

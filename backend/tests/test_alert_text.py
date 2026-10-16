@@ -286,3 +286,94 @@ def test_digest_line_appends_news_category_and_risk_diamond():
     }
     line = format_sentinel_digest_line(positive, name_resolver=lambda _s: "宁德时代")
     assert line == "▲ 宁德时代(SH600519) 海外储能大单 · 利好"
+
+
+# ── 港/美速览行（2026-10-16 中文名全覆盖设计 §4.3/§4.4）────────────────
+
+
+def test_digest_line_hk_row_dedupes_code_then_name_double_write():
+    """港股实拍原文是「2555.HK 茶百道遭强制停牌…」——代码与名字双写。
+
+    换码后必须是 ``▼ 茶百道(2555.HK) 遭强制停牌…``（设计稿 §4.3 改后金样）；
+    若只换代码不掐重名，会读成 ``茶百道(2555.HK) 茶百道遭强制停牌``（名字两遍）。
+    """
+    from backend.shared.alert_text import format_sentinel_digest_line
+
+    row = {
+        "alert_type": "news:negative",
+        "market": "HK",
+        "symbol": "2555.HK",
+        "direction": "down",
+        "title": "2555.HK 茶百道遭强制停牌：IPO操纵疑云与17%加盟商流失，"
+        "“加盟制茶饮第一股”陷信任危机",
+        "detail": {"payload": {}},
+    }
+    line = format_sentinel_digest_line(row, name_resolver=lambda _s: "茶百道")
+    assert line == (
+        "▼ 茶百道(2555.HK) 遭强制停牌：IPO操纵疑云与17%加盟商流失，“加盟制茶… · 利空"
+    )
+    assert line.count("茶百道") == 1  # 掐重：一行只出现一遍名字
+
+
+def test_digest_line_hk_code_without_name_keeps_rest_verbatim():
+    """标题只有裸码（无名字）时换码后不得吞正文——掐重只在名字紧随时生效。"""
+    from backend.shared.alert_text import format_sentinel_digest_line
+
+    row = {
+        "alert_type": "news:negative",
+        "market": "HK",
+        "symbol": "2555.HK",
+        "direction": "down",
+        "title": "2555.HK 遭强制停牌 茶百道回应",
+        "detail": {"payload": {}},
+    }
+    line = format_sentinel_digest_line(row, name_resolver=lambda _s: "茶百道")
+    assert line == "▼ 茶百道(2555.HK) 遭强制停牌 茶百道回应 · 利空"
+
+
+def test_digest_line_us_row_keeps_ticker_and_risk_diamond():
+    """美股速览行（设计稿 §4.4）：裸 ticker 换 ``甲骨文(ORCL)``，风险事件 ◆。"""
+    from backend.shared.alert_text import format_sentinel_digest_line
+
+    row = {
+        "alert_type": "news:risk_event",
+        "market": "US",
+        "symbol": "ORCL",
+        "direction": "down",
+        "title": "ORCL CoreWeave 违约概率超六成！黄仁勋“灭火”：融资成本在下降，"
+        "无需英伟达兜底",
+        "detail": {"payload": {}},
+    }
+    line = format_sentinel_digest_line(row, name_resolver=lambda _s: "甲骨文")
+    assert line == (
+        "◆ 甲骨文(ORCL) CoreWeave 违约概率超六成！黄仁勋“灭火”：融资成本在… · 风险"
+    )
+
+
+def test_digest_default_resolver_reads_stock_display_name(monkeypatch):
+    """默认解析器已换 ``stock_display_name.resolve``（港/美/指数全覆盖的共享解析）。
+
+    patch 模块属性即可：`_resolve_name` 在调用点 lazy import，每次调用都取补丁值。
+    """
+    import backend.shared.stock_display_name as sdn
+
+    seen: list[str] = []
+
+    def fake(symbol, hint=""):
+        seen.append(symbol)
+        return "茶百道"
+
+    monkeypatch.setattr(sdn, "resolve", fake)
+    from backend.shared.alert_text import format_sentinel_digest_line
+
+    row = {
+        "alert_type": "news:negative",
+        "market": "HK",
+        "symbol": "2555.HK",
+        "direction": "down",
+        "title": "2555.HK 遭强制停牌",
+        "detail": {"payload": {}},
+    }
+    line = format_sentinel_digest_line(row)
+    assert line == "▼ 茶百道(2555.HK) 遭强制停牌 · 利空"
+    assert seen == ["2555.HK"]

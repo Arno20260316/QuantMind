@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from backend.shared.simulation_account_keys import resolve_db_account_user
+from backend.shared.stock_display_name import identity as display_identity
 from backend.shared.stock_utils import StockCodeUtil
 from backend.services.live_trading.services.tdx_push_service import tdx_pusher
 
@@ -725,8 +726,12 @@ async def _notify(
     content: str,
     level: str = "warning",
     push_tdx: list | None = None,
+    qq_alert: bool = True,
 ) -> None:
-    """站内通知（前端通知铃铛）+ 可选通达信预警弹窗。失败不阻断。"""
+    """站内通知（前端通知铃铛）+ 可选通达信预警弹窗 + QQ 旁路。失败不阻断。
+
+    ``qq_alert=False``：本面 QQ 走 ``qq_digest`` 批量卡（策略提醒 2026-10-16 拍板）。
+    """
     try:
         from backend.shared.notification_publisher import publish_notification_async
 
@@ -737,6 +742,7 @@ async def _notify(
             content=content[:4000],
             type="trading",
             level=level,
+            qq_alert=qq_alert,
         )
     except Exception as exc:
         logger.warning("[TdxFeed] 站内通知失败: %s", exc)
@@ -754,6 +760,54 @@ def _alert_fired(redis_client, tenant_id: str, user_id: str, symbol: str) -> boo
         return True
     redis_client.set(key, "1", ttl=int(ALERT_COOLDOWN_SECONDS))
     return False
+
+
+def format_sltp_alert_text(
+    *, symbol: str, name: str, reason: str, entry: float, price: float
+) -> tuple[str, str]:
+    """止损/止盈提醒 → （标题, 正文）。形如：
+
+    ``⚠️ 止损止盈 · 国轩高科(SZ002074)`` / ``触发止盈 ｜ 成本 ¥41.20 ｜ 现价 ¥43.55``
+
+    纯函数、绝不抛（名字缺了只显示代码，桥持仓 name 为空时不再裸码上标题）。
+    """
+    ident = display_identity(symbol, hint=name) or str(symbol or "")
+    title = f"⚠️ 止损止盈 · {ident}"
+    content = f"{reason} ｜ 成本 ¥{float(entry):.2f} ｜ 现价 ¥{float(price):.2f}"
+    return title, content
+
+
+def format_strategy_digest_line(
+    *, symbol: str, name: str, score: float, threshold: float
+) -> str:
+    """策略提醒 → QQ 摘要单行（``qq_digest`` 批量卡用）。纯函数、绝不抛。"""
+    ident = display_identity(symbol, hint=name) or str(symbol or "")
+    return f"⚠️ {ident} 推理分数 {float(score):.2f} ≤ 阈值 {float(threshold):.2f}"
+
+
+def _enqueue_strategy_qq(
+    *,
+    tenant_id: str,
+    user_id: str,
+    symbol: str,
+    name: str,
+    score: float,
+    threshold: float,
+) -> None:
+    """本轮策略提醒 → QQ 摘要卡（120s 窗口合并，2026-10-16 拍板）；失败绝不阻断。"""
+    try:
+        from backend.shared.qq_digest import enqueue
+
+        enqueue(
+            digest_key=f"strategy:{tenant_id}:{user_id}",
+            header="🔔 策略提醒",
+            line=format_strategy_digest_line(
+                symbol=symbol, name=name, score=score, threshold=threshold
+            ),
+            footer="交易台 › 持仓监控",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TdxFeed] 策略提醒 QQ 摘要入队失败: %s", exc)
 
 
 async def _check_sltp_alerts(
@@ -787,13 +841,16 @@ async def _check_sltp_alerts(
             continue
         if redis_client and _alert_fired(redis_client, tenant_id, user_id, p["symbol"]):
             continue
-        name = p.get("name") or p["symbol"]
-        logger.warning("[TdxFeed] %s %s: %s", name, p["symbol"], reason)
+        name = str(p.get("name") or "").strip()
+        title, content = format_sltp_alert_text(
+            symbol=p["symbol"], name=name, reason=reason, entry=entry, price=price
+        )
+        logger.warning("[TdxFeed] %s %s: %s", name or p["symbol"], p["symbol"], reason)
         await _notify(
             tenant_id=tenant_id,
             user_id=user_id,
-            title=f"止损止盈提醒 · {name}",
-            content=f"{p['symbol']} {reason}（成本 {entry:.2f}，现价 {price:.2f}）",
+            title=title,
+            content=content,
             level="warning",
             push_tdx=[
                 {
@@ -891,18 +948,22 @@ async def _check_strategy_alerts(
             if p is None or not isinstance(score, (int, float)):
                 continue
             if float(score) <= threshold:
-                name = p.get("name") or symbol
-                reason = f"最新推理分数 {float(score):.2f} ≤ 阈值 {threshold:.2f}"
-                logger.info("[TdxFeed] 策略分数提醒 %s %s: %s", name, symbol, reason)
+                name = str(p.get("name") or "").strip()
+                reason = (
+                    f"最新推理分数 {float(score):.2f} ≤ 阈值 {float(threshold):.2f}"
+                )
+                logger.info(
+                    "[TdxFeed] 策略分数提醒 %s %s: %s", name or symbol, symbol, reason
+                )
                 await _notify(
                     tenant_id=tenant_id,
                     user_id=user_id,
-                    title=f"策略提醒 · {name}",
+                    title=(f"策略提醒 · {display_identity(symbol, hint=name)}"),
                     content=(
-                        f"{symbol} {reason}"
-                        f"（预测日 {row.get('prediction_trade_date') or '--'}）"
+                        f"{reason} ｜ 预测日 {row.get('prediction_trade_date') or '--'}"
                     ),
                     level="warning",
+                    qq_alert=False,  # QQ 面走 qq_digest 批量卡（2026-10-16 拍板）
                     push_tdx=[
                         {
                             "symbol": p["suffix"],
@@ -913,6 +974,14 @@ async def _check_strategy_alerts(
                             "reason": reason,
                         }
                     ],
+                )
+                _enqueue_strategy_qq(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    symbol=symbol,
+                    name=name,
+                    score=float(score),
+                    threshold=float(threshold),
                 )
                 feed_status["strategy_alerts_fired"] += 1
     except Exception as exc:

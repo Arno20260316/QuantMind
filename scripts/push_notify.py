@@ -27,6 +27,7 @@
   python scripts/push_notify.py send <title> <content>   # 主动发一条
   python scripts/push_notify.py test                     # 发一条测试消息
 """
+
 from __future__ import annotations
 
 import argparse
@@ -137,12 +138,64 @@ def _quantdb_lookup_name(symbol: str) -> str:
     try:
         for c in cands:
             row = con.execute(
-                "SELECT Name FROM read_parquet(?) WHERE Symbol = ? LIMIT 1",
-                [str(f), c]).fetchone()
+                "SELECT Name FROM read_parquet(?) WHERE Symbol = ? LIMIT 1", [str(f), c]
+            ).fetchone()
             if row and row[0]:
                 return str(row[0]).strip()
     finally:
         con.close()
+    return ""
+
+
+def _market_master_file(market: str) -> Path:
+    """港/美 security_master parquet 路径（尊重 QM_QUANTHK/QUANTUS_DATA_DIR，仅绝对路径）。"""
+    env_key, leaf = (
+        ("QM_QUANTHK_DATA_DIR", "quanthk")
+        if market == "hk"
+        else ("QM_QUANTUS_DATA_DIR", "quantus")
+    )
+    q = os.environ.get(env_key) or ""
+    base = Path(q) if q.startswith("/") else ROOT / "data" / leaf
+    return base / "2_base_sector" / "security_master" / "data.parquet"
+
+
+def _market_lookup_name(symbol: str) -> str:
+    """直读港/美 security_master（duckdb）；任何失败返回 ""（名拿不到不影响推送）。
+
+    键归一：港股 ``HK.0700``/``0700``/``00700`` → ``0700.HK``（4 位）；
+    美股 ``US.ORCL``/``ORCL.US`` → ``ORCL``。cn_name 优先、en_name 兜底。
+    """
+    import duckdb
+
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    probes: list[tuple[str, str]] = []  # (market, 键)
+    hk = re.fullmatch(r"(?:HK[.:]?)?(\d{1,5})(?:\.HK)?", s)
+    if hk:
+        probes.append(("hk", f"{int(hk.group(1)):04d}.HK"))
+    us = re.sub(r"\.US$", "", re.sub(r"^US[.:]", "", s))
+    if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", us):
+        probes.append(("us", us))
+    for market, key in probes:
+        f = _market_master_file(market)
+        if not f.is_file():
+            continue
+        try:
+            con = duckdb.connect()
+            try:
+                row = con.execute(
+                    "SELECT cn_name, en_name FROM read_parquet(?) WHERE symbol = ? LIMIT 1",
+                    [str(f), key],
+                ).fetchone()
+            finally:
+                con.close()
+        except Exception:  # noqa: BLE001 - 名称是点缀，读不动就跳过
+            continue
+        if row:
+            name = str(row[0] or "").strip() or str(row[1] or "").strip()
+            if name:
+                return name
     return ""
 
 
@@ -159,7 +212,7 @@ def _repair_name(name: str) -> str:
 
 
 def stock_name(symbol: str) -> str:
-    """股票中文名（缓存 → quantdb → ''）。失败不影响调用方。"""
+    """股票中文名（缓存 → quantdb → 港/美 security_master → ''）。失败不影响调用方。"""
     if not symbol:
         return ""
     cache = _load_name_cache()
@@ -170,6 +223,11 @@ def stock_name(symbol: str) -> str:
         name = _quantdb_lookup_name(symbol)
     except Exception as exc:  # noqa: BLE001
         _log(f"名称查询失败 {symbol}: {exc}")
+    if not name:
+        try:
+            name = _market_lookup_name(symbol)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"港美名称查询失败 {symbol}: {exc}")
     name = _repair_name(name)
     if name and name != "None":
         cache[symbol] = name
@@ -220,18 +278,26 @@ def _get_token(channel: str = "default") -> str:
         return str(cached["token"])
     import requests
 
-    r = requests.post(TOKEN_URL, timeout=_TIMEOUT,
-                      json={"appId": app_id, "clientSecret": secret})
+    r = requests.post(
+        TOKEN_URL, timeout=_TIMEOUT, json={"appId": app_id, "clientSecret": secret}
+    )
     r.raise_for_status()
     data = r.json()
     token = str(data.get("access_token") or "")
     if not token:
         raise RuntimeError(f"机器人令牌接口未返回 access_token: {str(data)[:200]}")
     try:
-        cache_path.write_text(json.dumps({
-            "token": token,
-            "expires_at": time.time() + float(data.get("expires_in") or 7200) - 60,
-        }), encoding="utf-8")
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "token": token,
+                    "expires_at": time.time()
+                    + float(data.get("expires_in") or 7200)
+                    - 60,
+                }
+            ),
+            encoding="utf-8",
+        )
     except OSError:
         pass
     return token
@@ -250,15 +316,23 @@ def send_text(content: str, channel: str = "default") -> dict:
 
     openid = _channel_openid(channel)
     if not openid:
-        raise RuntimeError(f"缺少 {_CHANNEL_KEYS[channel][2]}（请写入 config/keeper.env）")
+        raise RuntimeError(
+            f"缺少 {_CHANNEL_KEYS[channel][2]}（请写入 config/keeper.env）"
+        )
     token = _get_token(channel)
     r = requests.post(
         SEND_URL.format(openid=openid),
         timeout=_TIMEOUT,
-        headers={"Authorization": f"QQBot {token}",  # v2 接口要求 QQBot 前缀（Bearer 会 11241）
-                 "Content-Type": "application/json"},
-        json={"content": content, "msg_type": 0,
-              "msg_seq": int(time.time() * 1000) % (2**31)})
+        headers={
+            "Authorization": f"QQBot {token}",  # v2 接口要求 QQBot 前缀（Bearer 会 11241）
+            "Content-Type": "application/json",
+        },
+        json={
+            "content": content,
+            "msg_type": 0,
+            "msg_seq": int(time.time() * 1000) % (2**31),
+        },
+    )
     r.raise_for_status()
     return r.json()
 
@@ -269,14 +343,16 @@ def send_markdown(content: str, channel: str = "default") -> dict:
 
     openid = _channel_openid(channel)
     if not openid:
-        raise RuntimeError(f"缺少 {_CHANNEL_KEYS[channel][2]}（请写入 config/keeper.env）")
+        raise RuntimeError(
+            f"缺少 {_CHANNEL_KEYS[channel][2]}（请写入 config/keeper.env）"
+        )
     token = _get_token(channel)
     r = requests.post(
         SEND_URL.format(openid=openid),
         timeout=_TIMEOUT,
-        headers={"Authorization": f"QQBot {token}",
-                 "Content-Type": "application/json"},
-        json={"msg_type": 2, "markdown": {"content": content}})
+        headers={"Authorization": f"QQBot {token}", "Content-Type": "application/json"},
+        json={"msg_type": 2, "markdown": {"content": content}},
+    )
     r.raise_for_status()
     return r.json()
 
@@ -334,7 +410,9 @@ def _ledger_cash(agent: str) -> float | None:
 def _ledger_hold_volume(agent: str, symbol: str) -> int:
     try:
         d = json.loads((ROOT / "logs" / "live_ledger.json").read_text(encoding="utf-8"))
-        pos = ((d.get("agents") or {}).get(agent, {}).get("positions") or {}).get(symbol) or {}
+        pos = ((d.get("agents") or {}).get(agent, {}).get("positions") or {}).get(
+            symbol
+        ) or {}
         return int(pos.get("volume") or 0)
     except (OSError, ValueError, TypeError):
         return 0
@@ -352,26 +430,39 @@ def _clamp_reason(text: str, limit: int = 300) -> str:
         return text
     window = text[:limit]
     idx = max(window.rfind(ch) for ch in "、，。；！？,;.")
-    if idx >= limit // 2:            # 边界别收得太靠前（至少留半窗内容）
+    if idx >= limit // 2:  # 边界别收得太靠前（至少留半窗内容）
         return window[: idx + 1] + "…"
     return window + "…"
 
 
-def notify_order(*, side: str, symbol: str, volume: int, price: float | None = None,
-                 agent: str = "", reason: str = "", order_id: str = "",
-                 held_before: int | None = None, source: str = "",
-                 stop_loss: float | None = None,
-                 take_profit: float | None = None) -> None:
+def notify_order(
+    *,
+    side: str,
+    symbol: str,
+    volume: int,
+    price: float | None = None,
+    agent: str = "",
+    reason: str = "",
+    order_id: str = "",
+    held_before: int | None = None,
+    source: str = "",
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+) -> None:
     """下单成功事件 → QQ（▲买/▼卖，正文含原因/止损止盈/委托/余额/T+1/账号）。"""
     side_label = "买入" if side == "buy" else "卖出"
     icon = "▲" if side == "buy" else "▼"
     name = stock_name(symbol)
     sym = f"{name}({symbol})" if name else symbol
     price_txt = f" @¥{price:.2f}" if price else ""
-    held = held_before if held_before is not None else _ledger_hold_volume(agent, symbol)
+    held = (
+        held_before if held_before is not None else _ledger_hold_volume(agent, symbol)
+    )
     clearing = side == "sell" and held and volume >= held
-    act = f"{icon} {bold('清仓') if clearing else side_label} " \
-          f"{bold(sym)} {bold(f'{volume}股{price_txt}')}".strip()
+    act = (
+        f"{icon} {bold('清仓') if clearing else side_label} "
+        f"{bold(sym)} {bold(f'{volume}股{price_txt}')}".strip()
+    )
     body = []
     reason = (reason or "").strip()
     body.append(f"原因：{_clamp_reason(reason)}" if reason else "原因：—")
@@ -406,10 +497,12 @@ def main() -> int:
     t.add_argument("--channel", default="default", choices=["default", "hk", "us"])
     args = ap.parse_args()
     if args.cmd == "test":
-        notify("通知通道测试 ✅",
-               f"QuantMind keeper 已接通 QQ 机器人通知（{_now_cn():%F %T}）\n"
-               "keeper 告警（桥离线 / 主机守护 / 风控事件）都会推送到这里。",
-               channel=args.channel)
+        notify(
+            "通知通道测试 ✅",
+            f"QuantMind keeper 已接通 QQ 机器人通知（{_now_cn():%F %T}）\n"
+            "keeper 告警（桥离线 / 主机守护 / 风控事件）都会推送到这里。",
+            channel=args.channel,
+        )
     else:
         notify(args.title, args.content, channel=args.channel)
     return 0

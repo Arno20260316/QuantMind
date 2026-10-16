@@ -96,14 +96,14 @@ _TAIL = "详情见交易台 · 实时情报。"
 
 
 def _resolve_name(symbol: str) -> str:
-    """中文名（``stock_name_mapper``）；查不到/索引坏 → 空串，绝不抛。
+    """中文名（``stock_display_name`` 统一解析：A股/港股/美股/指数）；查不到 → 空串，绝不抛。
 
     告警文案是**消费端**：名字服务坏了只该少一个名字，不该少一条告警。
     """
     try:
-        from backend.shared.stock_name_mapper import resolve_name
+        from backend.shared.stock_display_name import resolve
 
-        return str(resolve_name(symbol) or "").strip()
+        return str(resolve(symbol) or "").strip()
     except Exception:  # noqa: BLE001
         return ""
 
@@ -222,6 +222,14 @@ def format_sentinel_digest_line(
             # 标题里已含裸代码（检测器写的就是 "002851.SZ 大幅下行"）→ 换成
             # 「名称(前缀码)」，别让同一只票在一行里出现两遍代码
             fact = fact.replace(symbol, ident, 1)
+            if name and ident != symbol:
+                # 检测器也可能写成「代码 名称」双写（实拍：港股
+                # "2555.HK 茶百道遭强制停牌…"）→ 换码后名字紧贴着再出现一遍，
+                # 掐掉那一份（只掐紧跟身份段的一份；正文里再提不算）
+                for needle in (f"{ident} {name}", f"{ident}{name}"):
+                    if needle in fact:
+                        fact = fact.replace(needle, f"{ident} ", 1)
+                        break
             ident = ""
     arrow = DIRECTION_ARROWS.get(str(row.get("direction") or "").strip(), "•")
     alert_type = str(row.get("alert_type") or "").strip()

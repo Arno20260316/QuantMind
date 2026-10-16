@@ -204,7 +204,7 @@ def test_compose_card_shape_matches_selected_design():
     )
     assert composed is not None
     title, body = composed
-    assert title == "📰 情报速览 · 午间 · 11:35 · 3条"
+    assert title == "📰 情报速览 · A股 · 午间 · 11:35 · 3条"
     lines = body.split("\n")
     assert lines[0] == "━" * 14
     assert lines[4] == "━" * 14
@@ -333,6 +333,25 @@ def test_flush_market_sends_card_clears_buffer_and_counts(sent):
     assert channel == "default"
     assert buffer_key("CN") in client.deleted
     assert client.lists.get(buffer_key("CN")) in (None, [])
+
+
+def test_flush_market_cn_card_carries_market_label(sent):
+    """2026-10-16 拍板：CN 卡也带市场词（production 经 market_labels 传「A股」）。"""
+    from backend.shared.qq_briefing import (
+        BRIEFING_SLOTS,
+        _slot,
+        enqueue_briefing,
+        flush_market,
+    )
+
+    client = FakeRedis()
+    enqueue_briefing(client, "CN", line="▼ 贵州茅台(600519) 批价下调传闻")
+    sent_count = flush_market(
+        client, "CN", _slot(BRIEFING_SLOTS[1]), market_label="A股"
+    )
+    assert sent_count == 1
+    title = sent[0][0]
+    assert title.startswith("📰 情报速览 · A股 · 午间")
 
 
 def test_flush_market_empty_buffer_returns_zero_and_sends_nothing(sent):

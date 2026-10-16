@@ -123,9 +123,10 @@ class TestScoreDropRule:
 
     def test_anchor_crossing_fires_exactly_once(self):
         # 当日基准 +0.5：前一扫 +0.2 还没越过回落线（0.30 < 0.35），本扫 +0.1 越过（0.40 ≥ 0.35）
-        assert evaluate_score_transition(
-            0.2, 0.1, drop_threshold=0.35, anchor=0.5
-        ) == (KIND_SCORE_DROP, SEVERITY_WARNING)
+        assert evaluate_score_transition(0.2, 0.1, drop_threshold=0.35, anchor=0.5) == (
+            KIND_SCORE_DROP,
+            SEVERITY_WARNING,
+        )
         # 越线后继续阴跌（每步都小于阈值）不重复报——同一段回落只有一次事件
         assert (
             evaluate_score_transition(0.1, 0.05, drop_threshold=0.35, anchor=0.5)
@@ -314,15 +315,11 @@ class TestConfig:
             == 2.0
         )
         assert (
-            parse_alert_config({"score_drop_threshold": "abc"})[
-                "score_drop_threshold"
-            ]
+            parse_alert_config({"score_drop_threshold": "abc"})["score_drop_threshold"]
             == 0.35
         )
         assert (
-            parse_alert_config({"score_drop_threshold": "0.5"})[
-                "score_drop_threshold"
-            ]
+            parse_alert_config({"score_drop_threshold": "0.5"})["score_drop_threshold"]
             == 0.5
         )
 
@@ -516,7 +513,29 @@ class TestDigestLine:
             )
             assert line == f"⚑ 麦格米特(SZ002851) {phrase}"
 
-    def test_missing_name_degrades_to_code_and_never_raises(self):
+    def test_missing_name_backfilled_by_display_resolver(self, monkeypatch):
+        """alert 漏名字时走 ``stock_display_name`` 兜底回填（2026-10-16 中文名覆盖）。
+
+        patch 模块属性：生产侧在调用点 lazy import，每次调用都会取到补丁值。
+        """
+        import backend.shared.stock_display_name as sdn
+
+        monkeypatch.setattr(sdn, "resolve", lambda symbol, hint="": "麦格米特")
+        from backend.shared.holding_alert_contract import format_holding_digest_line
+
+        line = format_holding_digest_line(
+            {"symbol": "002851.SZ", "kind": KIND_RISK_ANOMALY}
+        )
+        assert line == "⚑ 麦格米特(SZ002851) 盘中异动"
+
+    def test_missing_name_degrades_to_code_and_never_raises(self, monkeypatch):
+        """解析器也查不到（或抛）时只显示代码——绝不编造、绝不 代码(代码)。"""
+        import backend.shared.stock_display_name as sdn
+
+        def _boom(symbol, hint=""):
+            raise RuntimeError("resolver down")
+
+        monkeypatch.setattr(sdn, "resolve", _boom)
         from backend.shared.holding_alert_contract import format_holding_digest_line
 
         line = format_holding_digest_line(

@@ -349,6 +349,12 @@ def run(
     calibration = (
         _calibrate(close, amount, fwd_map, calibrate_days) if calibrate else None
     )
+    if calibration is None:
+        # pass2/日常重跑不带 --calibrate：沿用既有 evidence 的标定网格（网格自带
+        # sample_start/end 标注归属），不因重跑把方法论证据抹成空
+        prev = ds.load_product_json("evidence")
+        if isinstance(prev, dict):
+            calibration = prev.get("calibration")
 
     # 4) 信号面板 → 双过闸（h10 裁定，h5/h20 披露）
     panels = stats.compute_all_signals(close, amount)

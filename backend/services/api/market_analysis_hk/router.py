@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from backend.services.api.market_analysis_hk import (
     hk_heatmap_drill as drill,
     hk_opportunity as opp,
+    hk_smart_money as hksm,
     quanthk_feed as feed,
 )
 from backend.services.api.user_app.middleware.auth import get_current_user
@@ -89,7 +90,9 @@ async def get_sector_heatmap(
 
 @router.get("/heatmap/drill")
 async def get_heatmap_drill(
-    sector: str = Query(..., min_length=1, max_length=60, description="行业名（恒生口径）"),
+    sector: str = Query(
+        ..., min_length=1, max_length=60, description="行业名（恒生口径）"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """L2 下钻：行业成分股（成交额降序，≤300 只；父子和账，行业名不存在 404）。"""
@@ -514,3 +517,114 @@ async def trigger_refresh_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---- 聪明钱（细案 §5；只读产物，无产物 404 hk_smart_money_not_built） ----
+
+
+async def _hksm_read(fn, *args, **kwargs):
+    """产物读侧统一调度：线程池执行 + 未建 404 / 参数 400 收敛。"""
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except hksm.HkSmartMoneyNotBuilt:
+        raise HTTPException(
+            status_code=404, detail="hk_smart_money_not_built"
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception as exc:
+        raise _fatal(exc) from exc
+
+
+@router.get("/smart-money/overview")
+async def get_hk_smart_money_overview(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """概览：新鲜度 + 类型面板（持仓/5d/20d 净额 + 入柱 + 最强变体）+ 60 日趋势。
+
+    类型效力为历史统计（双过闸裁定口径），非模型预测、非交易指令。
+    """
+    _ = current_user
+    return await _hksm_read(hksm.get_overview)
+
+
+@router.get("/smart-money/types")
+async def get_hk_smart_money_types(
+    horizon: str = Query(default="10", description="聚焦窗口 5/10/20（入柱裁定取 10）"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """类型效力全网格：24 信号 × h5/h10/h20（IC/分位超额/命中/裁定格）。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_types, horizon)
+
+
+@router.get("/smart-money/seats")
+async def get_hk_smart_money_seats(
+    window: str = Query(default="60", description="窗口：20 / 60 / all（0 同 all）"),
+    category: str | None = Query(
+        default=None, description="类型：cn_broker / us_eu / hk / apac / other"
+    ),
+    sort: str = Query(
+        default="shrunk_hit", description="排序：shrunk_hit / avg_exc / n"
+    ),
+    min_events: int = Query(
+        default=5, ge=1, le=1000, description="最少事件数（行级过滤）"
+    ),
+    limit: int = Query(
+        default=hksm.SEATS_LIMIT_DEFAULT,
+        ge=5,
+        le=hksm.SEATS_LIMIT_MAX,
+        description="返回条数",
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """席位榜：历史胜率（事件后 10 日超额为正占比）+ 收缩估计——事后统计。"""
+    _ = current_user
+    return await _hksm_read(
+        hksm.get_seats,
+        window=window,
+        category=category,
+        sort=sort,
+        min_events=min_events,
+        limit=limit,
+    )
+
+
+@router.get("/smart-money/consensus")
+async def get_hk_smart_money_consensus(
+    limit: int = Query(
+        default=hksm.CONSENSUS_LIMIT_DEFAULT,
+        ge=5,
+        le=hksm.CONSENSUS_LIMIT_MAX,
+        description="返回条数",
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """共识榜：入柱信号截面分位等权复合分；零入柱 → 空榜 + evidence_only=true。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_consensus, limit)
+
+
+@router.get("/smart-money/stock/{symbol}")
+async def get_hk_smart_money_stock(
+    symbol: str,
+    days: int = Query(
+        default=hksm.STOCK_DAYS_DEFAULT,
+        ge=hksm.STOCK_DAYS_MIN,
+        le=hksm.STOCK_DAYS_MAX,
+        description="窗口（交易日）",
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """个股档案：事件时间线 + 类型持仓快照 + 窗口统计（无事件也 200）。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_stock, symbol, days)
+
+
+@router.get("/smart-money/evidence")
+async def get_hk_smart_money_evidence(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """证据台：协议/全网格裁定/标定网格/排除计数/A 席对账/方法学/警告。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_evidence)

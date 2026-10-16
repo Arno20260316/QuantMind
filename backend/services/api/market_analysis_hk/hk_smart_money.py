@@ -32,9 +32,24 @@ log = logging.getLogger(__name__)
 
 #: 席位榜参数域（产物 window 列取值；入参 "0" 视为 all，与常量 SEAT_WINDOWS 同义）
 SEATS_WINDOWS = ("20", "60", "all")
-SEATS_SORTS = ("shrunk_hit", "avg_exc", "n")
+#: 排序键 → seats 列对（主, 次）；NaN 沉底。lb_skill = v2 默认（90% 下界，
+#: 小样本自动沉底——细案 §2 原则）
+SEATS_SORT_COLUMNS: dict[str, list[str]] = {
+    "lb_skill": ["lb_skill_bp", "skill_bp"],
+    "skill": ["skill_bp", "n_exc10"],
+    "vw_skill": ["vw_skill_bp", "n_exc10"],
+    "avg_exc": ["avg_exc_bp", "n_events"],
+    "shrunk_hit": ["shrunk_hit", "n_events"],
+    "n": ["n_events", "shrunk_hit"],
+}
+SEATS_SORTS = tuple(SEATS_SORT_COLUMNS)
 SEATS_LIMIT_DEFAULT = 30
 SEATS_LIMIT_MAX = 100
+
+#: 席位档案：活跃标的条数与最近事件回溯（交易日分区数）/ 条数
+SEAT_PROFILE_SYMBOLS = 8
+SEAT_PROFILE_WINDOW_DAYS = 60
+SEAT_PROFILE_EVENTS = 10
 
 #: 共识榜参数域
 CONSENSUS_LIMIT_DEFAULT = 50
@@ -52,6 +67,12 @@ HORIZON_KEYS = tuple(str(h) for h in HORIZONS)
 #: 口径说明（随响应披露；与细案 §3.4/§3.5 文案一致）
 HIT_NOTE = "历史胜率 = 事件后 10 日超额（对当日全市场中位）为正的占比——事后统计，非预测"
 SHRINK_NOTE = "收缩估计 w=n/(n+20) 向中性收缩（超额 0bp、胜率 50%）；n 随行披露"
+SKILL_NOTE = (
+    "方向技能 = 买入事件 +事后超额 / 卖出事件 −事后超额（方向对不对）；"
+    "同样是事后统计——持续性审计（/persistence）显示席位层弱持续，"
+    "榜单是描述性盘点，不是可跟随信号"
+)
+LB_NOTE = "90% 下界 = 技能均值 − 1.28×标准误：小样本自动沉底，榜默认按此排序"
 SUSPECT_NOTE = "过户嫌疑（单席单日 |Δvalue| > 1.2×当日成交额）只标记，不计入统计"
 EPISODE_NOTE = "统计只用 episode 首日（同席同股同向 5 交易日内归并）"
 SOUTH_NOTE = "南向（内资·港股通）为 hsgt_south 直读披露，不在 CCASS 事件仓"
@@ -60,6 +81,10 @@ TIMELINE_NOTE = "事后超额为封存展示列（T+1 收盘入场口径），�
 
 class HkSmartMoneyNotBuilt(Exception):
     """港股聪明钱产物未构建（404 hk_smart_money_not_built）。"""
+
+
+class HkSeatNotFound(Exception):
+    """席位档案查无此席（404 seat_not_found）。"""
 
 
 # ---------------------------------------------------------------- 小工具
@@ -101,6 +126,19 @@ def _bool(v) -> bool | None:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
     return bool(v)
+
+
+def _s(v) -> str | None:
+    """pandas 标量 → JSON 安全 str|None（pd.NA/NaN/空白 一律 None，绝不落「nan」）。"""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        return None
+    t = str(v).strip()
+    return t if t else None
 
 
 def _iso(dt) -> str | None:
@@ -228,14 +266,59 @@ def get_types(horizon: str = "10") -> dict:
     }
 
 
+def _seat_row(r) -> dict:
+    """seats 行 → JSON（/seats items 与 /seat windows 共用一份序列化）。
+
+    v2 新列取 r.get：旧产物（19 列）在部署窗口期读回 None，不炸。
+    """
+    cat = str(r["category"])
+    return {
+        "participant_id": str(r["participant_id"]),
+        "participant_name": _s(r["participant_name"]),
+        "category": cat,
+        "category_label": ic.category_label(cat),
+        "kind": str(r["kind"]),
+        "window": str(r["window"]),
+        "n_events": _n(r["n_events"]),
+        "n_buy": _n(r["n_buy"]),
+        "n_sell": _n(r["n_sell"]),
+        "n_exc10": _n(r["n_exc10"]),
+        "avg_exc_bp": _r(r["avg_exc_bp"], 1),
+        "hit": _r(r["hit"], 3),
+        "buy_hit": _r(r["buy_hit"], 3),
+        "sell_hit": _r(r["sell_hit"], 3),
+        "t": _r(r["t"], 2),
+        "shrunk_exc_bp": _r(r["shrunk_exc_bp"], 1),
+        "shrunk_hit": _r(r["shrunk_hit"], 3),
+        "stability": _bool(r["stability"]),
+        "eligible": bool(r["eligible"]),
+        "last_event_date": _iso(r["last_event_date"]),
+        "first_event_date": _iso(r.get("first_event_date")),
+        "skill_bp": _r(r.get("skill_bp"), 1),
+        "skill_t": _r(r.get("skill_t"), 2),
+        "lb_skill_bp": _r(r.get("lb_skill_bp"), 1),
+        "vw_skill_bp": _r(r.get("vw_skill_bp"), 1),
+        "exc5_bp": _r(r.get("exc5_bp"), 1),
+        "exc20_bp": _r(r.get("exc20_bp"), 1),
+        "buy_exc_bp": _r(r.get("buy_exc_bp"), 1),
+        "sell_exc_bp": _r(r.get("sell_exc_bp"), 1),
+        "n_symbols": _n(r.get("n_symbols")),
+        "avg_value_m": _r(r.get("avg_value_m"), 2),
+    }
+
+
 def get_seats(
     window: str = "60",
     category: str | None = None,
-    sort: str = "shrunk_hit",
+    sort: str = "lb_skill",
     min_events: int = SEAT_MIN_EVENTS,
     limit: int = SEATS_LIMIT_DEFAULT,
 ) -> dict:
-    """席位榜：窗口/类型过滤 + 收缩排序（seats.parquet 现裁，NaN 沉底）。"""
+    """席位榜：窗口/类型过滤 + 排序白名单（seats.parquet 现裁，NaN 沉底）。
+
+    v2 默认 sort=lb_skill（90% 下界）：小样本噪声自动沉底；前端默认
+    min_events=50（读侧契约默认仍 SEAT_MIN_EVENTS）。
+    """
     w = "all" if window == "0" else window
     if w not in SEATS_WINDOWS:
         raise ValueError("window_invalid")
@@ -251,45 +334,10 @@ def get_seats(
     if category is not None:
         df = df[df["category"] == category]
     df = df[df["n_events"] >= int(min_events)]
-    if sort == "n":
-        df = df.sort_values(
-            ["n_events", "shrunk_hit"], ascending=False, na_position="last"
-        )
-    elif sort == "avg_exc":
-        df = df.sort_values(
-            ["avg_exc_bp", "n_events"], ascending=False, na_position="last"
-        )
-    else:  # shrunk_hit
-        df = df.sort_values(
-            ["shrunk_hit", "n_events"], ascending=False, na_position="last"
-        )
+    cols = [c for c in SEATS_SORT_COLUMNS[sort] if c in df.columns] or ["n_events"]
+    df = df.sort_values(cols, ascending=False, na_position="last")
 
-    items: list[dict] = []
-    for _, r in df.iterrows():
-        cat = str(r["category"])
-        items.append(
-            {
-                "participant_id": str(r["participant_id"]),
-                "participant_name": str(r["participant_name"]),
-                "category": cat,
-                "category_label": ic.category_label(cat),
-                "kind": str(r["kind"]),
-                "n_events": _n(r["n_events"]),
-                "n_buy": _n(r["n_buy"]),
-                "n_sell": _n(r["n_sell"]),
-                "n_exc10": _n(r["n_exc10"]),
-                "avg_exc_bp": _r(r["avg_exc_bp"], 1),
-                "hit": _r(r["hit"], 3),
-                "buy_hit": _r(r["buy_hit"], 3),
-                "sell_hit": _r(r["sell_hit"], 3),
-                "t": _r(r["t"], 2),
-                "shrunk_exc_bp": _r(r["shrunk_exc_bp"], 1),
-                "shrunk_hit": _r(r["shrunk_hit"], 3),
-                "stability": _bool(r["stability"]),
-                "eligible": bool(r["eligible"]),
-                "last_event_date": _iso(r["last_event_date"]),
-            }
-        )
+    items = [_seat_row(r) for _, r in df.iterrows()]
     latest = ds.load_product_json("latest") or {}
     return {
         "as_of": latest.get("as_of"),
@@ -303,6 +351,8 @@ def get_seats(
         "items": items[:limit],
         "notes": {
             "hit": HIT_NOTE,
+            "skill": SKILL_NOTE,
+            "lower_bound": LB_NOTE,
             "shrink": SHRINK_NOTE,
             "suspect": SUSPECT_NOTE,
             "episode": EPISODE_NOTE,
@@ -330,6 +380,147 @@ def get_consensus(limit: int = CONSENSUS_LIMIT_DEFAULT) -> dict:
             "missing": "分柱缺失以「—」展示，绝不填 50",
         },
     }
+
+
+def get_seat_profile(participant_id: str) -> dict:
+    """席位档案：三窗统计 + 月度战绩 + 活跃标的 top + 最近事件。
+
+    查无此席 → :class:`HkSeatNotFound`（404 seat_not_found）；产物缺失 → 404。
+    """
+    pid = (participant_id or "").strip().upper()
+    if not pid or len(pid) > 12:
+        raise ValueError("participant_invalid")
+    seats = ds.load_seats()
+    if seats is None:
+        raise HkSmartMoneyNotBuilt()
+    rows = seats[seats["participant_id"].astype(str) == pid]
+    if rows.empty:
+        raise HkSeatNotFound()
+    meta = rows.iloc[0]
+    cat = str(meta["category"])
+
+    windows = {str(r["window"]): _seat_row(r) for _, r in rows.iterrows()}
+
+    monthly: list[dict] = []
+    mon = ds.load_seat_monthly()
+    if mon is not None and not mon.empty:
+        sub = mon[mon["participant_id"].astype(str) == pid].sort_values("month")
+        for _, r in sub.iterrows():
+            monthly.append(
+                {
+                    "month": str(r["month"]),
+                    "n": _n(r["n"]),
+                    "skill_bp": _r(r["skill_bp"], 1),
+                    "vw_skill_bp": _r(r["vw_skill_bp"], 1),
+                    "hit": _r(r["hit"], 3),
+                }
+            )
+
+    top_symbols: list[dict] = []
+    syms = ds.load_seat_symbols()
+    if syms is not None and not syms.empty:
+        sub = (
+            syms[syms["participant_id"].astype(str) == pid]
+            .sort_values("n", ascending=False)
+            .head(SEAT_PROFILE_SYMBOLS)
+        )
+        for _, r in sub.iterrows():
+            top_symbols.append(
+                {
+                    "symbol": str(r["symbol"]),
+                    "name": _s(r["stock_name"]),
+                    "n": _n(r["n"]),
+                    "skill_bp": _r(r["skill_bp"], 1),
+                    "vw_skill_bp": _r(r["vw_skill_bp"], 1),
+                    "last_event_date": _iso(r["last_dt"]),
+                }
+            )
+
+    recent: list[dict] = []
+    edates = list(ds.event_dates())
+    if edates:
+        df = ds.load_events(
+            dates=edates[-SEAT_PROFILE_WINDOW_DAYS:],
+            columns=[
+                "dt",
+                "symbol",
+                "stock_name",
+                "participant_id",
+                "kind",
+                "direction",
+                "delta_value",
+                "delta_pct",
+                "price",
+                "transfer_suspect",
+                "episode_lead",
+                "fwd_exc_5",
+                "fwd_exc_10",
+                "fwd_exc_20",
+            ],
+        )
+        sub = (
+            df[df["participant_id"].astype(str) == pid]
+            .sort_values("dt", ascending=False)
+            .head(SEAT_PROFILE_EVENTS)
+        )
+        for _, r in sub.iterrows():
+            recent.append(
+                {
+                    "date": _iso(r["dt"]),
+                    "symbol": str(r["symbol"]),
+                    "name": _s(r["stock_name"]),
+                    "kind": _s(r["kind"]),
+                    "direction": _n(r["direction"]),
+                    "delta_value": _n(r["delta_value"]),
+                    "value_yi": _r(r["delta_value"] / 1e8, 4),
+                    "delta_pct": _r(r["delta_pct"], 4),
+                    "price": _r(r["price"], 3),
+                    "transfer_suspect": bool(r["transfer_suspect"]),
+                    "first_of_episode": bool(r["episode_lead"] == 1),
+                    "fwd_exc_5_bp": _r(r["fwd_exc_5"] * 1e4, 1),
+                    "fwd_exc_10_bp": _r(r["fwd_exc_10"] * 1e4, 1),
+                    "fwd_exc_20_bp": _r(r["fwd_exc_20"] * 1e4, 1),
+                }
+            )
+
+    latest = ds.load_product_json("latest") or {}
+    return {
+        "participant": {
+            "participant_id": pid,
+            "participant_name": _s(meta["participant_name"]),
+            "category": cat,
+            "category_label": ic.category_label(cat),
+            "kind": str(meta["kind"]),
+            "first_event_date": _iso(meta.get("first_event_date")),
+            "last_event_date": _iso(meta.get("last_event_date")),
+        },
+        "as_of": latest.get("as_of"),
+        "generated_at": latest.get("generated_at"),
+        "windows": windows,
+        "monthly": monthly,
+        "top_symbols": top_symbols,
+        "recent_events": recent,
+        "notes": {
+            "hit": HIT_NOTE,
+            "skill": SKILL_NOTE,
+            "lower_bound": LB_NOTE,
+            "shrink": SHRINK_NOTE,
+            "suspect": SUSPECT_NOTE,
+            "episode": EPISODE_NOTE,
+            "fwd": TIMELINE_NOTE,
+        },
+    }
+
+
+def get_persistence() -> dict:
+    """持续性审计台：seat_persistence.json 原样（构建期实算，同 evidence 模式）。
+
+    席位层弱持续是实测结论（非故障）——界面「稳健性」面如实披露。
+    """
+    p = ds.load_product_json("seat_persistence")
+    if not isinstance(p, dict):
+        raise HkSmartMoneyNotBuilt()
+    return p
 
 
 def _stock_stats(sub: pd.DataFrame, days: int) -> dict:

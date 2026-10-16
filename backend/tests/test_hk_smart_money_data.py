@@ -10,7 +10,12 @@
    - 封存前视列成熟度（远日成熟、尾日 NaN——绝不填 0）；
    - 类型覆盖：事件与持仓 = CCASS 5 类，flows = 6 类（含南向）；
    - 席位榜三窗口形状与单调（all 窗口事件数 ≥ 20 窗口）；
-   - 产物自洽：as_of ↔ evidence.eval_end ↔ seats.last_event_date ↔ 对账比。
+   - 产物自洽：as_of ↔ evidence.eval_end ↔ seats.last_event_date ↔ 对账比；
+3. **v2 面（技能/下界/月序/持续性，依赖 v2 产物，缺则 skip）**：
+   - 30 列契约 + 下界纪律（lb ⇔ n_exc10 ≥ SEAT_MIN_EVENTS，假 90% 不入榜）；
+   - 默认榜（n_events≥50）榜首必须显著（skill_t ≥ 2）；
+   - seat_monthly/seat_symbols 与席位榜 n_exc10 口径对账（可测样本两面同源）；
+   - latest.categories 技能列 + seat_persistence 弱持续区间护栏（0 < h < 0.3）。
 """
 
 from __future__ import annotations
@@ -23,12 +28,49 @@ from backend.services.api.market_analysis_shared import market_days
 from backend.shared.hk_smart_money import (
     CATEGORIES,
     CCASS_CATEGORIES,
+    SEAT_MIN_EVENTS,
     SOUTHBOUND_SEAT_IDS,
 )
 from backend.shared.hk_smart_money import datasets as ds
 from backend.shared.hk_smart_money import events as ev
 
 SEAT_WINDOWS = ("20", "60", "all")
+
+# v2 席位榜 30 列契约（stats.seat_metrics 输出，按窗口成套）
+SEAT_V2_COLUMNS = frozenset(
+    {
+        "participant_id",
+        "participant_name",
+        "category",
+        "kind",
+        "window",
+        "n_events",
+        "n_buy",
+        "n_sell",
+        "n_exc10",
+        "avg_exc_bp",
+        "hit",
+        "buy_hit",
+        "sell_hit",
+        "t",
+        "shrunk_exc_bp",
+        "shrunk_hit",
+        "stability",
+        "eligible",
+        "first_event_date",
+        "last_event_date",
+        "skill_bp",
+        "skill_t",
+        "lb_skill_bp",
+        "vw_skill_bp",
+        "exc5_bp",
+        "exc20_bp",
+        "buy_exc_bp",
+        "sell_exc_bp",
+        "n_symbols",
+        "avg_value_m",
+    }
+)
 
 
 def _sum_qty(rel: str, dt: str, extra_where: str = "") -> int:
@@ -187,3 +229,121 @@ def test_产物三面自洽(product):
     if not latest["admitted"]:
         assert latest["evidence_only"] is True
         assert consensus["items"] == []
+
+
+# ---------------------------------------------------------------- v2 面
+
+
+@pytest.fixture(scope="module")
+def v2_seats(product):
+    seats = ds.load_seats()
+    if seats is None or "lb_skill_bp" not in seats.columns:
+        pytest.skip("席位榜 v2 产物未重建——重建后自动纳入")
+    return seats
+
+
+def test_席位榜v2技能列与下界纪律(v2_seats):
+    """30 列契约；下界 ⇔ n_exc10 ≥ SEAT_MIN_EVENTS（假标 90% 绝不入榜）；榜首必须显著。"""
+    seats = v2_seats
+    assert set(seats.columns) == SEAT_V2_COLUMNS
+    has_lb = seats["lb_skill_bp"].notna()
+    assert bool(has_lb.any()) and bool((~has_lb).any())  # 两态都存在（小样本确沉底）
+    assert bool((seats.loc[has_lb, "n_exc10"] >= SEAT_MIN_EVENTS).all())
+    assert bool((seats.loc[~has_lb, "n_exc10"] < SEAT_MIN_EVENTS).all())
+    # 下界 ≤ 技能点值（同源减惩罚项；容 0.05 舍入）；技能 t 与技能同号
+    both = seats["lb_skill_bp"].notna() & seats["skill_bp"].notna()
+    assert bool(
+        (seats.loc[both, "lb_skill_bp"] <= seats.loc[both, "skill_bp"] + 0.05).all()
+    )
+    # 技能 t 与技能点值同号（两边都过舍入死区才参与：±0.1bp/±0.005 以下会被圆成 0）
+    st = seats["skill_t"].abs().gt(0.005) & seats["skill_bp"].abs().gt(0.05)
+    assert bool((seats.loc[st, "skill_t"] * seats.loc[st, "skill_bp"] > 0).all())
+    # 默认榜（前端 n_events ≥ 50）榜首必须显著：弱席位不得靠噪声/未成熟小样本上位
+    top50 = seats[(seats["window"] == "all") & (seats["n_events"] >= 50)].sort_values(
+        "lb_skill_bp", ascending=False
+    )
+    assert len(top50) >= 10
+    head = top50.iloc[0]
+    assert float(head["skill_t"]) >= 2.0, (
+        f"默认榜榜首 {head['participant_name']} skill_t={head['skill_t']}——"
+        "榜首不再显著，机构优势叙事须人工复核"
+    )
+    assert int(head["n_exc10"]) >= 50
+
+
+def test_席位v2月度标的产物自洽(v2_seats):
+    """月序/标的聚合金样口径=只用 fwd_exc_10 可测样本 → 对账基线 n_exc10（非 n_events）。"""
+    monthly = ds.load_seat_monthly()
+    symbols = ds.load_seat_symbols()
+    if monthly is None or symbols is None:
+        pytest.skip("v2 月序/标的产物未重建——重建后自动纳入")
+    assert list(monthly.columns) == [
+        "participant_id",
+        "month",
+        "n",
+        "skill_bp",
+        "vw_skill_bp",
+        "hit",
+    ]
+    assert list(symbols.columns) == [
+        "participant_id",
+        "symbol",
+        "stock_name",
+        "n",
+        "skill_bp",
+        "vw_skill_bp",
+        "last_dt",
+    ]
+    assert bool(monthly["n"].ge(1).all()) and bool(symbols["n"].ge(1).all())
+    assert bool(monthly["month"].str.fullmatch(r"\d{4}-\d{2}").all())
+    # 4/5 位皆合法：双柜台人民币柜位（80xxx/81xxx）为历史五位码，未强制统一
+    assert bool(symbols["symbol"].str.fullmatch(r"\d{4,5}\.HK").all())
+    assert float(symbols["stock_name"].notna().mean()) > 0.8  # 缺名允许，大面积缺即异常
+    # 可测事件集两面同源：按席求和 == all 窗 n_exc10（总量亦相等）
+    allw = v2_seats[v2_seats["window"] == "all"].set_index("participant_id")
+    for agg in (
+        monthly.groupby("participant_id")["n"].sum(),
+        symbols.groupby("participant_id")["n"].sum(),
+    ):
+        base = allw["n_exc10"].reindex(agg.index)
+        assert bool((agg == base).all()), "聚合计数与 n_exc10 口径漂移"
+    assert int(monthly["n"].sum()) == int(allw["n_exc10"].sum())
+    # 月序技能按 n 加权回算 = 席位全窗技能（仅 0.1bp 舍入差）
+    m = monthly.merge(
+        allw["skill_bp"].rename("seat_skill_bp"),
+        left_on="participant_id",
+        right_index=True,
+    )
+    m["w"] = m["skill_bp"] * m["n"]
+    tot = m.groupby("participant_id")[["w", "n"]].sum()
+    wmean = tot["w"] / tot["n"]
+    base = allw["skill_bp"].reindex(wmean.index)
+    assert float((wmean - base).abs().max()) < 1.0
+    # 标的 last_dt 顶日 ≤ 席位 last_event_date 顶日（可测样本 ⊆ 全事件）
+    assert str(symbols["last_dt"].max()) <= str(v2_seats["last_event_date"].max())
+
+
+def test_类别技能与持续性审计产物(product):
+    """latest.categories 技能列四类非空/南向空；persistence 弱持续护栏（0 < h < 0.3）。"""
+    latest = ds.load_product_json("latest")
+    by = {c["category"]: c for c in latest["categories"]}
+    for cat in CCASS_CATEGORIES:
+        if cat == "other":  # 'other' 极稀疏（实测 0 可测事件）→ 技能空是数据事实
+            continue
+        assert by[cat]["skill_bp"] is not None, f"{cat} 类别技能缺失"
+        assert by[cat]["vw_skill_bp"] is not None
+        assert by[cat]["n_lead_events"] > 0
+    assert by["southbound"]["skill_bp"] is None
+    assert by["southbound"]["n_lead_events"] is None
+
+    pj = ds.load_product_json("seat_persistence")
+    if pj is None:
+        pytest.skip("持续性审计产物未重建——重建后自动纳入")
+    assert pj["method"]["note"], "弱持续叙事必须随产物出墙（防止被当可跟随信号）"
+    sp = pj["spearman"]
+    # 区间护栏：弱正但 < 0.3——转负/走强都须人工复核（细案 §2 已知事实背板）
+    assert 0.0 < sp["h10"] < 0.3 and 0.0 < sp["h20"] < 0.3
+    assert abs(sp["hit"]) < 0.3
+    assert len(pj["quartiles"]) == 4
+    assert {h["category"] for h in pj["category_halves"]} == set(CCASS_CATEGORIES)
+    assert pj["scatter"] and all(s["n1"] >= 20 and s["n2"] >= 10 for s in pj["scatter"])

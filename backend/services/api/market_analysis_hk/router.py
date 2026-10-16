@@ -523,13 +523,15 @@ async def trigger_refresh_stream(
 
 
 async def _hksm_read(fn, *args, **kwargs):
-    """产物读侧统一调度：线程池执行 + 未建 404 / 参数 400 收敛。"""
+    """产物读侧统一调度：线程池执行 + 未建/查无 404 / 参数 400 收敛。"""
     try:
         return await asyncio.to_thread(fn, *args, **kwargs)
     except hksm.HkSmartMoneyNotBuilt:
         raise HTTPException(
             status_code=404, detail="hk_smart_money_not_built"
         ) from None
+    except hksm.HkSeatNotFound:
+        raise HTTPException(status_code=404, detail="seat_not_found") from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     except Exception as exc:
@@ -565,7 +567,8 @@ async def get_hk_smart_money_seats(
         default=None, description="类型：cn_broker / us_eu / hk / apac / other"
     ),
     sort: str = Query(
-        default="shrunk_hit", description="排序：shrunk_hit / avg_exc / n"
+        default="lb_skill",
+        description="排序：lb_skill / skill / vw_skill / avg_exc / shrunk_hit / n",
     ),
     min_events: int = Query(
         default=5, ge=1, le=1000, description="最少事件数（行级过滤）"
@@ -578,7 +581,7 @@ async def get_hk_smart_money_seats(
     ),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """席位榜：历史胜率（事件后 10 日超额为正占比）+ 收缩估计——事后统计。"""
+    """席位榜：方向技能（90% 下界默认排序）/胜率/收缩——事后统计，非预测。"""
     _ = current_user
     return await _hksm_read(
         hksm.get_seats,
@@ -588,6 +591,25 @@ async def get_hk_smart_money_seats(
         min_events=min_events,
         limit=limit,
     )
+
+
+@router.get("/smart-money/seat/{participant_id}")
+async def get_hk_smart_money_seat_profile(
+    participant_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """席位档案：三窗统计 + 月度战绩 + 活跃标的 + 最近事件（查无 404）。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_seat_profile, participant_id)
+
+
+@router.get("/smart-money/persistence")
+async def get_hk_smart_money_persistence(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """持续性审计：散点/秩相关/四分位 OOS/类别前后半（构建期实算，如实披露）。"""
+    _ = current_user
+    return await _hksm_read(hksm.get_persistence)
 
 
 @router.get("/smart-money/consensus")

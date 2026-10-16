@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""港股聪明钱 · 证据裁定（pass1 类型效力+席位统计；pass2 复合分回填）。
+"""港股聪明钱 · 证据裁定（pass1 类型效力；pass2 复合分回填）。
 
 三脚本节奏（细案 docs/港股市场分析_聪明钱深度分析_细案_20261016.md §4）：
-``--no-composite``（pass1：确保事件仓 → 24 候选信号双过闸 → seats.parquet +
-evidence.json）→ ``market_analysis/build_hk_smart_money.py``（逐日复合分）→
+``--no-composite``（pass1：确保事件仓 → 24 候选信号双过闸 → evidence.json）→
+``market_analysis/build_hk_smart_money.py``（逐日复合分）→
 本脚本（pass2：读 scores 分区回填 evidence.composite）。
 
 口径要点（细案 §3.3–§3.5；全部实现收在 ``backend.shared.hk_smart_money``）：
@@ -11,7 +11,8 @@ evidence.json）→ ``market_analysis/build_hk_smart_money.py``（逐日复合�
   （``build_events`` 的缺日并集语义），已有仓库默认增量刷新最近 40 个交易日；
 - 双过闸/命中/不对称/ICIR 全部来自 ``stats``（与 hk_opportunity_ic_check 判据
   一字不改）；相关塌缩 |ρ|>0.8 保留 |IC| 强者；
-- 席位统计只用 episode 首日 ∧ ¬嫌疑（``stats.seat_metrics``，收缩到中性）；
+- 席位统计（seats/月度/标的/持续性审计）自 2026-10-16 起由
+  ``market_analysis/build_hk_smart_money.py`` 每日生成（原在此处，暗坑已修）；
 - ``--calibrate``：事件闸阈值网格 {1M,2M,5M}×{3%,5%,10%} 抽样标定（只读原始
   分区、不写事件仓），网格与选定档写入 evidence.calibration；
 - 证据台 = evidence.json（allow_nan=False 原子写）+ logs/hk_smart_money_validate.csv。
@@ -407,29 +408,8 @@ def run(
         admitted_keys,
     )
 
-    # 5) 席位统计（episode 首日 ∧ ¬嫌疑；列裁剪控内存）
-    seat_cols = (
-        "dt",
-        "participant_id",
-        "participant_name",
-        "category",
-        "kind",
-        "direction",
-        "fwd_exc_10",
-        "episode_lead",
-        "transfer_suspect",
-    )
-    seat_events = ds.load_events(columns=seat_cols)
-    seats = stats.seat_metrics(seat_events, calendar)
-    if not seats.empty:
-        ds.write_parquet_atomic(seats, ds.product_dir() / "seats.parquet")
-    log.info(
-        "席位统计：%d 席位 × 3 窗口 = %d 行",
-        seats["participant_id"].nunique() if not seats.empty else 0,
-        len(seats),
-    )
-
-    # 6) 证据组装
+    # 5) 证据组装（席位统计自 2026-10-16 起迁至 build_hk_smart_money.py 每日
+    #    生成——席位榜是每日消费的盘点数据，不挂在校准节奏上）
     exclusions = _exclusions()
     warnings = _warnings(admitted_keys, calibration, exclusions)
     composite = None

@@ -129,6 +129,17 @@ SEAT_SHRINK_K: float = 20.0
 SEAT_NEUTRAL_HIT: float = 0.5
 SEAT_NEUTRAL_EXC: float = 0.0
 
+#: 席位技能 90% 单侧下界 z 值（lb = skill − z×SE）——v2 榜主排序键，
+#: 弱惩罚小样本：n 越小下界越低，噪声席位自然沉底（细案 §2 原则）
+SEAT_SKILL_Z: float = 1.28
+#: 持续性审计：散点/秩相关门槛（前半、后半方向技能可测事件数）
+SEAT_PERSIST_MIN_N1: int = 20
+SEAT_PERSIST_MIN_N2: int = 10
+#: 持续性审计：四分位排名门槛（前半可测事件数；与前端榜默认门槛一致）
+SEAT_PERSIST_QUARTILE_MIN_N: int = 50
+#: 持续性审计：秩相关最少席数（不足返回 None，绝不由极小样本给结论）
+SEAT_PERSIST_MIN_SEATS: int = 8
+
 # ---------------------------------------------------------------- 复合分（细案 §3.5）
 
 #: 发布分数的最少有效信号数（缺柱不计入，缺失绝不填 50）

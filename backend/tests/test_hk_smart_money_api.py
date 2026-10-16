@@ -6,8 +6,12 @@
 - overview：类型面板富化（入柱标记 + 该类最强 |h10 IC| 变体）；trends 透传但不
   重复 as_of/generated_at；
 - types：全网格 h5/h10/h20 结构与 horizon 校验（非法 400）；
-- seats：窗口/类型/最少事件过滤 + 三种排序 + 收缩字段缺失（NaN→null）+
-  last_event_date ISO 化；非法参数 400；
+- seats：窗口/类型/最少事件过滤 + 六种排序（默认 lb_skill=90% 下界，小样本
+  浮顶沉底）+ 收缩/技能字段缺失（NaN→null）+ 日期 ISO 化；非法参数 400；
+- seat 档案：三窗 + 月度（升序）+ 标的 top（降序、缺名→null）+ 最近事件
+  时间线（含续存/嫌疑标记）；小写 id 归一；查无 404 seat_not_found；畸形 400；
+  旧产物（无 monthly/symbols）优雅空列表；
+- persistence：seat_persistence.json 原样透传（弱持续如实披露）；
 - consensus：limit 截断 + total 全量 + 零入柱诚实空态（evidence_only=true）；
 - stock：代码三写法归一 4 位+.HK；时间线含嫌疑/续存标记；统计口径 = episode
   首日 ∧ ¬嫌疑；南向持仓直读 hsgt_south；无事件股仍 200；
@@ -71,6 +75,44 @@ def _event_row(
         "fwd_exc_10": exc10,
         "fwd_exc_20": exc10 * 2,
     }
+
+
+def _seat(pid, name, cat, window, n_events, **over):
+    """seats.parquet v2 行（29 列；默认值可覆盖——NaN 行专测 null 契约）。"""
+    row = {
+        "participant_id": pid,
+        "participant_name": name,
+        "category": cat,
+        "kind": "broker",
+        "window": window,
+        "n_events": n_events,
+        "n_buy": n_events,
+        "n_sell": 0,
+        "n_exc10": n_events,
+        "avg_exc_bp": 0.0,
+        "hit": 0.5,
+        "buy_hit": 0.5,
+        "sell_hit": None,
+        "t": 0.0,
+        "shrunk_exc_bp": 0.0,
+        "shrunk_hit": 0.5,
+        "stability": True,
+        "eligible": True,
+        "last_event_date": "20261015",
+        "first_event_date": "20260105",
+        "skill_bp": 0.0,
+        "skill_t": 0.0,
+        "lb_skill_bp": 0.0,
+        "vw_skill_bp": 0.0,
+        "exc5_bp": None,
+        "exc20_bp": None,
+        "buy_exc_bp": None,
+        "sell_exc_bp": None,
+        "n_symbols": 1,
+        "avg_value_m": 10.0,
+    }
+    row.update(over)
+    return row
 
 
 @pytest.fixture()
@@ -269,138 +311,318 @@ def seeded(env) -> _Env:
         },
     )
 
-    # 席位榜：19 列与真实 schema 同构（NaN/None → null 契约在内）
+    # 席位榜：29 列 v2 与真实 schema 同构（NaN/None → null 契约在内）
     seats = pd.DataFrame(
         [
-            {
-                "participant_id": "C1",
-                "participant_name": "測試甲",
-                "category": "hk",
-                "kind": "broker",
-                "window": "60",
-                "n_events": 10,
-                "n_buy": 6,
-                "n_sell": 4,
-                "n_exc10": 10,
-                "avg_exc_bp": 50.0,
-                "hit": 0.7,
-                "buy_hit": 0.8,
-                "sell_hit": 0.5,
-                "t": 2.5,
-                "shrunk_exc_bp": 45.0,
-                "shrunk_hit": 0.6,
-                "stability": True,
-                "eligible": True,
-                "last_event_date": "20261015",
-            },
-            {
-                "participant_id": "C2",
-                "participant_name": "測試乙",
-                "category": "us_eu",
-                "kind": "custodian",
-                "window": "60",
-                "n_events": 3,
-                "n_buy": 1,
-                "n_sell": 2,
-                "n_exc10": 3,
-                "avg_exc_bp": -20.0,
-                "hit": 0.33,
-                "buy_hit": 0.0,
-                "sell_hit": 0.5,
-                "t": -0.5,
-                "shrunk_exc_bp": -10.0,
-                "shrunk_hit": 0.9,
-                "stability": False,
-                "eligible": False,
-                "last_event_date": "20261014",
-            },
-            {
-                "participant_id": "C3",
-                "participant_name": "測試丙",
-                "category": "hk",
-                "kind": "broker",
-                "window": "60",
-                "n_events": 8,
-                "n_buy": 8,
-                "n_sell": 0,
-                "n_exc10": 8,
-                "avg_exc_bp": 30.0,
-                "hit": 0.6,
-                "buy_hit": 0.6,
-                "sell_hit": None,
-                "t": 1.2,
-                "shrunk_exc_bp": 35.0,
-                "shrunk_hit": 0.55,
-                "stability": True,
-                "eligible": True,
-                "last_event_date": "20261015",
-            },
-            {
-                "participant_id": "C4",
-                "participant_name": "測試丁",
-                "category": "hk",
-                "kind": "broker",
-                "window": "20",
-                "n_events": 12,
-                "n_buy": 2,
-                "n_sell": 10,
-                "n_exc10": 12,
-                "avg_exc_bp": 5.0,
-                "hit": 0.5,
-                "buy_hit": 0.5,
-                "sell_hit": 0.5,
-                "t": 0.1,
-                "shrunk_exc_bp": 4.0,
-                "shrunk_hit": 0.7,
-                "stability": False,
-                "eligible": True,
-                "last_event_date": "20261015",
-            },
-            {
-                "participant_id": "C5",
-                "participant_name": "測試戊",
-                "category": "cn_broker",
-                "kind": "broker",
-                "window": "60",
-                "n_events": 6,
-                "n_buy": 6,
-                "n_sell": 0,
-                "n_exc10": 0,
-                "avg_exc_bp": float("nan"),
-                "hit": float("nan"),
-                "buy_hit": float("nan"),
-                "sell_hit": float("nan"),
-                "t": float("nan"),
-                "shrunk_exc_bp": float("nan"),
-                "shrunk_hit": float("nan"),
-                "stability": float("nan"),
-                "eligible": True,
-                "last_event_date": "20261015",
-            },
-            {
-                "participant_id": "C6",
-                "participant_name": "測試己",
-                "category": "hk",
-                "kind": "broker",
-                "window": "all",
-                "n_events": 20,
-                "n_buy": 10,
-                "n_sell": 10,
-                "n_exc10": 20,
-                "avg_exc_bp": 10.0,
-                "hit": 0.55,
-                "buy_hit": 0.6,
-                "sell_hit": 0.5,
-                "t": 1.0,
-                "shrunk_exc_bp": 10.0,
-                "shrunk_hit": 0.545,
-                "stability": True,
-                "eligible": True,
-                "last_event_date": "20261015",
-            },
+            _seat(
+                "C1",
+                "測試甲",
+                "hk",
+                "60",
+                10,
+                n_buy=6,
+                n_sell=4,
+                avg_exc_bp=50.0,
+                hit=0.7,
+                buy_hit=0.8,
+                sell_hit=0.5,
+                t=2.5,
+                shrunk_exc_bp=45.0,
+                shrunk_hit=0.6,
+                skill_bp=60.0,
+                skill_t=2.6,
+                lb_skill_bp=52.0,
+                vw_skill_bp=58.0,
+                exc5_bp=30.0,
+                exc20_bp=55.0,
+                buy_exc_bp=70.0,
+                sell_exc_bp=20.0,
+                n_symbols=4,
+                avg_value_m=12.5,
+            ),
+            _seat(
+                "C2",
+                "測試乙",
+                "us_eu",
+                "60",
+                3,
+                kind="custodian",
+                n_buy=1,
+                n_sell=2,
+                avg_exc_bp=-20.0,
+                hit=0.33,
+                buy_hit=0.0,
+                sell_hit=0.5,
+                t=-0.5,
+                shrunk_exc_bp=-10.0,
+                shrunk_hit=0.9,
+                stability=False,
+                eligible=False,
+                last_event_date="20261014",
+                first_event_date="20260920",
+                skill_bp=90.0,  # 小样本浮顶：lb 口径下沉底
+                skill_t=1.5,
+                lb_skill_bp=10.0,
+                vw_skill_bp=85.0,
+                n_symbols=2,
+                avg_value_m=5.0,
+            ),
+            _seat(
+                "C3",
+                "測試丙",
+                "hk",
+                "60",
+                8,
+                n_buy=8,
+                n_sell=0,
+                avg_exc_bp=30.0,
+                hit=0.6,
+                buy_hit=0.6,
+                t=1.2,
+                shrunk_exc_bp=35.0,
+                shrunk_hit=0.55,
+                skill_bp=45.0,
+                skill_t=2.2,
+                lb_skill_bp=40.0,
+                vw_skill_bp=44.0,
+                n_symbols=3,
+                avg_value_m=8.0,
+            ),
+            _seat(
+                "C4",
+                "測試丁",
+                "hk",
+                "20",
+                12,
+                n_buy=2,
+                n_sell=10,
+                avg_exc_bp=5.0,
+                hit=0.5,
+                buy_hit=0.5,
+                sell_hit=0.5,
+                t=0.1,
+                shrunk_exc_bp=4.0,
+                shrunk_hit=0.7,
+                stability=False,
+                skill_bp=8.0,
+                skill_t=0.6,
+                lb_skill_bp=3.0,
+                vw_skill_bp=7.5,
+                n_symbols=5,
+                avg_value_m=15.0,
+                first_event_date="20260601",
+            ),
+            _seat(
+                "C5",
+                "測試戊",
+                "cn_broker",
+                "60",
+                6,
+                n_buy=6,
+                n_sell=0,
+                n_exc10=0,
+                avg_exc_bp=float("nan"),
+                hit=float("nan"),
+                buy_hit=float("nan"),
+                sell_hit=float("nan"),
+                t=float("nan"),
+                shrunk_exc_bp=float("nan"),
+                shrunk_hit=float("nan"),
+                stability=float("nan"),
+                skill_bp=float("nan"),
+                skill_t=float("nan"),
+                lb_skill_bp=float("nan"),
+                vw_skill_bp=float("nan"),
+                exc5_bp=float("nan"),
+                exc20_bp=float("nan"),
+                buy_exc_bp=float("nan"),
+                sell_exc_bp=float("nan"),
+                n_symbols=2,
+                avg_value_m=float("nan"),
+                first_event_date=float("nan"),
+            ),
+            _seat(
+                "C6",
+                "測試己",
+                "hk",
+                "all",
+                20,
+                n_buy=10,
+                n_sell=10,
+                avg_exc_bp=10.0,
+                hit=0.55,
+                buy_hit=0.6,
+                sell_hit=0.5,
+                t=1.0,
+                shrunk_exc_bp=10.0,
+                shrunk_hit=0.545,
+                skill_bp=12.0,
+                skill_t=1.1,
+                lb_skill_bp=11.5,
+                vw_skill_bp=12.0,
+                n_symbols=6,
+                avg_value_m=9.0,
+                first_event_date="20260401",
+            ),
+            # 档案专用小样本席（n=4 < 默认 min_events=5 → 不入榜单测试视野）
+            _seat(
+                "C7",
+                "測試庚",
+                "hk",
+                "20",
+                4,
+                n_buy=4,
+                n_sell=0,
+                n_exc10=4,
+                avg_exc_bp=20.0,
+                hit=0.75,
+                buy_hit=0.75,
+                shrunk_exc_bp=3.3,
+                shrunk_hit=0.54,
+                skill_bp=6.0,
+                skill_t=0.9,
+                lb_skill_bp=2.0,
+                vw_skill_bp=5.0,
+                n_symbols=2,
+                avg_value_m=4.0,
+                first_event_date="20260601",
+                last_event_date="20260901",
+            ),
+            _seat(
+                "C7",
+                "測試庚",
+                "hk",
+                "60",
+                4,
+                n_buy=4,
+                n_sell=0,
+                n_exc10=4,
+                avg_exc_bp=25.0,
+                hit=0.75,
+                buy_hit=0.75,
+                shrunk_exc_bp=4.2,
+                shrunk_hit=0.54,
+                skill_bp=8.0,
+                skill_t=1.0,
+                lb_skill_bp=5.0,
+                vw_skill_bp=7.0,
+                n_symbols=2,
+                avg_value_m=4.0,
+                first_event_date="20260601",
+                last_event_date="20260901",
+            ),
         ]
     )
     seats.to_parquet(p / "seats.parquet", index=False)
+
+    # 席位 v2 产物：月度序列（乱序写入验读侧排序）+ 标的聚合（缺名 → null）
+    pd.DataFrame(
+        [
+            {
+                "participant_id": "C1",
+                "month": "2026-08",
+                "n": 4,
+                "skill_bp": 50.0,
+                "vw_skill_bp": 48.0,
+                "hit": 0.75,
+            },
+            {
+                "participant_id": "C1",
+                "month": "2026-09",
+                "n": 6,
+                "skill_bp": 70.0,
+                "vw_skill_bp": 66.0,
+                "hit": 0.83,
+            },
+            {
+                "participant_id": "C7",
+                "month": "2026-09",
+                "n": 3,
+                "skill_bp": 12.0,
+                "vw_skill_bp": 11.0,
+                "hit": 0.67,
+            },
+            {
+                "participant_id": "C7",
+                "month": "2026-08",
+                "n": 1,
+                "skill_bp": -5.0,
+                "vw_skill_bp": -5.0,
+                "hit": 0.0,
+            },
+        ]
+    ).to_parquet(p / "seat_monthly.parquet", index=False)
+    pd.DataFrame(
+        [
+            {
+                "participant_id": "C1",
+                "symbol": "0001.HK",
+                "stock_name": "測試甲",
+                "n": 5,
+                "skill_bp": 60.0,
+                "vw_skill_bp": 58.0,
+                "last_dt": "20261015",
+            },
+            {
+                "participant_id": "C7",
+                "symbol": "0002.HK",
+                "stock_name": "測試乙",
+                "n": 3,
+                "skill_bp": 8.0,
+                "vw_skill_bp": 7.0,
+                "last_dt": "20260901",
+            },
+            {
+                "participant_id": "C7",
+                "symbol": "0001.HK",
+                "stock_name": None,
+                "n": 1,
+                "skill_bp": -2.0,
+                "vw_skill_bp": -2.0,
+                "last_dt": "20260815",
+            },
+        ]
+    ).to_parquet(p / "seat_symbols.parquet", index=False)
+    _write_json(
+        p,
+        "seat_persistence",
+        {
+            "split_date": "2026-05-06",
+            "scatter": [
+                {
+                    "participant_id": "C1",
+                    "name": "測試甲",
+                    "category": "hk",
+                    "n1": 120,
+                    "n2": 90,
+                    "skill1_bp": 40.0,
+                    "skill2_bp": 35.0,
+                }
+            ],
+            "spearman": {"h10": 0.116, "h20": 0.137, "hit": 0.04},
+            "quartiles": [
+                {
+                    "q": 1,
+                    "n_seats": 5,
+                    "n_events": 300,
+                    "forward_skill_bp": -10.0,
+                    "forward_hit": 0.48,
+                }
+            ],
+            "category_halves": [
+                {
+                    "category": "hk",
+                    "n": 100,
+                    "first_half_vw_skill_bp": -0.8,
+                    "second_half_vw_skill_bp": -0.9,
+                }
+            ],
+            "method": {
+                "skill": "方向技能 = 买 +超额 / 卖 −超额",
+                "note": "席位层弱持续是实测结论（非故障）：榜单为描述性统计，不是可跟随信号",
+            },
+        },
+    )
 
     # 事件仓三日（0001 四类合格事件 + 嫌疑 + 续存 + 0002 干扰行）
     day1 = pd.DataFrame(
@@ -545,6 +767,8 @@ def seeded(env) -> _Env:
         "/consensus",
         "/stock/0001.HK",
         "/evidence",
+        "/seat/C1",
+        "/persistence",
     ],
 )
 def test_无凭证401(raw_client, path):
@@ -560,6 +784,8 @@ def test_无凭证401(raw_client, path):
         "/consensus",
         "/stock/0001.HK",
         "/evidence",
+        "/seat/C1",
+        "/persistence",
     ],
 )
 def test_无产物404统一码(client, path):
@@ -617,34 +843,49 @@ def test_types全网格与horizon校验(client, seeded):
 
 def test_seats默认窗排序与样本过滤(client, seeded):
     d = client.get(f"{BASE}/seats").json()
-    assert d["window"] == "60" and d["sort"] == "shrunk_hit" and d["min_events"] == 5
-    # 60 窗 + n>=5：C1(0.6) > C3(0.55) > C5(NaN 沉底)；C2(3 事件) 剔除
+    # v2 默认 sort=lb_skill（90% 下界）；C2(3)/C7(4) 事件不足 5 被剔除
+    assert d["window"] == "60" and d["sort"] == "lb_skill" and d["min_events"] == 5
+    # 60 窗 + n>=5：lb C1(52) > C3(40) > C5(NaN 沉底)
     assert [it["participant_id"] for it in d["items"]] == ["C1", "C3", "C5"]
     assert d["total"] == 3
     c1 = d["items"][0]
     assert c1["category_label"] == "港资"
     assert c1["last_event_date"] == "2026-10-15"
+    assert c1["first_event_date"] == "2026-01-05"  # YYYYMMDD → ISO
     assert c1["stability"] is True
+    assert c1["skill_bp"] == 60.0 and c1["lb_skill_bp"] == 52.0
+    assert c1["vw_skill_bp"] == 58.0 and c1["n_symbols"] == 4
+    assert c1["avg_value_m"] == 12.5 and c1["exc5_bp"] == 30.0
     c5 = d["items"][2]
     assert c5["shrunk_hit"] is None and c5["avg_exc_bp"] is None  # NaN → null
     assert c5["stability"] is None
+    assert c5["skill_bp"] is None and c5["lb_skill_bp"] is None  # v2 列同样 null
+    assert c5["first_event_date"] is None and c5["avg_value_m"] is None
     assert d["horizon"] == 10
+    assert "lower_bound" in d["notes"] and "skill" in d["notes"]
 
 
 def test_seats窗口类别排序参数(client, seeded):
     d = client.get(f"{BASE}/seats?window=20").json()
-    assert [it["participant_id"] for it in d["items"]] == ["C4"]
+    assert [it["participant_id"] for it in d["items"]] == [
+        "C4"
+    ]  # C7(4) 被 min_events 拦
     d = client.get(f"{BASE}/seats?window=0").json()
     assert d["window"] == "all"
     assert [it["participant_id"] for it in d["items"]] == ["C6"]
     d = client.get(f"{BASE}/seats?category=hk").json()
     assert [it["participant_id"] for it in d["items"]] == ["C1", "C3"]
     d = client.get(f"{BASE}/seats?min_events=1").json()
-    assert d["items"][0]["participant_id"] == "C2"  # 0.9 最高但 n=3
+    # 小样本浮顶纪律：C2 shrunk_hit=0.9 面值最高，但 lb(10) 沉到 C1/C3 之后
+    assert [it["participant_id"] for it in d["items"]] == ["C1", "C3", "C2", "C7", "C5"]
+    d = client.get(f"{BASE}/seats?sort=shrunk_hit&min_events=1").json()
+    assert d["items"][0]["participant_id"] == "C2"  # 旧排序键仍可用（对照）
     d = client.get(f"{BASE}/seats?sort=n").json()
     assert d["items"][0]["participant_id"] == "C1"  # 10 事件最多
     d = client.get(f"{BASE}/seats?sort=avg_exc").json()
     assert d["items"][0]["participant_id"] == "C1"  # 50bp 最高
+    d = client.get(f"{BASE}/seats?sort=skill").json()
+    assert d["items"][0]["participant_id"] == "C1"  # 技能 60 最高
     d = client.get(f"{BASE}/seats?limit=5").json()
     assert len(d["items"]) == 3  # 少于 limit 不补行
 
@@ -655,6 +896,86 @@ def test_seats窗口类别排序参数(client, seeded):
 )
 def test_seats非法参数(client, seeded, qs):
     assert client.get(f"{BASE}/seats?{qs}").status_code in (400, 422)
+
+
+# ---------------------------------------------------------------- seat 档案
+
+
+def test_seat档案三窗月度标的契约(client, seeded):
+    d = client.get(f"{BASE}/seat/C7").json()
+    assert d["as_of"] == "2026-10-15"
+    meta = d["participant"]
+    assert meta["participant_id"] == "C7" and meta["category_label"] == "港资"
+    assert meta["first_event_date"] == "2026-06-01"
+    assert meta["last_event_date"] == "2026-09-01"
+    # 两窗行都在（乱序 → 未按窗口排序的字典；20 窗 lb 2.0 / 60 窗 lb 5.0）
+    assert set(d["windows"]) == {"20", "60"}
+    assert d["windows"]["20"]["lb_skill_bp"] == 2.0
+    assert d["windows"]["60"]["lb_skill_bp"] == 5.0
+    # 月度按月升序（产物乱序写入）
+    assert [m["month"] for m in d["monthly"]] == ["2026-08", "2026-09"]
+    assert d["monthly"][1]["skill_bp"] == 12.0
+    # 标的按事件数降序；缺名 → null（绝不落「nan」）
+    assert [s["symbol"] for s in d["top_symbols"]] == ["0002.HK", "0001.HK"]
+    assert d["top_symbols"][1]["name"] is None
+    assert d["top_symbols"][0]["last_event_date"] == "2026-09-01"
+    assert d["recent_events"] == []  # C7 无事件行（P* 才是事件席）
+    assert "skill" in d["notes"] and "fwd" in d["notes"]
+
+
+def test_seat档案小写id归一与404与400(client, seeded):
+    d = client.get(f"{BASE}/seat/c1").json()  # 小写归一
+    assert d["participant"]["participant_id"] == "C1"
+    assert [m["month"] for m in d["monthly"]] == ["2026-08", "2026-09"]
+    assert [s["symbol"] for s in d["top_symbols"]] == ["0001.HK"]
+    assert set(d["windows"]) == {"60"}
+    r = client.get(f"{BASE}/seat/NOPE")
+    assert r.status_code == 404 and r.json()["detail"] == "seat_not_found"
+    r = client.get(f"{BASE}/seat/{'X' * 13}")
+    assert r.status_code == 400 and r.json()["detail"] == "participant_invalid"
+
+
+def test_seat档案最近事件时间线(client, seeded, monkeypatch):
+    # 事件席 = P1（事件仓 id）；席位行借壳挂入（只验档案读链，不动榜单）
+    base = pd.read_parquet(seeded.product / "seats.parquet")
+    p1 = pd.DataFrame([_seat("P1", "席位一", "hk", "60", 3)])
+    monkeypatch.setattr(ds, "load_seats", lambda: pd.concat([base, p1]))
+    d = client.get(f"{BASE}/seat/P1").json()
+    evs = d["recent_events"]
+    # dt 降序：D2(10-14) 严格在前；同日两行（sort 非稳定）按内容断言
+    assert [e["date"] for e in evs] == ["2026-10-14", "2026-10-13", "2026-10-13"]
+    first = evs[0]
+    assert first["symbol"] == "0001.HK" and first["direction"] == 1
+    assert first["fwd_exc_10_bp"] == 300.0  # 0.03 → bp，封存展示列
+    assert first["first_of_episode"] is True and first["transfer_suspect"] is False
+    assert first["value_yi"] == 0.03
+    # D1 两行：episode 首日（100bp）与续存（9000bp）都进时间线、标记区分
+    d1 = {e["first_of_episode"]: e for e in evs if e["date"] == "2026-10-13"}
+    assert len(d1) == 2
+    assert d1[True]["fwd_exc_10_bp"] == 100.0
+    assert d1[False]["fwd_exc_10_bp"] == 9000.0
+    assert d["monthly"] == []  # P1 无月度行 → 空列表不炸
+
+
+def test_seat档案无v2产物优雅空(client, seeded, monkeypatch):
+    # 部署窗口期旧产物（无 monthly/symbols）：空列表而非 404/500
+    monkeypatch.setattr(ds, "load_seat_monthly", lambda: None)
+    monkeypatch.setattr(ds, "load_seat_symbols", lambda: None)
+    d = client.get(f"{BASE}/seat/C1").json()
+    assert d["monthly"] == [] and d["top_symbols"] == []
+
+
+# ---------------------------------------------------------------- persistence
+
+
+def test_persistence透传契约(client, seeded):
+    d = client.get(f"{BASE}/persistence").json()
+    assert d["split_date"] == "2026-05-06"
+    assert d["spearman"] == {"h10": 0.116, "h20": 0.137, "hit": 0.04}
+    assert d["scatter"][0]["n1"] == 120 and d["scatter"][0]["skill1_bp"] == 40.0
+    assert d["quartiles"][0]["forward_skill_bp"] == -10.0
+    assert d["category_halves"][0]["second_half_vw_skill_bp"] == -0.9
+    assert "描述性统计" in d["method"]["note"]
 
 
 # ---------------------------------------------------------------- consensus

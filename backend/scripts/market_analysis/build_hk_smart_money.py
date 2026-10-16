@@ -5,7 +5,10 @@
 
 - 入柱 = ``evidence.json.admitted``（方向 = h10 IC 符号；负向柱分位取 100−pct）
   —— **零入柱 → evidence-only 模式（不拒绝）**：共识榜空态 +
-  ``evidence_only=true``，类型效力表/席位榜（validate 产物）照常交付；
+  ``evidence_only=true``，类型效力表照常交付；
+- **席位统计 v2（2026-10-16 起）由本脚本每日生成**：seats.parquet（29 列）/
+  seat_monthly.parquet / seat_symbols.parquet / seat_persistence.json——
+  读侧每日消费的盘点数据不挂在校准节奏上（原在 validate，暗坑已修）；
 - ``evidence.json`` 缺失 / admitted 含未知键 / 缺 direction → 拒绝出分（退码 2，
   先跑 ``hk_smart_money_validate.py``）；
 - ``--rebuild-days N`` 同时作用于事件仓增量窗与评分重算窗（0 = 全量，首建/回填；
@@ -206,11 +209,15 @@ def _totals_lookup(win: list[str]) -> dict[tuple[str, str], tuple[float, int]]:
 
 
 def _category_panel(
-    close: pd.DataFrame, edates: list[str], cmap: dict[str, dict]
+    close: pd.DataFrame,
+    edates: list[str],
+    cmap: dict[str, dict],
+    cat_skill: dict[str, dict] | None = None,
 ) -> list[dict[str, Any]]:
     """6 类型面板：持仓市值（亿元）+ 5d/20d 净额（亿元）+ 净变动票数。
 
     南向净额只累计「有披露」的日子（缺披露日绝不伪造 0，days 并列披露）。
+    v2 加类别方向技能（skill_bp/vw_skill_bp/n_lead_events；南向无事件仓 → null）。
     """
     last = edates[-1]
     ts = pd.Timestamp(last)
@@ -260,6 +267,7 @@ def _category_panel(
             if days20
             else None
         )
+        sk = (cat_skill or {}).get(cat) or {}
         rows.append(
             {
                 "category": cat,
@@ -271,6 +279,9 @@ def _category_panel(
                 "net5_days": len(days5),
                 "net20_yi": net20,
                 "net20_days": len(days20),
+                "skill_bp": sk.get("skill_bp"),
+                "vw_skill_bp": sk.get("vw_skill_bp"),
+                "n_lead_events": sk.get("n_lead_events"),
             }
         )
     return rows
@@ -378,6 +389,44 @@ def build(rebuild_days: int = DEFAULT_REBUILD_DAYS, skip_events: bool = False) -
         raise RuntimeError("daily_forward 无可用分区（ccass 覆盖段内）")
     calendar = close.index
 
+    # 席位统计 v2（v2 起由 build 每日生成；validate 只留信号裁定——席位榜是
+    # 每日消费的盘点数据，不能挂在校准节奏上）。列裁剪控内存（细案 §3.2）。
+    seat_cols = (
+        "dt",
+        "symbol",
+        "stock_name",  # seat_symbols 标的聚合展示名（缺列即 KeyError）
+        "participant_id",
+        "participant_name",
+        "category",
+        "kind",
+        "direction",
+        "delta_value",
+        "episode_lead",
+        "transfer_suspect",
+        "fwd_exc_5",
+        "fwd_exc_10",
+        "fwd_exc_20",
+    )
+    seat_events = ds.load_events(columns=seat_cols)
+    seats = stats.seat_metrics(seat_events, calendar)
+    if not seats.empty:
+        ds.write_parquet_atomic(seats, ds.product_dir() / "seats.parquet")
+    seat_mon = stats.seat_monthly(seat_events)
+    if not seat_mon.empty:
+        ds.write_parquet_atomic(seat_mon, ds.product_dir() / "seat_monthly.parquet")
+    seat_sym = stats.seat_symbols(seat_events)
+    if not seat_sym.empty:
+        ds.write_parquet_atomic(seat_sym, ds.product_dir() / "seat_symbols.parquet")
+    ds.write_json_atomic("seat_persistence", stats.seat_persistence(seat_events))
+    cat_skill = stats.category_skill(seat_events)
+    log.info(
+        "席位统计 v2：%d 席 × 3 窗 / 月度 %d 行 / 标的聚合 %d 行 / 类别技能 %d 类",
+        seats["participant_id"].nunique() if not seats.empty else 0,
+        len(seat_mon),
+        len(seat_sym),
+        len(cat_skill),
+    )
+
     n_written = 0
     if spec:
         panels = stats.compute_all_signals(close, amount)
@@ -413,7 +462,7 @@ def build(rebuild_days: int = DEFAULT_REBUILD_DAYS, skip_events: bool = False) -
         "freshness": fresh,
         "partial": fresh["partial"],
         "counts_30d": counts30,
-        "categories": _category_panel(close, edates, cmap),
+        "categories": _category_panel(close, edates, cmap, cat_skill),
         "summary": {"scores_date": None, "pool_size": None, "covered_mean": None},
     }
     sdates = ds.score_dates()

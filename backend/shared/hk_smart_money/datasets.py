@@ -381,3 +381,19 @@ def load_seats() -> pd.DataFrame | None:
     if not path.is_file():
         return None
     return pd.read_parquet(path)
+
+
+def load_seat_monthly() -> pd.DataFrame | None:
+    """席位 × 自然月战绩序列（v2 产物；档案抽屉数据源）。"""
+    path = product_dir() / "seat_monthly.parquet"
+    if not path.is_file():
+        return None
+    return pd.read_parquet(path)
+
+
+def load_seat_symbols() -> pd.DataFrame | None:
+    """席位 × 标的聚合（v2 产物；档案 top_symbols 数据源）。"""
+    path = product_dir() / "seat_symbols.parquet"
+    if not path.is_file():
+        return None
+    return pd.read_parquet(path)

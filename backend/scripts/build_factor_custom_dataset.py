@@ -165,13 +165,24 @@ def _limit_threshold(code: str, trade_date: Any) -> float:
     return float(_limit_thresholds([str(code)], trade_date)[0])
 
 
+#: 生产钉扎文件名。研究侧 `screen_factors.py` 每次全量重选都直接改写 canonical 的
+#: `factor_selection.json`，而本构建（推理直读的生产数据集）若跟着它无声变 spec，
+#: 一次重选就会让全部存量模型门禁失败 —— 2026-10-16 事故：10-15 全量重选把 273 列
+#: 换成 242 列，5 个在产模型全缺 mapped fields。存在钉扎文件时构建只认它；
+#: 切换选列集必须把新筛选结果**显式晋升**为钉扎文件（一次全量重建随之发生）。
+PRODUCTION_SELECTION_NAME = "factor_selection_production.json"
+
+
+def _selection_path(root: Path) -> Path:
+    """生产构建实际读取的筛选集路径（钉扎优先，见 PRODUCTION_SELECTION_NAME）。"""
+    screening = root / "factor_research" / "screening"
+    pinned = screening / PRODUCTION_SELECTION_NAME
+    return pinned if pinned.is_file() else screening / "factor_selection.json"
+
+
 def _load_kept_columns(root: Path) -> dict[str, list[str]]:
     """读取筛选保留集（去 L2），按来源库归组为待合并列（列名排序保证确定性）。"""
-    sel = json.loads(
-        (root / "factor_research" / "screening" / "factor_selection.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    sel = json.loads(_selection_path(root).read_text(encoding="utf-8"))
     cols_by_lib: dict[str, list[str]] = {}
     for k in sel.get("kept", []):
         lib, name = str(k.get("library") or ""), str(k.get("name") or "")

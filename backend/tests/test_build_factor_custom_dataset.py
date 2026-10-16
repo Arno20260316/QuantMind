@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import pandas as pd
 from backend.scripts.build_factor_custom_dataset import (
     _limit_threshold,
     _limit_thresholds,
+    _load_kept_columns,
     _missing_dates,
     _missing_source_partitions,
     _selection_fingerprint,
@@ -172,6 +174,47 @@ def test_selection_fingerprint_changes_with_content():
     # Assert
     assert _selection_fingerprint(base) != _selection_fingerprint(added)
     assert _selection_fingerprint(base) != _selection_fingerprint(moved)
+
+
+def test_load_kept_columns_prefers_production_pin(tmp_path: Path):
+    """存在钉扎文件时，canonical 的研究侧重选**不得**改写生产构建的选列集。
+
+    2026-10-16 事故回归：10-15 全量重选直接改写 canonical 的 factor_selection.json，
+    生产数据集跟着换了 spec，5 个在产模型全部门禁失败。钉扎文件是晋级闸门。
+    """
+    # Arrange：canonical 是研究侧新重选，钉扎文件是在产选列集
+    screening = tmp_path / "factor_research" / "screening"
+    screening.mkdir(parents=True)
+    (screening / "factor_selection.json").write_text(
+        json.dumps({"kept": [{"library": "jq110", "name": "NEW_RESEARCH_COL"}]}),
+        encoding="utf-8",
+    )
+    (screening / "factor_selection_production.json").write_text(
+        json.dumps({"kept": [{"library": "jq110", "name": "PINNED_COL"}]}),
+        encoding="utf-8",
+    )
+
+    # Act
+    cols = _load_kept_columns(tmp_path)
+
+    # Assert
+    assert cols == {"jq110": ["PINNED_COL"]}
+
+
+def test_load_kept_columns_falls_back_to_canonical_without_pin(tmp_path: Path):
+    # Arrange：无钉扎文件（钉扎上线前的默认形态）
+    screening = tmp_path / "factor_research" / "screening"
+    screening.mkdir(parents=True)
+    (screening / "factor_selection.json").write_text(
+        json.dumps({"kept": [{"library": "jq110", "name": "CANON_COL"}]}),
+        encoding="utf-8",
+    )
+
+    # Act
+    cols = _load_kept_columns(tmp_path)
+
+    # Assert
+    assert cols == {"jq110": ["CANON_COL"]}
 
 
 def test_missing_dates_returns_only_unbuilt_partitions(tmp_path: Path):

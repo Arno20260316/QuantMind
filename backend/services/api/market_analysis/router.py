@@ -71,6 +71,7 @@ def _translate_error(exc: Exception) -> HTTPException:
 
 # ---- Sectors ----
 
+
 @router.post("/sectors", response_model=SectorResponse, status_code=201)
 async def create_sector(
     request: CreateSectorRequest,
@@ -95,7 +96,9 @@ async def list_sectors(
 ) -> list[SectorResponse]:
     async with get_session(read_only=True) as session:
         service = MarketAnalysisService(MarketAnalysisRepository(session))
-        items, _ = await service.list_sectors(sector_type=sector_type, limit=limit, offset=offset)
+        items, _ = await service.list_sectors(
+            sector_type=sector_type, limit=limit, offset=offset
+        )
         return [SectorResponse.model_validate(s) for s in items]
 
 
@@ -123,7 +126,10 @@ async def list_constituents(
             service = MarketAnalysisService(MarketAnalysisRepository(session))
             items = await service.list_constituents(sector_id)
             return [
-                {"instrument": str(c.instrument), "weight": float(c.weight) if c.weight else None}
+                {
+                    "instrument": str(c.instrument),
+                    "weight": float(c.weight) if c.weight else None,
+                }
                 for c in items
             ]
     except Exception as exc:
@@ -131,6 +137,7 @@ async def list_constituents(
 
 
 # ---- Metrics ----
+
 
 @router.get("/sectors/{sector_id}/metrics/latest", response_model=SectorMetricsResponse)
 async def get_latest_metrics(
@@ -160,7 +167,9 @@ async def get_latest_metrics(
         raise _translate_error(exc) from exc
 
 
-@router.get("/sectors/{sector_id}/metrics/history", response_model=list[SectorMetricsResponse])
+@router.get(
+    "/sectors/{sector_id}/metrics/history", response_model=list[SectorMetricsResponse]
+)
 async def get_metrics_history(
     sector_id: str,
     start_date: date = Query(...),
@@ -198,7 +207,9 @@ async def get_metrics_history(
 @router.get("/breadth", response_model=MarketBreadthResponse)
 async def get_market_breadth(
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> MarketBreadthResponse:
     """获取大盘情绪温度计与赚钱效应指标（优先快照，缺失回退实时聚合；显式历史日期无快照则空）。"""
@@ -210,10 +221,19 @@ async def get_market_breadth(
     if not date:
         data = quantdb_feed.get_market_breadth()
     else:
-        data = {"trade_date": date, "advance_count": 0, "decline_count": 0, "flat_count": 0,
-                "limit_up_count": 0, "limit_down_count": 0, "total_turnover_yi": 0.0,
-                "exploded_ratio": 0.0, "profit_effect_score": 0.0, "profit_effect": 0.0,
-                "limit_up_broken_ratio": 0.0}
+        data = {
+            "trade_date": date,
+            "advance_count": 0,
+            "decline_count": 0,
+            "flat_count": 0,
+            "limit_up_count": 0,
+            "limit_down_count": 0,
+            "total_turnover_yi": 0.0,
+            "exploded_ratio": 0.0,
+            "profit_effect_score": 0.0,
+            "profit_effect": 0.0,
+            "limit_up_broken_ratio": 0.0,
+        }
     return MarketBreadthResponse(**data)
 
 
@@ -222,7 +242,9 @@ async def get_heatmap(
     trade_date: date | None = Query(default=None, description="PPT 交易日（回退用）"),
     category: str = Query(default="shenwan", description="分类: shenwan 或 concept"),
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ):
     """获取申万一级行业或热门概念热力矩形图（优先快照/SQLite）。"""
@@ -292,6 +314,7 @@ async def get_heatmap_drill(
 
 # ---- Anomalies ----
 
+
 @router.get("/anomalies", response_model=list[AnomalyResponse])
 async def list_anomalies(
     trade_date: date | None = Query(default=None),
@@ -315,6 +338,7 @@ async def list_anomalies(
 
 # ---- Indices & Money Flow Extensions (QuantDB 真实驱动) ----
 
+
 @router.get("/status")
 async def get_snapshot_status(
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
@@ -325,7 +349,10 @@ async def get_snapshot_status(
     st = _snap.status(date)
     if st:
         return st
-    return {"has_snapshot": False, "message": "暂无快照，请先执行 backend/scripts/market_snapshot/compute.py"}
+    return {
+        "has_snapshot": False,
+        "message": "暂无快照，请先执行 backend/scripts/market_snapshot/compute.py",
+    }
 
 
 @router.get("/snapshot/dates")
@@ -338,6 +365,7 @@ async def get_snapshot_dates(
 
 
 # ---- 因子概率板（市场分析 · 细案 §六，P1 只读面） ----
+
 
 @router.get("/factor-board")
 async def get_factor_board(
@@ -362,16 +390,23 @@ async def get_factor_board(
     if board is None:
         target = out_dir / f"{date}.json" if date else out_dir / "latest.json"
         if target.exists():
-            raise HTTPException(status_code=409, detail=f"因子概率板产物损坏（{target.name}），请检查生成任务")
+            raise HTTPException(
+                status_code=409,
+                detail=f"因子概率板产物损坏（{target.name}），请检查生成任务",
+            )
         raise HTTPException(
             status_code=404,
             detail={
-                "message": "因子概率板尚未生成" if not date else f"决策日 {date} 无产物",
+                "message": "因子概率板尚未生成"
+                if not date
+                else f"决策日 {date} 无产物",
                 "available_dates": dates,
             },
         )
     if not isinstance(board, dict):
-        raise HTTPException(status_code=409, detail="因子概率板产物格式异常（顶层非对象）")
+        raise HTTPException(
+            status_code=409, detail="因子概率板产物格式异常（顶层非对象）"
+        )
     meta = board.get("meta") if isinstance(board.get("meta"), dict) else {}
     decision = str((meta or {}).get("decision_date") or "")
     if date and decision != date:
@@ -448,7 +483,9 @@ async def get_factor_board_members(
 @router.get("/indices/overview")
 async def get_indices_overview(
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
     """获取大盘核心指数快照（优先读快照，缺失回退实时聚合；显式历史日期无快照则空）。"""
@@ -469,7 +506,9 @@ async def get_indices_overview(
 async def get_stock_money_flow(
     limit: int = Query(default=20, ge=1, le=100),
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
     """个股资金流向排行榜（优先快照，缺失回退实时 L2 资金流）"""
@@ -489,7 +528,9 @@ async def get_stock_money_flow(
 @router.get("/money-flow/stocks/full")
 async def get_stock_money_flow_full(
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
     """全市场个股资金流（供前端本地搜索）；优先快照，无快照时回退实时单日全市场。"""
@@ -507,9 +548,18 @@ async def get_stock_money_flow_full(
 @router.get("/money-flow/panorama")
 async def get_money_flow_panorama(
     period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
-    sectors: str = Query("industry2", description="板块体系: industry1 / industry2 / concept"),
-    top_sectors: int = Query(10, ge=2, le=30, description="桑基展示板块数（all 时按 6:4 拆流入/流出）"),
-    stocks_per_sector: int = Query(5, ge=1, le=20, description="每板块展示的个股数（all=流入前 6/流出最深 4 双侧；inflow/outflow=单向 TopK）"),
+    sectors: str = Query(
+        "industry2", description="板块体系: industry1 / industry2 / concept"
+    ),
+    top_sectors: int = Query(
+        10, ge=2, le=30, description="桑基展示板块数（all 时按 6:4 拆流入/流出）"
+    ),
+    stocks_per_sector: int = Query(
+        5,
+        ge=1,
+        le=20,
+        description="每板块展示的个股数（all=流入前 6/流出最深 4 双侧；inflow/outflow=单向 TopK）",
+    ),
     direction: str = Query("all", description="方向: all / inflow / outflow"),
     date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
     current_user: dict = Depends(get_current_user),
@@ -524,15 +574,21 @@ async def get_money_flow_panorama(
         raise HTTPException(status_code=400, detail="direction_invalid")
     return await asyncio.to_thread(
         flow_panorama.get_panorama,
-        period=period, sector_set=sectors, top_sectors=top_sectors,
-        stocks_per_sector=stocks_per_sector, direction=direction, date=date,
+        period=period,
+        sector_set=sectors,
+        top_sectors=top_sectors,
+        stocks_per_sector=stocks_per_sector,
+        direction=direction,
+        date=date,
     )
 
 
 @router.get("/money-flow/sector")
 async def get_money_flow_sector(
     name: str = Query(..., min_length=1, description="板块名称（精确）"),
-    sectors: str = Query("industry2", description="板块体系: industry1 / industry2 / concept"),
+    sectors: str = Query(
+        "industry2", description="板块体系: industry1 / industry2 / concept"
+    ),
     period: str = Query("1d", description="周期: 1d, 3d, 5d, 10d, 20d"),
     top: int = Query(50, ge=1, le=200, description="成分行数上限"),
     date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
@@ -546,7 +602,11 @@ async def get_money_flow_sector(
         raise HTTPException(status_code=400, detail="sector_set_invalid")
     data = await asyncio.to_thread(
         flow_panorama.get_sector_detail,
-        name=name, sector_set=sectors, period=period, top=top, date=date,
+        name=name,
+        sector_set=sectors,
+        period=period,
+        top=top,
+        date=date,
     )
     if data is None:
         raise HTTPException(status_code=404, detail="sector_not_found")
@@ -555,7 +615,9 @@ async def get_money_flow_sector(
 
 @router.get("/money-flow/stock")
 async def get_money_flow_stock(
-    symbol: str = Query(..., min_length=1, description="股票代码（SH600036 / 600036.SH / 600036）"),
+    symbol: str = Query(
+        ..., min_length=1, description="股票代码（SH600036 / 600036.SH / 600036）"
+    ),
     days: int = Query(20, ge=1, le=60, description="序列长度（交易日）"),
     date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新）"),
     current_user: dict = Depends(get_current_user),
@@ -563,7 +625,10 @@ async def get_money_flow_stock(
     """个股明细：20 日五档序列 + 板块归因（资金流「返回板块」的双向面）。"""
     _ = current_user
     data = await asyncio.to_thread(
-        flow_panorama.get_stock_detail, symbol=symbol, days=days, date=date,
+        flow_panorama.get_stock_detail,
+        symbol=symbol,
+        days=days,
+        date=date,
     )
     if data is None:
         raise HTTPException(status_code=404, detail="stock_not_found")
@@ -572,7 +637,10 @@ async def get_money_flow_stock(
 
 @router.get("/money-flow/evidence")
 async def get_money_flow_evidence(
-    date: str | None = Query(default=None, description="交易日 YYYY-MM-DD（默认最新；快照日命中榜走日面板回溯）"),
+    date: str | None = Query(
+        default=None,
+        description="交易日 YYYY-MM-DD（默认最新；快照日命中榜走日面板回溯）",
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """证据台：命中榜（延续状态 × 历史条件超额）+ 信号档案（过闸/否决两节）。"""
@@ -581,6 +649,7 @@ async def get_money_flow_evidence(
 
 
 # ---- 聪明钱（市场分析 · 细案 §5.2；只读产物，无产物 404 smart_money_not_built） ----
+
 
 async def _sm_read(fn, *args, **kwargs):
     """产物读侧统一调度：线程池执行 + SmartMoneyNotBuilt → 404 收敛。"""
@@ -601,12 +670,40 @@ async def get_smart_money_overview(
 
 @router.get("/smart-money/stocks")
 async def get_smart_money_stocks(
-    limit: int = Query(100, ge=1, le=500, description="选股榜行数上限（score 降序）"),
+    limit: int = Query(
+        _sm.STOCKS_LIMIT_DEFAULT, ge=1, le=_sm.STOCKS_LIMIT_MAX, description="每页行数"
+    ),
+    offset: int = Query(0, ge=0, description="分页偏移"),
+    date: str | None = Query(
+        None,
+        description="历史快照日 YYYY-MM-DD；命中最近 ≤date 的计分日，"
+        "响应 as_of 标注真实快照日（研究评分，非交易指令）",
+    ),
+    event: str | None = Query(
+        None, description="最近事件类型：lhb / inst / block_trade / survey"
+    ),
+    industry: str | None = Query(None, description="行业名精确匹配（rs_hyname）"),
+    min_score: float | None = Query(None, ge=0, le=100, description="复合分下限"),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """选股榜：summary + items（研究评分，非交易指令）。"""
+    """选股榜：筛选 + 分页（默认当日；date= 走历史快照现算）。"""
     _ = current_user
-    return await _sm_read(_sm.get_stocks, limit=limit)
+    if event is not None and event not in _sm.STOCKS_EVENTS:
+        raise HTTPException(status_code=400, detail="event_invalid")
+    try:
+        return await _sm_read(
+            _sm.get_stocks,
+            limit=limit,
+            offset=offset,
+            date=date,
+            event=event,
+            industry=industry,
+            min_score=min_score,
+        )
+    except _sm.SmartMoneySnapshotMissing:
+        raise HTTPException(status_code=404, detail="smart_money_no_snapshot") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @router.get("/smart-money/stock/{symbol}")
@@ -614,9 +711,50 @@ async def get_smart_money_stock(
     symbol: str,
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """个股档案：榜上条目 + 事件时间线 + 北向季度序列（未上榜 200, on_board=false）。"""
+    """个股档案：榜上条目 + 时间线 + 北向序列 + 席位构成 + 大宗明细
+    （未上榜 200, on_board=false）。"""
     _ = current_user
     return await _sm_read(_sm.get_stock_detail, symbol)
+
+
+@router.get("/smart-money/track-record")
+async def get_smart_money_track_record(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """历史战绩：Top-N 组合逐日收益/窗口汇总/分箱/滚动 IC/最近案例。"""
+    _ = current_user
+    return await _sm_read(_sm.get_track_record)
+
+
+@router.get("/smart-money/event-study")
+async def get_smart_money_event_study(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """事件族 CAR：族内当日池分位 q5/q1 的超额路径（族级统计，非个股预测）。"""
+    _ = current_user
+    return await _sm_read(_sm.get_event_study)
+
+
+@router.get("/smart-money/seats")
+async def get_smart_money_seats(
+    window: str = Query("all", description="胜率窗口：20 / 60 / all"),
+    sort: str = Query("win_rate", description="排序：win_rate 或 net（全史净买额）"),
+    cls: str | None = Query(
+        None, alias="class", description="席位类型：inst / north / branch / other"
+    ),
+    limit: int = Query(
+        _sm.SEATS_LIMIT_DEFAULT, ge=1, le=_sm.SEATS_LIMIT_MAX, description="返回条数"
+    ),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """席位胜率榜（情报面：席位历史胜率，非交易指令）。"""
+    _ = current_user
+    try:
+        return await _sm_read(
+            _sm.get_seats, window=window, sort=sort, seat_class=cls, limit=limit
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @router.get("/smart-money/branches")
@@ -651,6 +789,7 @@ async def get_smart_money_dates(
 
 # ---- Tag Dual Lookup Endpoints (标签双向查询) ----
 
+
 @router.get("/tags/stats")
 async def get_tag_stats(
     limit: int = Query(default=30, ge=1, le=100),
@@ -667,9 +806,15 @@ async def get_tag_stats(
     if st:
         return st
     if date:
-        return {"trade_date": date, "total_sectors": 0, "total_stocks": 0,
-                "avg_tags_per_stock": 0.0, "max_tags_per_stock": 0,
-                "total_relations": 0, "hot_tags": []}
+        return {
+            "trade_date": date,
+            "total_sectors": 0,
+            "total_stocks": 0,
+            "avg_tags_per_stock": 0.0,
+            "max_tags_per_stock": 0,
+            "total_relations": 0,
+            "hot_tags": [],
+        }
     return quantdb_feed.get_tag_stats(limit=limit, hot_type=hot_type)
 
 
@@ -741,7 +886,7 @@ def _snap_normalize_symbol(symbol: str) -> str:
     if m:
         return f"{m.group(2)}{m.group(1)}"
     if re.fullmatch(r"\d{6}", s):
-        return (f"SH{s}" if s[0] in "69" else f"SZ{s}" if s[0] in "032" else f"BJ{s}")
+        return f"SH{s}" if s[0] in "69" else f"SZ{s}" if s[0] in "032" else f"BJ{s}"
     return s
 
 
@@ -752,7 +897,9 @@ async def get_money_flow_by_period(
     category: str = Query("shenwan", description="分类: shenwan 或 concept"),
     limit: int = Query(31, ge=1, le=100),
     date: str | None = Query(default=None, description="快照日期 YYYY-MM-DD，默认最新"),
-    realtime: bool = Query(default=False, description="true 时跳过快照，强制实时计算最新数据"),
+    realtime: bool = Query(
+        default=False, description="true 时跳过快照，强制实时计算最新数据"
+    ),
     current_user: dict = Depends(get_current_user),
 ) -> MoneyFlowPeriodResponse:
     """获取指定交易日周期 (1D/3D/5D/10D/20D) 的资金净流向排行榜（优先快照）。"""
@@ -760,14 +907,22 @@ async def get_money_flow_by_period(
     today_str = datetime.now().strftime("%Y-%m-%d")
     raw_items = None
     if not realtime:
-        raw_items = _snap.money_flow_period(period=period, dimension=dimension,
-                                            category=category, limit=limit, date=date)
+        raw_items = _snap.money_flow_period(
+            period=period,
+            dimension=dimension,
+            category=category,
+            limit=limit,
+            date=date,
+        )
     if raw_items is None:
         if date:
             raw_items = []
         else:
             raw_items = quantdb_feed.get_money_flow_period(
-                period=period, dimension=dimension, category=category, limit=limit,
+                period=period,
+                dimension=dimension,
+                category=category,
+                limit=limit,
             )
     if raw_items:
         items = [MoneyFlowPeriodItem(**it) for it in raw_items]
@@ -857,7 +1012,11 @@ def _persist_stream_snapshot(
     """
     try:
         env = os.getenv("QM_MARKET_SNAPSHOT_DIR", "").strip()
-        out_dir = Path(env).expanduser() if env else Path(os.getcwd()) / "data" / "market-analysis"
+        out_dir = (
+            Path(env).expanduser()
+            if env
+            else Path(os.getcwd()) / "data" / "market-analysis"
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
 
         base: dict[str, Any] = {}
@@ -870,7 +1029,9 @@ def _persist_stream_snapshot(
         if not isinstance(base, dict):
             base = {}
 
-        old_heatmap = base.get("heatmap") if isinstance(base.get("heatmap"), dict) else {}
+        old_heatmap = (
+            base.get("heatmap") if isinstance(base.get("heatmap"), dict) else {}
+        )
         heatmap: dict[str, Any] = dict(old_heatmap)
         if heatmap_shenwan:
             heatmap["shenwan"] = heatmap_shenwan
@@ -880,16 +1041,20 @@ def _persist_stream_snapshot(
         doc: dict[str, Any] = dict(base)
         # 旧版快照携带 sankey 块（已退役，消费方为零）：重写时顺带剔除，防止存量字段长留
         doc.pop("sankey", None)
-        doc.update({
-            "trade_date": trade_date,
-            "generated_at": generated_at,
-            "indices": indices or [],
-            "breadth": breadth or {},
-            "heatmap": heatmap,
-            "stock_flow": stock_flow or [],
-            "stock_flow_full": stock_flow_full or base.get("stock_flow_full") or [],
-            "money_flow_periods": money_flow_periods or base.get("money_flow_periods") or {},
-        })
+        doc.update(
+            {
+                "trade_date": trade_date,
+                "generated_at": generated_at,
+                "indices": indices or [],
+                "breadth": breadth or {},
+                "heatmap": heatmap,
+                "stock_flow": stock_flow or [],
+                "stock_flow_full": stock_flow_full or base.get("stock_flow_full") or [],
+                "money_flow_periods": money_flow_periods
+                or base.get("money_flow_periods")
+                or {},
+            }
+        )
 
         dated_path = out_dir / f"{trade_date}.json"
         tmp_dated = dated_path.with_suffix(".json.tmp")
@@ -900,7 +1065,11 @@ def _persist_stream_snapshot(
         tmp_dated.replace(dated_path)
         tmp_latest.replace(latest_path)
         _refresh_latest_tags_db(out_dir, trade_date, heatmap_shenwan, heatmap_concept)
-        logger.info("[market-analysis][stream] 快照已持久化 trade_date=%s dir=%s", trade_date, out_dir)
+        logger.info(
+            "[market-analysis][stream] 快照已持久化 trade_date=%s dir=%s",
+            trade_date,
+            out_dir,
+        )
         return trade_date
     except Exception as exc:  # noqa: BLE001
         logger.warning("[market-analysis][stream] 快照持久化失败: %s", exc)
@@ -928,10 +1097,16 @@ def _refresh_latest_tags_db(
             for it in items or []:
                 if not isinstance(it, dict):
                     continue
-                rows.append((
-                    cat, it.get("name"), it.get("value"),
-                    it.get("pct_change"), it.get("leader"), it.get("leader_pct"),
-                ))
+                rows.append(
+                    (
+                        cat,
+                        it.get("name"),
+                        it.get("value"),
+                        it.get("pct_change"),
+                        it.get("leader"),
+                        it.get("leader_pct"),
+                    )
+                )
         if not rows:
             return
         db_path = out_dir / "latest.db"
@@ -942,7 +1117,9 @@ def _refresh_latest_tags_db(
                 "category TEXT, name TEXT, value REAL, "
                 "pct_change REAL, leader TEXT, leader_pct REAL)"
             )
-            con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)"
+            )
             con.execute("DELETE FROM sector_mv")
             con.executemany("INSERT INTO sector_mv VALUES(?,?,?,?,?,?)", rows)
             con.execute(
@@ -955,7 +1132,8 @@ def _refresh_latest_tags_db(
             con.close()
         logger.info(
             "[market-analysis][stream] latest.db sector_mv 已刷新 trade_date=%s rows=%d",
-            trade_date, len(rows),
+            trade_date,
+            len(rows),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[market-analysis][stream] latest.db 刷新失败: %s", exc)
@@ -1019,22 +1197,30 @@ async def trigger_market_analysis_stream(
             if await request.is_disconnected():
                 return
 
-            heatmap = await _run_step("heatmap", quantdb_feed.get_sector_heatmap, "shenwan")
+            heatmap = await _run_step(
+                "heatmap", quantdb_feed.get_sector_heatmap, "shenwan"
+            )
             yield _sse("heatmap", {"heatmap": heatmap})
             if await request.is_disconnected():
                 return
 
-            stock_flow = await _run_step("stock_flow", quantdb_feed.get_stock_money_flow, 50)
+            stock_flow = await _run_step(
+                "stock_flow", quantdb_feed.get_stock_money_flow, 50
+            )
             yield _sse("stock_flow", {"stock_flow": stock_flow})
             if await request.is_disconnected():
                 return
 
             # 手动分析算完即落盘（概念热力/全量个股/多周期一并补算），否则离开页面
             # 重进时只能读到旧 latest.json，表现为“分析完一切换就回退到上一交易日”。
-            heatmap_concept = await _run_step("heatmap_concept", quantdb_feed.get_sector_heatmap, "concept")
+            heatmap_concept = await _run_step(
+                "heatmap_concept", quantdb_feed.get_sector_heatmap, "concept"
+            )
             if await request.is_disconnected():
                 return
-            stock_flow_full = await _run_step("stock_flow_full", quantdb_feed.get_stock_money_flow_full)
+            stock_flow_full = await _run_step(
+                "stock_flow_full", quantdb_feed.get_stock_money_flow_full
+            )
             if await request.is_disconnected():
                 return
             money_flow_periods: dict[str, Any] = {}
@@ -1043,7 +1229,11 @@ async def trigger_market_analysis_stream(
                     return
                 items = await _run_step(
                     f"period_{_period}_{_dim}_{_cat}",
-                    quantdb_feed.get_money_flow_period, _period, _dim, _cat, 31,
+                    quantdb_feed.get_money_flow_period,
+                    _period,
+                    _dim,
+                    _cat,
+                    31,
                 )
                 if items:
                     money_flow_periods[f"{_period}_{_dim}_{_cat}"] = items
@@ -1069,12 +1259,15 @@ async def trigger_market_analysis_stream(
                     money_flow_periods=money_flow_periods,
                 )
 
-            yield _sse("done", {
-                "trade_date": latest_dt,
-                "persisted_trade_date": persisted,
-                "message": "已从 QuantDB 读取最新数据并完成市场分析",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            yield _sse(
+                "done",
+                {
+                    "trade_date": latest_dt,
+                    "persisted_trade_date": persisted,
+                    "message": "已从 QuantDB 读取最新数据并完成市场分析",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
         except Exception as exc:  # pragma: no cover - 兜底
             logger.exception("[market-analysis][stream] 流式分析执行失败")
             yield _sse("error", {"message": f"市场分析失败: {exc}"})
@@ -1088,4 +1281,3 @@ async def trigger_market_analysis_stream(
             "X-Accel-Buffering": "no",
         },
     )
-

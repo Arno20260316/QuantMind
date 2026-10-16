@@ -50,11 +50,18 @@ def env(tmp_path, monkeypatch) -> _Env:
     )
     monkeypatch.setattr(signals, "ADMITTED_PILLARS", ADMITTED3)
 
-    # ---- 交易日历（daily_forward 分区目录；trading_calendar 只读目录名）
-    for d in CAL:
-        (e.quantdb / "1_kline_data" / "daily_forward" / f"dt={d:%Y%m%d}").mkdir(
-            parents=True
-        )
+    # ---- 行情（daily_forward 分区：目录名=日历 + close 面板供 analytics）
+    # A 每日 +1（100→109），B/C 恒 100——战绩/事件研究/席位全链需要收盘面板
+    for i, d in enumerate(CAL):
+        p = e.quantdb / "1_kline_data" / "daily_forward" / f"dt={d:%Y%m%d}"
+        p.mkdir(parents=True)
+        pd.DataFrame(
+            [
+                {"symbol": A, "time": d, "close": 100.0 + i},
+                {"symbol": B, "time": d, "close": 100.0},
+                {"symbol": C, "time": d, "close": 100.0},
+            ]
+        ).to_parquet(p / "data.parquet")
 
     # ---- 证券主表
     inst_dir = e.quantdb / "2_base_sector" / "instrument_detail"
@@ -230,6 +237,38 @@ class TestBuildEndToEnd:
         assert m["admitted"] == ADMITTED3_NAMES
         assert m["score_dates_total"] == len(dates)
         assert meta["sync_ok"] is True
+
+        # ---- analytics 产物（细案 §4）：三段 JSON + overview.industry + meta.analytics
+        tr = datasets.load_product_json("track_record")
+        assert tr["top_n"] == 10 and len(tr["daily"]) == len(CAL)
+        assert tr["rolling_ic"]["h"] == 10 and tr["rolling_ic"]["window"] == 60
+        # 最近案例 D0：A 榜前二；T+1 入场（101）、T+2 出场（102）→ ret_2 = 102/101−1
+        item = tr["recent"][0]
+        # 产物符号统一前缀式（与 items/前端契约一致；A 为数据层后缀式输入）
+        assert item["symbol"] == "SH600036" and item["score"] == pytest.approx(250 / 3, abs=0.01)
+        assert item["ret_2"] == pytest.approx(102 / 101 - 1, abs=1e-4)
+        assert item["status"] == "持有中"  # pos+10 > last_pos → 未闭合
+        assert item["ret_so_far"] == pytest.approx(109 / 101 - 1, abs=1e-4)
+
+        es = datasets.load_product_json("event_study")
+        assert es["car_days"] == 20
+        assert set(es["families"]) == {"龙虎榜", "机构席位", "大宗交易", "机构调研"}
+        assert len(es["families"]["大宗交易"]["car_q5_bp"]) == 20
+
+        st = datasets.load_product_json("seats")
+        assert st["horizon"] == 5 and st["n_events"] == 0  # 无席位表 → 空榜不炸
+
+        row0 = ov["industry"][0]
+        assert row0["industry"] == "银行"
+        assert row0["lhb_net_yi"] == pytest.approx(0.3)
+        assert row0["avg_score"] == pytest.approx(75.0)  # (250/3 + 200/3)/2
+        assert m["analytics"]["scores_days"] == len(CAL)
+        assert m["analytics"]["seat_coverage"] == {
+            "rows": 0,
+            "start": None,
+            "end": None,
+            "partial": True,
+        }
 
     def test_重复构建幂等(self, env):
         bsm.build(rebuild_days=0, run_sync=None)

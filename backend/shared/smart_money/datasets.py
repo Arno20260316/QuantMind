@@ -37,7 +37,15 @@ from backend.shared.stock_utils import StockCodeUtil
 
 log = logging.getLogger(__name__)
 
-RAW_DATASETS = ("lhb_detail", "lhb_inst", "lhb_branch", "block_trade", "survey")
+RAW_DATASETS = (
+    "lhb_detail",
+    "lhb_inst",
+    "lhb_branch",
+    "block_trade",
+    "survey",
+    "dzjy_detail",  # 大宗明细（机构专用接盘柱用；2026-10-16 起）
+    "lhb_seat",  # 龙虎榜席位明细（席位构成/分类；2026-10-16 起）
+)
 
 # ---------------------------------------------------------------- 通用缓存
 

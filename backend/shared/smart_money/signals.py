@@ -36,7 +36,7 @@ SURVEY_WINDOW_DAYS = 90
 #: 缺失柱填充分（披露口径：covered 计数随行输出，绝不把缺失当 0）
 FILL_SCORE = 50.0
 
-#: 柱候选全集（细案 §3.3；最终入柱由验证闸门裁定）
+#: 柱候选全集（细案 §3.3/§3.6；最终入柱由验证闸门裁定）
 PILLAR_CANDIDATES: tuple[str, ...] = (
     "inst_net_ratio_5d",
     "inst_net_buy_5d_z",
@@ -45,6 +45,8 @@ PILLAR_CANDIDATES: tuple[str, ...] = (
     "margin_bal_chg_20d",
     "dzjy_amount_ratio_5d",
     "dzjy_premium_5d",
+    "dzjy_inst_amount_ratio_5d",
+    "dzjy_inst_premium_5d",
     "survey_inst_90d",
 )
 
@@ -57,21 +59,29 @@ PILLAR_META: dict[str, dict[str, str]] = {
     "margin_bal_chg_20d": {"label": "融资余额变化·20日", "unit": "ratio"},
     "dzjy_amount_ratio_5d": {"label": "大宗成交占比·5日", "unit": "ratio"},
     "dzjy_premium_5d": {"label": "大宗折溢率·5日", "unit": "ratio"},
+    "dzjy_inst_amount_ratio_5d": {"label": "机构接盘大宗占比·5日", "unit": "ratio"},
+    "dzjy_inst_premium_5d": {"label": "机构接盘大宗折溢率·5日", "unit": "ratio"},
     "survey_inst_90d": {"label": "机构调研家数·90日", "unit": "count"},
 }
 
 #: 入柱裁定（名, 方向）——方向 = 验证 h10 IC 符号（+1/−1）。分位按方向对齐：
 #: 负向柱取 100−分位（HK 六柱「方向=实测方向」先例 hk_opportunity.py:151），
 #: 使柱分高 = 历史有利方向。由 backend/scripts/smart_money_validate.py 产出
-#: （2026-10-15 双过闸：inst_net_buy_5d_z IC=+0.0195 / lhb_net_ratio_5d
-#: IC=−0.0412 / margin_net_5d_z IC=−0.0101 / margin_bal_chg_20d IC=−0.0415，
-#: n=661；审计全文见 data/market-analysis/smart_money/evidence.json）；
+#: （2026-10-16 六柱过闸，新增「机构专用」买方口径双柱：dzjy_inst_amount_ratio_5d
+#: IC=−0.0313 / dzjy_inst_premium_5d IC=+0.0618〔全柱最强〕；存量四柱
+#: inst_net_buy_5d_z IC=+0.0195 / lhb_net_ratio_5d IC=−0.0413 /
+#: margin_net_5d_z IC=−0.0102 / margin_bal_chg_20d IC=−0.0414，n=662；
+#: 机构双柱因过滤全市场大宗样本 n=599；塌缩 0。否决：inst_net_ratio_5d 弱 /
+#: dzjy_amount_ratio_5d、dzjy_premium_5d、survey_inst_90d 反向。
+#: 审计全文见 data/market-analysis/smart_money/evidence.json）；
 #: 空=未裁定：build 拒绝出分（先跑验证脚本）。
 ADMITTED_PILLARS: tuple[tuple[str, int], ...] = (
     ("inst_net_buy_5d_z", 1),
     ("lhb_net_ratio_5d", -1),
     ("margin_net_5d_z", -1),
     ("margin_bal_chg_20d", -1),
+    ("dzjy_inst_amount_ratio_5d", -1),
+    ("dzjy_inst_premium_5d", 1),
 )
 
 
@@ -285,6 +295,48 @@ def pillar_dzjy_premium_5d(
     return num5 / den5.where(den5 > 0)
 
 
+def _dzjy_inst_rows(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """大宗明细中机构专用作**买方**（接盘）的行。
+
+    卖方为机构专用的是机构出货方向，不算接盘；无 seat_buyer 列（老数据）→ 空。
+    """
+    detail = data.get("dzjy_detail")
+    if detail is None or detail.empty or "seat_buyer" not in detail.columns:
+        return pd.DataFrame()
+    m = detail["seat_buyer"].astype(str).str.contains("机构专用", na=False)
+    return detail[m].copy()
+
+
+def pillar_dzjy_inst_amount_ratio_5d(
+    calendar: pd.DatetimeIndex,
+    data: dict[str, pd.DataFrame],
+    margin: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """机构专用接盘大宗成交额占流通市值比，5 日累计（细案 §3.6）。"""
+    use = _dzjy_inst_rows(data)
+    if use.empty:
+        return _empty(calendar)
+    return _rolled_event_sum(_pivot(use, calendar, "amount_ratio"), WINDOW_5D)
+
+
+def pillar_dzjy_inst_premium_5d(
+    calendar: pd.DatetimeIndex,
+    data: dict[str, pd.DataFrame],
+    margin: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """机构专用接盘大宗 5 日成交额加权折溢率（分数；正=溢价接盘）。"""
+    use = _dzjy_inst_rows(data)
+    if use.empty:
+        return _empty(calendar)
+    use = use[use["amount"] > 0].copy()
+    use["_num"] = use["premium"] * use["amount"]
+    num5 = _rolled_event_sum(_pivot(use, calendar, "_num"), WINDOW_5D)
+    den5 = _rolled_event_sum(_pivot(use, calendar, "amount"), WINDOW_5D)
+    if num5.empty:
+        return num5
+    return num5 / den5.where(den5 > 0)
+
+
 def pillar_survey_inst_90d(
     calendar: pd.DatetimeIndex,
     data: dict[str, pd.DataFrame],
@@ -307,11 +359,16 @@ _PILLAR_FUNCS: dict[str, Callable[..., pd.DataFrame]] = {
     "margin_bal_chg_20d": pillar_margin_bal_chg_20d,
     "dzjy_amount_ratio_5d": pillar_dzjy_amount_ratio_5d,
     "dzjy_premium_5d": pillar_dzjy_premium_5d,
+    "dzjy_inst_amount_ratio_5d": pillar_dzjy_inst_amount_ratio_5d,
+    "dzjy_inst_premium_5d": pillar_dzjy_inst_premium_5d,
     "survey_inst_90d": pillar_survey_inst_90d,
 }
 
 #: 事件类原始表（池来源；两融由 z 阈值另入）
 _EVENT_TABLES = ("lhb_detail", "lhb_inst", "block_trade", "survey")
+#: 柱计算数据面 = 事件表 + 机构大宗明细（后者与 block_trade 同源同事件，
+#: 只增机构买方视角、不入池——池窗口内的事件集合不变）
+_PILLAR_DATA_TABLES = (*_EVENT_TABLES, "dzjy_detail")
 
 
 def compute_pillars(
@@ -327,7 +384,7 @@ def compute_pillars(
         raise ValueError(f"未知柱 {unknown}（可选：{tuple(_PILLAR_FUNCS)}）")
     data = {
         name: align_events(raw.get(name, pd.DataFrame()), calendar)
-        for name in _EVENT_TABLES
+        for name in _PILLAR_DATA_TABLES
     }
     return {name: _PILLAR_FUNCS[name](calendar, data, margin) for name in use_names}
 

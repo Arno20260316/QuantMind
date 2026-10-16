@@ -5,7 +5,7 @@
  */
 
 import React from 'react';
-import { Store } from 'lucide-react';
+import { AlertCircle, Store } from 'lucide-react';
 import { Tooltip } from 'antd';
 import { EmptyHint, PeriodChips, RankRow, SectionCard } from '../../../market-analysis-shared/ui';
 import type { SmartBranchRow } from '../../services/smartMoneyService';
@@ -21,6 +21,9 @@ interface SmartMoneyBranchBoardProps {
   window: 5 | 20;
   onWindowChange: (w: 5 | 20) => void;
   loading?: boolean;
+  /** 窗口切换/加载失败 → 显式错误条（B4：不伪装成空数据） */
+  error?: string | null;
+  onRetry?: () => void;
 }
 
 export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
@@ -28,6 +31,8 @@ export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
   window,
   onWindowChange,
   loading,
+  error,
+  onRetry,
 }) => {
   const list = rows ?? [];
 
@@ -43,7 +48,20 @@ export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
         />
       }
     >
-      {loading && !list.length ? (
+      {error ? (
+        <div className="mx-1 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5">
+          <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+          <span className="text-[10px] text-amber-800 min-w-0 truncate">{error}</span>
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="ml-auto shrink-0 text-[10px] font-bold text-amber-700 hover:text-amber-900"
+            >
+              重试
+            </button>
+          )}
+        </div>
+      ) : loading && !list.length ? (
         <EmptyHint loading />
       ) : list.length ? (
         <div className="flex flex-col">

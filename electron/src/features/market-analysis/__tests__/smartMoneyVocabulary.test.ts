@@ -11,17 +11,25 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  BUCKET_TONES,
+  CAR_STRONG_COLOR,
+  CAR_WEAK_COLOR,
   MISSING,
+  SEAT_CLASS_ORDER,
   directionHint,
   directionLabel,
   eventTypeLabel,
+  fmtBp,
   fmtNum,
+  fmtPct,
   fmtScore,
+  fmtSigned,
   fmtYiFromWan,
   fmtYiFromYuan,
   pillarLabel,
   pillarShort,
   scoreCls,
+  seatClassLabel,
   signCls,
 } from '../smartMoneyVocabulary';
 
@@ -93,5 +101,48 @@ describe('方向与事件词', () => {
     expect(pillarShort('lhb_net_ratio_5d')).toBe('龙虎榜');
     expect(pillarLabel('brand_new_pillar')).toBe('brand_new_pillar');
     expect(pillarShort('brand_new_pillar')).toBe('brand_new_pillar');
+  });
+});
+
+describe('v2 格式器（B7 带符号统一 / 占比 / bp）', () => {
+  it('fmtSigned：正数带「+」，负数原样，0 不带号；缺失「—」', () => {
+    expect(fmtSigned(1.5)).toBe('+1.50');
+    expect(fmtSigned(-1.5)).toBe('-1.50');
+    expect(fmtSigned(0)).toBe('0.00');
+    expect(fmtSigned(null)).toBe(MISSING);
+  });
+
+  it('fmtBp 与 fmtSigned 同口径（bp 只是展示单位语境）', () => {
+    expect(fmtBp(37)).toBe('+37.0');
+    expect(fmtBp(-14)).toBe('-14.0');
+    expect(fmtBp(undefined)).toBe(MISSING);
+  });
+
+  it('fmtPct：0–1 分数 → 百分数带 %；缺失「—」', () => {
+    expect(fmtPct(0.4712)).toBe('47.1%');
+    expect(fmtPct(0.4712, 0)).toBe('47%');
+    expect(fmtPct(null)).toBe(MISSING);
+  });
+});
+
+describe('v2 常量纪律（席位类/评分桶/CAR 组色）', () => {
+  it('席位类型顺序与兜底标签齐全', () => {
+    expect(SEAT_CLASS_ORDER).toEqual(['inst', 'north', 'branch', 'other']);
+    expect(seatClassLabel('inst')).toBe('机构专用');
+    expect(seatClassLabel('north', '陆股通')).toBe('陆股通');
+    expect(seatClassLabel('unknown_cls')).toBe('unknown_cls');
+  });
+
+  it('评分桶四档色阶（紫阶强度递进，不占红绿）', () => {
+    expect(BUCKET_TONES).toHaveLength(4);
+    BUCKET_TONES.forEach((tone) => {
+      expect(tone).not.toContain('red');
+      expect(tone).not.toContain('green');
+    });
+  });
+
+  it('CAR 强/弱组=身份色（紫/蓝），绝不套红绿涨跌语义', () => {
+    expect(CAR_STRONG_COLOR).toBe('#7c3aed');
+    expect(CAR_WEAK_COLOR).toBe('#2563eb');
   });
 });

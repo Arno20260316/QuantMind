@@ -16,7 +16,7 @@ clip(-0.5, +1.0) 防仙股；close 用 QuantDB daily_forward 前复权（禁 dai
 
 产出：
 - {product}/evidence.json（页面证据台唯一读源：IC/ICIR/pos_rate/q1..q5/分年/
-  tail_ok/裁定/塌缩/复合分/口径说明）
+  IC 衰减/tail_ok/裁定/塌缩/复合分/口径说明）
 - logs/smart_money_validate.csv（全量明细）
 
 用法：
@@ -52,6 +52,7 @@ MIN_NAMES_MARKET = 100
 MIN_ABS_IC = 0.01
 MIN_DAYS_TAIL = 60
 HORIZONS = (5, 10)
+DECAY_HORIZONS = (2, 3, 5, 10, 20)  # IC 衰减视野；h=1 在 T+1 入场口径下恒 0，不出
 ADMIT_HORIZON = 10  # 入柱判据取 h=10（h=5 一同披露）
 CORR_COLLAPSE = 0.8
 DEFAULT_WARMUP = "2023-10-01"  # 柱暖机（z20 / 90D 窗需要历史）
@@ -64,6 +65,8 @@ FAMILY: dict[str, str] = {
     "margin_bal_chg_20d": "两融",
     "dzjy_amount_ratio_5d": "大宗",
     "dzjy_premium_5d": "大宗",
+    "dzjy_inst_amount_ratio_5d": "大宗",
+    "dzjy_inst_premium_5d": "大宗",
     "survey_inst_90d": "调研",
 }
 
@@ -91,9 +94,26 @@ def _tail_ok(ic_mean: float, q51_bp: float, n_days: int) -> bool:
     )
 
 
+def _daily_ics(mat: pd.DataFrame, fwd: pd.DataFrame, min_names: int) -> list[float]:
+    """逐日截面秩 IC 流（有效日 = 共同有值 ≥ min_names 且 IC 有限）。"""
+    ics: list[float] = []
+    for d in mat.index:
+        if d not in fwd.index:
+            continue
+        r = mat.loc[d]
+        f = fwd.loc[d]
+        ok = r.notna() & f.notna()
+        if ok.sum() < min_names:
+            continue
+        ic_val = float(np.corrcoef(r[ok].rank(), f[ok].rank())[0, 1])
+        if np.isfinite(ic_val):
+            ics.append(ic_val)
+    return ics
+
+
 def _seg_stats(mat: pd.DataFrame, fwd: pd.DataFrame, min_names: int) -> dict | None:
     """单段（全窗或某年）秩 IC 流 + 五分位超额。样本不足返回 None。"""
-    ics: list[float] = []
+    ics = _daily_ics(mat, fwd, min_names)
     q_acc: dict[int, list[float]] = {i: [] for i in range(5)}
     for d in mat.index:
         if d not in fwd.index:
@@ -105,9 +125,6 @@ def _seg_stats(mat: pd.DataFrame, fwd: pd.DataFrame, min_names: int) -> dict | N
             continue
         rr = r[ok]
         ff = f[ok]
-        ic_val = float(np.corrcoef(rr.rank(), ff.rank())[0, 1])
-        if np.isfinite(ic_val):
-            ics.append(ic_val)
         q = pd.qcut(rr.rank(method="first"), 5, labels=False)
         exc = ff - ff.median()
         for i in range(5):
@@ -132,6 +149,29 @@ def _seg_stats(mat: pd.DataFrame, fwd: pd.DataFrame, min_names: int) -> dict | N
         "q5_minus_q1_bp": round(q51, 0),
         "tail_ok": _tail_ok(ic_mean, q51, len(arr)),
     }
+
+
+def _decay(
+    mat: pd.DataFrame, closes: pd.DataFrame, min_names: int
+) -> dict[str, dict | None]:
+    """rank IC 随视野衰减（细案 §3.3；h=2..20——h=1 在 T+1 入场口径下恒 0，不出）。"""
+    out: dict[str, dict | None] = {}
+    for h in DECAY_HORIZONS:
+        fwd = (closes.shift(-h) / closes.shift(-1) - 1).clip(-0.5, 1.0)
+        fwd = fwd.replace([np.inf, -np.inf], np.nan)
+        ics = _daily_ics(mat, fwd, min_names)
+        if not ics:
+            out[str(h)] = None
+            continue
+        arr = np.asarray(ics)
+        mean = float(arr.mean())
+        std = arr.std(ddof=1)
+        out[str(h)] = {
+            "ic": round(mean, 4),
+            "icir": round(mean / std, 3) if std > 0 else None,
+            "n_days": int(len(arr)),
+        }
+    return out
 
 
 def _evaluate(mat: pd.DataFrame, closes: pd.DataFrame, min_names: int) -> dict:
@@ -197,6 +237,7 @@ def _composite_eval(closes: pd.DataFrame, eval_start: pd.Timestamp) -> dict | No
     if mat.empty:
         return None
     ev = _evaluate(mat, closes, MIN_NAMES_EVENT)
+    ev["decay"] = _decay(mat, closes, MIN_NAMES_EVENT)
     ev["n_dates"] = int(len(mat.index))
     ev["avg_pool"] = round(float(mat.notna().sum(axis=1).mean()), 1)
     ev["avg_covered"] = (
@@ -242,7 +283,8 @@ def run(eval_start: pd.Timestamp, warmup_start: pd.Timestamp, with_composite: bo
             "min_names_note": "LHB/大宗/调研类柱只在事件股上有值，日截面 30–400 只，门槛按性质分档并在此披露",
             "collapse": f"|截面秩相关|>{CORR_COLLAPSE} 的成对信号留 |IC| 强者",
             "direction": "入柱方向 = h10 IC 符号（+1/−1）；负向柱分位取 100−pct（方向对齐，HK 六柱先例），使柱分高 = 历史有利方向",
-            "indicators_only": "柱候选 8 个：机构席位 2 / 榜单整体 1 / 两融 2 / 大宗 2 / 调研 1",
+            "indicators_only": "柱候选 10 个：机构席位 2 / 榜单整体 1 / 两融 2 / 大宗 4 / 调研 1",
+            "decay": "rank IC @ h∈{2,3,5,10,20}（h=1 在 T+1 收盘入场口径下恒 0，不出；细案 §3.3 原列 h=1 的偏差见细案 §10）",
         },
         "signals": [],
         "correlation": {"pairs": [], "collapsed": []},
@@ -263,6 +305,7 @@ def run(eval_start: pd.Timestamp, warmup_start: pd.Timestamp, with_composite: bo
 
     rows_csv: list[dict] = []
     passed: list[str] = []
+    decay_map: dict[str, dict | None] = {}
     for name in signals.PILLAR_CANDIDATES:
         mat = eval_pillars.get(name, pd.DataFrame())
         mn = _min_names(name)
@@ -279,8 +322,10 @@ def run(eval_start: pd.Timestamp, warmup_start: pd.Timestamp, with_composite: bo
                     "by_year": {},
                 }
             )
+            decay_map[name] = None
             continue
         ev = _evaluate(mat, closes, mn)
+        decay_map[name] = _decay(mat, closes, mn)
         r10 = ev["results"].get(str(ADMIT_HORIZON))
         ok10 = bool(r10 and r10["tail_ok"])
         if ok10:
@@ -314,6 +359,8 @@ def run(eval_start: pd.Timestamp, warmup_start: pd.Timestamp, with_composite: bo
         if r5 is not None:
             msg += f" | h5 IC={r5['rank_ic']:+.4f} q5-q1={r5['q5_minus_q1_bp']:+.0f}bp"
         log.info(msg)
+
+    evidence["decay"] = decay_map
 
     # 相关塌缩（仅对过闸者）
     corr = _corr_matrix({k: v for k, v in eval_pillars.items() if k in passed})
@@ -387,12 +434,15 @@ def run(eval_start: pd.Timestamp, warmup_start: pd.Timestamp, with_composite: bo
     log.info("入柱裁定：%s（h=10 过闸 %d，塌缩掉 %d）", admitted, len(passed), len(passed) - len(admitted))
 
     if with_composite:
-        evidence["composite"] = _composite_eval(closes, eval_start)
-        if evidence["composite"]:
-            cr = evidence["composite"]["results"].get("10")
+        comp = _composite_eval(closes, eval_start)
+        if comp:
+            # 复合分衰减并入顶层 decay（名称键 "composite"），避免同一数据两处落盘
+            evidence["decay"]["composite"] = comp.pop("decay", None)
+            cr = comp["results"].get("10")
             log.info("复合分 h10：%s", cr)
         else:
             log.info("复合分：无 scores 快照（先跑 build_smart_money.py 回填后复跑本脚本）")
+        evidence["composite"] = comp
 
     # 落盘
     product = datasets.product_dir()

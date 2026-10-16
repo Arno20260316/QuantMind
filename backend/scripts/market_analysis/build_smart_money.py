@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""聪明钱产物构建：sync（可选）→ 逐日 scores 分区 → latest/trends/meta.json。
+"""聪明钱产物构建：sync（可选）→ 逐日 scores 分区 → latest/trends/meta.json
+→ 分析产物 track_record/event_study/seats.json（机构级 v2，细案 §4）。
 
 单命令幂等（细案 docs/市场分析_聪明钱追踪与选股_细案_20261015.md §5.3）；
 调度任务 ``smart_money_daily`` 串行调用（sync 失败但已有原始数据时仍构建，
@@ -13,6 +14,9 @@
 - ``--rebuild-days N``：重算最近 N 个交易日分区（日常 40）；0 = 全量（首建/回填）
 - 展示口径（细案 §5.2）：symbol 输出**前缀式**；缺失一律 null（前端「—」），
   绝不补 0；前向收益封存列 fwd_ret_* 不进任何产物（本脚本根本不读）
+- 分析产物每段独立 try：track_record（Top-N 战绩/分箱/滚动 IC）、event_study
+  （事件族 CAR）、seats（席位胜率榜）；单段失败只缺省该 JSON，不拖垮主链；
+  席位覆盖起始日随 meta.analytics.seat_coverage 披露（回补中 partial=true）
 
 用法（容器内）：
   docker exec -w /app quantmind python backend/scripts/market_analysis/build_smart_money.py
@@ -38,8 +42,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.shared.smart_money import datasets, signals, stats  # noqa: E402
-from backend.shared.stock_utils import StockCodeUtil  # noqa: E402
+from backend.shared.smart_money import analytics, datasets, signals, stats  # noqa: E402
+from backend.shared.smart_money.items import (  # noqa: E402
+    build_items,
+    i_or_none as _i,
+    n_or_none as _n,
+)
 from backend.shared.utc_datetime import utc_now  # noqa: E402
 
 log = logging.getLogger("build_smart_money")
@@ -77,7 +85,9 @@ def resolve_admitted() -> tuple[tuple[str, int], ...]:
     if names:
         unknown = [n for n in names if n not in signals.PILLAR_CANDIDATES]
         if unknown:
-            raise BuildRefused(f"admitted 含未知柱 {unknown}（候选：{signals.PILLAR_CANDIDATES}）")
+            raise BuildRefused(
+                f"admitted 含未知柱 {unknown}（候选：{signals.PILLAR_CANDIDATES}）"
+            )
         dirs = {s.get("name"): s.get("direction") for s in (ev.get("signals") or [])}
         out: list[tuple[str, int]] = []
         for n in names:
@@ -91,7 +101,9 @@ def resolve_admitted() -> tuple[tuple[str, int], ...]:
     admitted = tuple(signals.ADMITTED_PILLARS)
     unknown = [n for n, _ in admitted if n not in signals.PILLAR_CANDIDATES]
     if unknown:
-        raise BuildRefused(f"admitted 含未知柱 {unknown}（候选：{signals.PILLAR_CANDIDATES}）")
+        raise BuildRefused(
+            f"admitted 含未知柱 {unknown}（候选：{signals.PILLAR_CANDIDATES}）"
+        )
     bad = [n for n, d in admitted if d not in (1, -1)]
     if bad:
         raise BuildRefused(f"入柱方向非法 {bad}（须 +1/−1）")
@@ -140,22 +152,6 @@ def _write_json_atomic(name: str, payload: Any) -> Path:
     return path
 
 
-def _n(v: Any) -> float | None:
-    """numpy/NaN → JSON 安全 float|None（缺失一律 None，绝不补 0）。"""
-    if v is None:
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if pd.isna(f) else f
-
-
-def _i(v: Any) -> int | None:
-    f = _n(v)
-    return None if f is None else int(f)
-
-
 # ---------------------------------------------------------------- 构建核心
 
 
@@ -189,73 +185,13 @@ def _is_partial(sync_ok: bool) -> bool:
     return False
 
 
-def _window_sum(raw: dict[str, pd.DataFrame], table: str, col: str, win: pd.DatetimeIndex) -> dict:
-    df = raw.get(table)
-    if df is None or df.empty or col not in df.columns:
-        return {}
-    sub = df[df["trade_date"].isin(win)]
-    if sub.empty:
-        return {}
-    return sub.groupby("symbol")[col].sum().to_dict()
-
-
-def _build_items(
-    scores: pd.DataFrame,
+def _overview(
+    stats_df: pd.DataFrame,
     raw: dict[str, pd.DataFrame],
     cal: pd.DatetimeIndex,
     as_of: pd.Timestamp,
-    margin: pd.DataFrame,
-    admitted: tuple[tuple[str, int], ...],
-    north_delta_pp: dict[str, float | None],
-) -> list[dict]:
-    """当日选股榜条目（score 降序；金额单位随柱原样，缺失 null）。"""
-    pillar_names = [n for n, _ in admitted]
-    names = datasets.name_map()
-    industries = datasets.industry_map()
-    pos = int(cal.searchsorted(as_of))
-    win = cal[max(0, pos - signals.WINDOW_5D + 1) : pos + 1]
-    inst5 = _window_sum(raw, "lhb_inst", "inst_net_buy", win)
-    lhb5 = _window_sum(raw, "lhb_detail", "lhb_net_buy", win)
-    mg5: dict = {}
-    if margin is not None and not margin.empty:
-        mw = margin[margin["trade_date"].isin(win)]
-        if not mw.empty:
-            mg5 = mw.groupby("symbol")["finance_net"].sum().to_dict()
-    ev_map = stats.latest_event_map(raw, cal, as_of)
-
-    def _label(series: pd.Series, sym: str) -> str | None:
-        if series.empty or sym not in series.index:
-            return None
-        v = series.get(sym)
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return None
-        s = str(v)
-        return None if s in ("nan", "NaT", "<NA>", "") else s
-
-    items: list[dict] = []
-    for _, r in scores.sort_values("score", ascending=False).iterrows():
-        sym = str(r["symbol"])
-        items.append(
-            {
-                "symbol": StockCodeUtil.to_prefix(sym) or sym,
-                "name": _label(names, sym),
-                "industry": _label(industries, sym),
-                "score": _n(r["score"]),
-                "covered": _i(r["covered"]),
-                "n_pillars": _i(r["n_pillars"]),
-                "pct": {n: _n(r.get(f"pct_{n}")) for n in pillar_names},
-                "val": {n: _n(r.get(f"val_{n}")) for n in pillar_names},
-                "inst_net_5d": _n(inst5.get(sym)),
-                "lhb_net_5d": _n(lhb5.get(sym)),
-                "margin_net_5d": _n(mg5.get(sym)),
-                "north_q_delta_pp": _n(north_delta_pp.get(sym)),
-                "latest_event": ev_map.get(sym),
-            }
-        )
-    return items
-
-
-def _overview(stats_df: pd.DataFrame, raw: dict[str, pd.DataFrame], cal: pd.DatetimeIndex, as_of: pd.Timestamp) -> dict:
+    industry: list[dict],
+) -> dict:
     def _latest(col: str) -> tuple[str | None, float | None]:
         if col not in stats_df.columns:
             return None, None
@@ -276,8 +212,16 @@ def _overview(stats_df: pd.DataFrame, raw: dict[str, pd.DataFrame], cal: pd.Date
     mg_date, mg_net5 = _latest("margin_net_5d_yi")
     _, mg_bal = _latest("margin_bal_yi")
 
-    lhb20_n = tail20["lhb_n_stocks"].dropna() if "lhb_n_stocks" in tail20 else pd.Series(dtype=float)
-    lhb20_net = tail20["lhb_net_buy_yi"].dropna() if "lhb_net_buy_yi" in tail20 else pd.Series(dtype=float)
+    lhb20_n = (
+        tail20["lhb_n_stocks"].dropna()
+        if "lhb_n_stocks" in tail20
+        else pd.Series(dtype=float)
+    )
+    lhb20_net = (
+        tail20["lhb_net_buy_yi"].dropna()
+        if "lhb_net_buy_yi" in tail20
+        else pd.Series(dtype=float)
+    )
 
     return {
         "lhb": {
@@ -295,6 +239,7 @@ def _overview(stats_df: pd.DataFrame, raw: dict[str, pd.DataFrame], cal: pd.Date
         "branches_top": stats.branch_rank(
             raw.get("lhb_branch"), cal, as_of, window=signals.POOL_WINDOW, top_n=10
         ),
+        "industry": industry,
     }
 
 
@@ -315,6 +260,126 @@ def _trends(stats_df: pd.DataFrame) -> dict:
         "survey": _series(["survey_n_stocks", "survey_n_inst"], TREND_DAYS_SHORT),
         "margin": _series(["margin_net_5d_yi", "margin_bal_yi"], TREND_DAYS_MARGIN),
     }
+
+
+#: 事件族 → 原始表（event_study 输入；标签直供展示面）
+_EVENT_STUDY_FAMILIES: dict[str, str] = {
+    "龙虎榜": "lhb_detail",
+    "机构席位": "lhb_inst",
+    "大宗交易": "block_trade",
+    "机构调研": "survey",
+}
+
+
+def _load_scores_by_date() -> dict[pd.Timestamp, pd.DataFrame]:
+    """全史评分分区 {计分日: scores}（analytics 输入）。"""
+    out: dict[pd.Timestamp, pd.DataFrame] = {}
+    for dt in datasets.score_dates():
+        s = datasets.load_scores(dt)
+        if s is not None and not s.empty:
+            out[pd.Timestamp(dt)] = s
+    return out
+
+
+def _seat_coverage(seat: pd.DataFrame, lhb_detail: pd.DataFrame) -> dict:
+    """席位表覆盖披露（回补未完成时 start 晚于榜单全史起点 → partial=true）。"""
+    if seat is None or seat.empty or "trade_date" not in seat.columns:
+        return {"rows": 0, "start": None, "end": None, "partial": True}
+    smin = seat["trade_date"].min()
+    smax = seat["trade_date"].max()
+    full_start = (
+        lhb_detail["trade_date"].min()
+        if lhb_detail is not None and not lhb_detail.empty
+        else None
+    )
+    partial = bool(full_start is not None and pd.notna(smin) and smin > full_start)
+    return {
+        "rows": int(len(seat)),
+        "start": smin.strftime("%Y-%m-%d") if pd.notna(smin) else None,
+        "end": smax.strftime("%Y-%m-%d") if pd.notna(smax) else None,
+        "partial": partial,
+    }
+
+
+def _build_analytics(
+    raw: dict[str, pd.DataFrame],
+    cal: pd.DatetimeIndex,
+    last_scores: pd.DataFrame,
+) -> dict:
+    """分析产物（细案 §4）：track_record / event_study / seats + overview.industry。
+
+    每段独立 try——单段失败只记日志并缺省该产物，绝不拖垮 scores/latest 主链。
+    返回 {"industry": [...], "seat_coverage": {...}|None, "scores_days": n}。
+    """
+    info: dict[str, Any] = {"industry": [], "seat_coverage": None, "scores_days": 0}
+    scores_by_date = _load_scores_by_date()
+    info["scores_days"] = len(scores_by_date)
+    if not scores_by_date:
+        log.warning("analytics：无评分分区，跳过 track/event/seats")
+        return info
+    close = datasets.close_matrix(min(scores_by_date), pd.Timestamp(date.today()))
+    if close.empty:
+        log.warning("analytics：close 面板为空，跳过 track/event/seats")
+        return info
+    as_of = close.index[-1].strftime("%Y-%m-%d")
+    generated_at = utc_now().isoformat()
+
+    try:
+        track = analytics.track_record(close, scores_by_date, names=datasets.name_map())
+        rolling = analytics.ic_decay(close, scores_by_date)["rolling"]
+        _write_json_atomic(
+            "track_record",
+            {
+                "as_of": as_of,
+                "generated_at": generated_at,
+                **track,
+                "rolling_ic": rolling,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("analytics：track_record 段失败（其余段继续）")
+
+    try:
+        events = {
+            label: raw.get(table, pd.DataFrame())
+            for label, table in _EVENT_STUDY_FAMILIES.items()
+        }
+        es = analytics.event_study(close, scores_by_date, events)
+        _write_json_atomic(
+            "event_study", {"as_of": as_of, "generated_at": generated_at, **es}
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("analytics：event_study 段失败（其余段继续）")
+
+    seat_raw = raw.get("lhb_seat", pd.DataFrame())
+    try:
+        if not seat_raw.empty and "trade_date" in seat_raw.columns:
+            # 席位窗裁剪：baseline 取「同一窗」口径（细案 §3.5），
+            # 避免把全史 close 面板展开成 (日,股) 长表
+            seat_close = close.loc[close.index >= seat_raw["trade_date"].min()]
+        else:
+            seat_close = close
+        seats = analytics.seat_stats(seat_raw, seat_close)
+        _write_json_atomic("seats", {"generated_at": generated_at, **seats})
+        info["seat_coverage"] = _seat_coverage(
+            seat_raw, raw.get("lhb_detail", pd.DataFrame())
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("analytics：seats 段失败（其余段继续）")
+
+    try:
+        info["industry"] = analytics.industry_flow(
+            datasets.industry_map(),
+            cal,
+            lhb=raw.get("lhb_detail"),
+            inst=raw.get("lhb_inst"),
+            dzjy=raw.get("dzjy_detail"),
+            scores_latest=last_scores,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("analytics：industry_flow 段失败（其余段继续）")
+
+    return info
 
 
 def build(
@@ -355,7 +420,11 @@ def build(
         score_cal = cal[-rebuild_days:]
     else:
         score_cal = cal
-    calc_cal = cal if rebuild_days in (0, None) else cal[-(len(score_cal) + WARMUP_TRADING_DAYS):]
+    calc_cal = (
+        cal
+        if rebuild_days in (0, None)
+        else cal[-(len(score_cal) + WARMUP_TRADING_DAYS) :]
+    )
     if len(calc_cal) < len(score_cal):  # 日历本身不足（测试/新库）
         calc_cal = cal
 
@@ -372,27 +441,32 @@ def build(
         if sc.empty:
             continue
         _write_parquet_atomic(
-            sc, datasets.product_dir() / "scores" / f"dt={d.strftime('%Y%m%d')}" / "data.parquet"
+            sc,
+            datasets.product_dir()
+            / "scores"
+            / f"dt={d.strftime('%Y%m%d')}"
+            / "data.parquet",
         )
         n_written += 1
         last_scores, as_of = sc, d
     if last_scores is None or as_of is None:
-        raise BuildRefused(f"评分窗 {score_cal[0]:%Y-%m-%d}~{score_cal[-1]:%Y-%m-%d} 内池全空，无评分输出")
+        raise BuildRefused(
+            f"评分窗 {score_cal[0]:%Y-%m-%d}~{score_cal[-1]:%Y-%m-%d} 内池全空，无评分输出"
+        )
 
     # ---- 展示层（stats 窗 = 趋势窗 + 5 日短窗暖机）
-    stats_cal = cal[-(max(TREND_DAYS_MARGIN, TREND_DAYS_SHORT) + signals.WINDOW_5D):]
+    stats_cal = cal[-(max(TREND_DAYS_MARGIN, TREND_DAYS_SHORT) + signals.WINDOW_5D) :]
     stats_df = stats.daily_market_stats(stats_cal, raw, margin)
     north_pp: dict[str, float | None] = {}
     nd = datasets.north_delta()
     if not nd.empty:
-        north_pp = {
-            str(r["symbol"]): _n(r["delta"] * 100.0) for _, r in nd.iterrows()
-        }
+        north_pp = {str(r["symbol"]): _n(r["delta"] * 100.0) for _, r in nd.iterrows()}
 
-    items = _build_items(last_scores, raw, calc_cal, as_of, margin, admitted, north_pp)
+    items = build_items(last_scores, raw, calc_cal, as_of, margin, admitted, north_pp)
     covered_mean = _n(last_scores["covered"].mean())
     partial = _is_partial(sync_ok)
     freshness = _freshness()
+    analytics_info = _build_analytics(raw, cal, last_scores)
 
     latest = {
         "as_of": as_of.strftime("%Y-%m-%d"),
@@ -408,12 +482,18 @@ def build(
             for n, d in admitted
         ],
         "summary": {"pool_size": int(len(last_scores)), "covered_mean": covered_mean},
-        "overview": _overview(stats_df, raw, calc_cal, as_of),
+        "overview": _overview(
+            stats_df, raw, calc_cal, as_of, analytics_info["industry"]
+        ),
         "items": items,
         "freshness": freshness,
         "partial": partial,
     }
-    trends = {"as_of": as_of.strftime("%Y-%m-%d"), "generated_at": latest["generated_at"], **_trends(stats_df)}
+    trends = {
+        "as_of": as_of.strftime("%Y-%m-%d"),
+        "generated_at": latest["generated_at"],
+        **_trends(stats_df),
+    }
 
     meta = {
         "generated_at": latest["generated_at"],
@@ -422,10 +502,17 @@ def build(
         "rebuild_days": rebuild_days,
         "score_dates_written": n_written,
         "score_dates_total": len(datasets.score_dates()),
-        "window": {"calendar_start": cal[0].strftime("%Y-%m-%d"), "calendar_end": cal[-1].strftime("%Y-%m-%d")},
+        "window": {
+            "calendar_start": cal[0].strftime("%Y-%m-%d"),
+            "calendar_end": cal[-1].strftime("%Y-%m-%d"),
+        },
         "sync_ok": sync_ok,
         "partial": partial,
         "freshness": freshness,
+        "analytics": {
+            "scores_days": analytics_info["scores_days"],
+            "seat_coverage": analytics_info["seat_coverage"],
+        },
     }
 
     _write_json_atomic("latest", latest)
@@ -433,8 +520,17 @@ def build(
     _write_json_atomic("meta", meta)
     log.info(
         "构建完成：as_of=%s 评分日=%d（分区总 %d）池=%d covered均值=%s partial=%s",
-        meta["as_of"], n_written, meta["score_dates_total"],
-        latest["summary"]["pool_size"], covered_mean, partial,
+        meta["as_of"],
+        n_written,
+        meta["score_dates_total"],
+        latest["summary"]["pool_size"],
+        covered_mean,
+        partial,
+    )
+    log.info(
+        "analytics：行业 %d 行；席位覆盖 %s",
+        len(analytics_info["industry"]),
+        analytics_info["seat_coverage"],
     )
     return meta
 
@@ -447,7 +543,9 @@ def main() -> int:
     )
     parser = argparse.ArgumentParser(description="聪明钱产物构建")
     parser.add_argument(
-        "--rebuild-days", type=int, default=DEFAULT_REBUILD_DAYS,
+        "--rebuild-days",
+        type=int,
+        default=DEFAULT_REBUILD_DAYS,
         help="重算最近 N 个交易日分区（默认 40；0=全量，首建/回填用）",
     )
     parser.add_argument("--skip-sync", action="store_true", help="跳过采集（纯构建）")
@@ -456,7 +554,10 @@ def main() -> int:
         log.error("--rebuild-days 不可为负")
         return 2
     try:
-        build(rebuild_days=args.rebuild_days, run_sync=None if args.skip_sync else _default_sync)
+        build(
+            rebuild_days=args.rebuild_days,
+            run_sync=None if args.skip_sync else _default_sync,
+        )
     except BuildRefused as exc:
         log.error("构建拒绝：%s", exc)
         return 2

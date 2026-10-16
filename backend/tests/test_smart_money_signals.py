@@ -99,6 +99,85 @@ class TestPillarGolden:
         assert out.loc[CAL[0], "A.SH"] == pytest.approx(0.05)
 
 
+class TestDzjyInstPillars:
+    """机构专用**买方**（接盘）大宗柱：机构出货行不得计入、不入事件池。"""
+
+    def _detail(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                # 机构专用作买方（接盘）→ 计入
+                {
+                    "trade_date": CAL[0],
+                    "symbol": "A.SH",
+                    "seat_buyer": "机构专用",
+                    "seat_seller": "某证券营业部",
+                    "premium": 0.10,
+                    "amount": 3.0,
+                    "amount_ratio": 0.02,
+                },
+                # 机构专用作买方第二笔 → 并入同股同日
+                {
+                    "trade_date": CAL[0],
+                    "symbol": "A.SH",
+                    "seat_buyer": "机构专用",
+                    "seat_seller": "机构专用",
+                    "premium": -0.10,
+                    "amount": 1.0,
+                    "amount_ratio": 0.01,
+                },
+                # 机构专用作**卖方**（出货）→ 接盘柱不得计入（毒值 9.9 校验）
+                {
+                    "trade_date": CAL[0],
+                    "symbol": "B.SH",
+                    "seat_buyer": "某证券营业部",
+                    "seat_seller": "机构专用",
+                    "premium": 9.9,
+                    "amount": 100.0,
+                    "amount_ratio": 0.5,
+                },
+            ]
+        )
+
+    def test_机构接盘占比只计机构专用买方(self):
+        # Act
+        out = signals.compute_pillars(
+            CAL,
+            {"dzjy_detail": self._detail()},
+            None,
+            names=["dzjy_inst_amount_ratio_5d"],
+        )["dzjy_inst_amount_ratio_5d"]
+
+        # Assert：A 两笔机构买方占比求和 (0.02+0.01)；5 日窗内携带、出窗 NaN
+        assert out.loc[CAL[0], "A.SH"] == pytest.approx(0.03)
+        assert out.loc[CAL[4], "A.SH"] == pytest.approx(0.03)
+        assert pd.isna(out.loc[CAL[5], "A.SH"])
+        # B 是机构出货 → 不出现该列（缺失 ≠ 0）
+        assert "B.SH" not in out.columns
+
+    def test_机构接盘折溢率按成交额加权_机构出货行不污染(self):
+        out = signals.compute_pillars(
+            CAL,
+            {"dzjy_detail": self._detail()},
+            None,
+            names=["dzjy_inst_premium_5d"],
+        )["dzjy_inst_premium_5d"]
+        # (0.10×3 + (−0.10)×1) / (3+1) = 0.05
+        assert out.loc[CAL[0], "A.SH"] == pytest.approx(0.05)
+        assert "B.SH" not in out.columns
+
+    def test_缺seat_buyer列返回全空(self):
+        df = self._detail().drop(columns=["seat_buyer"])
+        out = signals.compute_pillars(
+            CAL, {"dzjy_detail": df}, None, names=["dzjy_inst_premium_5d"]
+        )["dzjy_inst_premium_5d"]
+        assert out.empty
+
+    def test_大宗明细不入事件池(self):
+        # 池来源仍是 _EVENT_TABLES（与 block_trade 同事件，不重复入池）
+        pool = signals.compute_pool(CAL, {"dzjy_detail": self._detail()})
+        assert not pool.to_numpy().any()
+
+
 class TestMarginPillars:
     def _margin(self) -> pd.DataFrame:
         rows = []

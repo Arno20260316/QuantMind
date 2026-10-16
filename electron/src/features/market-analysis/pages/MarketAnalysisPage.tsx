@@ -419,7 +419,7 @@ export const MarketAnalysisPage: React.FC = () => {
           {activeTab === 'factor-board' && <FactorBoardPanel />}
 
           {activeTab === 'smart-money' && (
-            <SmartMoneyPanel onPick={(s) => setWindowSymbol(s)} />
+            <SmartMoneyPanel date={snapDate} onOpenTerminal={(s) => setWindowSymbol(s)} />
           )}
         </div>
 

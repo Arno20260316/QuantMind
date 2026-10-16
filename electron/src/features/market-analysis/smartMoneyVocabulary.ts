@@ -110,6 +110,51 @@ export function fmtPct01(v: number | null | undefined): string {
   return fmtNum(Number(v) * 100, 1);
 }
 
+/** 分数（0–1）→ 百分比带 % 符号；缺失「—」 */
+export function fmtPct(v: number | null | undefined, digits = 1): string {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return MISSING;
+  return `${fmtNum(Number(v) * 100, digits)}%`;
+}
+
+/** 带符号数值（B7 唯一格式器：正数统一带「+」，0 不带号）；缺失「—」 */
+export function fmtSigned(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return MISSING;
+  const n = Number(v);
+  return `${n > 0 ? '+' : ''}${fmtNum(n, digits)}`;
+}
+
+/** bp → 带符号 1 位小数字符串（研究口径统一；不加单位后缀）；缺失「—」 */
+export function fmtBp(v: number | null | undefined, digits = 1): string {
+  return fmtSigned(v, digits);
+}
+
+/** 席位类型 chip 顺序（与后端 SEAT_CLASS_LABELS 键同集） */
+export const SEAT_CLASS_ORDER = ['inst', 'north', 'branch', 'other'] as const;
+
+/** 席位类型兜底标签（接口已随行返回 class_label，本表仅兜底） */
+export const SEAT_CLASS_FALLBACK: Record<string, string> = {
+  inst: '机构专用',
+  north: '陆股通',
+  branch: '券商席位',
+  other: '其他',
+};
+
+export function seatClassLabel(cls: string, fromApi?: string | null): string {
+  return fromApi || SEAT_CLASS_FALLBACK[cls] || cls;
+}
+
+/** 评分桶色阶（分桶不是涨跌，用紫阶强度；越靠后越深） */
+export const BUCKET_TONES = [
+  'bg-slate-100 text-slate-500 border-slate-200',
+  'bg-purple-50 text-purple-600 border-purple-100',
+  'bg-purple-100 text-purple-700 border-purple-200',
+  'bg-purple-600 text-white border-purple-600',
+] as const;
+
+/** 事件研究强/弱组双色（组=身份不是涨跌 → 中性紫/蓝，不占红绿语义） */
+export const CAR_STRONG_COLOR = '#7c3aed';
+export const CAR_WEAK_COLOR = '#2563eb';
+
 /** 金额/涨跌符号着色（A 股口径：红涨绿跌，仅用于数值正负）；0 与缺失走中性 */
 export function signCls(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(Number(v)) || Number(v) === 0) {

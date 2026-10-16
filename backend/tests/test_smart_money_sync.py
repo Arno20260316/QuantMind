@@ -377,3 +377,133 @@ class TestCumulativeMode:
 
         assert "survey" not in meta
         assert not (tmp_path / "survey.parquet").exists()
+
+
+# ---------------------------------------------------------------- 席位/大宗明细（v2 数据面）
+
+
+def _seat_raw() -> pd.DataFrame:
+    """akshare stock_lhb_stock_detail_em 原样列：占比实测**已是分数**（6.51% → 0.0651）。"""
+    return pd.DataFrame(
+        [
+            {
+                "序号": 1, "交易营业部名称": "机构专用", "买入金额": 1.2e8,
+                "买入金额-占总成交比例": 0.0651, "卖出金额": None,
+                "卖出金额-占总成交比例": None, "净额": 1.2e8, "类型": "买入",
+            },
+            {
+                "序号": 2, "交易营业部名称": "华鑫证券上海分公司", "买入金额": 8e7,
+                "买入金额-占总成交比例": 0.0434, "卖出金额": 5e7,
+                "卖出金额-占总成交比例": 0.0271, "净额": 3e7, "类型": "买入",
+            },
+            {
+                "序号": 3, "交易营业部名称": None, "买入金额": 1e7,
+                "买入金额-占总成交比例": 0.005, "卖出金额": None,
+                "卖出金额-占总成交比例": None, "净额": 1e7, "类型": "买入",
+            },
+        ]
+    )
+
+
+def _dzjy_raw() -> pd.DataFrame:
+    """akshare stock_dzjy_mrmx 原样列：成交额/流通市值实测为**百分数**（0.005926% → /100）。"""
+    return pd.DataFrame(
+        [
+            {
+                "序号": 1, "交易日期": "2026-10-15", "证券代码": "600036",
+                "证券简称": "招商银行", "涨跌幅": -0.05, "收盘价": 40.0,
+                "成交价": 39.2, "折溢率": -0.02, "成交量": 395918,
+                "成交额": 395918 * 39.2, "成交额/流通市值": 0.5926,
+                "买方营业部": "机构专用", "卖方营业部": "中信证券股份有限公司总部",
+            },
+            {
+                "序号": 2, "交易日期": "2026-10-15", "证券代码": "000001",
+                "证券简称": "平安银行", "涨跌幅": 1.2, "收盘价": 11.5,
+                "成交价": 11.62, "折溢率": 0.0104, "成交量": 1000000,
+                "成交额": 11620000.0, "成交额/流通市值": 0.005926,
+                "买方营业部": "华泰证券股份有限公司北京分公司", "卖方营业部": "机构专用",
+            },
+        ]
+    )
+
+
+class TestNormalizeLhbSeat:
+    def test_占比保持分数不缩放_对侧NaN保留(self):
+        out = sms.normalize_lhb_seat(_seat_raw(), "2026-10-15", "600036.SH", "buy")
+
+        assert len(out) == 2  # 席位名缺失行丢弃
+        first = out.iloc[0]
+        assert first["buy_ratio"] == pytest.approx(0.0651)  # 分数原样（不 ×100 也不 ÷100）
+        assert first["buy_amount"] == pytest.approx(1.2e8)
+        assert pd.isna(first["sell_amount"])  # 买入榜行对侧为 NaN → 原样保留
+        assert pd.isna(first["sell_ratio"])
+        assert first["trade_date"] == "2026-10-15"
+        assert first["symbol"] == "600036.SH"
+        assert first["side"] == "buy"
+        # 双向都出现的席位两列都在
+        second = out.iloc[1]
+        assert second["sell_amount"] == pytest.approx(5e7)
+        assert second["net_amount"] == pytest.approx(3e7)
+
+
+class TestNormalizeDzjyDetail:
+    def test_占比百分数归一分数_代码后缀式_折溢率分数(self):
+        out = sms.normalize_dzjy_detail(_dzjy_raw())
+
+        assert len(out) == 2
+        assert list(out["symbol"]) == ["600036.SH", "000001.SZ"]  # 后缀式
+        assert out.iloc[0]["trade_date"] == "2026-10-15"
+        # 成交额/流通市值：百分数 → 分数（0.005926 → 0.00005926）
+        assert out.iloc[1]["amount_ratio"] == pytest.approx(0.00005926)
+        # 折溢率 = 分数（-0.02 = -2%），不再除 100
+        assert out.iloc[0]["premium"] == pytest.approx(-0.02)
+        # 席位文本保留（analytics.classify_seat 的输入）
+        assert out.iloc[0]["seat_buyer"] == "机构专用"
+        assert out.iloc[1]["seat_seller"] == "机构专用"
+        # 价×量恒等式（单位定标）：成交额 ≈ 成交价 × 成交量
+        assert out.iloc[0]["amount"] == pytest.approx(395918 * 39.2)
+
+
+class TestSeatUnsupported:
+    @pytest.mark.parametrize(
+        ("symbol", "expect"),
+        [
+            ("111024.SH", True),  # 转债（沪 11 开头）
+            ("110043.SH", True),
+            ("123456.SZ", True),  # 转债（深 12 开头）
+            ("600036.SH", False),
+            ("000001.SZ", False),
+            ("300750.SZ", False),
+            ("11102.SH", False),  # 非 6 位
+            ("11ABCD.SZ", False),  # 非全数字
+        ],
+    )
+    def test_仅转债码判不支持(self, symbol, expect):
+        assert sms._is_seat_unsupported(symbol) is expect
+
+
+class TestSeatPending:
+    def test_新到旧排序_完成排除_窗过滤(self):
+        detail = pd.DataFrame(
+            [
+                ("2026-01-05", "A.SH"),
+                ("2026-01-06", "A.SH"),
+                ("2026-01-06", "B.SH"),
+                ("2026-01-07", "A.SH"),
+                ("2026-01-08", "B.SH"),
+                ("2026-01-09", "C.SH"),
+            ],
+            columns=["trade_date", "symbol"],
+        )
+        out = sms._seat_pending(
+            detail,
+            pd.Timestamp("2026-01-06").date(),
+            pd.Timestamp("2026-01-08").date(),
+            {("2026-01-07", "A.SH")},
+        )
+        # 01-05/01-09 出窗；01-07 A 已完成；同日保持原表序（稳定排序）
+        assert out == [
+            ("2026-01-08", "B.SH"),
+            ("2026-01-06", "A.SH"),
+            ("2026-01-06", "B.SH"),
+        ]

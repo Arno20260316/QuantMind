@@ -196,3 +196,389 @@ export function getInstitutionalParticipants(
     `/institutional/participants?category=${encodeURIComponent(category)}&q=${encodeURIComponent(q)}&limit=${limit}`,
   );
 }
+
+// ---- 聪明钱 · 席位行为统计与类型效力（细案 §6；契约见后端 hk_smart_money.py）----
+//
+// 契约要点：
+// - 404（产物未构建）→ `notBuilt` 空态，不白屏；evidence 生命周期独立；
+// - 缺失字段一律 null 原样透传（界面显示「—」，**绝不补 0**）；
+// - 「零入柱（evidence_only）」是真裁定（数据结论），不是链路故障。
+
+/** 携带状态码的取数错误；404（未构建）走 notBuilt 空态 */
+export class HkSmartMoneyError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'HkSmartMoneyError';
+    this.status = status;
+  }
+
+  get notBuilt(): boolean {
+    return this.status === 404;
+  }
+}
+
+async function hkSmGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${HK_API}${path}`, { headers: authHeaders() });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      detail = typeof body.detail === 'string' ? body.detail : '';
+    } catch {
+      detail = '';
+    }
+    throw new HkSmartMoneyError(
+      detail ? `港股聪明钱接口失败 ${res.status}: ${detail}` : `港股聪明钱接口失败 ${res.status}`,
+      res.status,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
+/** 口径脚注集合（键随面不同：hit/shrink/suspect/episode/eligible/method/fwd/…） */
+export type HkSmNotes = Record<string, string | null | undefined>;
+
+export interface HkSmFreshness {
+  ccass_date: string | null;
+  south_date: string | null;
+  kline_date: string | null;
+  ccass_lag_days: number | null;
+  partial: boolean | null;
+}
+
+/** 类型概览行（含该类型最强 h10 变体；rank_ic 为 None 的变体不进 best） */
+export interface HkSmCategoryRow {
+  category: string;
+  label: string | null;
+  category_label: string | null;
+  holding_yi: number | null;
+  holding_date: string | null;
+  n_symbols: number | null;
+  net5_yi: number | null;
+  net5_days: number | null;
+  net20_yi: number | null;
+  net20_days: number | null;
+  admitted: boolean | null;
+  best: {
+    h10_ic: number | null;
+    h10_tail_ok: boolean | null;
+    variant: string | null;
+    variant_label: string | null;
+    direction: number | null;
+    admitted: boolean | null;
+  } | null;
+}
+
+export interface HkSmCounts30d {
+  days: number | null;
+  events: number | null;
+  transfer_suspect: number | null;
+  first_seen: number | null;
+  exit_boundary: number | null;
+}
+
+export interface HkSmOverviewResponse {
+  as_of: string | null;
+  generated_at: string | null;
+  partial: boolean | null;
+  version: string | null;
+  evidence_only: boolean | null;
+  admitted: string[];
+  directions: Record<string, number | null>;
+  freshness: HkSmFreshness | null;
+  categories: HkSmCategoryRow[];
+  counts_30d: HkSmCounts30d | null;
+  summary: {
+    scores_date: string | null;
+    pool_size: number | null;
+    covered_mean: number | null;
+  } | null;
+  trends: {
+    window: number | null;
+    categories: Record<
+      string,
+      Array<{ date: string; net_yi: number | null; n_symbols: number | null }>
+    >;
+  } | null;
+  notes: HkSmNotes;
+}
+
+/** 单变体单horizon 段（24 信号 × 3 horizon） */
+export interface HkSmSignalSeg {
+  n_days: number | null;
+  rank_ic: number | null;
+  icir: number | null;
+  ic_pos_rate: number | null;
+  q1_bp: number | null;
+  q2_bp: number | null;
+  q3_bp: number | null;
+  q4_bp: number | null;
+  q5_bp: number | null;
+  q5_minus_q1_bp: number | null;
+  buy_hit: number | null;
+  sell_hit: number | null;
+  asym_bp: number | null;
+  n_top_obs: number | null;
+  n_bot_obs: number | null;
+  tail_ok: boolean | null;
+}
+
+export interface HkSmSignal {
+  name: string;
+  category: string;
+  category_label: string | null;
+  variant: string;
+  variant_label: string | null;
+  coverage: {
+    avg_names_per_day: number | null;
+    days: number | null;
+  } | null;
+  direction: number | null;
+  admitted: boolean | null;
+  decision: string | null;
+  results: Record<string, HkSmSignalSeg | undefined>;
+}
+
+export interface HkSmEvalWindow {
+  eval_start: string | null;
+  eval_end: string | null;
+  warmup_days: number | null;
+  event_days: number | null;
+  event_rows: number | null;
+}
+
+export interface HkSmCalibrationGridRow {
+  min_value_hkd: number | null;
+  min_pct: number | null;
+  mean_daily: number | null;
+  median_daily: number | null;
+  covered_symbols_mean: number | null;
+  value_median: number | null;
+  value_p90: number | null;
+  suspect_total: number | null;
+  in_target: boolean | null;
+}
+
+export interface HkSmCalibration {
+  sample_days: number | null;
+  sample_start: string | null;
+  sample_end: string | null;
+  target_daily_events: [number, number] | null;
+  grid: HkSmCalibrationGridRow[];
+  selected: { min_value_hkd: number | null; min_pct: number | null } | null;
+  note: string | null;
+}
+
+export interface HkSmTypesResponse {
+  validated_at: string | null;
+  as_of: string | null;
+  admit_horizon: number | null;
+  horizon: string | null;
+  window: HkSmEvalWindow | null;
+  admitted: string[];
+  calibration: HkSmCalibration | null;
+  signals: HkSmSignal[];
+  notes: HkSmNotes;
+}
+
+export interface HkSmSeatItem {
+  participant_id: string;
+  participant_name: string | null;
+  category: string;
+  category_label: string | null;
+  kind: string | null;
+  n_events: number | null;
+  n_buy: number | null;
+  n_sell: number | null;
+  n_exc10: number | null;
+  avg_exc_bp: number | null;
+  hit: number | null;
+  buy_hit: number | null;
+  sell_hit: number | null;
+  t: number | null;
+  shrunk_exc_bp: number | null;
+  shrunk_hit: number | null;
+  stability: boolean | null;
+  eligible: boolean | null;
+  last_event_date: string | null;
+}
+
+export interface HkSmSeatsResponse {
+  as_of: string | null;
+  generated_at: string | null;
+  window: string | null;
+  category: string | null;
+  sort: string | null;
+  min_events: number | null;
+  horizon: number | null;
+  total: number | null;
+  items: HkSmSeatItem[];
+  notes: HkSmNotes;
+}
+
+export interface HkSmConsensusItem {
+  symbol: string;
+  name: string | null;
+  score: number | null;
+  covered: number | null;
+  n_pillars: number | null;
+  pct: Record<string, number | null>;
+  val: Record<string, number | null>;
+}
+
+export interface HkSmConsensusResponse {
+  as_of: string | null;
+  generated_at: string | null;
+  adopted: string[];
+  directions: Record<string, number | null>;
+  evidence_only: boolean | null;
+  total: number | null;
+  items: HkSmConsensusItem[];
+  notes: HkSmNotes;
+}
+
+export interface HkSmTimelineRow {
+  date: string;
+  participant_id: string;
+  participant_name: string | null;
+  category: string;
+  category_label: string | null;
+  kind: string | null;
+  direction: number | null;
+  delta_qty: number | null;
+  delta_value: number | null;
+  value_yi: number | null;
+  delta_pct: number | null;
+  price: number | null;
+  pct_of_amount: number | null;
+  transfer_suspect: boolean | null;
+  first_of_episode: boolean | null;
+  fwd_exc_5_bp: number | null;
+  fwd_exc_10_bp: number | null;
+  fwd_exc_20_bp: number | null;
+}
+
+export interface HkSmStockHolding {
+  category: string;
+  category_label: string | null;
+  qty_sum: number | null;
+  n_seats: number | null;
+  date: string | null;
+}
+
+export interface HkSmStockStats {
+  days: number | null;
+  events: number | null;
+  n_buy: number | null;
+  n_sell: number | null;
+  net_value_yi: number | null;
+  avg_exc_10_bp: number | null;
+  buy_hit: number | null;
+  sell_hit: number | null;
+  by_category: Array<{
+    category: string;
+    category_label: string | null;
+    n_buy: number | null;
+    n_sell: number | null;
+    net_value_yi: number | null;
+    avg_exc_10_bp_buy: number | null;
+    avg_exc_10_bp_sell: number | null;
+  }>;
+  notes: HkSmNotes;
+}
+
+export interface HkSmStockResponse {
+  symbol: string;
+  name: string | null;
+  as_of: string | null;
+  generated_at: string | null;
+  window: { days: number | null; start: string | null } | null;
+  timeline: HkSmTimelineRow[];
+  holdings: HkSmStockHolding[];
+  stats: HkSmStockStats | null;
+  notes: HkSmNotes;
+}
+
+export interface HkSmEvidenceSignal extends HkSmSignal {
+  by_year?: unknown;
+}
+
+export interface HkSmEvidenceResponse {
+  validated_at: string | null;
+  version: string | null;
+  window: HkSmEvalWindow | null;
+  method: Record<string, string>;
+  admit_horizon: number | null;
+  signals: HkSmEvidenceSignal[];
+  correlation: {
+    pairs?: unknown[];
+    collapsed?: unknown[];
+  } | null;
+  calibration: HkSmCalibration | null;
+  exclusions: {
+    days: number | null;
+    south_days: number | null;
+    events: number | null;
+    transfer_suspect: number | null;
+    first_seen: number | null;
+    exit_boundary: number | null;
+    raw_moves: number | null;
+    transfer_suspect_share: number | null;
+  } | null;
+  reconciliation: {
+    as_of: string | null;
+    a_seat_qty_sum: number | null;
+    south_qty_sum: number | null;
+    ratio: number | null;
+  } | null;
+  composite: unknown;
+  admitted: string[];
+  evidence_only: boolean | null;
+  warnings: string[];
+}
+
+export function getHkSmOverview(): Promise<HkSmOverviewResponse> {
+  return hkSmGet<HkSmOverviewResponse>('/smart-money/overview');
+}
+
+export function getHkSmTypes(horizon: '5' | '10' | '20' = '10'): Promise<HkSmTypesResponse> {
+  return hkSmGet<HkSmTypesResponse>(`/smart-money/types?horizon=${horizon}`);
+}
+
+export interface HkSmSeatsQuery {
+  /** 事件窗口：'20' | '60' | 'all'（后端 "0"/缺省 → 全史） */
+  window?: string;
+  category?: string | null;
+  /** 排序：shrunk_hit | avg_exc | n */
+  sort?: string;
+  minEvents?: number;
+  limit?: number;
+}
+
+export function getHkSmSeats(q: HkSmSeatsQuery = {}): Promise<HkSmSeatsResponse> {
+  const params = new URLSearchParams();
+  params.set('window', q.window ?? '60');
+  if (q.category) params.set('category', q.category);
+  params.set('sort', q.sort ?? 'shrunk_hit');
+  params.set('min_events', String(Math.max(Math.trunc(q.minEvents ?? 5), 1)));
+  params.set('limit', String(Math.min(Math.max(Math.trunc(q.limit ?? 30), 1), 100)));
+  return hkSmGet<HkSmSeatsResponse>(`/smart-money/seats?${params.toString()}`);
+}
+
+export function getHkSmConsensus(limit = 50): Promise<HkSmConsensusResponse> {
+  const clamped = Math.min(Math.max(Math.trunc(limit), 5), 200);
+  return hkSmGet<HkSmConsensusResponse>(`/smart-money/consensus?limit=${clamped}`);
+}
+
+export function getHkSmStock(symbol: string, days = 60): Promise<HkSmStockResponse> {
+  const clamped = Math.min(Math.max(Math.trunc(days), 20), 120);
+  return hkSmGet<HkSmStockResponse>(
+    `/smart-money/stock/${encodeURIComponent(symbol)}?days=${clamped}`,
+  );
+}
+
+export function getHkSmEvidence(): Promise<HkSmEvidenceResponse> {
+  return hkSmGet<HkSmEvidenceResponse>('/smart-money/evidence');
+}

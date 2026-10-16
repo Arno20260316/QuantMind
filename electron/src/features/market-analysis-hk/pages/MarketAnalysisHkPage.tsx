@@ -7,7 +7,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Sparkles, Clock, RefreshCw, Zap, Activity, Waves, Building2, Coins, Layers, Briefcase, Target,
+  Sparkles, Clock, RefreshCw, Zap, Activity, Waves, Building2, Coins, Layers, Briefcase, Target, Radar,
 } from 'lucide-react';
 import { message } from 'antd';
 import { HkIndexCards } from '../components/HkIndexCards';
@@ -24,6 +24,7 @@ import { HkRotationPanel } from '../components/HkRotationPanel';
 import { HkSectorValuationPanel } from '../components/HkSectorValuationPanel';
 import { HkAhPanel } from '../components/HkAhPanel';
 import { HkInstitutionalPanel } from '../components/HkInstitutionalPanel';
+import { HkSmartMoneyPanel } from '../components/smart-money/HkSmartMoneyPanel';
 import { StockTerminalSearchBox } from '../../market-analysis-shared/components/StockTerminalSearchBox';
 import {
   StockTerminalWindow,
@@ -42,6 +43,7 @@ const NAV_TABS = [
   { id: 'valuation', label: '估值主题', icon: Coins },
   { id: 'rotation', label: '轮动 & AH', icon: Layers },
   { id: 'institutional', label: '机构持仓', icon: Briefcase },
+  { id: 'smart-money', label: '聪明钱', icon: Radar },
 ];
 
 export const MarketAnalysisHkPage: React.FC = () => {
@@ -223,6 +225,7 @@ export const MarketAnalysisHkPage: React.FC = () => {
         </div>
       )}
       {activeTab === 'institutional' && <HkInstitutionalPanel />}
+      {activeTab === 'smart-money' && <HkSmartMoneyPanel onPick={(s) => setWindowSymbol(s)} />}
 
       {/* 个股终端浮窗（全页面共用一个实例；搜索框已有独立实例，保留） */}
       <StockTerminalWindow

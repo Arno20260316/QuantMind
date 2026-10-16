@@ -45,6 +45,14 @@ QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py --dry-run   
 QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py             # 正式提交
 ```
 
+**对比训练（同因子/窗口换模型类型）**：`--model-type xgboost|catboost|lightgbm` 在命令行覆盖，job/display 名自动按 token 改写（LGB↔XGB↔CAT）；**必须同时 `--pin-versions-from <基准 run 的 config.yaml>`**——逐库目录版本与基准不一致即拒绝提交（保证三只模型吃同一份因子快照）。串行跑：一只完成再提交下一只。
+
+```bash
+QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py \
+    --model-type xgboost \
+    --pin-versions-from data/training_jobs/train_20261016083816_f668beed/config.yaml
+```
+
 脚本自带回读断言（轮询 `data/training_jobs/<run_id>/config.yaml`，默认 180s）：特征数=300、`factor_field_sources` 逐条来源一致、`label.target_horizon_days`、`factor_selection.method == ""`、版本 map 逐字一致、切分窗口逐字一致、`required_artifacts` 六件。**任何一条不过就是没交付。**
 
 ### 跨库契约（逐字认准，改载荷前先读）
@@ -70,6 +78,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/models/train
 - 注册模型落盘：`models/users/<tenant>/<user_id>/<model_id>/`（宿主路径；容器内 `/app/models/...`），8 件产物（含 `eval_report.json`/`shap_summary.csv`）。
 - 训练页（`#/model-training`）监控台：恢复进行中任务时「请求预览」显示**任务真实载荷**并带「任务载荷」标记——若显示 0 特征，先查是不是恢复了任务而草稿为空（已修复：`GET .../request` 端点 + `runRequest` prop）。
 - **回报口径**：样本外指标优先 `by_split.test / by_split.valid`，别用全窗 headline 冒充样本外（全窗虚高约 1.5×）；对异常强的段（如 test 56 天 win_rate 96%）要明说是单一行情；缺失数据一律「—」绝不为 0。
+- **横评/自查**：`python3 backend/scripts/compare_training_runs.py [--vs-archive] <run_id>...` —— 一张 markdown 表拉齐 by_split/rmse/auc/long_short/drift/逐年，`--vs-archive` 附全部历史 run 的分位排名（单看绝对值分不清「模型好」和「这行情大家都好」）。
 
 ## 铁律 / 已知坑
 

@@ -1,7 +1,11 @@
-"""提交跨库 T+5 LightGBM 训练，并对训练 config.yaml 做回读断言。
+"""提交跨库 T+5 树模型训练（lightgbm/xgboost/catboost），并对训练 config.yaml 做回读断言。
 
 唯一事实源：`data/quantdb/factor_research/screening/training_selection_300.json`
 （`backend/scripts/select_training_features.py` 的产物；`train_plan` + `features_payload`）。
+
+对比训练（同一套因子/切分换模型类型）：`--model-type xgboost`（job/display 名按
+模型 token 自动改写，LGB↔XGB↔CAT），并建议 `--pin-versions-from <基准 run 的
+config.yaml>` 钉扎逐库目录版本——版本不一致即拒绝提交，保证对比吃同一份因子快照。
 
 流程：
 1. admin 登录（口令取环境变量 QM_PASSWORD）；
@@ -20,6 +24,9 @@
 用法：
     QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py --dry-run
     QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py
+    # 对比训练：同因子/窗口换模型类型 + 钉扎库版本
+    QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py \\
+        --model-type xgboost --pin-versions-from data/training_jobs/<base_run>/config.yaml
 """
 
 from __future__ import annotations
@@ -39,6 +46,27 @@ _JOBS_DIR = _ROOT / "data/training_jobs"
 
 _MARKET = "CN"
 _CONFIG_POLL_INTERVAL_S = 5.0
+
+# 模型类型 → job/display 名 token 与模型产物文件名（train.py `_save_model` 分派）。
+_MODEL_TYPE_INFO: dict[str, dict[str, str]] = {
+    "lightgbm": {"token": "LGB", "label": "LightGBM", "file": "model.lgb"},
+    "xgboost": {"token": "XGB", "label": "XGBoost", "file": "model.xgb"},
+    "catboost": {"token": "CAT", "label": "CatBoost", "file": "model.cbm"},
+}
+
+
+def _derive_run_names(job_name: str, display_name: str, model_type: str) -> tuple[str, str]:
+    """把基准名里的模型 token 改写成目标模型；原名不含任何已知 token 时兜底追加。"""
+    info = _MODEL_TYPE_INFO[model_type]
+    for other in _MODEL_TYPE_INFO.values():
+        if other["token"] != info["token"]:
+            job_name = job_name.replace(f"_{other['token']}", f"_{info['token']}")
+            display_name = display_name.replace(other["label"], info["label"])
+    if info["token"] not in job_name:
+        job_name = f"{job_name}_{info['token']}"
+    if info["label"] not in display_name:
+        display_name = f"{display_name} {info['label']}"
+    return job_name, display_name
 
 
 def _fail(msg: str) -> None:
@@ -190,7 +218,7 @@ def _build_payload(sel: dict[str, Any], versions: dict[str, str]) -> dict[str, A
         # 而本机非 quantmind 容器合计仅 ~0.6G，收益可忽略、误伤风险实存。
         "pause_others": False,
         "required_artifacts": [
-            "model.lgb",
+            _MODEL_TYPE_INFO[str(tp["model_type"])]["file"],
             "pred.parquet",
             "pred.pkl",
             "metadata.json",
@@ -270,7 +298,8 @@ def _assert_config(
         tp["label"]["target_horizon_days"]
     ):
         fails.append(
-            f"label.target_horizon_days={label.get('target_horizon_days')!r} != 5"
+            f"label.target_horizon_days={label.get('target_horizon_days')!r} != "
+            f"{tp['label']['target_horizon_days']}"
         )
     if str(label.get("target_mode") or "") != str(tp["label"]["target_mode"]):
         fails.append(f"label.target_mode={label.get('target_mode')!r}")
@@ -280,8 +309,8 @@ def _assert_config(
             f"factor_selection.method={fsel.get('method')!r}（应为空，训练不得二次筛选）"
         )
 
-    if str(model.get("type") or "") != "lightgbm":
-        fails.append(f"model.type={model.get('type')!r}")
+    if str(model.get("type") or "") != str(tp["model_type"]):
+        fails.append(f"model.type={model.get('type')!r} != {tp['model_type']!r}")
     if int(model.get("num_boost_round") or -1) != int(tp["num_boost_round"]):
         fails.append(f"model.num_boost_round={model.get('num_boost_round')!r}")
     if int(model.get("early_stopping_rounds") or -1) != int(
@@ -311,7 +340,7 @@ def _assert_config(
         fails.append(f"data.factor_source={data.get('factor_source')!r}")
 
     want_art = {
-        "model.lgb",
+        _MODEL_TYPE_INFO[str(tp["model_type"])]["file"],
         "pred.parquet",
         "pred.pkl",
         "metadata.json",
@@ -324,6 +353,19 @@ def _assert_config(
             f"required_artifacts 缺项：{sorted(want_art - got_art)}（实得 {sorted(got_art)}）"
         )
     return fails
+
+
+def _load_pinned_versions(path: Path) -> dict[str, str]:
+    """从基准 run 的 config.yaml 读 data.factor_catalog_versions（含锚库的全量 map）。"""
+    if not path.is_file():
+        _fail(f"--pin-versions-from 路径不存在：{path}")
+    import yaml
+
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    pinned = (cfg.get("data") or {}).get("factor_catalog_versions") or {}
+    if not pinned:
+        _fail(f"{path} 未含 data.factor_catalog_versions，无法钉扎")
+    return {str(k): str(v) for k, v in pinned.items()}
 
 
 async def _poll_config(run_id: str, timeout_s: float) -> Path:
@@ -346,9 +388,43 @@ async def main() -> None:
     ap.add_argument(
         "--wait-config", type=float, default=180.0, help="config.yaml 等待秒数"
     )
+    ap.add_argument(
+        "--model-type",
+        choices=sorted(_MODEL_TYPE_INFO),
+        default=None,
+        help="覆盖 train_plan.model_type（对比训练用；job/display 名按 token 自动改写）",
+    )
+    ap.add_argument("--job-name", default="", help="覆盖任务机器名（默认按 model-type 改写）")
+    ap.add_argument(
+        "--display-name", default="", help="覆盖任务展示名（默认按 model-type 改写）"
+    )
+    ap.add_argument(
+        "--pin-versions-from",
+        type=Path,
+        default=None,
+        help="基准 run 的 config.yaml——逐库目录版本必须与其一致，否则拒绝提交（对比训练同快照）",
+    )
     args = ap.parse_args()
 
     sel = _load_selection(args.selection_json)
+    tp = sel["train_plan"]
+    model_type = str(args.model_type or tp.get("model_type") or "lightgbm")
+    if model_type not in _MODEL_TYPE_INFO:
+        _fail(f"不支持的 model_type={model_type!r}（可选：{sorted(_MODEL_TYPE_INFO)}）")
+    job_name, display_name = _derive_run_names(tp["job_name"], tp["display_name"], model_type)
+    if args.job_name:
+        job_name = args.job_name
+    if args.display_name:
+        display_name = args.display_name
+    sel = {
+        **sel,
+        "train_plan": {
+            **tp,
+            "model_type": model_type,
+            "job_name": job_name,
+            "display_name": display_name,
+        },
+    }
     tp = sel["train_plan"]
     print(f"[submit] 选型产物：{sel['path']}")
     print(
@@ -356,8 +432,8 @@ async def main() -> None:
         f"funnel.final={sel['funnel_final']}"
     )
     print(
-        f"[submit] job_name={tp['job_name']!r} model={tp['model_type']} "
-        f"horizon={tp['label']['target_horizon_days']} 窗="
+        f"[submit] job_name={tp['job_name']!r} display={tp['display_name']!r} "
+        f"model={tp['model_type']} horizon={tp['label']['target_horizon_days']} 窗="
         f"{tp['split']['train_start']}..{tp['split']['test_end']}"
     )
 
@@ -374,6 +450,22 @@ async def main() -> None:
             catalogs[lib] = await _fetch_catalog(client, token, lib)
             print(
                 f"  · {lib:22s} {catalogs[lib]['version_id']}  enabled={len(catalogs[lib]['columns'])}"
+            )
+        if args.pin_versions_from:
+            versions_now = {lib: str(cat["version_id"]) for lib, cat in catalogs.items()}
+            pinned = _load_pinned_versions(args.pin_versions_from)
+            if pinned != versions_now:
+                diffs = [
+                    f"{k}: now={versions_now.get(k)!r} pinned={pinned.get(k)!r}"
+                    for k in sorted(set(pinned) | set(versions_now))
+                    if pinned.get(k) != versions_now.get(k)
+                ]
+                _fail(
+                    "库目录版本与钉扎基准不一致（对比训练必须同一因子快照）："
+                    + "；".join(diffs)
+                )
+            print(
+                f"[submit] 库版本钉扎一致（{args.pin_versions_from}）：{len(pinned)} 库"
             )
         expected_sources = _validate_features(
             sel["features"], tp["anchor_lib"], catalogs
@@ -424,7 +516,8 @@ async def main() -> None:
                 print(f"  ✗ {f}")
             _fail(f"回读断言 {len(fails)} 条未通过")
         print(
-            f"[submit] 回读断言全部通过：{len(expected_sources)} 特征 / T+5 / method='' / "
+            f"[submit] 回读断言全部通过：{len(expected_sources)} 特征 / "
+            f"T+{tp['label']['target_horizon_days']} / method='' / "
             f"跨库来源逐条一致 / 窗口与版本钉扎一致"
         )
         print(f"[submit] run_id={run_id}，训练监控：data/training_jobs/{run_id}/")

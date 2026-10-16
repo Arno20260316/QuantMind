@@ -763,6 +763,28 @@ def _run_smart_money(date_str: str | None, force: bool) -> int:
     return 1
 
 
+def _run_hk_smart_money(date_str: str | None, force: bool) -> int:
+    """港股聪明钱产物「重跑」= 立刻按全量重算一份（同日覆盖，原子写）。
+
+    ``--date`` 不适用（评分追随库内最新交易日，不是某一天——给了会被静默忽略，
+    这里明说）；``--force`` 无特殊语义。退码透传 CLI：0 成功 / 1 构建失败
+    （不落盘）/ 2 evidence 未裁定（拒绝出分——首建须先手动跑 validate）。
+    """
+    script = os.path.join(
+        PROJECT_ROOT,
+        "backend",
+        "scripts",
+        "market_analysis",
+        "build_hk_smart_money.py",
+    )
+    cmd = [sys.executable, script, "--rebuild-days", "0"]
+    print(f"执行 {' '.join(cmd)}（输出直通）...")
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode in (0, 2):
+        return completed.returncode
+    return 1
+
+
 _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # 键 = 注册表任务键（唯一标识，禁止别名——测试防止漂移）
     "sim_eod": _run_sim_eod,
@@ -796,6 +818,8 @@ _RERUN_DISPATCH: dict[str, Callable[[str | None, bool], int]] = {
     # 资金流延续证据（重跑 = 立刻按日更形态全史再构建一份；同日覆盖，原子写）
     "flow_evidence": _run_flow_evidence,
     "smart_money": _run_smart_money,
+    # 港股聪明钱产物（重跑 = 立刻按全量重算一份；--date 不适用）
+    "hk_smart_money": _run_hk_smart_money,
     # P1 滚动重训派发：重跑 = 按配置试一轮（--force 不看 enabled/到点/本期标记；
     # 真正提交在 API 进程，同窗口重复派发被 campaign 幂等键挡住）。
     "retrain_dispatch": _run_retrain_dispatch,

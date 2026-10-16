@@ -657,6 +657,26 @@ JOBS: tuple[JobSpec, ...] = (
         "/data/market-analysis/smart_money）；重跑 = 立刻跳过采集按全量重算一份"
         "（同日覆盖原子写；--date 不适用——评分追随库内最新交易日）",
     ),
+    # 港股聪明钱产物（市场分析 · 港股聪明钱深度分析 细案 §7，2026-10-16）：与 A 股
+    # 聪明钱错峰 30 分钟（19:40/21:40），避免构建 IO 峰值叠加；构建只读本地
+    # parquet（ccass_top50/hsgt_south/daily_forward 由港股市场同步链维护，本特性
+    # 无独立采集脚本）。心跳 TTL 4 天（cron mon-fri，周末最长间隔 72h）。
+    JobSpec(
+        "hk_smart_money",
+        "港股聪明钱产物（市场分析）",
+        "celery_beat",
+        "celery",
+        "交易日 19:40 与 21:40（第二档 catch-up，幂等重跑）",
+        "HK_SMART_MONEY_ENABLED",
+        True,
+        345600,
+        "python backend/scripts/schedule_ctl.py run hk_smart_money",
+        "增量事件仓（CCASS 5 类型差分 + 南向直读）→ 逐日复合分 → latest/"
+        "consensus/trends（/data/market-analysis/hk_smart_money）；零入柱 = 真裁定"
+        "（evidence-only 空态照常发布概览）；evidence 未裁定退码 2 拒绝出分"
+        "（首建须先手动跑 validate，celery 如实转 failed）；重跑 = 立刻按全量重算"
+        "一份（同日覆盖原子写；--date 不适用——评分追随库内最新交易日）",
+    ),
 )
 
 JOBS_BY_KEY: dict[str, JobSpec] = {job.key: job for job in JOBS}

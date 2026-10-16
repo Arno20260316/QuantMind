@@ -1641,6 +1641,65 @@ def run_smart_money_build() -> dict[str, Any]:
         return {"status": "failed", "error": str(e)}
 
 
+@celery_app.task(name="engine.tasks.hk_smart_money_build")
+def run_hk_smart_money_build() -> dict[str, Any]:
+    """港股聪明钱产物（市场分析 · 港股聪明钱深度分析 细案 §7，2026-10-16）。
+
+    子进程跑 ``backend/scripts/market_analysis/build_hk_smart_money.py``：增量
+    事件仓（CCASS 5 类型差分，南向直读 hsgt_south）→ 逐日复合分 → latest/
+    consensus/trends（``datasets.product_dir()``，原子写，同日重跑覆盖）。本特性
+    无独立采集脚本——ccass_top50/hsgt_south 由港股市场同步链维护，构建只读。
+    beat 排 19:40 与 21:40 两档（与 A 股聪明钱错峰 30 分钟；第二档 catch-up，
+    脚本幂等）。
+
+    CLI 退码 0 成功 / 1 构建失败（不落盘）/ 2 evidence 未裁定（拒绝出分——首建
+    须先手动跑 hk_smart_money_validate.py）；退码≠0 如实转 failed，绝不静默
+    产出坏产物。
+    """
+    import subprocess
+    import sys
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from backend.shared.scheduler_registry import heartbeat as _sched_heartbeat
+
+    _sched_heartbeat("hk_smart_money")
+    try:
+        root = _Path(__file__).resolve().parents[4]  # 仓库根目录（含 backend/）
+        script = (
+            root / "backend" / "scripts" / "market_analysis" / "build_hk_smart_money.py"
+        )
+        cmd = [sys.executable, str(script)]  # 只读构建；默认重算最近 40 个交易日
+        started = datetime.now()
+        logger.info("[HkSmartMoney] 开始: %s", " ".join(str(c) for c in cmd))
+
+        proc = subprocess.run(
+            cmd, cwd=str(root), capture_output=True, text=True, timeout=3600
+        )
+        if proc.returncode != 0:
+            logger.error(
+                "[HkSmartMoney] 失败 code=%d stderr=%s",
+                proc.returncode,
+                proc.stderr[-4000:],
+            )
+            return {
+                "status": "failed",
+                "returncode": proc.returncode,
+                "stderr_tail": proc.stderr[-4000:],
+            }
+
+        elapsed = (datetime.now() - started).total_seconds()
+        logger.info("[HkSmartMoney] 完成 用时%.0fs\n%s", elapsed, proc.stdout[-2000:])
+        return {
+            "status": "success",
+            "elapsed_s": round(elapsed, 1),
+            "stdout_tail": proc.stdout[-1200:],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[HkSmartMoney] 失败: %s", e)
+        return {"status": "failed", "error": str(e)}
+
+
 @celery_app.task(name="engine.tasks.flow_evidence_build")
 def run_flow_evidence_build() -> dict[str, Any]:
     """资金流延续证据产物（市场分析 · 资金流全景 v2 §3/§8，2026-10-11）。

@@ -308,6 +308,22 @@ if os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true":
         "schedule": crontab(minute="10", hour="21", day_of_week="1-5"),
     }
 
+# 港股聪明钱产物（市场分析 · 港股聪明钱深度分析 细案 §7，2026-10-16）：与 A 股
+# 聪明钱错峰 30 分钟（19:40 先建、21:40 第二档 catch-up，脚本幂等，同日重跑
+# 覆盖）。构建只读本地 parquet（ccass_top50/hsgt_south 由港股市场同步链维护，
+# 无独立采集脚本）。落 QM_MARKET_SNAPSHOT_DIR 根下 market-analysis/hk_smart_money
+# （worker 容器未注入该 env 时由 datasets.product_dir 的容器兜底解析 /data），
+# API/前端读取。独立开关 HK_SMART_MONEY_ENABLED。
+if os.getenv("HK_SMART_MONEY_ENABLED", "true").lower() == "true":
+    beat_schedule["hk-smart-money-daily"] = {
+        "task": "engine.tasks.hk_smart_money_build",
+        "schedule": crontab(minute="40", hour="19", day_of_week="1-5"),
+    }
+    beat_schedule["hk-smart-money-catchup"] = {
+        "task": "engine.tasks.hk_smart_money_build",
+        "schedule": crontab(minute="40", hour="21", day_of_week="1-5"),
+    }
+
 celery_app.conf.update(
     # 序列化
     task_serializer="json",

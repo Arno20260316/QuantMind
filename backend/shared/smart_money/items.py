@@ -81,11 +81,7 @@ def build_items(
     def _label(series: pd.Series, sym: str) -> str | None:
         if series.empty or sym not in series.index:
             return None
-        v = series.get(sym)
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return None
-        s = str(v)
-        return None if s in ("nan", "NaT", "<NA>", "") else s
+        return datasets.s_or_none(series.get(sym))
 
     items: list[dict] = []
     for _, r in scores.sort_values("score", ascending=False).iterrows():

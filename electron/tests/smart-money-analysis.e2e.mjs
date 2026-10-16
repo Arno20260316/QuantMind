@@ -1,13 +1,15 @@
-/** A 股市场分析 · 聪明钱 v2（机构版）E2E —— 实机验证
+/** A 股市场分析 · 聪明钱 v2.1（一框六面）E2E —— 实机验证
  *
  * 覆盖：
- * 1) 「聪明钱」Tab 九区内容断言（概览带六卡 / 生态趋势 / 战绩追踪 / 事件研究 CAR /
- *    选股榜 / 席位榜 / 行业净买 / 营业部榜 / 验证证据台（双过闸审计））
- * 2) 交互：战绩 h10 切换、选股榜分页（下一页/上一页）、个股档案抽屉 → 个股终端浮窗、
- *    席位榜三筛（窗口/排序/类型）、营业部榜 20 日窗口、面板头历史快照日期切换
- * 3) 图表面：canvas 数量（ECharts 实渲染）
- * 4) 接口面：/smart-money/* 八端点全部 200（overview/stocks/dates/evidence/
- *    track-record/event-study/seats/branches）
+ * 1) 分面内容断言（逐面切换）：选股榜（默认）/ 战绩追踪 / 席位面 / 事件研究 /
+ *    生态趋势 / 验证口径；头部与概览带六卡常驻。
+ * 2) 懒加载闸：未切到的面零取数（track-record/event-study/evidence/branches），
+ *    切面才出对应接口 200。
+ * 3) 排版收敛：选股榜面（最长面）面板纵向占用 ≤ 1600px（用户诉求：9 屏 → 1–2 屏）。
+ * 4) 交互：战绩 h10 切换、选股榜分页（下一页/上一页）、个股档案抽屉 → 个股终端浮窗、
+ *    席位榜三筛（窗口/排序/类型）、营业部榜 20 日窗口、面板头历史快照日期切换。
+ * 5) 图表面：各面 canvas 实渲染（ECharts）。
+ * 6) 接口面：/smart-money/* 八端点全部 200。
  *
  * 依赖：本地部署（deploy_frontend.sh → quantmind-web:3080）+ 后端产物已构建。
  * 断言取向：内容关键字命中（轮询等待，不用固定 sleep 兜底硬断言）；
@@ -80,6 +82,15 @@ async function waitApi(pat, timeoutMs = 10000) {
   return false;
 }
 
+/** 切分面（标签栏 role=tab，按名点击）；切完等目标文案 */
+async function openFace(name, expectText, timeoutMs = 15000) {
+  const tab = p.locator('[role=tab]', { hasText: name }).first();
+  if (!(await tab.count())) return false;
+  await tab.click({ timeout: 4000 }).catch(() => undefined);
+  if (!expectText) return true;
+  return await waitForText((t) => t.includes(expectText), timeoutMs);
+}
+
 async function terminalOpen() {
   return await p.locator('span', { hasText: '个股终端' }).count() > 0;
 }
@@ -89,17 +100,6 @@ async function closeTerminal() {
     await btn.click({ timeout: 3000 }).catch(() => undefined);
     await p.waitForTimeout(600);
   }
-}
-
-/** 主内容区滚动（长面板；分页按钮/席位榜在折叠下方） */
-async function scrollMain(fraction) {
-  await p.evaluate((f) => {
-    const els = [...document.querySelectorAll('.custom-scrollbar, .overflow-y-auto')]
-      .sort((a, el2) => el2.scrollHeight - a.scrollHeight);
-    const el = els[0];
-    if (el && el.scrollHeight > el.clientHeight) el.scrollTop = (el.scrollHeight - el.clientHeight) * f;
-  }, fraction).catch(() => undefined);
-  await p.waitForTimeout(700);
 }
 
 // ---- 登录 ----
@@ -150,73 +150,95 @@ const tabOk = await p
   .catch(() => false);
 hard(tabOk, '聪明钱 Tab 点击');
 
-// ---- 九区内容断言（数据就位判据：证据台 + 最近案例，两处皆在长面板尾部） ----
+// ---- 默认面（选股榜）就位：概览带六卡 + 选股榜 + 六分面标签 ----
 const ready = await waitForText(
-  (t) => t.includes('验证证据台（双过闸审计）') && t.includes('最近案例（近 10 计分日'),
+  (t) => t.includes('聪明钱选股榜（池内复合分降序）') && t.includes('龙虎榜生态'),
   35000,
 );
-hard(ready, '聪明钱面板数据渲染（证据台 + 战绩最近案例）');
-await p.waitForTimeout(1500); // ECharts 渲染余量（canvas 无文本信号可等）
+hard(ready, '选股榜面数据渲染（选股榜 + 概览带）');
+await p.waitForTimeout(1200); // 渲染余量
 
-const KEYS = [
+const HEAD_KEYS = [
   '聪明钱 · 席位与资金行为统计评分',
   '研究评分卡（非模型预测、非交易指令）',
   '数据截至',
   '龙虎榜生态', '机构席位', '两融', '大宗交易', '机构调研', '北向持仓（季度）',
-  '生态趋势',
-  '战绩追踪 · 历史回溯统计（非预测）',
-  '全史（h5）', '平均超额', '计分日',
-  '最近案例（近 10 计分日 × Top-5，含进行中）',
-  '事件研究 · CAR（历史回溯统计，非预测）',
   '聪明钱选股榜（池内复合分降序）',
-  '席位榜',
-  '行业净买（20 日）',
-  '活跃席位（龙虎榜营业部）',
-  '验证证据台（双过闸审计）',
-  '复合分（入柱等权·方向对齐后）',
-  'IC 衰减',
-  '口径与新鲜度',
 ];
 f = await bodyText();
-const miss = KEYS.filter((k) => !f.includes(k));
-hard(miss.length === 0, `九区关键字 ${KEYS.length - miss.length}/${KEYS.length}${miss.length ? ' 缺：' + miss.join('｜') : ''}`);
-await p.screenshot({ path: `${OUT}/sm-panel-full.png`, fullPage: true });
+let miss = HEAD_KEYS.filter((k) => !f.includes(k));
+hard(miss.length === 0, `头部+概览带+选股榜关键字 ${HEAD_KEYS.length - miss.length}/${HEAD_KEYS.length}${miss.length ? ' 缺：' + miss.join('｜') : ''}`);
 
-// ---- 图表面：canvas 实渲染（滚动全页触发懒渲染后计数） ----
-for (const fr of [0, 0.35, 0.7, 1]) await scrollMain(fr);
-const canvasN = await p.locator('canvas').count();
-hard(canvasN >= 4, `ECharts canvas 实渲染数 ${canvasN}（≥4；预期≈8：战绩3 + CAR4 + 衰减1）`);
-await scrollMain(0);
+// 分面标签六枚
+const tabLabels = await p.locator('[role=tab]').allInnerTexts();
+const wantTabs = ['选股榜', '战绩追踪', '席位面', '事件研究', '生态趋势', '验证口径'];
+hard(
+  wantTabs.every((t) => tabLabels.some((l) => l.includes(t))),
+  `分面标签六枚：${tabLabels.map((s) => s.replace(/\s+/g, '')).join('/') || '(无)'}`,
+);
+await p.screenshot({ path: `${OUT}/sm21-face-stocks.png` });
 
-// ---- 战绩区 h10 切换（区 4 的 h10 按钮是页内第一枚） ----
-const h10btns = p.locator('button', { hasText: /^h10$/ });
-const h10n = await h10btns.count();
-if (h10n > 0) {
-  await h10btns.first().click({ timeout: 3000 }).catch(() => undefined);
+// ---- 懒加载闸：尚未切面 → 懒面零取数 ----
+const lazyBefore = ['/track-record', '/event-study', '/evidence', '/branches'].filter((ep) =>
+  apiCalls.some((c) => c.includes(ep)),
+);
+hard(lazyBefore.length === 0, `懒加载闸：未切面零取数（意外已取：${lazyBefore.join(',') || '无'}）`);
+
+// ---- 排版收敛：选股榜面（最长面）面板纵向占用 ----
+const panelH = await p.evaluate(() => {
+  const h2 = [...document.querySelectorAll('h2')].find((el) => el.textContent.includes('聪明钱'));
+  const sec = h2 ? h2.closest('section') : null;
+  return sec ? Math.round(sec.getBoundingClientRect().height) : -1;
+});
+hard(panelH > 0 && panelH <= 1600, `选股榜面纵向占用 ${panelH}px ≤ 1600px（一框六面收敛；viewport 1150px）`);
+
+// ---- 面 2：战绩追踪 ----
+console.log('\n---- 分面：战绩追踪 ----');
+hard(await openFace('战绩追踪', '战绩追踪 · 历史回溯统计'), '战绩追踪面渲染');
+// 数据到达门：FaceCard 标题先于 /track-record 数据渲染，直接采样会 0/4（首轮实测）
+await waitForText((t) => t.includes('平均超额') || t.includes('全史（h5）'), 15000);
+f = await bodyText();
+const TRACK_KEYS = ['全史（h5）', '平均超额', '计分日', '最近案例（近 10 计分日'];
+miss = TRACK_KEYS.filter((k) => !f.includes(k));
+hard(miss.length === 0 && (await waitApi('/track-record')), `战绩面关键字 ${TRACK_KEYS.length - miss.length}/${TRACK_KEYS.length} + /track-record 200${miss.length ? ' 缺：' + miss.join('｜') : ''}`);
+await p.waitForTimeout(1200);
+const canvasTrack = await p.locator('canvas').count();
+soft(canvasTrack >= 3, `战绩面 ECharts canvas ${canvasTrack}（预期 3：累计超额/评分桶/滚动IC）`);
+await p.screenshot({ path: `${OUT}/sm21-face-track.png`, fullPage: true });
+
+// 战绩 h10 切换（战绩面内唯一一组 h5/h10）
+const h10btn = p.locator('button', { hasText: /^h10$/ }).first();
+if (await h10btn.count()) {
+  const before = await bodyText();
+  await h10btn.click({ timeout: 3000 }).catch(() => undefined);
   await p.waitForTimeout(1200);
-  soft(true, `战绩 h10 切换点击（页内 h10 按钮 ${h10n} 枚，点第一枚=战绩区）`);
+  const after = await bodyText();
+  soft(after !== before || after.includes('h10'), '战绩 h10 切换点击生效');
 } else {
   soft(false, '战绩 h10 按钮未找到');
 }
 
-// ---- 席位榜三筛：类型=机构专用 / 窗口 20 日 / 排序 净买 ----
-console.log('\n---- 席位榜三筛 ----');
-const scrollSeat = await waitForText((t) => t.includes('席位榜'), 8000);
-soft(scrollSeat, '席位榜区存在（筛选前）');
+// ---- 面 3：席位面（席位榜 + 营业部榜双栏）----
+console.log('\n---- 分面：席位面 ----');
+hard(await openFace('席位面', '活跃席位（龙虎榜营业部）'), '席位面渲染（双栏：席位榜 + 营业部榜）');
+hard(await waitApi('/seats'), '席位榜 /seats 200');
+hard(await waitApi('/branches'), '营业部榜 /branches 200（懒取数触发）');
+f = await bodyText();
+soft(f.includes('席位榜') && f.includes('对照池内基线'), '席位榜基线对照文案在');
+
+// 三筛：类型=机构专用 / 窗口 20 日 / 排序 按净买
 const instChip = p.locator('button', { hasText: '机构专用' }).first();
 if (await instChip.count()) {
   await instChip.click({ timeout: 3000 }).catch(() => undefined);
-  const ok = await waitApi('seats?window=all&sort=win_rate&class=inst', 10000);
-  hard(ok, '席位筛选：类型=机构专用 → /seats class=inst 200');
+  hard(await waitApi('seats?window=all&sort=win_rate&class=inst', 10000), '席位筛选：类型=机构专用 → /seats class=inst 200');
 } else {
   hard(false, '席位类型 chip「机构专用」未找到');
 }
 const w20 = p.locator('button', { hasText: /^20 日$/ });
 const w20n = await w20.count();
 if (w20n >= 1) {
-  await w20.nth(0).click({ timeout: 3000 }).catch(() => undefined); // [0]=席位榜（营业部榜在区 7）
-  const ok = await waitApi('seats?window=20', 10000);
-  hard(ok, '席位筛选：窗口 20 日 → /seats window=20 200');
+  await w20.nth(0).click({ timeout: 3000 }).catch(() => undefined); // [0]=席位榜（营业部榜 DOM 在后）
+  hard(await waitApi('seats?window=20', 10000), '席位筛选：窗口 20 日 → /seats window=20 200');
 } else {
   hard(false, '席位窗口 chip「20 日」未找到');
 }
@@ -227,24 +249,52 @@ if (await byNet.count()) {
 } else {
   soft(false, '席位排序 chip「按净买」未找到');
 }
-// 复位（供后续截图/营业部榜判据干净）
 const resetAll = p.locator('button', { hasText: '全部类型' }).first();
 if (await resetAll.count()) await resetAll.click({ timeout: 3000 }).catch(() => undefined);
 await p.waitForTimeout(800);
-f = await bodyText();
-soft(f.includes('对照池内基线'), '席位榜基线对照文案在（h5 超额>0 占比 · 对照池内基线）');
 
-// ---- 营业部榜 20 日窗口（区 7 的第二枚「20 日」） ----
-if (w20n >= 2) {
-  await w20.nth(w20n - 1).click({ timeout: 3000 }).catch(() => undefined);
-  const ok = await waitApi('branches?window=20', 10000);
-  hard(ok, '营业部榜：窗口 20 日 → /branches window=20 200');
+// 营业部榜 20 日窗口（本面第二枚「20 日」）
+const w20n2 = await w20.count();
+if (w20n2 >= 2) {
+  await w20.nth(1).click({ timeout: 3000 }).catch(() => undefined);
+  hard(await waitApi('branches?window=20', 10000), '营业部榜：窗口 20 日 → /branches window=20 200');
 } else {
-  soft(false, `营业部榜「20 日」按钮共 ${w20n} 枚（预期 ≥2：席位榜 + 营业部榜）`);
+  soft(false, `营业部榜「20 日」按钮共 ${w20n2} 枚（预期 ≥2：席位榜 + 营业部榜）`);
 }
+await p.screenshot({ path: `${OUT}/sm21-face-seats.png` });
 
-// ---- 选股榜分页 ----
+// ---- 面 4：事件研究 ----
+console.log('\n---- 分面：事件研究 ----');
+hard(await openFace('事件研究', '事件研究 · CAR'), '事件研究面渲染');
+hard(await waitApi('/event-study'), '事件研究 /event-study 200（懒取数触发）');
+await p.waitForTimeout(1200);
+const canvasEvent = await p.locator('canvas').count();
+soft(canvasEvent >= 1, `事件研究面 ECharts canvas ${canvasEvent}（预期 ≥4：CAR 族曲线）`);
+await p.screenshot({ path: `${OUT}/sm21-face-event.png`, fullPage: true });
+
+// ---- 面 5：生态趋势 ----
+console.log('\n---- 分面：生态趋势 ----');
+hard(await openFace('生态趋势', '行业净买（20 日）'), '生态趋势面渲染（趋势图 + 行业净买）');
+await p.waitForTimeout(1200);
+const canvasEco = await p.locator('canvas').count();
+soft(canvasEco >= 3, `生态趋势面 ECharts canvas ${canvasEco}（预期 ≥5：趋势 4 + 行业柱 1）`);
+await p.screenshot({ path: `${OUT}/sm21-face-eco.png`, fullPage: true });
+
+// ---- 面 6：验证口径（证据台 + 口径与新鲜度）----
+console.log('\n---- 分面：验证口径 ----');
+hard(await openFace('验证口径', '验证证据台（双过闸审计）'), '验证口径面渲染（证据台）');
+hard(await waitApi('/evidence'), '证据台 /evidence 200（懒取数触发）');
+f = await bodyText();
+const EV_KEYS = ['复合分（入柱等权·方向对齐后）', 'IC 衰减', '口径与新鲜度'];
+miss = EV_KEYS.filter((k) => !f.includes(k));
+hard(miss.length === 0, `验证面关键字 ${EV_KEYS.length - miss.length}/${EV_KEYS.length}${miss.length ? ' 缺：' + miss.join('｜') : ''}`);
+await p.waitForTimeout(1200);
+soft((await p.locator('canvas').count()) >= 1, '验证面 ECharts canvas ≥1（IC 衰减）');
+await p.screenshot({ path: `${OUT}/sm21-face-evidence.png`, fullPage: true });
+
+// ---- 回选股榜：分页 / 抽屉 / 日期 ----
 console.log('\n---- 选股榜分页 ----');
+hard(await openFace('选股榜', '聪明钱选股榜（池内复合分降序）'), '回选股榜面渲染');
 const hasPager = await waitForText((t) => /第 \d+\/\d+ 页 · 每页 50/.test(t), 8000);
 hard(hasPager, '分页器渲染（第 x/n 页 · 每页 50）');
 const nextBtn = p.locator('button', { hasText: '下一页' }).first();
@@ -262,11 +312,9 @@ if ((await nextBtn.count()) && (await nextBtn.isEnabled().catch(() => false))) {
 } else {
   soft(true, `下一页不可用（池内 ≤50 只，数据实况）`);
 }
-await p.screenshot({ path: `${OUT}/sm-stockboard.png` });
 
 // ---- 个股档案抽屉 → 个股终端 ----
 console.log('\n---- 个股档案抽屉 ----');
-await scrollMain(0.5);
 const row = p.locator('div[title^="打开 "]').first();
 if (await row.count()) {
   const rowTitle = await row.getAttribute('title').catch(() => '');
@@ -274,7 +322,7 @@ if (await row.count()) {
   const drawerOk = await waitForText((t) => t.includes('事件时间线') && t.includes('最近龙虎榜席位构成'), 12000);
   hard(drawerOk, `选股榜行「${rowTitle || '?'}」→ 抽屉打开（事件时间线 + 席位构成）`);
   soft(await waitForText((t) => t.includes('大宗交易明细') || t.includes('北向持股占比'), 6000), '抽屉其余区（大宗明细/北向序列）');
-  await p.screenshot({ path: `${OUT}/sm-drawer.png` });
+  await p.screenshot({ path: `${OUT}/sm21-drawer.png` });
   const toTerm = p.locator('button, span', { hasText: '打开个股终端' }).first();
   if (await toTerm.count()) {
     await toTerm.click({ timeout: 3000 }).catch(() => undefined);
@@ -286,7 +334,6 @@ if (await row.count()) {
     }
     hard(opened, '抽屉「打开个股终端 ➔」→ 个股终端浮窗弹出');
     if (opened) {
-      await p.screenshot({ path: `${OUT}/sm-terminal.png` });
       const termReady = await waitForText((t) => t.includes('前复权') && !t.includes('在上方搜索框输入代码'), 15000);
       soft(termReady, '终端主体渲染 K 线区（非空态）');
     }
@@ -306,7 +353,6 @@ if (await row.count()) {
 
 // ---- 历史快照日期切换（面板头 select；选项=最新快照 + 历史日期） ----
 console.log('\n---- 历史快照日期切换 ----');
-await scrollMain(0);
 const dateSel = p.locator('select:has(option:text-is("最新快照"))').first();
 if (await dateSel.count()) {
   const nOpt = await dateSel.locator('option').count();
@@ -319,7 +365,7 @@ if (await dateSel.count()) {
     f = await bodyText();
     hard(f.includes('数据截至') && f.includes('聪明钱 · 席位与资金行为统计评分'), '历史快照下头部（数据截至）与面板完好');
     if (f.includes('（请求 ')) console.log('· 头部含回退提示（请求日期非快照日，回退最近）');
-    await p.screenshot({ path: `${OUT}/sm-date-history.png` });
+    await p.screenshot({ path: `${OUT}/sm21-date-history.png` });
     await dateSel.selectOption({ index: 0 }).catch(() => undefined);
     await p.waitForTimeout(2000);
     soft((await bodyText()).includes('数据截至'), '切回最新快照');

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -190,3 +191,68 @@ class TestEventTimeline:
         raw.mkdir()
         monkeypatch.setattr(datasets, "raw_dir", lambda: raw)
         assert datasets.event_timeline("600036.SH") == []
+
+    def test_字符串列NA不回吐(self, tmp_path, monkeypatch):
+        """可空 string dtype 列读出的 pd.NA 一律 None——生产 500 回归
+        （2026-10-16 stock/SH603668 reception_place=pd.NA →
+        PydanticSerializationError）。时间线整体须 JSON 严格可序列化。"""
+        raw = tmp_path / "smart_money"
+        raw.mkdir()
+        monkeypatch.setattr(datasets, "raw_dir", lambda: raw)
+        d1 = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        pd.DataFrame(
+            {
+                "symbol": ["600036.SH", "600036.SH"],
+                "trade_date": [d1, d1],
+                "reason": pd.array([pd.NA, "日涨幅偏离值达7%"], dtype="string"),
+                "interpretation": pd.array([None, "3家机构买入"], dtype="string"),
+                "close": [40.0, 40.0],
+                "pct_chg": [7.2, 7.2],
+                "lhb_net_buy": [1.2e8, 1.2e8],
+                "net_ratio": [0.05, 0.05],
+                "fwd_ret_1d": [1.1, 1.1],
+                "fwd_ret_2d": [None, None],
+                "fwd_ret_5d": [3.1, 3.1],
+                "fwd_ret_10d": [8.8, 8.8],
+            }
+        ).to_parquet(raw / "lhb_detail.parquet")
+        pd.DataFrame(
+            {
+                "symbol": ["600036.SH"],
+                "trade_date": [d1],
+                "inst_count": [25],
+                "reception_type": pd.array([pd.NA], dtype="string"),
+                "reception_place": pd.array([pd.NA], dtype="string"),
+            }
+        ).to_parquet(raw / "survey.parquet")
+
+        ev = datasets.event_timeline("600036.SH", limit=10)
+
+        survey = next(e for e in ev if e["type"] == "survey")
+        assert survey["reception_type"] is None
+        assert survey["reception_place"] is None
+        na = next(e for e in ev if e["type"] == "lhb" and e["reason"] is None)
+        ok = next(e for e in ev if e["type"] == "lhb" and e["reason"] is not None)
+        assert na["interpretation"] is None
+        assert ok["reason"] == "日涨幅偏离值达7%"
+        assert ok["interpretation"] == "3家机构买入"
+        # 严格 JSON（allow_nan=False 同浏览器解析严格度）：NaN/pd.NA 都不得存活
+        json.dumps(ev, allow_nan=False)
+
+
+class TestStringSanitizer:
+    def test_pandas空值一律None(self):
+        assert datasets.s_or_none(pd.NA) is None
+        assert datasets.s_or_none(float("nan")) is None
+        assert datasets.s_or_none(pd.NaT) is None
+        assert datasets.s_or_none(None) is None
+        assert datasets.s_or_none("   ") is None
+        # 已字符串化的 NA 拼写（历史 str() 转换的遗留污染）
+        assert datasets.s_or_none("nan") is None
+        assert datasets.s_or_none("<NA>") is None
+        assert datasets.s_or_none("NaT") is None
+
+    def test_保留真实文本并去空白(self):
+        assert datasets.s_or_none(" 机构专用 ") == "机构专用"
+        assert datasets.s_or_none("电话会议") == "电话会议"
+        assert datasets.s_or_none("0") == "0"

@@ -382,6 +382,44 @@ def test_stock未上榜仍200空档案(client, env):
     assert body["study_ref"]["families"] == []
 
 
+def test_stock字符串列NA不回吐500(client, env):
+    """生产 500 回归（2026-10-16 stock/SH603668）：调研/龙虎榜表可空字符串列
+    读出的 pd.NA 直进时间线 JSON → PydanticSerializationError。string dtype
+    列落盘读回即 pd.NA，响应须落 null 且整体 200。"""
+    _write_latest(env)
+    # 覆写龙虎榜表：reason/interpretation 为 string dtype 空值（读回即 pd.NA）
+    pd.DataFrame(
+        {
+            "trade_date": [TODAY - pd.Timedelta(days=2)],
+            "symbol": ["600036.SH"],
+            "reason": pd.array([pd.NA], dtype="string"),
+            "interpretation": pd.array([pd.NA], dtype="string"),
+            "lhb_net_buy": [1e7],
+            "net_ratio": [0.03],
+        }
+    ).to_parquet(env.raw / "lhb_detail.parquet")
+    pd.DataFrame(
+        {
+            "trade_date": [TODAY - pd.Timedelta(days=2), TODAY - pd.Timedelta(days=1)],
+            "symbol": ["600036.SH", "600036.SH"],
+            "inst_count": [25, 3],
+            "reception_type": pd.array([pd.NA, "电话会议"], dtype="string"),
+            "reception_place": pd.array([pd.NA, None], dtype="string"),
+        }
+    ).to_parquet(env.raw / "survey.parquet")
+
+    r = client.get(f"{BASE}/stock/SH600036")
+
+    assert r.status_code == 200, r.text
+    timeline = r.json()["timeline"]
+    lhb = next(e for e in timeline if e["type"] == "lhb")
+    assert lhb["reason"] is None and lhb["interpretation"] is None
+    survey_na = next(e for e in timeline if e["type"] == "survey" and e["inst_count"] == 25)
+    assert survey_na["reception_type"] is None and survey_na["reception_place"] is None
+    survey_ok = next(e for e in timeline if e["type"] == "survey" and e["inst_count"] == 3)
+    assert survey_ok["reception_type"] == "电话会议" and survey_ok["reception_place"] is None
+
+
 def test_stock席位构成与大宗明细(client, env):
     _write_latest(env)
     _write_stock_raw(env)  # 提供 lhb 时间线（study_ref 引族）

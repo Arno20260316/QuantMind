@@ -432,8 +432,8 @@ def event_timeline(symbol: str, limit: int = 20, lookback_days: int = 365) -> li
                 "type": "lhb",
                 "label": "龙虎榜",
                 "date": r["trade_date"].strftime("%Y-%m-%d"),
-                "reason": r.get("reason"),
-                "interpretation": r.get("interpretation"),
+                "reason": s_or_none(r.get("reason")),
+                "interpretation": s_or_none(r.get("interpretation")),
                 "close": _f(r.get("close")),
                 "pct_chg": _f(r.get("pct_chg")),
                 "net_buy": _f(r.get("lhb_net_buy")),
@@ -450,7 +450,7 @@ def event_timeline(symbol: str, limit: int = 20, lookback_days: int = 365) -> li
                 "type": "inst",
                 "label": "机构席位",
                 "date": r["trade_date"].strftime("%Y-%m-%d"),
-                "reason": r.get("reason"),
+                "reason": s_or_none(r.get("reason")),
                 "inst_buy": _f(r.get("inst_buy")),
                 "inst_sell": _f(r.get("inst_sell")),
                 "inst_net_buy": _f(r.get("inst_net_buy")),
@@ -480,8 +480,8 @@ def event_timeline(symbol: str, limit: int = 20, lookback_days: int = 365) -> li
                 "label": "机构调研",
                 "date": r["trade_date"].strftime("%Y-%m-%d"),
                 "inst_count": _f(r.get("inst_count")),
-                "reception_type": r.get("reception_type"),
-                "reception_place": r.get("reception_place"),
+                "reception_type": s_or_none(r.get("reception_type")),
+                "reception_place": s_or_none(r.get("reception_place")),
             }
         )
     events.sort(key=lambda e: e["date"], reverse=True)
@@ -497,3 +497,23 @@ def _f(v: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if pd.notna(f) else None
+
+
+def s_or_none(v: Any) -> str | None:
+    """pandas 标量 → JSON 安全 str|None（字符串事实列的唯一过闸口）。
+
+    parquet 可空字符串列（pandas ``string`` dtype）读出的 pd.NA 直进 JSON 会炸
+    响应序列化（PydanticSerializationError 500，2026-10-16 stock/SH603668
+    reception_place 实案）；np.nan 走 float 路径会落成非法 JSON ``NaN``、
+    经 str() 又会落成 ``"nan"`` 显示。已字符串化的 NA 拼写一并清零。
+    注意：**不能**用 ``v or ""`` 兜底——pd.NA 布尔求值抛 TypeError。
+    """
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        return None
+    s = str(v).strip()
+    return None if s in ("", "nan", "NaN", "NaT", "<NA>") else s

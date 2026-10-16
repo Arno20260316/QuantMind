@@ -322,12 +322,12 @@ def _seat_breakdown(suffix: str) -> dict | None:
     day = day.sort_values(["side", "net_amount"], ascending=[True, False])
     rows: list[dict] = []
     for _, r in day.iterrows():
-        seat_name = None if pd.isna(r.get("seat_name")) else str(r.get("seat_name"))
+        seat_name = datasets.s_or_none(r.get("seat_name"))
         cls = analytics.classify_seat(seat_name)
         rows.append(
             {
                 "seat_name": seat_name,
-                "side": str(r.get("side") or ""),
+                "side": datasets.s_or_none(r.get("side")) or "",
                 "class": cls,
                 "class_label": analytics.SEAT_CLASS_LABELS.get(cls, cls),
                 "buy_amount": n_or_none(r.get("buy_amount")),
@@ -352,8 +352,8 @@ def _dzjy_recent(suffix: str) -> list[dict]:
     )
     rows: list[dict] = []
     for _, r in sub.iterrows():
-        buyer = str(r.get("seat_buyer") or "")
-        seller = str(r.get("seat_seller") or "")
+        buyer = datasets.s_or_none(r.get("seat_buyer")) or ""
+        seller = datasets.s_or_none(r.get("seat_seller")) or ""
         rows.append(
             {
                 "date": pd.Timestamp(r["trade_date"]).strftime("%Y-%m-%d"),

@@ -21,6 +21,12 @@ export interface ModelTrainingRunStatus {
   isCompleted: boolean;
 }
 
+/** 任务提交时的请求载荷（与轮询端点分开：载荷含全部特征，体积大，只拉一次） */
+export interface ModelTrainingRunRequest {
+  runId: string;
+  request: Record<string, unknown>;
+}
+
 export interface UserModelRecord {
   tenant_id: string;
   user_id: string;
@@ -643,6 +649,19 @@ class ModelTrainingService {
   async getTrainingRun(runId: string): Promise<ModelTrainingRunStatus> {
     const resp = await this.client.get<ModelTrainingRunStatus>(`/models/training-runs/${runId}`);
     return resp.data;
+  }
+
+  /**
+   * 拉取该任务**提交时**的请求载荷，供恢复监控已有任务时展示真实的请求预览。
+   * 拉取失败（任务不存在/无权）返回 null，由页面回落到页内草稿预览。
+   */
+  async getTrainingRunRequest(runId: string): Promise<ModelTrainingRunRequest | null> {
+    try {
+      const resp = await this.client.get<ModelTrainingRunRequest>(`/models/training-runs/${runId}/request`);
+      return resp.data ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async cancelTrainingRun(runId: string): Promise<{ runId: string; status: string; cancelled: boolean }> {

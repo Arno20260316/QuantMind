@@ -1302,6 +1302,32 @@ async def get_training_run_for_owner(run_id: str, current_user: dict[str, Any]) 
     return await _build_training_run_detail(record)
 
 
+async def get_training_run_request_for_owner(
+    run_id: str, current_user: dict[str, Any]
+) -> dict[str, Any]:
+    """返回该任务**提交时的请求载荷**（钉扎后），供前端「请求预览」在恢复态显示真实提交内容。
+
+    与轮询端点分开：载荷含全部特征与 ``factor_field_sources``（本任务实测 ~24KB），
+    放进 3s 轮询会把带宽与渲染开销按轮次放大；此端点由前端在恢复时一次性拉取。
+    """
+    tenant_id = str(current_user.get("tenant_id") or "default")
+    user_id = str(current_user.get("user_id") or current_user.get("sub") or "unknown")
+
+    async with get_session(read_only=True) as session:
+        stmt = select(TrainingJobRecord).where(
+            TrainingJobRecord.id == run_id,
+            TrainingJobRecord.tenant_id == tenant_id,
+            TrainingJobRecord.user_id == user_id,
+        )
+        record = (await session.execute(stmt)).scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(status_code=404, detail="Training run not found")
+
+    request = record.request_payload if isinstance(record.request_payload, dict) else {}
+    return {"runId": record.id, "request": request}
+
+
 async def get_training_run_for_admin(run_id: str) -> dict[str, Any]:
     """后台训练任务详情：管理员看全部用户（列表已是全量，详情不再按 owner 过滤）。
 

@@ -244,6 +244,9 @@ export const ModelTrainingPage: React.FC = () => {
   const [result, setResult] = useState<TrainingResult | null>(null);
   const [resultError, setResultError] = useState<string>('');
   const [activeRunId, setActiveRunId] = useState<string>('');
+  // 恢复监控已有任务时拉取的「任务提交载荷」：监控台请求预览以它为准，
+  // 页内草稿在切页/新会话后可能为空，拿草稿当预览会出现「0 特征」与任务不符。
+  const [activeRunRequest, setActiveRunRequest] = useState<Record<string, unknown> | null>(null);
   const [settingDefaultModel, setSettingDefaultModel] = useState(false);
   const [draftSavedAt, setDraftSavedAt] = useState<string>('');
   const [trainingNodes, setTrainingNodes] = useState<any[]>([]);
@@ -685,6 +688,8 @@ export const ModelTrainingPage: React.FC = () => {
       return;
     }
     clearTimers();
+    // 本会话新提交的任务：请求预览回到页内草稿（与刚提交的载荷一致）
+    setActiveRunRequest(null);
     setResultError('');
     setResult(null);
     setTrainingStatus('running');
@@ -755,6 +760,7 @@ export const ModelTrainingPage: React.FC = () => {
         setExecutionStage('已取消');
         setBackendRunStatus('');
         setActiveRunId('');
+        setActiveRunRequest(null);
         message.info('训练已取消');
         return;
       }
@@ -767,6 +773,7 @@ export const ModelTrainingPage: React.FC = () => {
           setTrainingStatus('draft');
           setExecutionStage('待配置');
           setBackendRunStatus('');
+          setActiveRunRequest(null);
         } else {
           const parsed = parseTrainingResult(requestPreview, runId, run.result);
           if (parsed) {
@@ -779,6 +786,7 @@ export const ModelTrainingPage: React.FC = () => {
           } else {
             setResultError('结果解析失败');
             setTrainingStatus('draft');
+            setActiveRunRequest(null);
           }
         }
       }
@@ -805,6 +813,11 @@ export const ModelTrainingPage: React.FC = () => {
       setExecutionStage('训练进行中（已从上次会话恢复）');
       setCurrentStep(3);
       setActiveRunId(run.runId);
+      // 拉取该任务提交时的真实载荷：监控台的请求预览/配置核对以它为准，
+      // 不再拿（可能为空的）页内草稿冒充运行中任务的配置。
+      const detail = await modelTrainingService.getTrainingRunRequest(run.runId);
+      if (!active) return;
+      setActiveRunRequest(detail?.request ?? null);
       startPolling(run.runId);
     })();
     return () => {
@@ -827,6 +840,7 @@ export const ModelTrainingPage: React.FC = () => {
     setTrainingStatus('draft');
     setResult(null);
     setResultError('');
+    setActiveRunRequest(null);
   };
 
   const handleCancelTraining = () => {
@@ -846,6 +860,7 @@ export const ModelTrainingPage: React.FC = () => {
           setExecutionStage('已取消');
           setBackendRunStatus('');
           setActiveRunId('');
+          setActiveRunRequest(null);
           message.success('训练已取消');
         } catch (err: any) {
           message.error(`取消失败: ${err.message}`);
@@ -874,6 +889,7 @@ export const ModelTrainingPage: React.FC = () => {
     setTrainingStatus('draft');
     setResult(null);
     setCurrentStep(0);
+    setActiveRunRequest(null);
     localStorage.removeItem(STORAGE_KEY);
     message.info('配置已重置');
   };
@@ -1309,7 +1325,7 @@ export const ModelTrainingPage: React.FC = () => {
                     )}
                     {currentStep === 1 && <TrainingTargetConfig target={target} timePeriods={timePeriods} onTargetChange={(t) => dispatch({ type: 'SET_TARGET', payload: t })} onTimeChange={(k, v) => dispatch({ type: 'SET_TIME', key: k, value: v })} dataCoverage={dataCoverage} factorFilter={factorFilter} onFactorFilterChange={setFactorFilter} />}
                     {currentStep === 2 && <ParameterConfig params={params} context={context} onParamsChange={(p) => dispatch({ type: 'SET_PARAMS', payload: p })} onContextChange={(c) => dispatch({ type: 'SET_CONTEXT', payload: c })} displayName={displayName} onDisplayNameChange={(n, m) => dispatch({ type: 'SET_DISPLAY_NAME', payload: { name: n, mode: m } })} autoDisplayName={autoDisplayName} market={trainingMarket} target={target} onTargetChange={(t) => dispatch({ type: 'SET_TARGET', payload: t })} wfa={wfaConfig} onWfaChange={(w) => dispatch({ type: 'SET_WFA', payload: w })} />}
-                    {currentStep === 3 && <TrainingConsole trainingStatus={trainingStatus} executionStage={executionStage} progress={progress} logs={logs} backendRunStatus={backendRunStatus} result={result} requestPreview={requestPreview} totalDays={totalDays} trainDays={trainDays} valDays={valDays} testDays={testDays} target={target} factorFilter={factorFilter} onGoToResult={() => setCurrentStep(4)} />}
+                    {currentStep === 3 && <TrainingConsole trainingStatus={trainingStatus} executionStage={executionStage} progress={progress} logs={logs} backendRunStatus={backendRunStatus} result={result} requestPreview={requestPreview} runRequest={activeRunRequest} totalDays={totalDays} trainDays={trainDays} valDays={valDays} testDays={testDays} target={target} factorFilter={factorFilter} onGoToResult={() => setCurrentStep(4)} />}
                     {currentStep === 4 && <TrainingResultView result={result} resultError={resultError} settingDefaultModel={settingDefaultModel} onSetDefaultModel={handleSetDefaultModel} onExportConfig={handleExportConfig} trainingStatus={trainingStatus} />}
                   </motion.div>
                 </AnimatePresence>

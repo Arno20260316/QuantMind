@@ -1491,6 +1491,70 @@ export const buildTrainingRequest = (
   };
 };
 
+/** 训练任务「已提交载荷」的展示摘要（后端 /training-runs/{id}/request 返回）。 */
+export interface RunRequestSummary {
+  displayName: string;
+  featureCount: number;
+  featureKeys: string[];
+  modelTypes: string[];
+  ensembleMethod: string;
+  market: string;
+  benchmark: string;
+  poolLabel: string;
+  trainStart: string;
+  testEnd: string;
+  /** null = 载荷未带 factor_selection，无法判断是否启用筛选 */
+  filterEnabled: boolean | null;
+  filterNTop: number | null;
+  filterIcThreshold: number | null;
+}
+
+/**
+ * 把「已提交载荷」整理成监控台可直接展示的摘要。
+ * 恢复监控一个已有任务时，「请求预览」必须以该任务**提交时**的载荷为准——
+ * 本页表单草稿可能已被清空或改成了别的选择，显示草稿会与真实训练内容不符
+ * （典型症状：任务实际 300 特征，预览却显示 0）。
+ */
+export const summarizeRunRequest = (
+  request: Record<string, unknown> | null | undefined,
+): RunRequestSummary | null => {
+  if (!request || typeof request !== 'object') return null;
+  const rawFeatures = Array.isArray(request.features) ? request.features : [];
+  const featureKeys = Array.from(new Set(
+    rawFeatures
+      .map((item) => String(item).trim())
+      .filter(Boolean)
+      // 跨库条目形如 "库:列"，展示口径取输出列名
+      .map((key) => { const i = key.indexOf(':'); return i >= 0 ? key.slice(i + 1) : key; }),
+  ));
+  const modelType = String(request.model_type || '').trim();
+  const modelTypesArr = Array.isArray(request.model_types)
+    ? request.model_types.map((m) => String(m)).filter(Boolean)
+    : [];
+  const context = request.context && typeof request.context === 'object'
+    ? (request.context as Record<string, unknown>) : {};
+  const factorSelection = request.factor_selection && typeof request.factor_selection === 'object'
+    ? (request.factor_selection as Record<string, unknown>) : null;
+  const readNum = (v: unknown): number | null => (
+    typeof v === 'number' && Number.isFinite(v) ? v : null
+  );
+  return {
+    displayName: String(request.display_name || request.job_name || '').trim(),
+    featureCount: featureKeys.length,
+    featureKeys,
+    modelTypes: modelTypesArr.length > 1 ? modelTypesArr : (modelType ? [modelType] : []),
+    ensembleMethod: String(request.ensemble || 'none'),
+    market: String(context.market || '').trim(),
+    benchmark: String(context.benchmark || '').trim(),
+    poolLabel: String(request.pool_id || '').trim() || '全市场',
+    trainStart: String(request.train_start || '').trim(),
+    testEnd: String(request.test_end || '').trim(),
+    filterEnabled: factorSelection ? String(factorSelection.method || '') !== '' : null,
+    filterNTop: factorSelection ? readNum(factorSelection.n_top) : null,
+    filterIcThreshold: factorSelection ? readNum(factorSelection.ic_threshold) : null,
+  };
+};
+
 export interface TrainingFactorFilterConfig {
   enabled: boolean;
   nTop: number;

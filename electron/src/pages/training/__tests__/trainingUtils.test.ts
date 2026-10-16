@@ -19,6 +19,7 @@ import {
   DEFAULT_TARGET,
   DEFAULT_TIME_PERIODS,
   resolveEvalIcHeadline,
+  summarizeRunRequest,
   type EvalReport,
 } from '../trainingUtils';
 
@@ -156,5 +157,80 @@ describe('集合训练自动命名 buildAutoDisplayName', () => {
     const name = buildAutoDisplayName(dayjs('2026-10-09'), { mode: 'return', horizonDays: 5 }, 48, undefined, 'CN', 'lightgbm');
 
     expect(name).toBe('LGB_09_T5_Alpha48_Base_CN');
+  });
+});
+
+describe('任务载荷摘要 summarizeRunRequest', () => {
+  /**
+   * 监控台「请求预览」必须显示**任务提交时的载荷**（跨库任务实测 300 特征），
+   * 而不是页内草稿——草稿在切页/新会话后可能为空，曾把运行中任务显示成 0 特征。
+   */
+  it('跨库载荷按输出列名去重计数：库:列 与裸列名视为同一列', () => {
+    const summary = summarizeRunRequest({
+      features: ['l2_factors:amt_20', 'amt_20', 'style_idio_vol_20'],
+    });
+
+    expect(summary?.featureCount).toBe(2);
+    expect(summary?.featureKeys).toEqual(['amt_20', 'style_idio_vol_20']);
+  });
+
+  it('T+5 跨库任务载荷：展示字段逐项取自提交内容', () => {
+    const summary = summarizeRunRequest({
+      job_name: 'T5_Cross300_LGB_20261016',
+      display_name: 'T+5 跨库300因子 LightGBM',
+      features: ['concept_exposure_top1', 'l2_factors:amt_20'],
+      model_type: 'lightgbm',
+      ensemble: 'none',
+      context: { market: 'CN', benchmark: 'SH000300' },
+      factor_selection: { method: '', n_top: 300, ic_threshold: 0.01 },
+      train_start: '2022-10-17T00:00:00+08:00',
+      test_end: '2026-09-10T00:00:00+08:00',
+    });
+
+    expect(summary?.displayName).toBe('T+5 跨库300因子 LightGBM');
+    expect(summary?.featureCount).toBe(2);
+    expect(summary?.modelTypes).toEqual(['lightgbm']);
+    expect(summary?.ensembleMethod).toBe('none');
+    expect(summary?.market).toBe('CN');
+    expect(summary?.benchmark).toBe('SH000300');
+    expect(summary?.poolLabel).toBe('全市场');
+    expect(summary?.trainStart).toBe('2022-10-17T00:00:00+08:00');
+    expect(summary?.testEnd).toBe('2026-09-10T00:00:00+08:00');
+  });
+
+  it('method 为空串 = 训练不做特征筛选；有 method 才视为启用', () => {
+    const disabled = summarizeRunRequest({
+      features: ['a'],
+      factor_selection: { method: '', n_top: 300, ic_threshold: 0.01 },
+    });
+    const enabled = summarizeRunRequest({
+      features: ['a'],
+      factor_selection: { method: 'ic_icir', n_top: 80, ic_threshold: 0.01 },
+    });
+
+    expect(disabled?.filterEnabled).toBe(false);
+    expect(disabled?.filterNTop).toBe(300);
+    expect(enabled?.filterEnabled).toBe(true);
+    expect(enabled?.filterNTop).toBe(80);
+    expect(enabled?.filterIcThreshold).toBe(0.01);
+  });
+
+  it('factor_selection 缺失时筛选状态为「未知」（null），不冒充已关闭', () => {
+    const summary = summarizeRunRequest({ features: ['a'] });
+
+    expect(summary?.filterEnabled).toBeNull();
+    expect(summary?.filterNTop).toBeNull();
+  });
+
+  it('多模型载荷优先用 model_types；空载荷返回 null 由调用方回落草稿', () => {
+    const multi = summarizeRunRequest({
+      features: ['a'],
+      model_type: 'lightgbm',
+      model_types: ['lightgbm', 'xgboost'],
+    });
+
+    expect(multi?.modelTypes).toEqual(['lightgbm', 'xgboost']);
+    expect(summarizeRunRequest(null)).toBeNull();
+    expect(summarizeRunRequest(undefined)).toBeNull();
   });
 });

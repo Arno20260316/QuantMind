@@ -1,16 +1,18 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import dayjs from 'dayjs';
 import { Card, Divider, Alert, Progress, Tabs, Empty, Typography, Button, Tag, message, Tooltip } from 'antd';
 import { Play, FileText, LayoutGrid, Copy, Terminal, CheckCircle2, Layers, Calendar, Target, Clock, ArrowDown } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useNavigate } from 'react-router-dom';
 import { getMarketConfig } from '../../config/marketConfig';
+import type { AppMarket } from '../../store/slices/uiSlice';
 import {
   TrainingStatus,
   TrainingResult,
   TrainingRequestPayload,
   TrainingFactorFilterConfig,
   DEFAULT_FACTOR_FILTER,
+  summarizeRunRequest,
 } from './trainingUtils';
 
 interface TrainingConsoleProps {
@@ -21,6 +23,12 @@ interface TrainingConsoleProps {
   backendRunStatus: string;
   result: TrainingResult | null;
   requestPreview: TrainingRequestPayload;
+  /**
+   * 监控的任务**提交时**的载荷（恢复已有任务时由页面拉取）。
+   * 一旦提供，「请求预览」与配置核对以它为准——本页草稿可能为空或已改选，
+   * 显示草稿会与真实训练内容不符（症状：任务实际几百个特征，预览却显示 0）。
+   */
+  runRequest?: Record<string, unknown> | null;
   totalDays: number;
   trainDays: number;
   valDays: number;
@@ -78,6 +86,7 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
   backendRunStatus,
   result,
   requestPreview,
+  runRequest,
   totalDays,
   trainDays,
   valDays,
@@ -90,6 +99,47 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<string>('request');
   const logsContainerRef = useRef<HTMLDivElement>(null);
+
+  // 展示视图：监控已有任务时以任务提交载荷（runRequest）为准，
+  // 否则回落到页内草稿（requestPreview）——避免草稿为空时预览显示 0 特征。
+  const consoleView = useMemo(() => {
+    const runSummary = summarizeRunRequest(runRequest);
+    if (runSummary) {
+      return {
+        isRunPayload: true,
+        displayName: runSummary.displayName || '未命名任务',
+        modelTypes: runSummary.modelTypes,
+        ensembleMethod: runSummary.ensembleMethod,
+        featureCount: runSummary.featureCount,
+        // 载荷里的 market 是任意字符串；getMarketConfig 对未收录市场回落 CN，
+        // 这里只做类型收窄（与 getMarketSessions 同口径）。
+        benchmark: runSummary.benchmark
+          || getMarketConfig((runSummary.market || 'CN').toUpperCase() as AppMarket).benchmark,
+        poolLabel: runSummary.poolLabel,
+        filterEnabled: runSummary.filterEnabled ?? DEFAULT_FACTOR_FILTER.enabled,
+        filterNTop: runSummary.filterNTop ?? DEFAULT_FACTOR_FILTER.nTop,
+        filterIcThreshold: runSummary.filterIcThreshold ?? DEFAULT_FACTOR_FILTER.icThreshold,
+        trainStart: runSummary.trainStart,
+        testEnd: runSummary.testEnd,
+        payloadJson: JSON.stringify(runRequest, null, 2),
+      };
+    }
+    return {
+      isRunPayload: false,
+      displayName: requestPreview.displayName || '未命名任务',
+      modelTypes: requestPreview.params?.model_types || (requestPreview.params?.model_type ? [requestPreview.params.model_type] : []),
+      ensembleMethod: requestPreview.params?.ensemble_method || '',
+      featureCount: requestPreview.selectedFeatures?.length || 0,
+      benchmark: requestPreview.context?.benchmark || getMarketConfig(requestPreview.context?.market || 'CN').benchmark,
+      poolLabel: requestPreview.pool_id || '全市场',
+      filterEnabled: factorFilter?.enabled ?? DEFAULT_FACTOR_FILTER.enabled,
+      filterNTop: factorFilter?.nTop ?? DEFAULT_FACTOR_FILTER.nTop,
+      filterIcThreshold: factorFilter?.icThreshold ?? DEFAULT_FACTOR_FILTER.icThreshold,
+      trainStart: requestPreview.timePeriods?.train?.[0],
+      testEnd: requestPreview.timePeriods?.test?.[1],
+      payloadJson: JSON.stringify(requestPreview, null, 2),
+    };
+  }, [runRequest, requestPreview, factorFilter]);
 
   // 训练开始后自动切换到日志 Tab
   useEffect(() => {
@@ -107,7 +157,7 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
 
   const handleCopyJson = async () => {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(requestPreview, null, 2));
+      await navigator.clipboard.writeText(consoleView.payloadJson);
       message.success('请求配置 JSON 已复制到剪贴板');
     } catch {
       message.error('复制失败');
@@ -136,7 +186,7 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
     }
   };
 
-  const modelTypes = requestPreview.params?.model_types || (requestPreview.params?.model_type ? [requestPreview.params.model_type] : []);
+  const modelTypes = consoleView.modelTypes;
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
@@ -246,7 +296,12 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                   <CheckCircle2 size={14} className="text-emerald-500" />
                   <span>任务配置核对</span>
                 </div>
-                <span className="text-[11px] font-normal text-slate-400">{requestPreview.displayName || '未命名任务'}</span>
+                <span className="flex items-center gap-1.5">
+                  {consoleView.isRunPayload && (
+                    <Tag color="geekblue" className="!mr-0 rounded-full text-[10px] border-none">任务载荷</Tag>
+                  )}
+                  <span className="text-[11px] font-normal text-slate-400">{consoleView.displayName}</span>
+                </span>
               </div>
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="rounded-xl bg-slate-50 p-2.5 border border-slate-100">
@@ -261,9 +316,9 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                     ) : (
                       <span className="text-slate-500 font-mono text-[11px]">未选择模型</span>
                     )}
-                    {requestPreview.params?.ensemble_method && requestPreview.params.ensemble_method !== 'none' && (
+                    {consoleView.ensembleMethod && consoleView.ensembleMethod !== 'none' && (
                       <Tag color="purple" className="!mr-0 font-mono text-[10px]">
-                        {requestPreview.params.ensemble_method}
+                        {consoleView.ensembleMethod}
                       </Tag>
                     )}
                   </div>
@@ -271,14 +326,14 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                 <div className="rounded-xl bg-slate-50 p-2.5 border border-slate-100">
                   <div className="text-[10px] text-slate-400 font-semibold mb-1">特征与基准</div>
                   <div className="text-slate-700 font-medium truncate">
-                    {requestPreview.selectedFeatures?.length || 0} 个因子 · {requestPreview.context?.benchmark || getMarketConfig(requestPreview.context?.market || 'CN').benchmark}
+                    {consoleView.featureCount} 个因子 · {consoleView.benchmark}
                   </div>
-                  <div className="mt-1 text-[11px] text-slate-600 truncate" title={requestPreview.pool_id || '全市场'}>
-                    股票池：{requestPreview.pool_id || '全市场'}
+                  <div className="mt-1 text-[11px] text-slate-600 truncate" title={consoleView.poolLabel}>
+                    股票池：{consoleView.poolLabel}
                   </div>
-                  {(factorFilter?.enabled ?? DEFAULT_FACTOR_FILTER.enabled) ? (
+                  {consoleView.filterEnabled ? (
                     <div className="mt-1 text-[10px] text-amber-600">
-                      将按 IC/ICIR 筛选（|IC|≥{factorFilter?.icThreshold ?? DEFAULT_FACTOR_FILTER.icThreshold} · top-{factorFilter?.nTop ?? DEFAULT_FACTOR_FILTER.nTop}）
+                      将按 IC/ICIR 筛选（|IC|≥{consoleView.filterIcThreshold} · top-{consoleView.filterNTop}）
                     </div>
                   ) : (
                     <div className="mt-1 text-[10px] text-emerald-600">未启用筛选，全部特征将直接入模</div>
@@ -287,7 +342,7 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                 <div className="rounded-xl bg-slate-50 p-2.5 border border-slate-100 col-span-2">
                   <div className="text-[10px] text-slate-400 font-semibold mb-1">样本切分区间</div>
                   <div className="text-slate-600 font-mono text-[11px] truncate">
-                    {formatDateOnly(requestPreview.timePeriods?.train?.[0])} ~ {formatDateOnly(requestPreview.timePeriods?.test?.[1])}
+                    {formatDateOnly(consoleView.trainStart)} ~ {formatDateOnly(consoleView.testEnd)}
                   </div>
                 </div>
               </div>
@@ -363,13 +418,18 @@ export const TrainingConsole: React.FC<TrainingConsoleProps> = ({
                     <FileText size={14} />
                     请求预览
                     <Tag className="!mr-0 !ml-1 rounded-full text-[10px] bg-slate-100 text-slate-600 border-none">
-                      {requestPreview.selectedFeatures?.length || 0} 特征
+                      {consoleView.featureCount} 特征
                     </Tag>
+                    {consoleView.isRunPayload && (
+                      <Tag color="geekblue" className="!mr-0 rounded-full text-[10px] border-none">
+                        任务载荷
+                      </Tag>
+                    )}
                   </span>
                 ),
                 children: (
                   <pre className="h-[440px] overflow-auto rounded-2xl border border-slate-200 bg-slate-50/80 p-4 font-mono text-[11px] leading-5 text-slate-700 custom-scrollbar select-text">
-                    {JSON.stringify(requestPreview, null, 2)}
+                    {consoleView.payloadJson}
                   </pre>
                 ),
               },

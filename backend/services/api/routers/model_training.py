@@ -18,6 +18,7 @@ from backend.services.api.routers.admin.admin_training import (
     cancel_training_run as _cancel_training_run,
     get_latest_training_run_for_owner,
     get_training_run_for_owner,
+    get_training_run_request_for_owner,
     submit_training_job,
 )
 from backend.services.api.routers.admin.model_management import (
@@ -839,6 +840,17 @@ async def get_training_run(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     return await get_training_run_for_owner(run_id, current_user)
+
+
+@router.get(
+    "/training-runs/{run_id}/request",
+    summary="获取训练任务已提交的请求载荷（用户态，一次性拉取用）",
+)
+async def get_training_run_request(
+    run_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    return await get_training_run_request_for_owner(run_id, current_user)
 
 
 @router.post("/training-runs/{run_id}/cancel", summary="取消训练任务（用户态）")

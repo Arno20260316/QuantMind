@@ -284,20 +284,38 @@ def _prepare_arrays(
 
     # 逐列取中位数：train_df[features] 整块取值会临时复制 ~8GB（7.4M×273 float32）
     fill_values_raw = {c: train_df[c].median() for c in features}
-    fill_values = {k: (0.0 if (isinstance(v, float) and math.isnan(v)) else v) for k, v in fill_values_raw.items()}
+    # 中位数本身也可能非有限（列含 ±inf 时 pandas median 不忽略 inf）——一律回退 0.0，
+    # 否则「填缺失」会把 inf 再写回矩阵，XGBoost 照旧 Check failed。
+    fill_values = {k: (0.0 if (isinstance(v, float) and not math.isfinite(v)) else v) for k, v in fill_values_raw.items()}
     _fill_vec = np.array([fill_values[c] for c in features], dtype=np.float32)
 
     def _fill(frame: pd.DataFrame) -> np.ndarray:
         # 预分配一块 float32 矩阵逐列搬入并原地填 NaN。原实现
         # 「frame[features].copy() → 逐列 astype/fillna → to_numpy(float32)」
         # 同时存在 2~3 份整块副本（7.7M×273 时每份 ≈8GB），是预处理段峰值主因。
+        # ±inf 与 NaN 同口径视作缺失（因子除零产物，如 gap_mined:HD_NUMCHG_YOY）：
+        # LightGBM 默认把 inf 当缺失所以掩盖了该问题，XGBoost 的 QuantileDMatrix
+        # 对 inf 直接 Check failed（2026-10-16 T+5_Cross300_XGB 实证）。
         arr = np.empty((len(frame), len(features)), dtype=np.float32)
+        _inf_cols: list[tuple[str, int]] = []
         for i, c in enumerate(features):
             col = frame[c].to_numpy(dtype=np.float32, copy=True)
             mask = np.isnan(col)
+            inf_mask = np.isinf(col)
+            if inf_mask.any():
+                _inf_cols.append((c, int(inf_mask.sum())))
+                mask = mask | inf_mask
             if mask.any():
                 col[mask] = _fill_vec[i]
             arr[:, i] = col
+        if _inf_cols:
+            _top = sorted(_inf_cols, key=lambda t: -t[1])[:5]
+            logger.warning(
+                "_fill: %d 列含 ±inf，已按缺失填充（total=%d，Top: %s）",
+                len(_inf_cols),
+                sum(n for _, n in _inf_cols),
+                ", ".join(f"{c}×{n}" for c, n in _top),
+            )
         return arr
 
     X_train = _fill(train_df)

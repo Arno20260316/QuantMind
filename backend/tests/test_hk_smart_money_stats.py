@@ -234,13 +234,12 @@ def test_compute_scores_direction_flip_and_missing_not_filled():
 
 def test_flow_variants_domain_and_zero_fill():
     cal = pd.bdate_range("2026-01-05", periods=25)
-    cal_str = [d.strftime("%Y%m%d") for d in cal]
     syms = pd.Index(["A.HK", "B.HK"])
-    last, prev_day = cal_str[-1], cal_str[-2]
+    last, prev_day = cal[-1], cal[-2]
     flows = pd.DataFrame(
         [
             {
-                "dt": last,
+                "dt": last.strftime("%Y%m%d"),
                 "symbol": "A.HK",
                 "category": "hk",
                 "net_value": 1e5,
@@ -253,20 +252,26 @@ def test_flow_variants_domain_and_zero_fill():
     )
     holdings = pd.DataFrame(
         [
-            {"dt": d, "symbol": "A.HK", "category": "hk", "qty_sum": 100, "n_seats": 1}
-            for d in cal_str
+            {
+                "dt": d.strftime("%Y%m%d"),
+                "symbol": "A.HK",
+                "category": "hk",
+                "qty_sum": 100,
+                "n_seats": 1,
+            }
+            for d in cal
         ]
     )
-    pres = _holdings_presence(holdings, cal_str, syms, "hk")
+    pres = _holdings_presence(holdings, cal, syms, "hk")
     dom = _domain(pres)
     assert bool(pres.loc[last, "A.HK"]) and not bool(pres.loc[last, "B.HK"])
-    assert bool(dom.loc[cal_str[0], "A.HK"])  # 当日即域
+    assert bool(dom.loc[cal[0], "A.HK"])  # 当日即域
 
     def _fill(field: str) -> pd.DataFrame:
-        raw = _flows_field(flows, field, cal_str, syms, "hk")
+        raw = _flows_field(flows, field, cal, syms, "hk")
         return raw.mask(dom & raw.isna(), 0.0)
 
-    amt = pd.DataFrame(1e8, index=cal_str, columns=syms)
+    amt = pd.DataFrame(1e8, index=cal, columns=syms)
     variants = _variants_from_flow(
         _fill("net_value"),
         _fill("n_up"),
@@ -277,6 +282,10 @@ def test_flow_variants_domain_and_zero_fill():
         breadth=True,
     )
     assert set(variants) == {"net5_z", "net5_tt", "net20_tt", "breadth5"}
+    # 索引契约：面板与 calendar 同轴（DatetimeIndex）——曾按字符串索引而
+    # 与 amount 错位静默全 NaN（2026-10-16 事故），此处钉死
+    for mat in variants.values():
+        assert mat.index.equals(cal)
     assert variants["net5_tt"].loc[last, "A.HK"] == pytest.approx(2e-4)
     assert variants["net20_tt"].loc[last, "A.HK"] == pytest.approx(5e-5)
     assert variants["net5_z"].loc[last, "A.HK"] == pytest.approx(4.4721, abs=1e-3)

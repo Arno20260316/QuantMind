@@ -60,34 +60,41 @@ log = logging.getLogger(__name__)
 def _flows_field(
     flows: pd.DataFrame,
     field: str,
-    cal_str: list[str],
+    calendar: pd.DatetimeIndex,
     symbols: pd.Index,
     category: str,
 ) -> pd.DataFrame:
-    """单字段 日×票 矩阵（缺失 → NaN；调用方按定义域填 0）。"""
+    """单字段 日×票 矩阵（缺失 → NaN；调用方按定义域填 0）。
+
+    索引 = calendar（DatetimeIndex）：面板与 close/amount 同轴，否则 mask/相除
+    因索引错位静默全 NaN（2026-10-16 事故）。产物 dt 列是 YYYYMMDD 字符串，
+    转 datetime 后再 reindex。
+    """
     sub = flows[flows["category"] == category]
     if sub.empty:
-        return pd.DataFrame(np.nan, index=cal_str, columns=symbols, dtype="float64")
+        return pd.DataFrame(np.nan, index=calendar, columns=symbols, dtype="float64")
     piv = sub.pivot_table(
         index="dt", columns="symbol", values=field, aggfunc="sum", observed=False
     )
-    return piv.reindex(index=cal_str, columns=symbols)
+    piv.index = pd.to_datetime(piv.index, format="%Y%m%d")
+    return piv.reindex(index=calendar, columns=symbols)
 
 
 def _holdings_presence(
     holdings: pd.DataFrame,
-    cal_str: list[str],
+    calendar: pd.DatetimeIndex,
     symbols: pd.Index,
     category: str,
 ) -> pd.DataFrame:
-    """日×票 持仓存在掩码（某类型 qty>0 的票）。"""
+    """日×票 持仓存在掩码（某类型 qty>0 的票；索引 = calendar，口径同上）。"""
     sub = holdings[(holdings["category"] == category) & (holdings["qty_sum"] > 0)]
     if sub.empty:
-        return pd.DataFrame(False, index=cal_str, columns=symbols, dtype="bool")
+        return pd.DataFrame(False, index=calendar, columns=symbols, dtype="bool")
     piv = sub.assign(one=1).pivot_table(
         index="dt", columns="symbol", values="one", aggfunc="max", observed=False
     )
-    return piv.reindex(index=cal_str, columns=symbols).notna()
+    piv.index = pd.to_datetime(piv.index, format="%Y%m%d")
+    return piv.reindex(index=calendar, columns=symbols).notna()
 
 
 def _domain(presence: pd.DataFrame) -> pd.DataFrame:
@@ -137,7 +144,6 @@ def compute_all_signals(
     """
     calendar = close.index
     symbols = close.columns
-    cal_str = [d.strftime("%Y%m%d") for d in calendar]
     flows = ds.load_flows()
     holdings = ds.load_holdings()
     if flows.empty:
@@ -146,15 +152,15 @@ def compute_all_signals(
 
     panels: dict[str, pd.DataFrame] = {}
     for cat in CCASS_CATEGORIES:
-        pres = _holdings_presence(holdings, cal_str, symbols, cat)
+        pres = _holdings_presence(holdings, calendar, symbols, cat)
         dom = _domain(pres)
-        net = _flows_field(flows, "net_value", cal_str, symbols, cat)
+        net = _flows_field(flows, "net_value", calendar, symbols, cat)
         net = net.mask(dom & net.isna(), 0.0)
-        up = _flows_field(flows, "n_up", cal_str, symbols, cat)
+        up = _flows_field(flows, "n_up", calendar, symbols, cat)
         up = up.mask(dom & up.isna(), 0.0)
-        dn = _flows_field(flows, "n_dn", cal_str, symbols, cat)
+        dn = _flows_field(flows, "n_dn", calendar, symbols, cat)
         dn = dn.mask(dom & dn.isna(), 0.0)
-        act = _flows_field(flows, "n_active", cal_str, symbols, cat)
+        act = _flows_field(flows, "n_active", calendar, symbols, cat)
         act = act.mask(dom & act.isna(), 0.0)
         amt_c = amt.mask(dom & amt.isna(), 0.0)
         variants = _variants_from_flow(net, up, dn, act, amt_c, dom, breadth=True)

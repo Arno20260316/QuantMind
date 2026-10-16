@@ -96,10 +96,19 @@ class EventBuilder:
         amount: pd.DataFrame,
         fwd: dict[int, tuple[pd.DataFrame, pd.DataFrame]],
         data_dir: Path | str | None = None,
+        min_value_hkd: float | None = None,
+        min_pct: float | None = None,
+        min_price: float | None = None,
     ) -> None:
+        """阈值默认取包常量；显式传入仅供标定网格（validate --calibrate）。"""
         self._close = close
         self._amount = amount
         self._fwd = fwd
+        self._min_value = (
+            EVENT_MIN_VALUE_HKD if min_value_hkd is None else float(min_value_hkd)
+        )
+        self._min_pct = EVENT_MIN_PCT if min_pct is None else float(min_pct)
+        self._min_price = MIN_PRICE_HKD if min_price is None else float(min_price)
         from backend.services.api.market_analysis_hk import (
             institutional_classifier as ic,
         )
@@ -253,9 +262,9 @@ class EventBuilder:
         pct = dq / qty_prev.where(qty_prev > 0)
 
         ok = (
-            (dv.abs() >= EVENT_MIN_VALUE_HKD)
-            & (pct.abs() >= EVENT_MIN_PCT)
-            & (price >= MIN_PRICE_HKD)
+            (dv.abs() >= self._min_value)
+            & (pct.abs() >= self._min_pct)
+            & (price >= self._min_price)
         )
         kept = merged[ok].copy()
         if kept.empty:
@@ -389,6 +398,27 @@ class EventBuilder:
         return flows[list(_FLOW_DTYPES)].astype(_FLOW_DTYPES)
 
 
+def write_day_artifacts(
+    dt: str,
+    events: pd.DataFrame,
+    flows: pd.DataFrame,
+    universe: pd.DataFrame,
+    holdings: pd.DataFrame,
+) -> None:
+    """单日四件套原子落盘。
+
+    布局唯一出处：``events/dt=*/{data,flows,universe,holdings}.parquet``。
+    读侧（``datasets.load_events/load_flows/load_universe/load_holdings``）必须
+    与此一致——历史上 flows 曾按顶层 ``flows/`` 目录读而永远落空（写读缝，
+    2026-10-16 修复），改动此处须同步 ``datasets._artifact_paths`` 的调用。
+    """
+    base = ds.product_dir() / "events" / f"dt={dt}"
+    ds.write_parquet_atomic(events, base / "data.parquet")
+    ds.write_parquet_atomic(flows, base / "flows.parquet")
+    ds.write_parquet_atomic(universe, base / "universe.parquet")
+    ds.write_parquet_atomic(holdings, base / "holdings.parquet")
+
+
 def build_events(rebuild_days: int = 40) -> dict[str, Any]:
     """事件仓编排（增量或全量），逐日原子写 events/flows/counts/universe。
 
@@ -453,11 +483,7 @@ def build_events(rebuild_days: int = 40) -> dict[str, Any]:
             else:
                 counts["south_flow_rows"] = 0
                 counts["south_available"] = False
-            base = ds.product_dir() / "events" / f"dt={dt}"
-            ds.write_parquet_atomic(events, base / "data.parquet")
-            ds.write_parquet_atomic(flows, base / "flows.parquet")
-            ds.write_parquet_atomic(universe, base / "universe.parquet")
-            ds.write_parquet_atomic(holdings, base / "holdings.parquet")
+            write_day_artifacts(dt, events, flows, universe, holdings)
             _write_counts(dt, counts)
             stats["days_written"] += 1
             stats["events_total"] += counts["events_n"]
@@ -509,3 +535,8 @@ def _read_counts(dt: str) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def read_counts(dt: str) -> dict[str, Any]:
+    """读逐日计数（events/dt=/counts.json）；缺失/损坏返回空 dict。"""
+    return _read_counts(dt)

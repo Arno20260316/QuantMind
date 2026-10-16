@@ -163,6 +163,81 @@ def test_load_south_sanitize_and_dedupe(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- 产物面
 
 
+def test_day_artifacts_writer_reader_seam(tmp_path, monkeypatch):
+    """写读缝回归（2026-10-16 事故）：flows 必须从 events/dt=*/flows.parquet 读回。
+
+    写侧只经 events.write_day_artifacts、读侧只经 datasets.load_*，任一侧改布局
+    而另一侧未同步即红。事故形态：读侧曾按顶层 flows/ 目录找，永远空 → validate
+    在 compute_all_signals 才炸（事件仓 466 分区全白建）。
+    """
+    from backend.shared.hk_smart_money import events as ev
+
+    monkeypatch.setenv("QM_MARKET_SNAPSHOT_DIR", str(tmp_path))
+    dt = "20260105"
+    ev.write_day_artifacts(
+        dt,
+        events=pd.DataFrame({"dt": [dt], "participant_id": ["C1"]}),
+        flows=pd.DataFrame({"dt": [dt], "category": ["x"], "net_value": [1.0]}),
+        universe=pd.DataFrame({"symbol": ["0001.HK"]}),
+        holdings=pd.DataFrame({"dt": [dt], "symbol": ["0001.HK"], "qty_sum": [9]}),
+    )
+    assert ds.event_dates() == (dt,)
+    assert ds.flow_dates() == (dt,)  # 顶层 flows/ 目录不存在，flows 随日分区
+    assert len(ds.load_flows()) == 1
+    assert len(ds.load_flows(dates=[dt])) == 1
+    assert len(ds.load_events()) == 1
+    assert len(ds.load_universe()) == 1
+    assert len(ds.load_holdings()) == 1
+    assert ds.load_flows().iloc[0]["net_value"] == 1.0
+    # dt 必须回读为 YYYYMMDD 字符串：DuckDB 默认把 dt=YYYYMMDD 目录名当 hive
+    # 分区、按 BIGINT 覆盖/注入 dt 列（2026-10-16 第三事故），此处钉死
+    assert list(ds.load_flows()["dt"]) == [dt]
+    assert list(ds.load_events()["dt"]) == [dt]
+    assert list(ds.load_holdings()["dt"]) == [dt]
+
+
+def test_empty_first_partition_schema_readable(tmp_path, monkeypatch):
+    """空首分区 schema 回归（2026-10-16 第二事故）：首日 prev=None → events/flows
+    为空帧，修复前 object 列落成 parquet null 型，DuckDB 多文件读（取首文件
+    schema）对后续 VARCHAR 列 cast 报错。写侧自描述 + 读侧 union_by_name 双保险。
+    """
+    from backend.shared.hk_smart_money import events as ev
+
+    monkeypatch.setenv("QM_MARKET_SNAPSHOT_DIR", str(tmp_path))
+    ev.write_day_artifacts(
+        "20260105",
+        events=pd.DataFrame(columns=["dt", "symbol", "participant_id"]),
+        flows=pd.DataFrame(columns=["dt", "symbol", "category", "net_value"]),
+        universe=pd.DataFrame({"symbol": ["0001.HK"]}),
+        holdings=pd.DataFrame({"dt": ["20260105"], "symbol": ["0001.HK"]}),
+    )
+    ev.write_day_artifacts(
+        "20260106",
+        events=pd.DataFrame({"dt": ["20260106"], "symbol": ["0001.HK"]}),
+        flows=pd.DataFrame(
+            {"dt": ["20260106"], "symbol": ["0001.HK"], "category": ["x"]}
+        ),
+        universe=pd.DataFrame({"symbol": ["0001.HK"]}),
+        holdings=pd.DataFrame({"dt": ["20260106"], "symbol": ["0001.HK"]}),
+    )
+    flows = ds.load_flows()  # 修复前：VARCHAR→NULL cast 报错
+    assert list(flows["symbol"]) == ["0001.HK"]
+    events = ds.load_events()
+    assert list(events["symbol"]) == ["0001.HK"]
+    # 写侧自描述：空分区列非 null 型（读单文件也不炸）
+    one = ds.load_flows(dates=["20260105"])
+    assert one.empty
+    assert list(one.columns) == ["dt", "symbol", "category", "net_value"]
+
+
+def test_load_flows_missing_dates_returns_empty(tmp_path, monkeypatch):
+    """域外日期静默跳过（dates 显式传入但无分区）。"""
+    monkeypatch.setenv("QM_MARKET_SNAPSHOT_DIR", str(tmp_path))
+    assert ds.load_flows(dates=["20260105"]).empty
+    assert ds.flow_dates() == ()
+    assert ds.load_events().empty
+
+
 def test_product_dir_resolution(tmp_path, monkeypatch):
     monkeypatch.setenv("QM_MARKET_SNAPSHOT_DIR", str(tmp_path))
     assert ds.product_dir() == tmp_path / "hk_smart_money"

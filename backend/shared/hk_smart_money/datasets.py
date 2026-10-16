@@ -252,6 +252,15 @@ def write_json_atomic(name: str, payload: Any) -> Path:
 def write_parquet_atomic(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".parquet.tmp")
+    if df.empty:
+        # 空帧的 object 列直写 parquet 会落成 null 类型：首日（prev=None）的
+        # events/flows 即空帧，DuckDB 多文件读按首文件取 schema 时后续 VARCHAR
+        # 列 cast 报错（2026-10-16 事故，与 flows 读缝同批）。写侧转 string dtype
+        # 使空分区自描述，不依赖读侧容错。
+        df = df.copy()
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype("string")
     df.to_parquet(tmp, index=False)
     os.replace(tmp, path)
 
@@ -259,7 +268,7 @@ def write_parquet_atomic(df: pd.DataFrame, path: Path) -> None:
 # ---------------------------------------------------------------- 产物分区
 
 
-def _product_dates(kind: str) -> tuple[str, ...]:
+def _artifact_dates(kind: str, filename: str) -> tuple[str, ...]:
     root = product_dir() / kind
     if not root.is_dir():
         return ()
@@ -267,34 +276,54 @@ def _product_dates(kind: str) -> tuple[str, ...]:
         sorted(
             m.group(1)
             for name in os.listdir(root)
-            if (m := _DATE_RE.match(name)) and (root / name / "data.parquet").is_file()
+            if (m := _DATE_RE.match(name)) and (root / name / filename).is_file()
         )
     )
 
 
+def _artifact_paths(kind: str, filename: str, dates: Sequence[str]) -> list[str]:
+    return [
+        str(product_dir() / kind / f"dt={d}" / filename)
+        for d in dates
+        if (product_dir() / kind / f"dt={d}" / filename).is_file()
+    ]
+
+
 def event_dates() -> tuple[str, ...]:
-    return _product_dates("events")
+    return _artifact_dates("events", "data.parquet")
 
 
 def flow_dates() -> tuple[str, ...]:
-    return _product_dates("flows")
+    """逐日 flows 与 events 同落 ``events/dt=*/flows.parquet``（写侧唯一出处
+    events.write_day_artifacts；顶层不存在独立 flows/ 目录）。"""
+    return _artifact_dates("events", "flows.parquet")
 
 
 def score_dates() -> tuple[str, ...]:
-    return _product_dates("scores")
+    return _artifact_dates("scores", "data.parquet")
 
 
 def _read_many(
     paths: Sequence[str], columns: Sequence[str] | None = None
 ) -> pd.DataFrame:
-    """DuckDB 批量读分区（显式路径列表；columns 为内部常量白名单）。"""
+    """DuckDB 批量读分区（显式路径列表；columns 为内部常量白名单）。
+
+    两个选项都不可省：
+    - ``union_by_name=True``：默认按首文件取 schema，首日空分区的 null 型列
+      （修复前存量产物）会让后续 VARCHAR 列 cast 报错；
+    - ``hive_partitioning=false``：``dt=YYYYMMDD`` 目录名会被 DuckDB 自动当
+      hive 分区，把 dt 列按 BIGINT 覆盖/注入（2026-10-16 事故：面板索引变
+      int、落「过闸 0」假裁定）。
+    """
     if not paths:
         return pd.DataFrame()
     cols = ", ".join(columns) if columns else "*"
     con = duckdb.connect()
     try:
         return con.execute(
-            f"SELECT {cols} FROM read_parquet($paths)", {"paths": list(paths)}
+            f"SELECT {cols} FROM read_parquet($paths, union_by_name = true,"
+            " hive_partitioning = false)",
+            {"paths": list(paths)},
         ).fetchdf()
     finally:
         con.close()
@@ -305,25 +334,15 @@ def load_events(
 ) -> pd.DataFrame:
     """事件仓（可按日期子集/列裁剪；dt 列 = YYYYMMDD 字符串）。"""
     use = list(dates) if dates is not None else list(event_dates())
-    paths = [
-        str(product_dir() / "events" / f"dt={d}" / "data.parquet")
-        for d in use
-        if (product_dir() / "events" / f"dt={d}" / "data.parquet").is_file()
-    ]
-    return _read_many(paths, columns)
+    return _read_many(_artifact_paths("events", "data.parquet", use), columns)
 
 
 def load_flows(
     dates: Sequence[str] | None = None, columns: Sequence[str] | None = None
 ) -> pd.DataFrame:
-    """逐日类型净流（6 类型长格式）。"""
+    """逐日类型净流（6 类型长格式；与 events 同日分区 ``flows.parquet``）。"""
     use = list(dates) if dates is not None else list(flow_dates())
-    paths = [
-        str(product_dir() / "flows" / f"dt={d}" / "data.parquet")
-        for d in use
-        if (product_dir() / "flows" / f"dt={d}" / "data.parquet").is_file()
-    ]
-    return _read_many(paths, columns)
+    return _read_many(_artifact_paths("events", "flows.parquet", use), columns)
 
 
 def load_universe(dates: Sequence[str] | None = None) -> pd.DataFrame:
@@ -347,12 +366,7 @@ def load_holdings(dates: Sequence[str] | None = None) -> pd.DataFrame:
     信号定义域（当日或前日 qty>0）与 overview 类型持仓市值的唯一数据源。
     """
     use = list(dates) if dates is not None else list(event_dates())
-    paths = [
-        str(product_dir() / "events" / f"dt={d}" / "holdings.parquet")
-        for d in use
-        if (product_dir() / "events" / f"dt={d}" / "holdings.parquet").is_file()
-    ]
-    return _read_many(paths)
+    return _read_many(_artifact_paths("events", "holdings.parquet", use))
 
 
 def load_scores(dt: str) -> pd.DataFrame | None:

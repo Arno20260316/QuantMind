@@ -1,5 +1,5 @@
 /**
- * 聪明钱面板接线 v2（八区取数 → 布局 → 交互 → B 系列修复验收）。
+ * 聪明钱面板接线 v2.1（一框六面重排：取数 → 布局 → 分面交互 → B 系列修复验收）。
  *
  * 为什么值得钉住：
  * - 榜单行点击必须打开个股档案抽屉，抽屉内「打开个股终端」把 symbol 交给页面；
@@ -10,6 +10,9 @@
  * - B4：席位窗口切换失败必须进错误条，不能伪装成「无记录」；
  * - B9：北向卡增持/减持双向展示；缺失条目仍渲染「—」而不是 0 分；
  * - B5：证据台 h5/h10 视野切换 + 分年表 + IC 衰减图存在。
+ * - v2.1：仅激活面挂载（切走即卸，ECharts 不进 display:none 空转）；战绩/事件
+ *   研究/证据台/营业部榜切到该面才取数（懒加载）；面内失败只走显式重试，绝不
+ *   自动风暴（useFaceData 的 loaded/error 闸）。
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -71,6 +74,11 @@ const mockEventStudy = vi.mocked(getSmartMoneyEventStudy);
 const mockSeats = vi.mocked(getSmartMoneySeats);
 const mockDates = vi.mocked(getSmartMoneyDates);
 const mockStock = vi.mocked(getSmartMoneyStock);
+
+/** 切到某个分面（标签栏按钮；role=tab） */
+const openFace = async (name: string) => {
+  await userEvent.click(screen.getByRole('tab', { name }));
+};
 
 const PILLARS = [
   { name: 'inst_net_buy_5d_z', label: '机构净买额·5日z20', unit: 'z', direction: 1 },
@@ -352,7 +360,7 @@ beforeEach(() => {
   mockStock.mockResolvedValue(STOCK_DETAIL);
 });
 
-describe('聪明钱面板接线 v2', () => {
+describe('聪明钱面板接线 v2.1（一框六面）', () => {
   it('榜单行点击 → 个股档案抽屉；抽屉「打开个股终端」→ onOpenTerminal(symbol)', async () => {
     const onOpenTerminal = vi.fn();
     render(<SmartMoneyPanel onOpenTerminal={onOpenTerminal} />);
@@ -417,8 +425,83 @@ describe('聪明钱面板接线 v2', () => {
     await screen.findByText(/部分数据源未就绪/);
   });
 
+  it('B9：北向卡增持/减持双向展示（top_dec 不再被丢弃）', async () => {
+    render(<SmartMoneyPanel />);
+    await screen.findByText('招商银行');
+    expect(screen.getByText('五粮液')).toBeInTheDocument();
+    expect(screen.getByText('+1.21pp')).toBeInTheDocument();
+    expect(screen.getByText('-0.88pp')).toBeInTheDocument();
+  });
+
+  it('主面 404（smart_money_not_built）→ 空态说明卡而非白屏/报错', async () => {
+    const err = new SmartMoneyError('smart_money_not_built', 404);
+    mockOverview.mockRejectedValue(err);
+    render(<SmartMoneyPanel />);
+
+    await screen.findByText(/聪明钱统计尚未生成/);
+    expect(screen.queryByText('天马科技')).not.toBeInTheDocument();
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+  });
+
+  it('v2.1：标签栏六面 + 默认选股榜激活（aria-selected）', async () => {
+    render(<SmartMoneyPanel />);
+    await screen.findByText('天马科技');
+
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs.map((t) => t.textContent)).toEqual([
+      '选股榜',
+      '战绩追踪',
+      '席位面',
+      '事件研究',
+      '生态趋势',
+      '验证口径',
+    ]);
+    expect(screen.getByRole('tab', { name: '选股榜' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: '验证口径' })).toHaveAttribute('aria-selected', 'false');
+  });
+
+  it('v2.1：懒加载——未切到的面绝不取数（战绩/事件/证据/营业部榜）', async () => {
+    render(<SmartMoneyPanel />);
+    await screen.findByText('天马科技');
+
+    expect(mockTrack).not.toHaveBeenCalled();
+    expect(mockEventStudy).not.toHaveBeenCalled();
+    expect(mockEvidence).not.toHaveBeenCalled();
+    expect(mockBranches).not.toHaveBeenCalled();
+
+    await openFace('战绩追踪');
+    await waitFor(() => expect(mockTrack).toHaveBeenCalledTimes(1));
+    expect(mockEventStudy).not.toHaveBeenCalled();
+    expect(mockEvidence).not.toHaveBeenCalled();
+
+    await openFace('事件研究');
+    await waitFor(() => expect(mockEventStudy).toHaveBeenCalledTimes(1));
+    expect(mockEvidence).not.toHaveBeenCalled();
+
+    await openFace('验证口径');
+    await waitFor(() => expect(mockEvidence).toHaveBeenCalledTimes(1));
+
+    await openFace('席位面');
+    await waitFor(() => expect(mockBranches).toHaveBeenCalledWith(5));
+  });
+
+  it('v2.1：非激活面卸载（切走即卸，回切重新取数）', async () => {
+    render(<SmartMoneyPanel />);
+    await screen.findByText('天马科技');
+    const callsAfterFirstRender = mockStocks.mock.calls.length;
+
+    await openFace('事件研究');
+    await screen.findByText(/事件研究 · CAR/);
+    expect(screen.queryByText('天马科技')).not.toBeInTheDocument();
+
+    await openFace('选股榜');
+    await screen.findByText('天马科技');
+    await waitFor(() => expect(mockStocks.mock.calls.length).toBeGreaterThan(callsAfterFirstRender));
+  });
+
   it('B4：席位窗口切换失败 → 错误条（不伪装空数据）', async () => {
     render(<SmartMoneyPanel />);
+    await openFace('席位面');
     await screen.findByText('华鑫证券上海分公司');
 
     mockSeats.mockRejectedValue(new Error('席位库连接失败'));
@@ -431,6 +514,7 @@ describe('聪明钱面板接线 v2', () => {
 
   it('席位榜：窗口/排序/类型三筛均透传服务端', async () => {
     render(<SmartMoneyPanel />);
+    await openFace('席位面');
     await screen.findByText('华鑫证券上海分公司');
     expect(mockSeats).toHaveBeenCalledWith(expect.objectContaining({ window: 'all', sort: 'win_rate' }));
 
@@ -448,6 +532,7 @@ describe('聪明钱面板接线 v2', () => {
 
   it('营业部榜窗口切换重新取数（5 → 20）', async () => {
     render(<SmartMoneyPanel />);
+    await openFace('席位面');
     await screen.findByText('国泰君安南京太平南路');
     expect(mockBranches).toHaveBeenCalledWith(5);
 
@@ -456,46 +541,63 @@ describe('聪明钱面板接线 v2', () => {
     await waitFor(() => expect(mockBranches).toHaveBeenCalledWith(20));
   });
 
-  it('B9：北向卡增持/减持双向展示（top_dec 不再被丢弃）', async () => {
-    render(<SmartMoneyPanel />);
-    await screen.findByText('招商银行');
-    expect(screen.getByText('五粮液')).toBeInTheDocument();
-    expect(screen.getByText('+1.21pp')).toBeInTheDocument();
-    expect(screen.getByText('-0.88pp')).toBeInTheDocument();
-  });
-
   it('B5：证据台 h5/h10 切换 + 分年表 + 衰减图存在', async () => {
     render(<SmartMoneyPanel />);
+    await openFace('验证口径');
     await screen.findByText(/验证证据台/);
 
     // 默认 h10（复合分分年表标题随视野）
     expect(screen.getByText('复合分分年（h10）')).toBeInTheDocument();
 
-    // h5 chip：TrackRecord（区 4）与证据台（区 8）各有一组，取后者
-    await userEvent.click(screen.getAllByRole('button', { name: 'h5' })[1]);
+    await userEvent.click(screen.getByRole('button', { name: 'h5' }));
     expect(screen.getByText('复合分分年（h5）')).toBeInTheDocument();
     expect(screen.getByText('IC·h5')).toBeInTheDocument();
 
-    // 图表（衰减/累计/桶/CAR/行业/趋势/sparkline 均为 mock 元素）
+    // 图表（衰减图均为 mock 元素）；口径与新鲜度随面归位（原底部三列 → 本面尾）
     expect(screen.getAllByTestId('echarts-mock').length).toBeGreaterThan(0);
+    expect(screen.getByText('口径与新鲜度')).toBeInTheDocument();
+    expect(screen.getByText(/两融披露截至/)).toBeInTheDocument();
+  });
+
+  it('面内取数失败 → 面内错误条 + 重试成功；不自动风暴', async () => {
+    mockEvidence.mockRejectedValueOnce(new Error('证据库崩了'));
+    render(<SmartMoneyPanel />);
+
+    await openFace('验证口径');
+    await screen.findByText(/证据库崩了/);
+
+    // 失败后既不再自动重取，也不在来回切面时重取（loaded/error 闸）
+    await openFace('选股榜');
+    await screen.findByText('天马科技');
+    await openFace('验证口径');
+    await screen.findByText(/证据库崩了/);
+    expect(mockEvidence).toHaveBeenCalledTimes(1);
+
+    // 显式重试（第二次 mock 生效 → 内容出现）
+    await userEvent.click(screen.getByRole('button', { name: '重试' }));
+    await screen.findByText(/验证证据台/);
+    expect(mockEvidence).toHaveBeenCalledTimes(2);
+  });
+
+  it('刷新：概览重取 + 已激活懒面重取（战绩面为例）', async () => {
+    render(<SmartMoneyPanel />);
+    await openFace('战绩追踪');
+    await waitFor(() => expect(mockTrack).toHaveBeenCalledTimes(1));
+    const overviewCalls = mockOverview.mock.calls.length;
+
+    await userEvent.click(screen.getByRole('button', { name: /刷新/ }));
+    await waitFor(() => expect(mockTrack).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockOverview.mock.calls.length).toBeGreaterThan(overviewCalls));
   });
 
   it('战绩区：全史头号数字 + 最近案例行点击开档案', async () => {
     render(<SmartMoneyPanel />);
-    await screen.findByText(/战绩追踪/);
+    await openFace('战绩追踪');
+    await screen.findByText(/战绩追踪 · 历史回溯统计/);
     expect(screen.getByText('平均超额')).toBeInTheDocument();
     expect(screen.getByText('持有中·3d')).toBeInTheDocument();
 
     await userEvent.click(screen.getByText('示例甲'));
     await waitFor(() => expect(mockStock).toHaveBeenCalledWith('SH600001'));
-  });
-
-  it('主面 404（smart_money_not_built）→ 空态说明卡而非白屏/报错', async () => {
-    const err = new SmartMoneyError('smart_money_not_built', 404);
-    mockOverview.mockRejectedValue(err);
-    render(<SmartMoneyPanel />);
-
-    await screen.findByText(/聪明钱统计尚未生成/);
-    expect(screen.queryByText('天马科技')).not.toBeInTheDocument();
   });
 });

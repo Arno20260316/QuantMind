@@ -9,7 +9,7 @@
 import React, { useMemo, useState } from 'react';
 import { FlaskConical, GitMerge, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { Tooltip } from 'antd';
-import { EmptyHint, PeriodChips, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard, PeriodChips } from '../../../market-analysis-shared/ui';
 import type {
   SmartEvidenceResponse,
   SmartEvidenceSeg,
@@ -73,11 +73,14 @@ const SegCells: React.FC<{ seg: SmartEvidenceSeg | null | undefined }> = ({ seg 
 interface SmartMoneyEvidenceCardProps {
   evidence: SmartEvidenceResponse | null;
   loading?: boolean;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 export const SmartMoneyEvidenceCard: React.FC<SmartMoneyEvidenceCardProps> = ({
   evidence,
   loading,
+  bare = false,
 }) => {
   const [h, setH] = useState('10');
 
@@ -152,7 +155,8 @@ export const SmartMoneyEvidenceCard: React.FC<SmartMoneyEvidenceCardProps> = ({
 
   if (!evidence) {
     return (
-      <SectionCard
+      <FaceCard
+        bare={bare}
         icon={<FlaskConical className="w-3.5 h-3.5 text-purple-600" />}
         title="验证证据台（双过闸审计）"
       >
@@ -160,7 +164,7 @@ export const SmartMoneyEvidenceCard: React.FC<SmartMoneyEvidenceCardProps> = ({
           text={loading ? '加载中…' : '验证数据尚未生成（随每日构建产出）'}
           loading={loading}
         />
-      </SectionCard>
+      </FaceCard>
     );
   }
 
@@ -173,7 +177,8 @@ export const SmartMoneyEvidenceCard: React.FC<SmartMoneyEvidenceCardProps> = ({
   const win = evidence.window;
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<FlaskConical className="w-3.5 h-3.5 text-purple-600" />}
       title={
         <span className="flex items-center gap-1.5">
@@ -373,6 +378,6 @@ export const SmartMoneyEvidenceCard: React.FC<SmartMoneyEvidenceCardProps> = ({
           </div>
         )}
       </div>
-    </SectionCard>
+    </FaceCard>
   );
 };

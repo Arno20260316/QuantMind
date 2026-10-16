@@ -6,7 +6,7 @@
 
 import React, { useMemo } from 'react';
 import { Activity } from 'lucide-react';
-import { EmptyHint, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard } from '../../../market-analysis-shared/ui';
 import type { SmartTrendRow } from '../../services/smartMoneyService';
 import { MISSING, fmtNum } from '../../smartMoneyVocabulary';
 import {
@@ -21,6 +21,8 @@ import {
 interface SmartMoneyEcoTrendSectionProps {
   trends: Record<string, SmartTrendRow[]> | null;
   loading?: boolean;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 type TrendDef = {
@@ -171,10 +173,12 @@ const TrendCard: React.FC<{ def: TrendDef; rows: SmartTrendRow[] }> = ({ def, ro
 export const SmartMoneyEcoTrendSection: React.FC<SmartMoneyEcoTrendSectionProps> = ({
   trends,
   loading,
+  bare = false,
 }) => {
   const hasAny = DEFS.some((d) => (trends?.[d.key]?.length ?? 0) > 0);
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<Activity className="w-3.5 h-3.5 text-purple-600" />}
       title={
         <span className="flex items-center gap-1.5">
@@ -196,6 +200,6 @@ export const SmartMoneyEcoTrendSection: React.FC<SmartMoneyEcoTrendSectionProps>
           ))}
         </div>
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

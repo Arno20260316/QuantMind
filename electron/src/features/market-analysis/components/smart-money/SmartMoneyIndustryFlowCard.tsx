@@ -6,7 +6,7 @@
 
 import React, { useMemo } from 'react';
 import { Factory } from 'lucide-react';
-import { EmptyHint, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard } from '../../../market-analysis-shared/ui';
 import type { SmartIndustryRow } from '../../services/smartMoneyService';
 import { MISSING, fmtNum, fmtSigned } from '../../smartMoneyVocabulary';
 import { AXIS_LABEL, CHART_COLORS, SmartChart } from './charts';
@@ -16,6 +16,8 @@ const TOP_N = 12;
 interface SmartMoneyIndustryFlowCardProps {
   rows: SmartIndustryRow[] | null | undefined;
   loading?: boolean;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 interface FlowRow {
@@ -30,6 +32,7 @@ interface FlowRow {
 export const SmartMoneyIndustryFlowCard: React.FC<SmartMoneyIndustryFlowCardProps> = ({
   rows,
   loading,
+  bare = false,
 }) => {
   const flow: FlowRow[] = useMemo(() => {
     const list = (rows ?? []).map((r) => {
@@ -115,7 +118,8 @@ export const SmartMoneyIndustryFlowCard: React.FC<SmartMoneyIndustryFlowCardProp
   }, [flow]);
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<Factory className="w-3.5 h-3.5 text-purple-600" />}
       title={
         <span className="flex items-center gap-1.5">
@@ -138,6 +142,6 @@ export const SmartMoneyIndustryFlowCard: React.FC<SmartMoneyIndustryFlowCardProp
           </div>
         </>
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

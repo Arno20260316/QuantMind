@@ -8,7 +8,7 @@
 import React, { useMemo, useState } from 'react';
 import { History, ListOrdered } from 'lucide-react';
 import { Tooltip } from 'antd';
-import { EmptyHint, PeriodChips, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard, PeriodChips } from '../../../market-analysis-shared/ui';
 import type {
   SmartTrackRecent,
   SmartTrackRecordResponse,
@@ -56,6 +56,8 @@ interface SmartMoneyTrackRecordSectionProps {
   data: SmartTrackRecordResponse | null;
   loading?: boolean;
   onPick?: (symbol: string) => void;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 const WindowStatRow: React.FC<{ w: SmartTrackWindow }> = ({ w }) => (
@@ -122,6 +124,7 @@ export const SmartMoneyTrackRecordSection: React.FC<SmartMoneyTrackRecordSection
   data,
   loading,
   onPick,
+  bare = false,
 }) => {
   const [h, setH] = useState('h5');
 
@@ -279,7 +282,8 @@ export const SmartMoneyTrackRecordSection: React.FC<SmartMoneyTrackRecordSection
   const mono = data?.buckets?.monotonicity ?? null;
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<History className="w-3.5 h-3.5 text-purple-600" />}
       title={
         <span className="flex items-center gap-1.5">
@@ -396,28 +400,31 @@ export const SmartMoneyTrackRecordSection: React.FC<SmartMoneyTrackRecordSection
                 T+1 收盘入场口径 · 点行打开个股档案
               </span>
             </div>
-            <div className="grid grid-cols-[64px_minmax(110px,1.3fr)_48px_64px_64px_64px_56px] gap-1.5 px-1 pb-1 text-[9px] font-extrabold text-slate-400 border-b border-slate-100">
-              <span>日</span>
-              <span>标的</span>
-              <span className="text-right">分</span>
-              <span className="text-right">至今</span>
-              <span className="text-right">h5</span>
-              <span className="text-right">h10</span>
-              <span className="text-center">状态</span>
+            {/* 限高滚动：近 10 计分日 × Top-5 全量入表会拉长整面，表头吸顶滚动阅读 */}
+            <div className="max-h-[300px] overflow-y-auto custom-scrollbar rounded-lg border border-slate-100/80">
+              <div className="grid grid-cols-[64px_minmax(110px,1.3fr)_48px_64px_64px_64px_56px] gap-1.5 px-1 py-1 text-[9px] font-extrabold text-slate-400 border-b border-slate-100 sticky top-0 bg-white/95 backdrop-blur z-[5]">
+                <span>日</span>
+                <span>标的</span>
+                <span className="text-right">分</span>
+                <span className="text-right">至今</span>
+                <span className="text-right">h5</span>
+                <span className="text-right">h10</span>
+                <span className="text-center">状态</span>
+              </div>
+              {(data.recent ?? []).length ? (
+                (data.recent ?? []).map((r) => (
+                  <RecentRow key={`${r.date}-${r.symbol}`} r={r} onPick={onPick} />
+                ))
+              ) : (
+                <EmptyHint text="近期无案例入池" />
+              )}
             </div>
-            {(data.recent ?? []).length ? (
-              (data.recent ?? []).map((r) => (
-                <RecentRow key={`${r.date}-${r.symbol}`} r={r} onPick={onPick} />
-              ))
-            ) : (
-              <EmptyHint text="近期无案例入池" />
-            )}
             <div className="text-[9px] text-slate-400 px-1 mt-1">
               「至今」=T+1 收盘入场至最新收盘的浮动收益（持有中最新实况）；「h5/h10」=已实现前向收益，未到期为「—」。
             </div>
           </div>
         </div>
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

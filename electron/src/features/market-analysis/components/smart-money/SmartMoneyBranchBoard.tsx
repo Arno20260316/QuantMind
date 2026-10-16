@@ -7,7 +7,7 @@
 import React from 'react';
 import { AlertCircle, Store } from 'lucide-react';
 import { Tooltip } from 'antd';
-import { EmptyHint, PeriodChips, RankRow, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard, PeriodChips, RankRow } from '../../../market-analysis-shared/ui';
 import type { SmartBranchRow } from '../../services/smartMoneyService';
 import { fmtYiFromYuan, signCls } from '../../smartMoneyVocabulary';
 
@@ -24,6 +24,8 @@ interface SmartMoneyBranchBoardProps {
   /** 窗口切换/加载失败 → 显式错误条（B4：不伪装成空数据） */
   error?: string | null;
   onRetry?: () => void;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
@@ -33,11 +35,13 @@ export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
   loading,
   error,
   onRetry,
+  bare = false,
 }) => {
   const list = rows ?? [];
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<Store className="w-3.5 h-3.5 text-purple-600" />}
       title="活跃席位（龙虎榜营业部）"
       extra={
@@ -94,6 +98,6 @@ export const SmartMoneyBranchBoard: React.FC<SmartMoneyBranchBoardProps> = ({
       ) : (
         <EmptyHint text={`近 ${window} 日无席位记录`} />
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

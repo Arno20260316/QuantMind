@@ -7,7 +7,7 @@
 
 import React, { useMemo } from 'react';
 import { FlaskRound } from 'lucide-react';
-import { EmptyHint, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard } from '../../../market-analysis-shared/ui';
 import type { SmartEventFamily, SmartEventStudyResponse } from '../../services/smartMoneyService';
 import { CAR_STRONG_COLOR, CAR_WEAK_COLOR, MISSING, fmtSigned } from '../../smartMoneyVocabulary';
 import { AXIS_LABEL, BASE_GRID, CHART_COLORS, SmartChart, tipNum } from './charts';
@@ -17,6 +17,8 @@ const FAMILY_ORDER = ['龙虎榜', '机构席位', '大宗交易', '机构调研
 interface SmartMoneyEventStudySectionProps {
   data: SmartEventStudyResponse | null;
   loading?: boolean;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
 }
 
 const FamilyCard: React.FC<{ name: string; fam: SmartEventFamily; carDays: number }> = ({
@@ -115,13 +117,15 @@ const FamilyCard: React.FC<{ name: string; fam: SmartEventFamily; carDays: numbe
 export const SmartMoneyEventStudySection: React.FC<SmartMoneyEventStudySectionProps> = ({
   data,
   loading,
+  bare = false,
 }) => {
   const families = data?.families ?? {};
   const names = FAMILY_ORDER.filter((n) => families[n]).concat(
     Object.keys(families).filter((n) => !FAMILY_ORDER.includes(n)),
   );
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       icon={<FlaskRound className="w-3.5 h-3.5 text-purple-600" />}
       title={
         <span className="flex items-center gap-1.5">
@@ -155,6 +159,6 @@ export const SmartMoneyEventStudySection: React.FC<SmartMoneyEventStudySectionPr
           ))}
         </div>
       )}
-    </SectionCard>
+    </FaceCard>
   );
 };

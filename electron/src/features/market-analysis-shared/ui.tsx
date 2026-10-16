@@ -89,6 +89,48 @@ export function SectionCard({
   );
 }
 
+/** 分面容器：framed（默认）= 独立白卡（与 SectionCard 同款）；
+ *
+ * `bare` = 无卡壳（标题行 + 内容直接铺开）——供「统一大框 + 页内标签面」使用，
+ * 避免卡中卡；标签面标题保留（面内口径说明不随卡壳一起丢）。
+ */
+export function FaceCard({
+  bare = false,
+  title,
+  icon,
+  extra,
+  children,
+  className = '',
+}: {
+  /** true = 无卡壳（嵌在统一大框内的标签面用） */
+  bare?: boolean;
+  title: React.ReactNode;
+  icon?: React.ReactNode;
+  extra?: React.ReactNode;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  if (!bare) {
+    return (
+      <SectionCard title={title} icon={icon} extra={extra} className={className}>
+        {children}
+      </SectionCard>
+    );
+  }
+  return (
+    <div className={`flex flex-col gap-2.5 min-w-0 ${className}`}>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <h3 className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5 min-w-0">
+          {icon}
+          <span className="min-w-0">{title}</span>
+        </h3>
+        {extra && <div className="flex items-center gap-2 flex-wrap">{extra}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
 /** 通用排行表行（表格行二三列对齐名/值）
  *
  * 传 `onClick` 时整行为可点击入口（如点击弹出个股终端浮窗）：

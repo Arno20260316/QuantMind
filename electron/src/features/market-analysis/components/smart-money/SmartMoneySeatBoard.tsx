@@ -8,7 +8,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, Store } from 'lucide-react';
 import { Tooltip } from 'antd';
-import { EmptyHint, PeriodChips, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard, PeriodChips } from '../../../market-analysis-shared/ui';
 import {
   getSmartMoneySeats,
   type SmartSeatsResponse,
@@ -50,6 +50,8 @@ interface SmartMoneySeatBoardProps {
   /** 外部选中的席位（详情页联动高亮，可选） */
   highlightSeat?: string | null;
   onPickSeat?: (seatName: string) => void;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
   className?: string;
 }
 
@@ -110,6 +112,7 @@ export const SmartMoneySeatBoard: React.FC<SmartMoneySeatBoardProps> = ({
   refreshToken = 0,
   highlightSeat,
   onPickSeat,
+  bare = false,
   className = '',
 }) => {
   const [win, setWin] = useState('all');
@@ -153,7 +156,8 @@ export const SmartMoneySeatBoard: React.FC<SmartMoneySeatBoardProps> = ({
   const baseline = data?.baseline_win_rate ?? null;
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       className={className}
       icon={<Store className="w-3.5 h-3.5 text-purple-600" />}
       title={
@@ -233,9 +237,10 @@ export const SmartMoneySeatBoard: React.FC<SmartMoneySeatBoardProps> = ({
           <EmptyHint text="该筛选条件下暂无席位记录" />
         ) : (
           <>
-            <div className="overflow-x-auto">
+            {/* 限高滚动（表头吸顶）：50 席/页全展开会拉长整面，框内滚动阅读 */}
+            <div className="max-h-[420px] overflow-auto custom-scrollbar rounded-lg border border-slate-100/80">
               <div className="min-w-[560px] flex flex-col">
-                <div className="grid grid-cols-[minmax(140px,1.6fr)_74px_minmax(0,0.8fr)_minmax(0,0.7fr)_minmax(0,0.8fr)_56px_64px] gap-1.5 px-1 pb-1 text-[9px] font-extrabold text-slate-400 border-b border-slate-100">
+                <div className="grid grid-cols-[minmax(140px,1.6fr)_74px_minmax(0,0.8fr)_minmax(0,0.7fr)_minmax(0,0.8fr)_56px_64px] gap-1.5 px-1 py-1 text-[9px] font-extrabold text-slate-400 border-b border-slate-100 sticky top-0 bg-white/95 backdrop-blur z-[5]">
                   <span>席位</span>
                   <span>类型</span>
                   <span className="text-right">净买(亿)</span>
@@ -282,6 +287,6 @@ export const SmartMoneySeatBoard: React.FC<SmartMoneySeatBoardProps> = ({
           </>
         )}
       </div>
-    </SectionCard>
+    </FaceCard>
   );
 };

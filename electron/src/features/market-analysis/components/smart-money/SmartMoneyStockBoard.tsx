@@ -8,7 +8,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, Crosshair, ListFilter } from 'lucide-react';
 import { Tooltip } from 'antd';
-import { EmptyHint, SectionCard } from '../../../market-analysis-shared/ui';
+import { EmptyHint, FaceCard } from '../../../market-analysis-shared/ui';
 import {
   getSmartMoneyStocks,
   type SmartPillarMeta,
@@ -50,6 +50,8 @@ interface SmartMoneyStockBoardProps {
   onPick?: (symbol: string) => void;
   /** 响应元数据上抛（面板头部展示 as_of/partial/池规模） */
   onMeta?: (meta: { as_of: string | null; partial: boolean | null; total: number } | null) => void;
+  /** true = 无卡壳（统一大框内的标签面） */
+  bare?: boolean;
   className?: string;
 }
 
@@ -66,6 +68,7 @@ export const SmartMoneyStockBoard: React.FC<SmartMoneyStockBoardProps> = ({
   industryOptions,
   onPick,
   onMeta,
+  bare = false,
   className = '',
 }) => {
   const [q, setQ] = useState<BoardQuery>({ event: null, industry: null, minScore: 0, offset: 0 });
@@ -118,7 +121,8 @@ export const SmartMoneyStockBoard: React.FC<SmartMoneyStockBoardProps> = ({
     !!date && !!resp?.as_of && resp.as_of !== date && !loading && !error;
 
   return (
-    <SectionCard
+    <FaceCard
+      bare={bare}
       className={className}
       title={
         <span className="flex items-center gap-1.5">
@@ -237,7 +241,8 @@ export const SmartMoneyStockBoard: React.FC<SmartMoneyStockBoardProps> = ({
           )
         ) : (
           <>
-            <div className="overflow-x-auto">
+            {/* 限高滚动（表头吸顶）：50 行/页全展开会占近 2 屏，框内滚动阅读 */}
+            <div className="max-h-[440px] overflow-auto custom-scrollbar rounded-lg border border-slate-100/80">
               <div className={`min-w-[860px] flex flex-col ${loading ? 'opacity-60' : ''} transition-opacity`}>
                 <div
                   className={`grid ${COLS} gap-2 px-1 pb-1.5 text-[9px] font-extrabold text-slate-400 border-b border-slate-100 sticky top-0 bg-white/95 backdrop-blur z-[5]`}
@@ -376,6 +381,6 @@ export const SmartMoneyStockBoard: React.FC<SmartMoneyStockBoardProps> = ({
           </>
         )}
       </div>
-    </SectionCard>
+    </FaceCard>
   );
 };
